@@ -1,0 +1,268 @@
+<!-- Served by aicouncil.server; no external assets (see the CSP header). -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Council</title>
+<link rel="stylesheet" href="/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#9878;</text></svg>">
+
+<div id="app" class="app">
+
+  <!-- ================= Sidebar ================= -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 3v18M4 7h16M6.5 7l-3 6a3.5 3.5 0 0 0 7 0zM17.5 7l-3 6a3.5 3.5 0 0 0 7 0z"/>
+        </svg>
+      </div>
+      <div class="brand-text">
+        <h1>AI Council</h1>
+        <span class="brand-sub">Draft &rarr; Polish pipeline</span>
+      </div>
+    </div>
+
+    <!-- Target repository -->
+    <section class="panel">
+      <h2 class="panel-title">Target repository</h2>
+      <button id="repo-btn" class="repo-btn" type="button">
+        <span class="repo-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+          </svg>
+        </span>
+        <span class="repo-label" id="repo-label">Choose a repository&hellip;</span>
+      </button>
+      <div id="repo-meta" class="repo-meta hidden"></div>
+      <div id="recent-repos" class="recent"></div>
+    </section>
+
+    <!-- Live agent rail -->
+    <section class="panel">
+      <h2 class="panel-title">Council</h2>
+      <div id="agent-rail" class="agent-rail"></div>
+    </section>
+
+    <!-- Mode toggles -->
+    <section class="panel">
+      <h2 class="panel-title">Mode</h2>
+
+      <label class="toggle toggle-danger" for="zero-touch">
+        <input type="checkbox" id="zero-touch">
+        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+        <span class="toggle-text">
+          <strong>Zero-Touch Mode</strong>
+          <em>Run autonomously, skip all approvals</em>
+        </span>
+      </label>
+
+      <label class="toggle" for="safety-snapshot">
+        <input type="checkbox" id="safety-snapshot">
+        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+        <span class="toggle-text">
+          <strong>Safety snapshot</strong>
+          <em>Enable one-click rollback</em>
+        </span>
+      </label>
+
+      <label class="toggle" for="solo-mode">
+        <input type="checkbox" id="solo-mode">
+        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+        <span class="toggle-text">
+          <strong>Solo mode</strong>
+          <em>Skip the draft, use Claude only</em>
+        </span>
+      </label>
+
+      <label class="toggle" for="clean-worktree">
+        <input type="checkbox" id="clean-worktree">
+        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+        <span class="toggle-text">
+          <strong>Require clean tree</strong>
+          <em>Refuse to run on uncommitted work</em>
+        </span>
+      </label>
+
+      <div id="zero-touch-warning" class="inline-warning hidden">
+        Auto-approve flags will be passed to the CLI. Files change without
+        confirmation.
+      </div>
+    </section>
+
+    <div class="sidebar-spacer"></div>
+
+    <nav class="sidebar-foot">
+      <button id="settings-btn" class="ghost-btn" type="button">Settings</button>
+      <button id="history-btn" class="ghost-btn" type="button">History</button>
+    </nav>
+  </aside>
+
+  <!-- ================= Main ================= -->
+  <main class="main">
+
+    <header class="topbar">
+      <div class="status-pill" id="status-pill">
+        <span class="dot" id="status-dot"></span>
+        <span id="status-text">Idle</span>
+      </div>
+      <div class="topbar-meta" id="topbar-meta"></div>
+      <div class="topbar-actions">
+        <span class="conn" id="conn-state" title="Event stream">
+          <span class="conn-dot"></span><span class="conn-text">connecting</span>
+        </span>
+        <button id="cancel-btn" class="btn btn-quiet hidden" type="button">Cancel run</button>
+        <button id="rollback-btn" class="btn btn-quiet hidden" type="button">Roll back</button>
+      </div>
+    </header>
+
+    <!-- Task composer -->
+    <section class="composer" id="composer">
+      <textarea id="task-input" class="task-input" rows="3" spellcheck="false"
+        placeholder="Describe the change you want. Be specific about files, behaviour and edge cases&hellip;
+Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP, with tests."></textarea>
+      <div class="composer-foot">
+        <span class="hint"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> to run</span>
+        <button id="run-btn" class="btn btn-primary" type="button" disabled>
+          <span class="btn-spinner" aria-hidden="true"></span>
+          <span class="btn-label">Convene the council</span>
+        </button>
+      </div>
+    </section>
+
+    <!-- Approval gate -->
+    <section id="approval-gate" class="approval hidden" aria-live="polite">
+      <div class="approval-head">
+        <span class="approval-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>
+          </svg>
+        </span>
+        <div>
+          <strong>Review required</strong>
+          <p id="approval-copy">The draft is ready. <b>Nothing has been written to disk yet.</b>
+             Approving lets the senior stage apply changes to your repository.</p>
+        </div>
+      </div>
+      <textarea id="approval-note" class="approval-note" rows="2" spellcheck="false"
+        placeholder="Optional: steer the senior stage. Takes precedence over the draft."></textarea>
+      <div class="approval-actions">
+        <button id="reject-btn" class="btn btn-quiet" type="button">Reject</button>
+        <button id="approve-btn" class="btn btn-primary" type="button">Approve &amp; execute</button>
+      </div>
+    </section>
+
+    <!-- Output -->
+    <section class="output">
+      <div class="tabs" role="tablist">
+        <button class="tab active" data-tab="stream" role="tab">Live stream</button>
+        <button class="tab" data-tab="draft" role="tab">Draft <span class="tab-badge hidden" id="badge-draft"></span></button>
+        <button class="tab" data-tab="final" role="tab">Senior review <span class="tab-badge hidden" id="badge-final"></span></button>
+        <button class="tab" data-tab="diff" role="tab">Diff <span class="tab-badge hidden" id="badge-diff"></span></button>
+        <div class="tabs-spacer"></div>
+        <label class="autoscroll" for="autoscroll" title="Follow output as it arrives">
+          <input type="checkbox" id="autoscroll" checked> Follow
+        </label>
+      </div>
+
+      <div class="tab-panels">
+        <div class="tab-panel active" data-panel="stream">
+          <div id="stream" class="stream" role="log" aria-live="polite"></div>
+        </div>
+        <div class="tab-panel" data-panel="draft">
+          <div id="draft-view" class="markdown empty-state">
+            The junior stage&rsquo;s proposal appears here. It is read-only &mdash;
+            no files are touched during this stage.
+          </div>
+        </div>
+        <div class="tab-panel" data-panel="final">
+          <div id="final-view" class="markdown empty-state">
+            The senior stage&rsquo;s review and summary of applied changes appears here.
+          </div>
+        </div>
+        <div class="tab-panel" data-panel="diff">
+          <div id="diff-view" class="diff-view empty-state">
+            Changes made to your working tree appear here as a git diff.
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- ================= Directory picker ================= -->
+<div id="picker" class="modal hidden" role="dialog" aria-modal="true" aria-label="Choose a repository">
+  <div class="modal-card modal-card-tall">
+    <header class="modal-head">
+      <h3>Choose a repository</h3>
+      <button class="icon-btn" data-close="picker" type="button" aria-label="Close">&times;</button>
+    </header>
+    <div class="picker-bar">
+      <button id="picker-up" class="btn btn-quiet btn-sm" type="button">&uarr; Up</button>
+      <button id="picker-home" class="btn btn-quiet btn-sm" type="button">Home</button>
+      <input id="picker-path" class="picker-path" spellcheck="false" aria-label="Current path">
+    </div>
+    <div id="picker-list" class="picker-list"></div>
+    <footer class="modal-foot">
+      <span id="picker-status" class="picker-status"></span>
+      <button id="picker-select" class="btn btn-primary" type="button">Select this folder</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ================= Settings ================= -->
+<div id="settings" class="modal hidden" role="dialog" aria-modal="true" aria-label="Settings">
+  <div class="modal-card modal-card-tall">
+    <header class="modal-head">
+      <h3>Settings</h3>
+      <button class="icon-btn" data-close="settings" type="button" aria-label="Close">&times;</button>
+    </header>
+    <div class="modal-body">
+      <p class="settings-note">
+        Each stage shells out to a locally installed CLI that carries your own
+        subscription auth. No API keys are stored or sent.
+        <code>{prompt}</code> is replaced with the generated prompt.
+      </p>
+      <div id="provider-forms"></div>
+
+      <div class="field">
+        <label for="house-rules">Standing project rules</label>
+        <textarea id="house-rules" rows="4" spellcheck="false"
+          placeholder="Appended to every prompt. e.g. Use tabs. Never add dependencies without asking. All new code needs tests."></textarea>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label for="port-input">Preferred port</label>
+          <input id="port-input" type="number" min="1024" max="65535">
+        </div>
+        <div class="field field-check">
+          <label class="checkline" for="open-browser">
+            <input type="checkbox" id="open-browser"> Open a window on launch
+          </label>
+        </div>
+      </div>
+
+      <div id="doctor-out" class="doctor"></div>
+    </div>
+    <footer class="modal-foot">
+      <button id="reset-config" class="btn btn-quiet" type="button">Reset to defaults</button>
+      <span class="modal-foot-spacer"></span>
+      <button id="run-doctor" class="btn btn-quiet" type="button">Re-check CLIs</button>
+      <button id="save-settings" class="btn btn-primary" type="button">Save</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ================= History ================= -->
+<div id="history" class="modal hidden" role="dialog" aria-modal="true" aria-label="Run history">
+  <div class="modal-card modal-card-tall">
+    <header class="modal-head">
+      <h3>Run history</h3>
+      <button class="icon-btn" data-close="history" type="button" aria-label="Close">&times;</button>
+    </header>
+    <div id="history-list" class="history-list"></div>
+  </div>
+</div>
+
+<div id="toasts" class="toasts" aria-live="assertive"></div>
+
+<script src="/app.js"></script>

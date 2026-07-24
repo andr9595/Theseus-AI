@@ -1,0 +1,35 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# --- AI Council runtime state ---
+# Local machine config lives in ~/.config/ai-council, but allow an in-repo
+# override for development. Never commit it: it can contain absolute paths.
+config.local.json
+.aicouncil/
+runs/
+*.run.json
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Editors / OS ---
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.example.json
+.idea/
+*.swp
+*~
+.DS_Store
+
+# --- Node (only if the optional Electron shell is ever added) ---
+node_modules/
+package-lock.json

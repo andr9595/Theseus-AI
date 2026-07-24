@@ -1,0 +1,337 @@
+# AI Council
+
+A local, dark-themed desktop dashboard that runs a **two-stage coding pipeline**
+across your existing AI subscriptions — with **zero per-token API cost**.
+
+```
+   Your task
+       |
+       v
+  ┌──────────────────┐   read-only     ┌──────────────────┐   writes to disk
+  │  Stage 1 · Codex │ ─── draft ───>  │ Stage 2 · Claude │ ──> your repo
+  │   Junior Draft   │                 │  Senior Polish   │
+  └──────────────────┘                 └──────────────────┘
+                            ^
+                            └── approval gate (unless Zero-Touch is on)
+```
+
+Stage 1 shells out to the `codex` CLI (your ChatGPT Plus/Pro subscription) to
+survey the repository and write an implementation proposal. Stage 2 shells out
+to the `claude` CLI (your Claude Pro subscription) to verify that proposal
+against the real code, correct it, and apply the change.
+
+**Nothing in this application reads, stores or transmits an API key.** It
+drives the CLIs you have already authenticated, so the marginal cost of a run
+is zero.
+
+---
+
+## Why the pipeline is ordered this way
+
+Claude Pro's usage is rationed on a rolling window; Codex's is comparatively
+generous. The expensive part of any coding task is the *exploration* — reading
+the codebase, weighing approaches, discarding dead ends. So the junior stage
+absorbs that cost, and the senior stage receives a pre-digested proposal and
+spends its scarcer quota on judgement and application.
+
+Stage 2 is explicitly instructed to treat the draft as **untrusted input** —
+a colleague's suggestion, not a specification. That framing is deliberate: the
+main failure mode of a naive two-model chain is the second model politely
+rubber-stamping a confidently-wrong first draft.
+
+---
+
+## Requirements
+
+| Requirement | Notes |
+|---|---|
+| Python **3.9+** | Standard library only — no `pip install`, no virtualenv, no build step |
+| `git` | For the repo picker, diff viewer and rollback |
+| A browser | Chromium-family gets a frameless app window; Firefox gets a plain window |
+| `codex` CLI | Optional — Stage 1. See [Installing the agent CLIs](#installing-the-agent-clis) |
+| `claude` CLI | Optional — Stage 2 |
+
+The app itself has **no dependencies at all**. If the two CLIs are not
+installed yet, everything still runs — point the providers at the bundled mock
+agent (below) and the full pipeline is exercisable end to end.
+
+---
+
+## Quick start
+
+```bash
+git clone https://github.com/andr9595/ai-council.git
+cd ai-council
+./run.sh
+```
+
+That is the whole install. `run.sh` locates a Python 3.9+ interpreter, starts a
+loopback-only server on port 8760, and opens the dashboard in a browser window.
+
+Check what the app can see:
+
+```bash
+./run.sh --doctor
+```
+
+```
+AI Council v1.0.0
+  python      : 3.12.3 (/usr/bin/python3)
+  config      : /home/you/.config/ai-council/config.json
+  zero-touch  : off
+  target repo : (none selected)
+
+Providers:
+  [MISS] Codex    codex      -> not found on PATH
+  [MISS] Claude   claude     -> not found on PATH
+```
+
+### Launcher flags
+
+| Flag | Effect |
+|---|---|
+| `--doctor` | Report environment and CLI availability, then exit |
+| `--no-browser` | Start the server without opening a window |
+| `--port N` | Preferred port (falls back to a free one if taken) |
+| `--print-url` | Print only the dashboard URL, then serve |
+
+---
+
+## Using it
+
+1. **Pick a target repository.** Click the folder button in the sidebar. The
+   picker badges directories that are git repos; only those can be selected.
+2. **Describe the task.** Be specific about files, behaviour and edge cases —
+   the draft stage is only as good as its brief.
+3. **Run it** with the button or <kbd>Ctrl</kbd>+<kbd>Enter</kbd>.
+4. **Watch the council work.** The sidebar rail shows which agent is active;
+   the Live stream tab carries their output line by line as it arrives.
+5. **Review and approve.** The run pauses with the draft in the **Draft** tab
+   and nothing yet written to disk. Optionally type a steer — it takes
+   precedence over the draft — then click **Approve & execute**.
+6. **Inspect the result.** The **Diff** tab renders the actual `git diff` of
+   your working tree, per file, with line numbers.
+7. **Roll back** if you don't like it. One click restores the tree exactly.
+
+### The tabs
+
+| Tab | Contents |
+|---|---|
+| **Live stream** | Interleaved stdout/stderr from both CLIs, tagged by agent |
+| **Draft** | Stage 1's proposal, rendered as Markdown with highlighted code |
+| **Senior review** | Stage 2's review, change summary and verification notes |
+| **Diff** | The real working-tree diff, syntax-marked and collapsible per file |
+
+---
+
+## Zero-Touch Mode
+
+The toggle the whole design orbits around.
+
+**Off (default).** The run pauses at the approval gate. The draft is read-only
+by instruction, so at that moment *nothing has been written to disk*. Clicking
+**Approve & execute** is what grants Stage 2 permission to modify files.
+
+**On.** No gate. The pipeline runs start to finish unattended, and Stage 2
+receives its CLI's auto-approve flag (`--dangerously-skip-permissions` for
+`claude`, `--dangerously-bypass-approvals-and-sandbox` for `codex`).
+
+Three properties hold in both modes, and they are covered by tests:
+
+- **Stage 1 never receives an auto-approve flag.** It is read-only by contract
+  regardless of the toggle.
+- **The flags are never baked into the command template.** They live in a
+  separate config field and are appended only when permission has actually been
+  granted — so switching Zero-Touch off is sufficient to guarantee they are not
+  passed.
+- **A safety snapshot is taken immediately before Stage 2 runs**, so any run is
+  reversible.
+
+> **Zero-Touch means what it says.** An agent will create, modify and delete
+> files in your repository with no further confirmation. Use it on a branch,
+> keep Safety Snapshot on, and don't point it at anything you can't afford to
+> lose.
+
+### Other toggles
+
+| Toggle | Effect |
+|---|---|
+| **Safety snapshot** | Capture the worktree before Stage 2 so **Roll back** works. Leave on. |
+| **Solo mode** | Skip Stage 1 and send the task straight to Claude. Costs more quota; use for tasks too small to be worth a draft. |
+| **Require clean tree** | Refuse to start if the repo has uncommitted changes. |
+
+---
+
+## How rollback works
+
+Before Stage 2 writes anything, the app records your worktree as a real commit
+object — reachable from `refs/ai-council/snapshot`, so `git gc` can't reap it:
+
+```
+GIT_INDEX_FILE=<scratch> git add -A     # tracked edits AND untracked files
+GIT_INDEX_FILE=<scratch> git write-tree
+git commit-tree <tree> -p HEAD
+```
+
+It uses a **scratch index**, so your real index — and any carefully staged
+hunks in it — is never touched. It deliberately does *not* use `git stash
+create`, which cannot capture untracked files: a rollback built on it would
+delete every new file you hadn't committed yet.
+
+Rollback then resets to HEAD, cleans, and lays the snapshot tree back down.
+Ignored files (`node_modules/`, `.venv/`, build output) are neither captured
+nor deleted. The one thing not reproduced is the staged/unstaged split:
+everything uncommitted before the run is uncommitted after it, but changes
+that were staged come back unstaged.
+
+---
+
+## Installing the agent CLIs
+
+The pipeline needs `codex` and `claude` on your `PATH`. On Pop!\_OS / Ubuntu:
+
+```bash
+./scripts/install-deps.sh          # add --vscode to also install VS Code
+```
+
+It installs Node.js (the CLIs ship as npm packages), the two CLIs into a
+user-owned npm prefix, and `gh`. Run `./scripts/install-deps.sh --check` first
+to see what it would do. It uses `sudo` — read it before running it.
+
+Then authenticate each CLI once, interactively:
+
+```bash
+claude          # browser login for Claude Pro
+codex login     # browser login for ChatGPT Plus/Pro
+```
+
+Confirm the app can see them with `./run.sh --doctor`.
+
+### Trying it without the CLIs
+
+A mock agent ships in `scripts/`. It streams realistic Markdown and writes a
+real file, so the full Draft → Approve → Polish → Diff → Rollback loop works:
+
+Settings → for each stage, set the command to (one argument per line):
+
+```
+python3
+/absolute/path/to/ai-council/scripts/mock-agent.py
+--role
+drafter                       ← use "polisher" for Stage 2
+{prompt}
+```
+
+---
+
+## Configuring the providers
+
+Each stage is just a command template. `{prompt}` is replaced with the
+generated prompt; it can appear anywhere, including inside a larger argument
+like `--message={prompt}`.
+
+| Field | Meaning |
+|---|---|
+| **Command** | argv, one argument per line. Never passed through a shell. |
+| **Auto-approve arguments** | Appended *only* when permission has been granted. |
+| **Timeout** | Seconds before the child process group is killed. |
+| **Pipe the prompt on stdin** | For CLIs that prefer stdin. Automatic above 96 KB regardless. |
+
+Defaults:
+
+| Stage | Command | Auto-approve |
+|---|---|---|
+| 1 · Codex | `codex exec {prompt}` | `--dangerously-bypass-approvals-and-sandbox` |
+| 2 · Claude | `claude -p {prompt}` | `--dangerously-skip-permissions` |
+
+**Standing project rules** are appended to every prompt in both stages — a good
+place for "use tabs", "never add a dependency without asking", "all new code
+needs tests".
+
+Config lives at `~/.config/ai-council/config.json`. Run transcripts are written
+to `~/.config/ai-council/runs/` and surfaced in the History panel.
+
+---
+
+## Architecture
+
+```
+aicouncil/
+├── __main__.py     Entry point, browser launcher, --doctor
+├── server.py       http.server + SSE, token auth, Origin/Host validation
+├── pipeline.py     The state machine: drafting → gate → polishing → complete
+├── providers.py    CLI adapters: argv construction, streaming, cancellation
+├── prompts.py      Stage 1 / Stage 2 / solo prompt construction
+├── gitutil.py      Repo status, diffs, snapshot & rollback plumbing
+├── config.py       Atomic JSON config with deep-merged defaults
+├── events.py       Pub/sub bus with replay and per-subscriber backpressure
+└── web/            index.html · app.css · app.js  (no build step)
+```
+
+**Stack rationale.** A local web GUI, not Electron or Qt. It needs no package
+manager, no compiler and no `sudo` to run; it renders Markdown, syntax and
+diffs natively; and it works on Wayland without a toolkit. The cost is a
+hand-written Markdown renderer, highlighter and diff viewer in `app.js` —
+roughly 400 lines, which buys a zero-dependency install.
+
+**Streaming** is Server-Sent Events, not WebSockets: the wire format is three
+lines of text over an ordinary HTTP response, where RFC 6455 frame masking in
+`http.server` would be a lot of fragile code for a stream that only ever flows
+server → browser. Subscribers have bounded queues, so a stalled tab sheds old
+events instead of blocking the pipeline thread.
+
+### Security
+
+`localhost` is not a trust boundary — any web page you visit can issue requests
+to `127.0.0.1:8760`. Since this app's API can run a coding agent with
+auto-approve flags, four defences are layered:
+
+1. **Per-launch session token**, never persisted, required on every `/api/` call.
+2. **Origin validation** — rejects requests from real remote sites (drive-by CSRF).
+3. **Host validation** — rejects non-loopback `Host` headers (DNS rebinding).
+4. **No shell** — commands run as argv lists with `shell=False`, so a prompt
+   containing `` ` ``, `$(...)` or `;` is inert data.
+
+The UI is served under a strict CSP with no external assets, so agent output
+rendered as Markdown can never pull in a third party. Binding to anything other
+than loopback is refused outright.
+
+---
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+58 tests, standard library only. They drive real subprocesses, real sockets and
+real git repositories in temporary directories rather than mocking them — the
+parts most likely to break are exactly the ones a mock would paper over.
+
+Coverage focuses on the properties that matter if they're wrong:
+
+- Auto-approve flags reach the child process **if and only if** permission was
+  granted, and never reach Stage 1.
+- The approval gate is reached with a **pristine working tree**.
+- Rollback restores agent changes **without destroying pre-existing uncommitted
+  work** — the regression that made `git stash create` unusable here.
+- Cross-origin and bad-token requests are rejected; path traversal is blocked.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `codex`/`claude` shows **not found** | Not on `PATH`. Run `./scripts/install-deps.sh`, or set an absolute path in Settings. |
+| Stage 2 finishes but the diff is empty | The CLI ran without write permission. With Zero-Touch off, you must click **Approve & execute** — that's what grants it. |
+| "Missing session token" | The dashboard was opened without the launcher's URL. Restart with `./run.sh`. |
+| Run hangs, no output | The CLI is waiting on interactive input. Check its auto-approve arguments in Settings. |
+| Port already in use | The server falls back to a free port automatically; read the URL it prints. |
+| Stream shows "reconnecting" | The server stopped. It reconnects with backoff once it's back. |
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).

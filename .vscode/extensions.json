@@ -1,0 +1,10 @@
+{
+  // Suggested extensions for working on AI Council. None are required to run
+  // it - the app is pure Python standard library with a no-build frontend.
+  "recommendations": [
+    "ms-python.python",
+    "ms-python.vscode-pylance",
+    "eamodio.gitlens",
+    "esbenp.prettier-vscode"
+  ]
+}
