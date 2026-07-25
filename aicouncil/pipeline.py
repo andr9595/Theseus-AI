@@ -406,6 +406,8 @@ class Pipeline:
             # cannot complete: it would block on an interactive permission
             # prompt that nothing in this pipeline can answer.
             execute_approved = run.zero_touch
+            # Set when Stage 1 fails, which forces the gate back on.
+            draft_failed = False
 
             # ---- Stage 1: Junior Draft ----------------------------------
             if not run.solo:
@@ -428,14 +430,25 @@ class Pipeline:
                     return
 
                 if not result.ok:
-                    # A failed junior is recoverable: the senior can work from
-                    # the task alone. Warn and continue rather than aborting.
+                    # A failed junior is recoverable - the senior can work from
+                    # the task alone - but it is not what the operator asked
+                    # for. Continuing unattended would turn "junior drafts,
+                    # senior verifies" into a solo agent writing to the repo
+                    # with no draft and nobody watching, which is a combination
+                    # nobody selected. Degrade to the approval gate instead of
+                    # escalating past it; the operator can still approve.
+                    draft_failed = True
                     self.bus.publish(
                         "log",
                         level="warn",
                         message=(
                             f"Draft stage failed ({result.error}). "
-                            f"Continuing with the senior stage alone."
+                            + (
+                                "Pausing for approval: Zero-Touch assumes a "
+                                "draft to verify, and there is none."
+                                if run.zero_touch
+                                else "The senior stage can continue alone."
+                            )
                         ),
                     )
                 draft_text = result.stdout
@@ -444,12 +457,18 @@ class Pipeline:
             # Shown whenever Zero-Touch is off, including in Solo Mode where
             # there is no draft to read - the operator is still approving that
             # an agent may write to their repository.
-            if not run.zero_touch:
+            if not run.zero_touch or draft_failed:
                 self._set_state(run, AWAITING_APPROVAL, draft=draft_text)
                 self.bus.publish(
                     "log",
                     level="info",
-                    message="Paused for review. Nothing has been written to disk yet.",
+                    message=(
+                        "Paused for review. Nothing has been written to disk yet."
+                        if not draft_failed
+                        else "Paused for review: the draft stage failed, so there "
+                             "is nothing to verify. Approving runs the senior "
+                             "stage alone against your task."
+                    ),
                 )
                 self._gate.wait()
                 with self._lock:

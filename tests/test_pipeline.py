@@ -340,14 +340,20 @@ class TestFailureHandling(PipelineTestBase):
         self.assertTrue(run.error)
 
     def test_failing_junior_stage_does_not_abort_the_run(self):
-        # A dead junior is recoverable: the senior can work from the task alone.
+        # A dead junior is recoverable — the senior can work from the task
+        # alone — but recovery is the operator's call, not the pipeline's.
+        # Under Zero-Touch the run degrades to the approval gate rather than
+        # proceeding unattended; see TestDraftFailureDoesNotEscalate.
         self.store.update({
-            "zero_touch": True,
+            "zero_touch": False,
             "providers": {"drafter": mock_provider("drafter", "Junior", ["--fail"])},
         })
         run = self.pipeline.start("carry on regardless", str(self.repo))
-        self.wait_terminal()
+        self.wait_for(lambda: run.state == "awaiting_approval")
         self.assertEqual(run.stages["drafter"].state, "failed")
+
+        self.pipeline.approve()
+        self.wait_terminal()
         self.assertEqual(run.state, "complete", run.error)
 
     def test_missing_executable_is_reported_not_raised(self):
@@ -474,3 +480,55 @@ class TestEventStream(PipelineTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDraftFailureDoesNotEscalate(PipelineTestBase):
+    """A failed Stage 1 must not turn Zero-Touch into an unattended solo run.
+
+    Zero-Touch means "you may skip my approval because a junior drafted it and
+    a senior is verifying that draft". With no draft, that premise is gone —
+    proceeding anyway silently grants an agent unattended write access under a
+    setting the operator chose for a different situation.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.store.update({
+            "zero_touch": True,
+            "providers": {"drafter": mock_provider("drafter", "Junior", ["--fail"])},
+        })
+
+    def test_zero_touch_falls_back_to_the_gate(self):
+        run = self.pipeline.start("do the thing", str(self.repo))
+        self.wait_for(
+            lambda: run.state == "awaiting_approval", what="the fallback gate"
+        )
+        # And crucially: nothing written while it waits.
+        self.assertFalse((self.repo / "AI_COUNCIL_DEMO.md").exists())
+        self.assertTrue(gitutil.status(self.repo).clean)
+
+    def test_operator_can_still_approve_the_solo_continuation(self):
+        run = self.pipeline.start("do the thing", str(self.repo))
+        self.wait_for(lambda: run.state == "awaiting_approval")
+        self.pipeline.approve()
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertTrue((self.repo / "AI_COUNCIL_DEMO.md").exists())
+
+    def test_rejecting_writes_nothing(self):
+        run = self.pipeline.start("do the thing", str(self.repo))
+        self.wait_for(lambda: run.state == "awaiting_approval")
+        self.pipeline.reject()
+        self.wait_terminal()
+        self.assertEqual(run.state, "cancelled")
+        self.assertTrue(gitutil.status(self.repo).clean)
+
+    def test_a_healthy_draft_still_skips_the_gate_under_zero_touch(self):
+        # The fallback must not become a gate on every Zero-Touch run.
+        self.store.update({
+            "providers": {"drafter": mock_provider("drafter", "Junior Draft")},
+        })
+        run = self.pipeline.start("do the thing", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertNotEqual(run.state, "awaiting_approval")
