@@ -610,6 +610,8 @@ function renderAgents() {
 
     const duration = stage && stage.duration ? ` · ${fmtDuration(stage.duration)}` : '';
     const initial = (provider.label || id).slice(0, 2).toUpperCase();
+    // An empty model means the CLI picks; say so rather than showing a blank.
+    const modelLabel = provider.model || 'default model';
 
     return (
       `<div class="agent-card ${stageState} ${available ? '' : 'unavailable'}" data-agent="${id}">` +
@@ -620,7 +622,16 @@ function renderAgents() {
           (available ? '' :
             `<div class="agent-missing">${esc(provider.command ? provider.command[0] : '?')} not found</div>`) +
         `</div>` +
-        `<div class="agent-state">${esc(label)}${esc(duration)}</div>` +
+        `<div class="agent-right">` +
+          `<div class="agent-state">${esc(label)}${esc(duration)}</div>` +
+          `<button class="model-chip${provider.model ? ' set' : ''}" type="button" ` +
+            `data-model-for="${id}" title="Change the model for this stage">` +
+            `${esc(modelLabel)}` +
+            `<svg viewBox="0 0 24 24" width="9" height="9" fill="none" stroke="currentColor" ` +
+            `stroke-width="3" stroke-linecap="round" stroke-linejoin="round">` +
+            `<path d="M6 9l6 6 6-6"/></svg>` +
+          `</button>` +
+        `</div>` +
       `</div>`
     );
   }).join('');
@@ -763,7 +774,105 @@ function clearStream() {
 }
 
 /* ==========================================================================
-   8. Modals
+   8. Model picker
+   Neither CLI can enumerate its own models, so the list is whatever the user
+   has configured plus a free-text entry. That keeps a newly released model
+   one keystroke away instead of requiring an app update.
+   ========================================================================== */
+
+function closeModelMenu() {
+  const open = $('.model-menu');
+  if (open) open.remove();
+}
+
+function openModelMenu(anchor, providerId) {
+  closeModelMenu();
+  const provider = ((state.config || {}).providers || {})[providerId] || {};
+  const models = provider.models || [];
+  const current = provider.model || '';
+
+  const menu = document.createElement('div');
+  menu.className = 'model-menu';
+  menu.innerHTML =
+    `<div class="model-menu-head">${esc(provider.label || providerId)} model</div>` +
+    `<button class="model-opt${current ? '' : ' active'}" data-value="">` +
+      `<span class="model-opt-name">CLI default</span>` +
+      `<span class="model-opt-note">whatever the CLI is set to</span>` +
+    `</button>` +
+    models.map(m =>
+      `<button class="model-opt${m === current ? ' active' : ''}" data-value="${esc(m)}">` +
+        `<span class="model-opt-name">${esc(m)}</span>` +
+        // Bare aliases track the newest model in a family; pinned IDs don't.
+        `<span class="model-opt-note">${/^[a-z]+$/.test(m) ? 'alias · always latest' : 'pinned'}</span>` +
+      `</button>`
+    ).join('') +
+    `<div class="model-menu-custom">` +
+      `<input class="model-custom-input" placeholder="Other model…" spellcheck="false" ` +
+        `value="${esc(models.includes(current) ? '' : current)}">` +
+      `<button class="btn btn-quiet btn-sm model-custom-apply" type="button">Set</button>` +
+    `</div>`;
+
+  document.body.appendChild(menu);
+
+  // Anchor below the chip, then nudge back inside the viewport.
+  const r = anchor.getBoundingClientRect();
+  menu.style.top = `${r.bottom + 6}px`;
+  menu.style.left = `${Math.min(r.left, window.innerWidth - menu.offsetWidth - 12)}px`;
+  if (menu.getBoundingClientRect().bottom > window.innerHeight - 8) {
+    menu.style.top = `${Math.max(8, r.top - menu.offsetHeight - 6)}px`;
+  }
+
+  const apply = (value) => {
+    closeModelMenu();
+    setModel(providerId, value);
+  };
+
+  menu.addEventListener('click', (e) => {
+    const opt = e.target.closest('.model-opt');
+    if (opt) { apply(opt.dataset.value); return; }
+    if (e.target.closest('.model-custom-apply')) {
+      apply($('.model-custom-input', menu).value.trim());
+    }
+  });
+  menu.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && e.target.classList.contains('model-custom-input')) {
+      apply(e.target.value.trim());
+    }
+  });
+
+  // Defer so the click that opened the menu doesn't immediately close it.
+  setTimeout(() => {
+    document.addEventListener('click', onDocClickCloseModel, { once: true });
+  }, 0);
+}
+
+function onDocClickCloseModel(e) {
+  if (e.target.closest('.model-menu') || e.target.closest('.model-chip')) {
+    document.addEventListener('click', onDocClickCloseModel, { once: true });
+    return;
+  }
+  closeModelMenu();
+}
+
+async function setModel(providerId, value) {
+  const providers = (state.config || {}).providers || {};
+  const provider = providers[providerId] || {};
+  // Remember a hand-typed model so it appears in the list next time.
+  const models = provider.models || [];
+  const patch = { providers: { [providerId]: { model: value } } };
+  if (value && !models.includes(value)) {
+    patch.providers[providerId].models = [...models, value];
+  }
+  await patchConfig(patch);
+  toast(
+    value ? `${provider.label || providerId} → ${value}`
+          : `${provider.label || providerId} → CLI default`,
+    'ok', 2600
+  );
+}
+
+/* ==========================================================================
+   9. Modals
    ========================================================================== */
 
 function openModal(id) { $(`#${id}`).classList.remove('hidden'); }
@@ -856,8 +965,24 @@ function renderSettings() {
           `<textarea rows="3" data-field="command">${esc((p.command || []).join('\n'))}</textarea>` +
         `</div>` +
         `<div class="field">` +
-          `<label>Auto-approve arguments (added only in Zero-Touch Mode)</label>` +
+          `<label>Auto-approve arguments (added only when execution is approved)</label>` +
           `<textarea rows="2" data-field="auto_approve_args">${esc((p.auto_approve_args || []).join('\n'))}</textarea>` +
+        `</div>` +
+        `<div class="field-row">` +
+          `<div class="field">` +
+            `<label>Model (blank = the CLI's own default)</label>` +
+            `<input type="text" data-field="model" value="${esc(p.model || '')}">` +
+          `</div>` +
+          `<div class="field">` +
+            `<label>Model flag (<code>{model}</code> substituted)</label>` +
+            `<input type="text" data-field="model_args" ` +
+              `value="${esc((p.model_args || []).join(' '))}">` +
+          `</div>` +
+        `</div>` +
+        `<div class="field">` +
+          `<label>Selectable models, one per line ` +
+            `<span class="field-hint">— shown in the picker on the agent card</span></label>` +
+          `<textarea rows="4" data-field="models">${esc((p.models || []).join('\n'))}</textarea>` +
         `</div>` +
         `<div class="field-row">` +
           `<div class="field">` +
@@ -905,6 +1030,10 @@ async function saveSettings() {
       label: field('label').value.trim() || id,
       command,
       auto_approve_args: lines('auto_approve_args'),
+      model: field('model').value.trim(),
+      // Space-separated on this form, since a model flag is always short.
+      model_args: field('model_args').value.trim().split(/\s+/).filter(Boolean),
+      models: lines('models'),
       timeout_seconds: Math.max(30, parseInt(field('timeout_seconds').value, 10) || 900),
       prompt_on_stdin: field('prompt_on_stdin').checked,
     };
@@ -1217,6 +1346,17 @@ function wire() {
   // -- tabs -------------------------------------------------------------
   $$('.tab').forEach(tab => tab.addEventListener('click', () => switchTab(tab.dataset.tab)));
 
+  // -- model picker -----------------------------------------------------
+  // Delegated: the agent rail is re-rendered on every state change.
+  $('#agent-rail').addEventListener('click', (e) => {
+    const chip = e.target.closest('.model-chip');
+    if (!chip) return;
+    e.stopPropagation();
+    if ($('.model-menu')) { closeModelMenu(); return; }  // toggle
+    openModelMenu(chip, chip.dataset.modelFor);
+  });
+  window.addEventListener('resize', closeModelMenu);
+
   // -- repo picker ------------------------------------------------------
   $('#repo-btn').addEventListener('click', () => {
     openModal('picker');
@@ -1270,7 +1410,10 @@ function wire() {
     if (e.target === modal) modal.classList.add('hidden');
   }));
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') $$('.modal').forEach(m => m.classList.add('hidden'));
+    if (e.key === 'Escape') {
+      closeModelMenu();
+      $$('.modal').forEach(m => m.classList.add('hidden'));
+    }
   });
 
   // -- delegated: copy buttons and diff collapse ------------------------

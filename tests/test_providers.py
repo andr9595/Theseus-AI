@@ -119,6 +119,54 @@ class TestBuildArgv(unittest.TestCase):
         self.assertNotIn("", argv)
 
 
+class TestModelSelection(unittest.TestCase):
+    def test_no_model_means_no_model_flag(self):
+        # Blank must mean "let the CLI decide", not "--model ''".
+        argv, _ = build_argv(CLAUDE, "hi", auto_approve=False)
+        self.assertNotIn("--model", argv)
+
+    def test_model_is_passed_before_the_prompt(self):
+        provider = dict(CLAUDE, model="opus")
+        argv, _ = build_argv(provider, "hi", auto_approve=False)
+        self.assertEqual(argv, ["claude", "-p", "--model", "opus", "hi"])
+
+    def test_model_and_auto_approve_both_precede_the_prompt(self):
+        provider = dict(CLAUDE, model="claude-opus-4-8")
+        argv, _ = build_argv(provider, "hi", auto_approve=True)
+        self.assertEqual(argv, [
+            "claude", "-p",
+            "--model", "claude-opus-4-8",
+            "--dangerously-skip-permissions",
+            "hi",
+        ])
+
+    def test_whitespace_only_model_is_ignored(self):
+        provider = dict(CLAUDE, model="   ")
+        argv, _ = build_argv(provider, "hi", auto_approve=False)
+        self.assertNotIn("--model", argv)
+
+    def test_custom_model_flag_shape_is_honoured(self):
+        # Some CLIs want `-m X`, others `--model=X`; both must work.
+        short = dict(CODEX, model="o3", model_args=["-m", "{model}"])
+        argv, _ = build_argv(short, "task", auto_approve=False)
+        self.assertEqual(argv, ["codex", "exec", "-m", "o3", "task"])
+
+        joined = dict(CODEX, model="o3", model_args=["--model={model}"])
+        argv, _ = build_argv(joined, "task", auto_approve=False)
+        self.assertEqual(argv, ["codex", "exec", "--model=o3", "task"])
+
+    def test_model_goes_last_when_prompt_is_on_stdin(self):
+        provider = dict(CLAUDE, model="sonnet", prompt_on_stdin=True)
+        argv, stdin = build_argv(provider, "hi", auto_approve=False)
+        self.assertEqual(argv, ["claude", "-p", "--model", "sonnet"])
+        self.assertEqual(stdin, "hi")
+
+    def test_model_value_is_never_shell_interpreted(self):
+        provider = dict(CLAUDE, model="a; rm -rf /")
+        argv, _ = build_argv(provider, "hi", auto_approve=False)
+        self.assertIn("a; rm -rf /", argv)  # one literal argv entry
+
+
 class TestRedaction(unittest.TestCase):
     def test_prompt_is_replaced_with_a_placeholder(self):
         argv = ["claude", "-p", "a very long prompt"]

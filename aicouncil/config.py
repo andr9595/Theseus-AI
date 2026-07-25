@@ -80,6 +80,16 @@ DEFAULT_DRAFTER = {
     "prompt_on_stdin": False,
     "timeout_seconds": 900,
     "cwd_mode": "repo",  # run inside the selected target repository
+    # --- Model selection ---------------------------------------------------
+    # Empty means "whatever the CLI is configured to use by default", which is
+    # the safest choice: it keeps working when a vendor ships a new model.
+    "model": "",
+    # Neither CLI can enumerate its own models, so this list is seeded and then
+    # owned by the user. Editing it in Settings is the supported way to add a
+    # model the day it ships - nothing here is hardcoded into the pipeline.
+    "models": ["gpt-5.1-codex-max", "gpt-5.1-codex", "gpt-5.1", "o3"],
+    # argv fragment used to pass the model. `{model}` is substituted.
+    "model_args": ["--model", "{model}"],
 }
 
 # Stage 2 - the "senior". Expensive, rationed. Reviews and applies.
@@ -93,6 +103,23 @@ DEFAULT_POLISHER = {
     "prompt_on_stdin": False,
     "timeout_seconds": 1800,
     "cwd_mode": "repo",
+    # --- Model selection ---------------------------------------------------
+    "model": "",
+    # `claude --model` takes either an alias that always resolves to the latest
+    # model in a family, or a pinned full ID. Aliases are listed first because
+    # they are the better default: they survive a model release, where a pinned
+    # ID silently keeps you on the old one.
+    "models": [
+        "opus",
+        "sonnet",
+        "haiku",
+        "fable",
+        "claude-opus-4-8",
+        "claude-sonnet-5",
+        "claude-haiku-4-5",
+        "claude-fable-5",
+    ],
+    "model_args": ["--model", "{model}"],
 }
 
 DEFAULTS: Dict[str, Any] = {

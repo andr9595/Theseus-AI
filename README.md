@@ -256,8 +256,33 @@ like `--message={prompt}`.
 |---|---|
 | **Command** | argv, one argument per line. Never passed through a shell. |
 | **Auto-approve arguments** | Appended *only* when permission has been granted. |
+| **Model** | Blank means the CLI's own default. See below. |
+| **Model flag** | How the model is passed — `--model {model}`, `-m {model}`, `--model={model}`. |
+| **Selectable models** | The list offered in the picker, one per line. |
 | **Timeout** | Seconds before the child process group is killed. |
 | **Pipe the prompt on stdin** | For CLIs that prefer stdin. Automatic above 96 KB regardless. |
+
+### Choosing a model per stage
+
+Click the model chip on either agent card to switch that stage's model. The
+picker offers the configured list, the CLI's own default, and a free-text box
+for anything else — typing a model adds it to the list for next time.
+
+Neither CLI can enumerate its own models, so **the list is data, not code**: it
+lives in your config and is editable in Settings. A model released tomorrow is
+one keystroke away rather than an app update.
+
+Aliases (`opus`, `sonnet`, `haiku`, `fable`) always resolve to the newest model
+in that family; a pinned ID (`claude-opus-4-8`) stays where you put it. The
+picker labels which is which, because the difference only shows up months later
+when a pinned stage is quietly running a superseded model.
+
+Blank — the default — passes no `--model` flag at all, so each CLI uses
+whatever it is configured for. That is the setting most likely to still be
+correct in six months.
+
+A practical split: put the cheap, generous-quota model on Stage 1 and spend the
+rationed one on Stage 2, which is where judgement actually matters.
 
 Defaults:
 

@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 PROMPT_TOKEN = "{prompt}"
+MODEL_TOKEN = "{model}"
 
 # A prompt longer than this is piped on stdin regardless of the configured
 # mode. Linux caps a single argv entry at MAX_ARG_STRLEN (128 KB), and the CLI
@@ -133,8 +134,25 @@ def build_argv(
         prompt_index = len(argv)
         argv.append(prompt)
 
+    # Flags to splice in ahead of the prompt. Model first so the final argv
+    # reads `cli --model X --auto-approve <prompt>` rather than interleaved.
+    extra: List[str] = []
+
+    model = str(provider.get("model") or "").strip()
+    if model:
+        # Fall back to the flag form, never to a bare `{model}`: a config
+        # missing `model_args` would otherwise inject the model as a stray
+        # positional argument, which most CLIs read as the prompt.
+        template_args = provider.get("model_args") or ["--model", MODEL_TOKEN]
+        for token in template_args:
+            if not token:
+                continue
+            extra.append(token.replace(MODEL_TOKEN, model))
+
     if auto_approve:
-        extra = [a for a in (provider.get("auto_approve_args") or []) if a]
+        extra.extend(a for a in (provider.get("auto_approve_args") or []) if a)
+
+    if extra:
         # With the prompt on stdin there is no positional to stay ahead of, so
         # the flags simply go last.
         insert_at = len(argv) if prompt_index is None else prompt_index

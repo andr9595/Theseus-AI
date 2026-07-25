@@ -206,11 +206,86 @@ html, body {
 .agent-name { font-size: 12.5px; font-weight: 600; }
 .agent-role { font-size: 10.5px; color: var(--text-3); }
 
+.agent-right {
+  display: flex; flex-direction: column; align-items: flex-end; gap: 4px;
+  flex: 0 0 auto;
+}
+
 .agent-state {
   font-family: var(--mono); font-size: 10px;
   text-transform: uppercase; letter-spacing: .06em;
   color: var(--text-3);
 }
+
+/* ---- Model chip on the agent card ---- */
+
+.model-chip {
+  display: inline-flex; align-items: center; gap: 3px;
+  max-width: 108px; padding: 1px 5px 1px 7px;
+  font: inherit; font-family: var(--mono); font-size: 9.5px;
+  color: var(--text-3);
+  background: var(--bg-3);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  cursor: pointer;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  transition: color .14s, border-color .14s, background .14s;
+}
+.model-chip:hover { color: var(--text); border-color: #303a4e; background: var(--bg-4); }
+.model-chip.set { color: var(--agent-color, var(--accent-2)); }
+.model-chip svg { flex: 0 0 auto; opacity: .7; }
+
+/* ---- Model picker menu ---- */
+
+.model-menu {
+  position: fixed;
+  z-index: 60;
+  min-width: 236px; max-width: 300px;
+  padding: 5px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  animation: rise .13s ease-out;
+}
+
+.model-menu-head {
+  padding: 6px 9px 7px;
+  font-size: 10px; font-weight: 650;
+  letter-spacing: .08em; text-transform: uppercase;
+  color: var(--text-3);
+  border-bottom: 1px solid var(--line-soft);
+  margin-bottom: 4px;
+}
+
+.model-opt {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  width: 100%; padding: 6px 9px;
+  font: inherit; text-align: left;
+  color: var(--text-2);
+  background: none; border: 0; border-radius: 6px;
+  cursor: pointer;
+}
+.model-opt:hover { background: var(--bg-3); color: var(--text); }
+.model-opt.active { background: rgba(124, 92, 255, .13); color: var(--accent-2); }
+.model-opt-name { font-family: var(--mono); font-size: 11.5px; }
+.model-opt-note { font-size: 9.5px; color: var(--text-3); flex: 0 0 auto; }
+.model-opt.active .model-opt-note { color: var(--accent-2); opacity: .75; }
+
+.model-menu-custom {
+  display: flex; gap: 5px;
+  margin-top: 4px; padding: 6px 4px 2px;
+  border-top: 1px solid var(--line-soft);
+}
+.model-custom-input {
+  flex: 1; min-width: 0; padding: 5px 8px;
+  font-family: var(--mono); font-size: 11px;
+  color: var(--text);
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.model-custom-input:focus { outline: none; border-color: var(--accent); }
 
 /* Running: pulsing left border + a sweeping progress line at the base. */
 .agent-card.running {

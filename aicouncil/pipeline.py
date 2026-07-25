@@ -66,6 +66,7 @@ class StageRecord:
     error: str = ""
     command: List[str] = field(default_factory=list)
     exit_code: Optional[int] = None
+    model: str = ""  # "" means the CLI's own default was used
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -82,6 +83,7 @@ class StageRecord:
             "error": self.error,
             "command": self.command,
             "exit_code": self.exit_code,
+            "model": self.model,
         }
 
 
@@ -217,12 +219,14 @@ class Pipeline:
                     id="drafter",
                     label=d.get("label", "Codex"),
                     role=d.get("role", "Junior Draft"),
+                    model=str(d.get("model") or ""),
                 )
             p = providers.get("polisher", {})
             run.stages["polisher"] = StageRecord(
                 id="polisher",
                 label=p.get("label", "Claude"),
                 role=p.get("role", "Senior Polish"),
+                model=str(p.get("model") or ""),
             )
 
             self._run = run
@@ -323,6 +327,7 @@ class Pipeline:
     ) -> ProviderResult:
         provider = self.store.get("providers", {}).get(stage_id, {})
         stage = run.stages[stage_id]
+        stage.model = str(provider.get("model") or "")
         stage.state = "running"
         stage.started_at = time.time()
         self.bus.publish("stage_started", stage=stage_id, run=run.to_dict())
