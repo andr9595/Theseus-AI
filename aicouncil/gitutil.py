@@ -264,12 +264,29 @@ def diff_stat(path: str | Path) -> Dict[str, int]:
 
     for rel in _untracked_files(root):
         result["files"] += 1
+        path = Path(root) / rel
+        # Counting "lines" in a binary file produces a meaningless number that
+        # then inflates the +N shown in the UI. An agent that imports a module
+        # to verify its work leaves .pyc files behind, so this is common in
+        # practice, not a corner case. git itself reports "-" for binary in
+        # --numstat; skip them the same way.
+        if _is_binary(path):
+            continue
         try:
-            with open(Path(root) / rel, "r", encoding="utf-8", errors="ignore") as fh:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
                 result["insertions"] += sum(1 for _ in fh)
         except OSError:
             pass
     return result
+
+
+def _is_binary(path: Path, probe_bytes: int = 8000) -> bool:
+    """Heuristic used by git itself: a NUL byte early in the file means binary."""
+    try:
+        with open(path, "rb") as fh:
+            return b"\0" in fh.read(probe_bytes)
+    except OSError:
+        return False
 
 
 # --------------------------------------------------------------------------

@@ -141,6 +141,28 @@ class TestZeroTouch(PipelineTestBase):
         self.assertIn("edited by hand", (self.repo / "README.md").read_text())
 
 
+class TestDiffStat(PipelineTestBase):
+    def test_binary_untracked_files_are_counted_but_not_line_counted(self):
+        # Regression: an agent that imports a module to verify its work leaves
+        # a .pyc behind. Reading it as text invented ~9 "insertions" and
+        # inflated the +N in the UI summary.
+        (self.repo / "notes.txt").write_text("one\ntwo\nthree\n")
+        (self.repo / "blob.bin").write_bytes(b"\x00\x01\x02" * 500)
+
+        stat = gitutil.diff_stat(self.repo)
+        self.assertEqual(stat["files"], 2, "both files should be counted")
+        self.assertEqual(
+            stat["insertions"], 3,
+            "only the text file's lines should count toward insertions",
+        )
+
+    def test_binary_files_still_appear_in_the_diff(self):
+        # Skipping the line count must not skip the file itself.
+        (self.repo / "blob.bin").write_bytes(b"\x00\xff" * 100)
+        diff = gitutil.working_diff(self.repo)
+        self.assertIn("blob.bin", diff)
+
+
 class TestApprovalGate(PipelineTestBase):
     def test_run_pauses_and_writes_nothing_before_approval(self):
         self.store.update({"zero_touch": False})
