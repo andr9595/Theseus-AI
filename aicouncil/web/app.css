@@ -1158,3 +1158,32 @@ kbd {
 /* Marks a quota figure that was measured a while ago rather than just now —
    Codex's comes from its last run's log, so it can lag. */
 .usage-stale { margin-left: 1px; opacity: .65; }
+
+/* ---- Role editor in Settings ---- */
+
+.provider-form select[data-field="role_template"] {
+  padding: 7px 9px;
+  font-family: var(--sans); font-size: 12px;
+  color: var(--text);
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.provider-form select:focus { outline: none; border-color: var(--accent); }
+
+.role-system {
+  font-family: var(--mono); font-size: 11px; line-height: 1.55;
+  min-height: 120px;
+}
+
+.link-btn {
+  padding: 0; margin-left: 6px;
+  font: inherit; font-size: 10.5px;
+  color: var(--accent-2);
+  background: none; border: 0;
+  border-bottom: 1px dashed rgba(157, 133, 255, .4);
+  cursor: pointer;
+}
+.link-btn:hover { border-bottom-color: var(--accent-2); }
+
+.field-hint.warn { color: var(--yellow); }

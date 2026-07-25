@@ -177,6 +177,9 @@ class Pipeline:
             # The agents assignable to either job. Served rather than hardcoded
             # in the browser so commands and permission flags have one home.
             "agents": cfg.agent_catalog(),
+            # The role behaviours a stage can be assigned. Served rather than
+            # duplicated in the browser, so the shipped text has one home.
+            "roles": prompts.role_catalog(),
             "providers_status": [
                 probe(providers[k]) for k in ("drafter", "polisher") if k in providers
             ],
@@ -413,7 +416,10 @@ class Pipeline:
             if not run.solo:
                 self._set_state(run, DRAFTING)
                 draft_prompt = prompts.build_draft_prompt(
-                    run.task, run.repo, repo_status, house_rules
+                    run.task, run.repo, repo_status, house_rules,
+                    system=prompts.resolve_system(
+                        "drafter", providers.get("drafter", {})
+                    ),
                 )
                 # Stage 1 is read-only by instruction, so it never receives the
                 # auto-approve flags regardless of the Zero-Touch setting.
@@ -520,7 +526,10 @@ class Pipeline:
             self._set_state(run, POLISHING)
             if run.solo:
                 polish_prompt = prompts.build_solo_prompt(
-                    run.task, run.repo, repo_status, house_rules
+                    run.task, run.repo, repo_status, house_rules,
+                    system=prompts.resolve_system(
+                        run.solo_stage, providers.get(run.solo_stage, {})
+                    ),
                 )
             else:
                 polish_prompt = prompts.build_polish_prompt(
@@ -530,6 +539,9 @@ class Pipeline:
                     repo_status,
                     house_rules,
                     run.reviewer_note,
+                    system=prompts.resolve_system(
+                        "polisher", providers.get("polisher", {})
+                    ),
                 )
 
             result = self._run_stage(

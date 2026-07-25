@@ -18,7 +18,7 @@ failure mode of a naive two-model chain.
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 MAX_DRAFT_CHARS = 60_000
 
@@ -114,6 +114,156 @@ How you confirmed this works, or precisely what you could not verify.\
 """
 
 
+REVIEWER_SYSTEM = """\
+You are an ADVERSARIAL REVIEWER. Your job is to find what is wrong with the \
+code, not to fix it.
+
+RULES - these are strict:
+1. DO NOT modify, create or delete any file. Report findings only.
+2. Assume the code is wrong until you have checked. Read the actual \
+implementation rather than trusting names, comments or docstrings.
+3. Rank findings by what they would cost if they shipped, not by how easy they \
+are to describe.
+
+For each finding give:
+
+### <one-line summary>
+**Where:** `path/file.py:LINE`
+**Why it is wrong:** the specific mechanism, not a category.
+**How it fails:** concrete inputs or sequence that produces the bad outcome.
+**Confidence:** high / medium / low, and what would settle it.
+
+Finish with a short section listing what you checked and found *correct*, so \
+the reader knows what the review covered. If you found nothing serious, say so \
+plainly - a review that invents problems to look thorough is worse than a \
+short one.\
+"""
+
+
+TEST_WRITER_SYSTEM = """\
+You are a TEST ENGINEER. You write tests that would have caught real bugs.
+
+Read the implementation first and test what it actually does, including the \
+paths that only run when something goes wrong. Match the repository's existing \
+test framework, layout and naming - do not introduce a new one.
+
+Prefer:
+- Tests that pin a behaviour someone could plausibly break.
+- One clear assertion per test, named for the property it protects.
+- Real inputs and real collaborators where practical; mock only what is slow, \
+non-deterministic or external.
+
+Avoid tests that only restate the implementation, tests that pass regardless \
+of the code under test, and coverage for its own sake. If a behaviour is \
+already well covered, say so instead of duplicating it.
+
+End with a note on what you deliberately did not test, and why.\
+"""
+
+
+SECURITY_SYSTEM = """\
+You are a SECURITY REVIEWER. Report only findings with a plausible attacker \
+and a plausible path.
+
+RULES:
+1. DO NOT modify any file. Report only.
+2. For each finding, name the trust boundary being crossed and who is on the \
+other side of it. A "vulnerability" with no untrusted input is not one.
+3. Trace the data from where it enters to where it does damage, citing real \
+file paths and line numbers.
+
+For each finding:
+
+### <one-line summary>
+**Where:** `path/file.py:LINE`
+**Trust boundary:** what crosses it, and from where.
+**Impact:** what an attacker gains, concretely.
+**Severity and why:** tied to the impact, not to the category name.
+**Fix direction:** one or two lines - not a patch.
+
+Explicitly list what you examined and considered safe. Do not report generic \
+best-practice advice as a finding; if the code is sound, say so.\
+"""
+
+
+# The role catalogue. Each entry is a starting point the operator can edit -
+# the shipped text is a default, not a law.
+#
+# ``writes`` records whether the behaviour expects to modify files. It is
+# advisory today: permission is still granted per stage, so assigning a
+# read-only behaviour to the writing stage produces an agent told not to write
+# that nonetheless *may*. The UI flags that mismatch rather than silently
+# resolving it, because guessing which of the two the operator meant is exactly
+# the kind of quiet reinterpretation that makes a safety setting untrustworthy.
+ROLE_TEMPLATES: Dict[str, Dict] = {
+    "junior_draft": {
+        "name": "Junior Draft",
+        "summary": "Surveys the repo and proposes a change. Never writes.",
+        "system": DRAFT_SYSTEM,
+        "writes": False,
+    },
+    "senior_polish": {
+        "name": "Senior Polish",
+        "summary": "Verifies the draft against the code, corrects it, applies it.",
+        "system": POLISH_SYSTEM,
+        "writes": True,
+    },
+    "solo": {
+        "name": "Solo Architect",
+        "summary": "Works the task directly, with no draft to review.",
+        "system": SOLO_SYSTEM,
+        "writes": True,
+    },
+    "adversarial_review": {
+        "name": "Adversarial Reviewer",
+        "summary": "Hunts for defects and reports them. Fixes nothing.",
+        "system": REVIEWER_SYSTEM,
+        "writes": False,
+    },
+    "test_writer": {
+        "name": "Test Writer",
+        "summary": "Writes tests that would have caught real bugs.",
+        "system": TEST_WRITER_SYSTEM,
+        "writes": True,
+    },
+    "security_review": {
+        "name": "Security Reviewer",
+        "summary": "Reports findings with a real attacker and a real path.",
+        "system": SECURITY_SYSTEM,
+        "writes": False,
+    },
+}
+
+# Which template a stage falls back to when its setting is missing or unknown.
+DEFAULT_TEMPLATE = {"drafter": "junior_draft", "polisher": "senior_polish"}
+
+
+def role_catalog() -> List[Dict]:
+    """The selectable roles, for the Settings dropdown."""
+    return [
+        {"id": key, **{k: v for k, v in tpl.items()}}
+        for key, tpl in ROLE_TEMPLATES.items()
+    ]
+
+
+def resolve_system(stage_id: str, provider: Optional[Dict] = None) -> str:
+    """The system prompt a stage should actually use.
+
+    An edited prompt wins over its template, which wins over the shipped
+    default for that stage. Blank means "use the template", so clearing the
+    box in Settings restores the default rather than sending an empty prompt.
+    """
+    provider = provider or {}
+    custom = str(provider.get("role_system") or "").strip()
+    if custom:
+        return custom
+    key = str(provider.get("role_template") or "").strip()
+    template = ROLE_TEMPLATES.get(key)
+    if template is None:
+        template = ROLE_TEMPLATES[DEFAULT_TEMPLATE.get(stage_id, "solo")]
+    return template["system"]
+
+
 def _repo_block(repo_path: str, repo_status: Optional[Dict]) -> str:
     """Describe the target repository so the agent knows where it is."""
     lines = [f"Target repository: {repo_path}"]
@@ -147,10 +297,12 @@ def build_draft_prompt(
     repo_path: str,
     repo_status: Optional[Dict] = None,
     house_rules: str = "",
+    system: str = "",
 ) -> str:
-    """Stage 1 prompt: ask the junior for a read-only proposal."""
+    """Stage 1 prompt. ``system`` overrides the stage's default behaviour."""
+    system = system or DRAFT_SYSTEM
     return (
-        f"{DRAFT_SYSTEM}\n"
+        f"{system}\n"
         f"{_rules_block(house_rules)}\n"
         f"# Context\n{_repo_block(repo_path, repo_status)}\n\n"
         f"# Task\n{task.strip()}\n"
@@ -164,12 +316,14 @@ def build_polish_prompt(
     repo_status: Optional[Dict] = None,
     house_rules: str = "",
     reviewer_note: str = "",
+    system: str = "",
 ) -> str:
     """Stage 2 prompt: hand the senior the task plus the junior's draft.
 
     ``reviewer_note`` carries any free-text steer the human typed at the
     approval gate, and is given precedence over the draft itself.
     """
+    system = system or POLISH_SYSTEM
     draft = (draft or "").strip()
     if len(draft) > MAX_DRAFT_CHARS:
         # Keep the head (understanding/approach) and the tail (risks), which
@@ -190,7 +344,7 @@ def build_polish_prompt(
         )
 
     return (
-        f"{POLISH_SYSTEM}\n"
+        f"{system}\n"
         f"{_rules_block(house_rules)}\n"
         f"# Context\n{_repo_block(repo_path, repo_status)}\n\n"
         f"# Task\n{task.strip()}\n"
@@ -207,10 +361,12 @@ def build_solo_prompt(
     repo_path: str,
     repo_status: Optional[Dict] = None,
     house_rules: str = "",
+    system: str = "",
 ) -> str:
     """Single-stage prompt used when Solo Mode bypasses the draft stage."""
+    system = system or SOLO_SYSTEM
     return (
-        f"{SOLO_SYSTEM}\n"
+        f"{system}\n"
         f"{_rules_block(house_rules)}\n"
         f"# Context\n{_repo_block(repo_path, repo_status)}\n\n"
         f"# Task\n{task.strip()}\n"

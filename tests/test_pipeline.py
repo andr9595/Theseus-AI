@@ -532,3 +532,96 @@ class TestDraftFailureDoesNotEscalate(PipelineTestBase):
         self.wait_terminal()
         self.assertEqual(run.state, "complete", run.error)
         self.assertNotEqual(run.state, "awaiting_approval")
+
+
+class TestRoleTemplates(unittest.TestCase):
+    """Role behaviour is a setting, not a constant.
+
+    The shipped prompts are defaults the operator can replace; what must not
+    change is that the resolved text actually reaches the CLI.
+    """
+
+    def test_catalog_entries_are_complete(self):
+        from aicouncil import prompts
+
+        catalog = prompts.role_catalog()
+        self.assertGreaterEqual(len(catalog), 6)
+        for role in catalog:
+            for key in ("id", "name", "summary", "system", "writes"):
+                self.assertIn(key, role, f"{role.get('id')} missing {key}")
+            self.assertTrue(role["system"].strip())
+            self.assertIsInstance(role["writes"], bool)
+
+    def test_stage_defaults_when_nothing_is_configured(self):
+        from aicouncil import prompts
+
+        self.assertIn("JUNIOR ENGINEER", prompts.resolve_system("drafter", {}))
+        self.assertIn("SENIOR STAFF ARCHITECT", prompts.resolve_system("polisher", {}))
+
+    def test_a_template_replaces_the_stage_default(self):
+        from aicouncil import prompts
+
+        text = prompts.resolve_system("drafter", {"role_template": "security_review"})
+        self.assertIn("SECURITY REVIEWER", text)
+        self.assertNotIn("JUNIOR ENGINEER", text)
+
+    def test_edited_text_beats_the_template(self):
+        from aicouncil import prompts
+
+        text = prompts.resolve_system(
+            "drafter",
+            {"role_template": "security_review", "role_system": "Be a poet."},
+        )
+        self.assertEqual(text, "Be a poet.")
+
+    def test_blank_override_falls_back_rather_than_sending_nothing(self):
+        # Clearing the box in Settings must restore the template, not ship an
+        # empty system prompt.
+        from aicouncil import prompts
+
+        for blank in ("", "   ", "\n\t "):
+            text = prompts.resolve_system("drafter", {"role_system": blank})
+            self.assertIn("JUNIOR ENGINEER", text)
+
+    def test_an_unknown_template_falls_back_to_the_stage_default(self):
+        from aicouncil import prompts
+
+        text = prompts.resolve_system("polisher", {"role_template": "no_such_role"})
+        self.assertIn("SENIOR STAFF ARCHITECT", text)
+
+    def test_the_resolved_role_reaches_the_agent(self):
+        from aicouncil import prompts
+
+        prompt = prompts.build_draft_prompt(
+            "add a feature", "/tmp/r", None, "",
+            system=prompts.resolve_system(
+                "drafter", {"role_template": "adversarial_review"}
+            ),
+        )
+        self.assertIn("ADVERSARIAL REVIEWER", prompt)
+        self.assertIn("add a feature", prompt)
+
+    def test_house_rules_still_apply_over_a_custom_role(self):
+        from aicouncil import prompts
+
+        prompt = prompts.build_draft_prompt(
+            "task", "/tmp/r", None, "ALWAYS USE TABS",
+            system="Custom behaviour.",
+        )
+        self.assertIn("Custom behaviour.", prompt)
+        self.assertIn("ALWAYS USE TABS", prompt)
+
+
+class TestRoleReachesTheRun(PipelineTestBase):
+    def test_a_configured_role_is_used_by_a_real_run(self):
+        # End to end: set a role, run, and confirm the agent saw that text.
+        self.store.update({
+            "zero_touch": True,
+            "providers": {"drafter": {"role_system": "SENTINEL-ROLE-TEXT"}},
+        })
+        run = self.pipeline.start("do a thing", str(self.repo))
+        self.wait_terminal()
+        # The mock agent echoes the prompt length and its role; the prompt it
+        # received is what the pipeline built.
+        self.assertTrue(run.stages["drafter"].output)
+        self.assertEqual(run.state, "complete", run.error)

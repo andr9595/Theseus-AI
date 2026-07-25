@@ -525,6 +525,7 @@ const state = {
   agents: [],
   repoStatus: null,
   usage: {},
+  roles: [],
   busy: false,
   streamLines: [],
   activeTab: 'stream',
@@ -1098,6 +1099,27 @@ function renderSettings() {
           `</div>` +
         `</div>` +
         `<div class="field">` +
+          `<label>Role — what this stage is told to do` +
+            `<span class="field-hint"> — the shipped text is a starting point</span>` +
+          `</label>` +
+          `<select data-field="role_template">` +
+            (state.roles || []).map(r =>
+              `<option value="${esc(r.id)}"${r.id === (p.role_template || '') ? ' selected' : ''}>` +
+                `${esc(r.name)} — ${esc(r.summary)}</option>`
+            ).join('') +
+          `</select>` +
+        `</div>` +
+        `<div class="field">` +
+          `<label>Behaviour ` +
+            `<button class="link-btn" type="button" data-reset-role="${id}">` +
+              `reset to the template</button>` +
+          `</label>` +
+          `<textarea rows="8" class="role-system" data-field="role_system" ` +
+            `placeholder="Using the template above. Type here to override it.">` +
+            `${esc(p.role_system || '')}</textarea>` +
+          `<span class="field-hint" data-role-warn="${id}"></span>` +
+        `</div>` +
+        `<div class="field">` +
           `<label>Command (one argument per line, <code>{prompt}</code> is substituted)</label>` +
           `<textarea rows="3" data-field="command">${esc((p.command || []).join('\n'))}</textarea>` +
         `</div>` +
@@ -1144,9 +1166,38 @@ function renderSettings() {
     );
   }).join('');
 
+  $$('.provider-form').forEach(updateRoleWarning);
   $('#house-rules').value = conf.house_rules || '';
   $('#port-input').value = conf.port || 8760;
   $('#open-browser').checked = conf.open_browser !== false;
+}
+
+/** Flag a behaviour whose write expectation disagrees with the stage's actual
+ *  permission. Not resolved automatically: guessing which of the two the
+ *  operator meant is how a safety setting stops being trustworthy. */
+function updateRoleWarning(form) {
+  if (!form) return;
+  const id = form.dataset.provider;
+  const chosen = $('[data-field="role_template"]', form).value;
+  const role = (state.roles || []).find(r => r.id === chosen);
+  const note = $(`[data-role-warn="${id}"]`, form.parentElement) || $(`[data-role-warn="${id}"]`);
+  if (!note || !role) return;
+
+  // Today permission is per stage: the drafter is read-only, the polisher
+  // writes once approved.
+  const stageWrites = id === 'polisher';
+  if (role.writes && !stageWrites) {
+    note.textContent = `"${role.name}" expects to modify files, but this stage `
+      + `is read-only — it will produce a proposal, not changes.`;
+    note.className = 'field-hint warn';
+  } else if (!role.writes && stageWrites) {
+    note.textContent = `"${role.name}" is a report-only behaviour, but this `
+      + `stage may write once approved. It will be told not to.`;
+    note.className = 'field-hint warn';
+  } else {
+    note.textContent = '';
+    note.className = 'field-hint';
+  }
 }
 
 async function saveSettings() {
@@ -1178,6 +1229,8 @@ async function saveSettings() {
       command,
       auto_approve_args: lines('auto_approve_args'),
       stream_args: lines('stream_args'),
+      role_template: field('role_template').value,
+      role_system: field('role_system').value.trim(),
       model: field('model').value.trim(),
       // Space-separated on this form, since a model flag is always short.
       model_args: field('model_args').value.trim().split(/\s+/).filter(Boolean),
@@ -1415,6 +1468,7 @@ async function loadState() {
     state.busy = data.busy;
     state.agents = data.agents || [];
     state.providers = data.providers_status || [];
+    state.roles = data.roles || [];
     state.repoStatus = data.repo_status;
     state.usage = data.usage || {};
     renderAll();
@@ -1576,6 +1630,21 @@ function wire() {
     renderSettings();
     openModal('settings');
   });
+  $('#provider-forms').addEventListener('click', (e) => {
+    const reset = e.target.closest('[data-reset-role]');
+    if (!reset) return;
+    const form = reset.closest('.provider-form');
+    $('[data-field="role_system"]', form).value = '';
+    updateRoleWarning(form);
+    toast('Back to the template text.', 'ok', 2400);
+  });
+
+  $('#provider-forms').addEventListener('change', (e) => {
+    if (e.target.matches('[data-field="role_template"]')) {
+      updateRoleWarning(e.target.closest('.provider-form'));
+    }
+  });
+
   $('#save-settings').addEventListener('click', saveSettings);
 
   // Picking an agent fills in its command and flags straight away, so the form

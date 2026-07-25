@@ -150,6 +150,12 @@ def agent_catalog() -> List[Dict[str, Any]]:
 # Stage 1 - the "junior". Cheap, fast, generous quota. Drafts the solution.
 DEFAULT_DRAFTER = {
     "id": "drafter",
+    # --- Role -------------------------------------------------------------
+    # Which behaviour this stage performs. The catalogue lives in prompts.py;
+    # `role_system` overrides it with edited text, and blank means "use the
+    # template", so clearing the box in Settings restores the default.
+    "role_template": "junior_draft",
+    "role_system": "",
     "role": "Junior Draft",
     "enabled": True,
     # When true the prompt is piped on stdin and `{prompt}` is dropped from
@@ -175,6 +181,12 @@ DEFAULT_DRAFTER = {
 # Stage 2 - the "senior". Expensive, rationed. Reviews and applies.
 DEFAULT_POLISHER = {
     "id": "polisher",
+    # --- Role -------------------------------------------------------------
+    # Which behaviour this stage performs. The catalogue lives in prompts.py;
+    # `role_system` overrides it with edited text, and blank means "use the
+    # template", so clearing the box in Settings restores the default.
+    "role_template": "senior_polish",
+    "role_system": "",
     "role": "Senior Polish",
     "enabled": True,
     "prompt_on_stdin": False,

@@ -337,6 +337,37 @@ If a future CLI release renames these flags, edit the field; nothing here is
 compiled into the app. Clearing it is safe too — you simply get the old
 all-at-the-end behaviour back, and the app stops trying to parse events.
 
+### Roles
+
+What each stage is *told to do* is a setting, not a constant. Settings → per
+stage → **Role**:
+
+| Template | Behaviour | Writes |
+|---|---|---|
+| Junior Draft | Surveys the repo, proposes a change | no |
+| Senior Polish | Verifies the draft, corrects it, applies it | yes |
+| Solo Architect | Works the task directly, no draft to review | yes |
+| Adversarial Reviewer | Hunts for defects, fixes nothing | no |
+| Test Writer | Writes tests that would have caught real bugs | yes |
+| Security Reviewer | Findings with a real attacker and a real path | no |
+
+Pick one and it takes effect on the next run. The text box below it overrides
+the template entirely — edit it, or clear it to go back. Blank means "use the
+template", so clearing the box restores the default rather than sending an
+empty prompt.
+
+Combined with agent assignment, that already covers a lot: put Claude on the
+draft stage as an **Adversarial Reviewer** and Codex on the polish stage, and
+Claude is no longer the final voice.
+
+**A caveat the UI states rather than hides.** Permission is still granted *per
+stage* — Stage 1 is read-only, Stage 2 writes once approved. So a writing role
+on Stage 1 produces an agent told to modify files that cannot, and a
+report-only role on Stage 2 gets told not to write while still permitted to.
+Settings flags the mismatch instead of silently resolving it; guessing which
+of the two you meant is how a safety setting stops being trustworthy. Making
+`can_write` a property of the role rather than the stage is the next step.
+
 ### Quota
 
 Each agent card carries a percentage chip showing the vendor's own figure, read
