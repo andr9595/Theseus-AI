@@ -37,7 +37,7 @@ from . import config as cfg
 from . import gitutil
 from .events import EventBus, drain, sse_comment, sse_format
 from .pipeline import Pipeline, PipelineBusy
-from .providers import probe
+from .providers import discover_models, probe
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 HEARTBEAT_SECONDS = 15.0
@@ -196,6 +196,7 @@ class Handler(BaseHTTPRequestHandler):
             ("GET", "/api/history"): self._api_history,
             ("GET", "/api/run"): self._api_run,
             ("GET", "/api/doctor"): self._api_doctor,
+            ("GET", "/api/models"): self._api_models,
             ("POST", "/api/config"): self._api_set_config,
             ("POST", "/api/config/reset"): lambda p: {
                 "ok": True, "config": self.app.store.reset()
@@ -350,6 +351,18 @@ class Handler(BaseHTTPRequestHandler):
                 probe(providers[k]) for k in ("drafter", "polisher") if k in providers
             ],
         }
+
+    def _api_models(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """What models the configured CLI reports it can actually run."""
+        pid = (params.get("provider") or [""])[0]
+        provider = self.app.store.get("providers", {}).get(pid)
+        if not provider:
+            raise ValueError(f"No such provider: {pid!r}")
+        result = discover_models(provider)
+        result["ok"] = True
+        result["provider"] = pid
+        result["current"] = provider.get("model", "")
+        return result
 
     def _api_start(self, params: Dict[str, list]) -> Dict[str, Any]:
         body = self._read_body()

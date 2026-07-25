@@ -268,9 +268,15 @@ Click the model chip on either agent card to switch that stage's model. The
 picker offers the configured list, the CLI's own default, and a free-text box
 for anything else — typing a model adds it to the list for next time.
 
-Neither CLI can enumerate its own models, so **the list is data, not code**: it
-lives in your config and is editable in Settings. A model released tomorrow is
-one keystroke away rather than an app update.
+The picker asks each CLI what it can actually run. Codex publishes an
+account-scoped list in `$CODEX_HOME/models_cache.json` — read live, so it
+reflects your login's entitlements. Claude ships no such file, so the picker
+offers its documented `--model` aliases.
+
+Nothing is hardcoded, deliberately: a shipped list is wrong the moment a model
+is renamed, and wrong *per account* regardless. A ChatGPT-account Codex login
+rejects models an API key would accept, with a 400 at run time rather than
+anything you could see when choosing.
 
 Aliases (`opus`, `sonnet`, `haiku`, `fable`) always resolve to the newest model
 in that family; a pinned ID (`claude-opus-4-8`) stays where you put it. The

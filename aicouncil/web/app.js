@@ -797,14 +797,47 @@ function closeModelMenu() {
   if (open) open.remove();
 }
 
-function openModelMenu(anchor, providerId) {
+/** Anchor below the chip, then nudge back inside the viewport. Called twice:
+ *  once for the loading state and again once the real list has resized it. */
+function positionModelMenu(menu, anchor) {
+  const r = anchor.getBoundingClientRect();
+  menu.style.top = `${r.bottom + 6}px`;
+  menu.style.left = `${Math.min(r.left, window.innerWidth - menu.offsetWidth - 12)}px`;
+  if (menu.getBoundingClientRect().bottom > window.innerHeight - 8) {
+    menu.style.top = `${Math.max(8, r.top - menu.offsetHeight - 6)}px`;
+  }
+}
+
+async function openModelMenu(anchor, providerId) {
   closeModelMenu();
   const provider = ((state.config || {}).providers || {})[providerId] || {};
-  const models = provider.models || [];
   const current = provider.model || '';
 
   const menu = document.createElement('div');
   menu.className = 'model-menu';
+  menu.innerHTML =
+    `<div class="model-menu-head">${esc(provider.label || providerId)} model</div>` +
+    `<div class="model-loading">Asking ${esc(provider.label || providerId)}…</div>`;
+  document.body.appendChild(menu);
+  positionModelMenu(menu, anchor);
+
+  // Ask the CLI what it can actually run. A list shipped in this app would be
+  // wrong for accounts with different entitlements — a ChatGPT-account Codex
+  // login rejects models an API key would accept, with a 400 at run time.
+  let models = provider.models || [];
+  let source = 'configured in Settings';
+  let error = '';
+  try {
+    const data = await api(`/api/models?provider=${encodeURIComponent(providerId)}`);
+    if (data.models && data.models.length) {
+      models = data.models;
+      source = data.source || '';
+    }
+    error = data.error || '';
+  } catch (err) {
+    error = err.message;
+  }
+
   menu.innerHTML =
     `<div class="model-menu-head">${esc(provider.label || providerId)} model</div>` +
     `<button class="model-opt${current ? '' : ' active'}" data-value="">` +
@@ -815,24 +848,18 @@ function openModelMenu(anchor, providerId) {
       `<button class="model-opt${m === current ? ' active' : ''}" data-value="${esc(m)}">` +
         `<span class="model-opt-name">${esc(m)}</span>` +
         // Bare aliases track the newest model in a family; pinned IDs don't.
-        `<span class="model-opt-note">${/^[a-z]+$/.test(m) ? 'alias · always latest' : 'pinned'}</span>` +
+        `<span class="model-opt-note">${/^[a-z]+$/.test(m) ? 'alias · always latest' : ''}</span>` +
       `</button>`
     ).join('') +
+    (error ? `<div class="model-menu-error">${esc(error)}</div>` : '') +
     `<div class="model-menu-custom">` +
       `<input class="model-custom-input" placeholder="Other model…" spellcheck="false" ` +
         `value="${esc(models.includes(current) ? '' : current)}">` +
       `<button class="btn btn-quiet btn-sm model-custom-apply" type="button">Set</button>` +
-    `</div>`;
+    `</div>` +
+    (source ? `<div class="model-menu-source">${esc(source)}</div>` : '');
 
-  document.body.appendChild(menu);
-
-  // Anchor below the chip, then nudge back inside the viewport.
-  const r = anchor.getBoundingClientRect();
-  menu.style.top = `${r.bottom + 6}px`;
-  menu.style.left = `${Math.min(r.left, window.innerWidth - menu.offsetWidth - 12)}px`;
-  if (menu.getBoundingClientRect().bottom > window.innerHeight - 8) {
-    menu.style.top = `${Math.max(8, r.top - menu.offsetHeight - 6)}px`;
-  }
+  positionModelMenu(menu, anchor);
 
   const apply = (value) => {
     closeModelMenu();

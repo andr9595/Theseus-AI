@@ -84,10 +84,11 @@ DEFAULT_DRAFTER = {
     # Empty means "whatever the CLI is configured to use by default", which is
     # the safest choice: it keeps working when a vendor ships a new model.
     "model": "",
-    # Neither CLI can enumerate its own models, so this list is seeded and then
-    # owned by the user. Editing it in Settings is the supported way to add a
-    # model the day it ships - nothing here is hardcoded into the pipeline.
-    "models": ["gpt-5.1-codex-max", "gpt-5.1-codex", "gpt-5.1", "o3"],
+    # Deliberately empty. Codex publishes an account-scoped model list in
+    # $CODEX_HOME/models_cache.json, and the picker reads it - a shipped list
+    # would be both stale and wrong for accounts with different entitlements
+    # (a ChatGPT-account login cannot run every model an API key can).
+    "models": [],
     # argv fragment used to pass the model. `{model}` is substituted.
     "model_args": ["--model", "{model}"],
 }
@@ -105,20 +106,12 @@ DEFAULT_POLISHER = {
     "cwd_mode": "repo",
     # --- Model selection ---------------------------------------------------
     "model": "",
-    # `claude --model` takes either an alias that always resolves to the latest
-    # model in a family, or a pinned full ID. Aliases are listed first because
-    # they are the better default: they survive a model release, where a pinned
-    # ID silently keeps you on the old one.
-    "models": [
-        "opus",
-        "sonnet",
-        "haiku",
-        "fable",
-        "claude-opus-4-8",
-        "claude-sonnet-5",
-        "claude-haiku-4-5",
-        "claude-fable-5",
-    ],
+    # Empty for the same reason as the drafter: the picker asks the CLI. For
+    # Claude that means the documented `--model` aliases, which always resolve
+    # to the current model in each family. Pinned IDs are not enumerated -
+    # this app cannot know which ones an account may use, and a stale pinned
+    # ID is exactly the failure being avoided. Type one to use it anyway.
+    "models": [],
     "model_args": ["--model", "{model}"],
 }
 

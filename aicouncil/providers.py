@@ -22,6 +22,7 @@ Two behaviours are worth calling out:
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
@@ -378,6 +379,74 @@ class ProviderRunner:
 # --------------------------------------------------------------------------
 # Diagnostics
 # --------------------------------------------------------------------------
+
+
+def discover_models(provider: Dict) -> Dict:
+    """Ask the CLI what models it can actually run, rather than guessing.
+
+    A hand-written list is worse than no list: it looks authoritative and is
+    wrong the moment a vendor renames a model or an account tier changes what
+    it may use. Codex maintains ``models_cache.json`` in ``$CODEX_HOME``, keyed
+    to the logged-in account and refreshed from the server, so that file is the
+    real answer for the machine it is read on.
+
+    Claude Code ships no equivalent cache; its ``--model`` help documents the
+    alias form instead, and an alias always resolves to the current model in
+    that family, so aliases are what we offer.
+
+    Returns ``{"models": [...], "source": "...", "error": "..."}``. Callers
+    fall back to the configured list when ``models`` is empty.
+    """
+    exe = (provider.get("command") or [""])[0]
+    base = os.path.basename(str(exe))
+
+    if "codex" in base:
+        return _discover_codex_models()
+    if "claude" in base:
+        # Aliases only. Pinned IDs are deliberately not enumerated here: this
+        # app has no way to know which ones the account may use, and a stale
+        # pinned ID is the failure mode we are trying to avoid.
+        return {
+            "models": ["opus", "sonnet", "haiku", "fable"],
+            "source": "claude --model aliases (always resolve to the latest)",
+            "error": "",
+        }
+    return {"models": [], "source": "", "error": "No discovery available for this CLI."}
+
+
+def _discover_codex_models() -> Dict:
+    """Read Codex's own account-scoped model cache."""
+    home = os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
+    cache = Path(home) / "models_cache.json"
+    if not cache.exists():
+        return {
+            "models": [],
+            "source": "",
+            "error": (
+                f"{cache} not found. Run `codex` once so it fetches the model "
+                f"list for your account."
+            ),
+        }
+    try:
+        data = json.loads(cache.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        return {"models": [], "source": str(cache), "error": f"Unreadable: {exc}"}
+
+    models = []
+    for entry in data.get("models") or []:
+        if not isinstance(entry, dict):
+            continue
+        slug = entry.get("slug")
+        # `visibility: hide` marks internal models (e.g. codex-auto-review)
+        # that are not meant to be selected as the session model.
+        if slug and entry.get("visibility") == "list":
+            models.append(str(slug))
+
+    return {
+        "models": models,
+        "source": f"{cache} (fetched {data.get('fetched_at', '?')})",
+        "error": "" if models else "Cache contained no selectable models.",
+    }
 
 
 def probe(provider: Dict) -> Dict:

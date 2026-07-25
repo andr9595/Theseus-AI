@@ -4,7 +4,11 @@ The invariant under test: auto-approve flags reach the child process if and
 only if the pipeline explicitly granted permission.
 """
 
+import json
+import os
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -12,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from aicouncil.providers import (  # noqa: E402
     ARGV_PROMPT_LIMIT,
+    discover_models,
     ProviderUnavailable,
     build_argv,
     redact_argv,
@@ -192,3 +197,67 @@ class TestResolveBinary(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestModelDiscovery(unittest.TestCase):
+    """Models come from the CLI, never from a list shipped in this app.
+
+    A seeded list was wrong in practice: `gpt-5.1-codex` was rejected at run
+    time with "not supported when using Codex with a ChatGPT account" — the
+    entitlements differ per account, so only the CLI knows.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-models-"))
+        self._old = os.environ.get("CODEX_HOME")
+        os.environ["CODEX_HOME"] = str(self.tmp)
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = self._old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_cache(self, payload):
+        (self.tmp / "models_cache.json").write_text(json.dumps(payload))
+
+    def test_reads_slugs_from_the_codex_cache(self):
+        self._write_cache({"fetched_at": "2026-07-25T01:03:30Z", "models": [
+            {"slug": "gpt-5.6-sol", "visibility": "list"},
+            {"slug": "gpt-5.5", "visibility": "list"},
+        ]})
+        r = discover_models({"command": ["codex", "exec", "{prompt}"]})
+        self.assertEqual(r["models"], ["gpt-5.6-sol", "gpt-5.5"])
+        self.assertFalse(r["error"])
+
+    def test_hidden_models_are_excluded(self):
+        # codex-auto-review is marked hide; it is not a selectable session model.
+        self._write_cache({"models": [
+            {"slug": "gpt-5.6-sol", "visibility": "list"},
+            {"slug": "codex-auto-review", "visibility": "hide"},
+        ]})
+        r = discover_models({"command": ["codex", "exec", "{prompt}"]})
+        self.assertEqual(r["models"], ["gpt-5.6-sol"])
+
+    def test_missing_cache_explains_itself(self):
+        r = discover_models({"command": ["codex", "exec", "{prompt}"]})
+        self.assertEqual(r["models"], [])
+        self.assertIn("models_cache.json", r["error"])
+
+    def test_corrupt_cache_does_not_raise(self):
+        (self.tmp / "models_cache.json").write_text("{not json")
+        r = discover_models({"command": ["codex", "exec", "{prompt}"]})
+        self.assertEqual(r["models"], [])
+        self.assertTrue(r["error"])
+
+    def test_claude_offers_aliases_not_pinned_ids(self):
+        r = discover_models({"command": ["claude", "-p", "{prompt}"]})
+        self.assertIn("opus", r["models"])
+        # A pinned ID would go stale and silently keep running an old model.
+        self.assertFalse([m for m in r["models"] if m.startswith("claude-")])
+
+    def test_unknown_cli_reports_no_discovery(self):
+        r = discover_models({"command": ["some-other-agent", "{prompt}"]})
+        self.assertEqual(r["models"], [])
+        self.assertTrue(r["error"])
