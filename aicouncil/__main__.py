@@ -168,10 +168,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         threading.Thread(target=launch, name="open-ui", daemon=True).start()
 
+    # Poll once now and on the configured interval, so the first thing the
+    # dashboard paints is a real number rather than a dash.
+    state.usage.start()
+
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         print("\n  Shutting down...")
+        state.usage.stop()
         state.pipeline.cancel()
         server.shutdown()
         server.server_close()

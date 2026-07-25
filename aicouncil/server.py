@@ -38,6 +38,7 @@ from . import gitutil
 from .events import EventBus, drain, sse_comment, sse_format
 from .pipeline import Pipeline, PipelineBusy
 from .providers import discover_models, probe
+from .usage import UsagePoller
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 HEARTBEAT_SECONDS = 15.0
@@ -55,6 +56,11 @@ class AppState:
         self.pipeline = Pipeline(store, self.bus)
         self.token = secrets.token_urlsafe(24)
         self.started_at = time.time()
+        # Publishing on the bus means every open tab updates together, and a
+        # tab opened later replays the last reading instead of showing blank.
+        self.usage = UsagePoller(
+            store, on_update=lambda snap: self.bus.publish("usage", usage=snap)
+        )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -197,6 +203,10 @@ class Handler(BaseHTTPRequestHandler):
             ("GET", "/api/run"): self._api_run,
             ("GET", "/api/doctor"): self._api_doctor,
             ("GET", "/api/models"): self._api_models,
+            ("GET", "/api/usage"): lambda p: {
+                "ok": True, "usage": self.app.usage.snapshot()
+            },
+            ("POST", "/api/usage/refresh"): self._api_usage_refresh,
             ("POST", "/api/config"): self._api_set_config,
             ("POST", "/api/config/reset"): lambda p: {
                 "ok": True, "config": self.app.store.reset()
@@ -303,6 +313,7 @@ class Handler(BaseHTTPRequestHandler):
         state = self.app.pipeline.snapshot_state()
         state["ok"] = True
         state["version"] = __version__
+        state["usage"] = self.app.usage.snapshot()
         repo = state["config"].get("target_repo") or ""
         state["repo_status"] = gitutil.status(repo).to_dict() if repo else None
         return state
@@ -363,6 +374,10 @@ class Handler(BaseHTTPRequestHandler):
         result["provider"] = pid
         result["current"] = provider.get("model", "")
         return result
+
+    def _api_usage_refresh(self, params: Dict[str, list]) -> Dict[str, Any]:
+        self.app.usage.poll_once()
+        return {"ok": True, "usage": self.app.usage.snapshot()}
 
     def _api_start(self, params: Dict[str, list]) -> Dict[str, Any]:
         body = self._read_body()

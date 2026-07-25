@@ -524,6 +524,7 @@ const state = {
   // holds its own copy of a command or a permission flag.
   agents: [],
   repoStatus: null,
+  usage: {},
   busy: false,
   streamLines: [],
   activeTab: 'stream',
@@ -653,6 +654,7 @@ function renderAgents() {
         `</div>` +
         `<div class="agent-right">` +
           `<div class="agent-state">${esc(label)}${esc(duration)}</div>` +
+          usageChipHtml(id) +
           `<button class="model-chip${provider.model ? ' set' : ''}" type="button" ` +
             `data-model-for="${id}" title="Change the model for this stage">` +
             `${esc(modelLabel)}` +
@@ -664,6 +666,50 @@ function renderAgents() {
       `</div>`
     );
   }).join('');
+
+  // The CSP forbids inline style attributes, so bar widths are set through the
+  // CSSOM after the markup lands. Writing `style="width:24%"` into the string
+  // above looks correct in the DOM inspector and renders as a 0px bar.
+  $$('[data-fill]', rail).forEach(el => { el.style.width = `${el.dataset.fill}%`; });
+}
+
+
+/** Quota chip. Shows the vendor's own percentage, or says plainly that the
+ *  agent cannot report one — never a number this app inferred. */
+function usageChipHtml(providerId) {
+  const u = (state.usage || {})[providerId];
+  if (!u) return '';
+  if (!u.supported) {
+    return `<span class="usage-chip none" title="${esc(u.note || '')}">no quota data</span>`;
+  }
+  if (!u.worst) {
+    const why = u.error || 'Not checked yet.';
+    return `<span class="usage-chip none" title="${esc(why)}">quota ?</span>`;
+  }
+  const pct = Math.round(u.worst.percent);
+  const level = pct >= 90 ? 'crit' : pct >= 75 ? 'warn' : 'ok';
+  const tip = u.limits.map(l =>
+    `${l.label}: ${l.percent}% used${l.resets ? ` · resets ${l.resets}` : ''}`
+  ).join('\n') + (u.error ? `\n\n(last poll failed: ${u.error})` : '');
+  return (
+    `<button class="usage-chip ${level}" type="button" data-usage-for="${providerId}" ` +
+      `title="${esc(tip)}">` +
+      `<span class="usage-bar"><span data-fill="${Math.min(100, pct)}"></span></span>` +
+      `${pct}%` +
+    `</button>`
+  );
+}
+
+/** Highest reported usage across the agents a run will actually use. */
+function worstUsageFor(providerIds) {
+  let worst = null;
+  for (const id of providerIds) {
+    const u = (state.usage || {})[id];
+    if (u && u.worst && (!worst || u.worst.percent > worst.percent)) {
+      worst = { ...u.worst, agent: id };
+    }
+  }
+  return worst;
 }
 
 function renderRepo() {
@@ -1187,8 +1233,8 @@ async function showHistory() {
     list.innerHTML = runs.map(r => {
       const stat = r.diff_stat || {};
       const changed = stat.files
-        ? `<span class="history-stat"><span style="color:var(--green)">+${stat.insertions || 0}</span> ` +
-          `<span style="color:var(--red)">&minus;${stat.deletions || 0}</span></span>`
+        ? `<span class="history-stat"><span class="stat-add">+${stat.insertions || 0}</span> ` +
+          `<span class="stat-del">&minus;${stat.deletions || 0}</span></span>`
         : '';
       return (
         `<div class="history-row ${esc(r.state)}">` +
@@ -1316,6 +1362,11 @@ function connect() {
     renderAll();
   });
 
+  on('usage', (d) => {
+    state.usage = d.usage || {};
+    renderAgents();
+  });
+
   on('config', (d) => {
     state.config = d.config;
     renderAll();
@@ -1352,6 +1403,7 @@ async function loadState() {
     state.agents = data.agents || [];
     state.providers = data.providers_status || [];
     state.repoStatus = data.repo_status;
+    state.usage = data.usage || {};
     renderAll();
   } catch (err) {
     toast(err.message, 'error', 12000);
@@ -1362,6 +1414,22 @@ async function startRun() {
   const task = $('#task-input').value.trim();
   if (!task) return;
   const conf = state.config || {};
+
+  // Quota warning. Advisory only: the reading is a snapshot, and only the
+  // operator knows whether this particular task is worth the remaining budget.
+  const stages = conf.solo_mode ? [conf.solo_stage || 'polisher'] : ['drafter', 'polisher'];
+  const worst = worstUsageFor(stages);
+  const threshold = Number(conf.usage_warn_percent ?? 85);
+  if (worst && worst.percent >= threshold) {
+    const ok = confirm(
+      `Quota warning\n\n` +
+      `${worst.label} is at ${Math.round(worst.percent)}% used` +
+      (worst.resets ? `, resets ${worst.resets}` : '') + `.\n\n` +
+      `This run may exhaust it. Continue anyway?`
+    );
+    if (!ok) return;
+  }
+
   if (conf.zero_touch) {
     const ok = confirm(
       'Zero-Touch Mode is ON.\n\n' +
@@ -1447,6 +1515,14 @@ function wire() {
     if (e.target.closest('[data-disable-solo]')) {
       patchConfig({ solo_mode: false });
       toast('Solo mode off — the draft stage is back in the pipeline.', 'ok', 3600);
+      return;
+    }
+    const usageChip = e.target.closest('[data-usage-for]');
+    if (usageChip) {
+      usageChip.classList.add('checking');
+      api('/api/usage/refresh', { method: 'POST' })
+        .then(d => { state.usage = d.usage || {}; renderAgents(); })
+        .catch(err => toast(err.message, 'error'));
       return;
     }
     const chip = e.target.closest('.model-chip');
@@ -1565,9 +1641,9 @@ function wire() {
 async function boot() {
   if (!TOKEN) {
     document.body.innerHTML =
-      '<div style="padding:44px;font-family:system-ui;color:#e6e9f0">' +
+      '<div class="boot-error">' +
       '<h2>Missing session token</h2>' +
-      '<p style="color:#9aa3b5">Open the dashboard using the URL the launcher ' +
+      '<p>Open the dashboard using the URL the launcher ' +
       'printed &mdash; it carries a one-time token for this session.</p></div>';
     return;
   }

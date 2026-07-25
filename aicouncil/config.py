@@ -220,6 +220,17 @@ DEFAULTS: Dict[str, Any] = {
     # --- Prompting ----------------------------------------------------------
     # Extra standing instructions appended to both stages.
     "house_rules": "",
+    # --- Quota ---------------------------------------------------------------
+    # Poll the CLI's own /usage on launch and on this interval. Claude answers
+    # locally, so this costs no tokens; agents that cannot report say so.
+    "usage_polling": True,
+    "usage_poll_seconds": 300,
+    # Warn before starting a run once the worst reported limit is at or above
+    # this. A warning only - the operator can always force the run through,
+    # because the reading is a snapshot and only they know what the work is
+    # worth.
+    "usage_warn_percent": 85,
+
     # --- Server -------------------------------------------------------------
     "port": 8760,
     "open_browser": True,

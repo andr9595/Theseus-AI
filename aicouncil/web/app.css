@@ -1100,3 +1100,57 @@ kbd {
     transition-duration: .01ms !important;
   }
 }
+
+/* ---- Quota chip on the agent card ---- */
+
+.usage-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 1px 7px;
+  font: inherit; font-family: var(--mono); font-size: 9.5px;
+  color: var(--text-3);
+  background: var(--bg-3);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  cursor: pointer;
+  transition: color .14s, border-color .14s, opacity .14s;
+}
+.usage-chip:hover { color: var(--text); border-color: #303a4e; }
+.usage-chip.checking { opacity: .5; cursor: progress; }
+
+/* An agent that cannot report quota says so, and is not clickable — a dash
+   that looks like a reading is worse than an honest blank. */
+.usage-chip.none {
+  cursor: default; opacity: .65;
+  border-style: dashed;
+}
+.usage-chip.none:hover { color: var(--text-3); border-color: var(--line); }
+
+.usage-bar {
+  display: block; position: relative;
+  width: 26px; height: 3px;
+  background: var(--bg-4);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.usage-bar > span {
+  position: absolute; inset: 0 auto 0 0;
+  background: currentColor;
+  border-radius: 2px;
+}
+
+.usage-chip.ok   { color: var(--text-2); }
+.usage-chip.warn { color: var(--yellow); border-color: rgba(234, 179, 8, .32); }
+.usage-chip.crit { color: var(--red);    border-color: rgba(244, 99, 99, .38); }
+
+/* History diff counts. Classes rather than inline colour: the CSP blocks
+   `style=` attributes, so an inline colour renders as inherited grey. */
+.history-stat .stat-add { color: var(--green); }
+.history-stat .stat-del { color: var(--red); }
+
+/* Shown when the dashboard is opened without the launcher's session token. */
+.boot-error {
+  padding: 44px;
+  font-family: var(--sans);
+  color: var(--text);
+}
+.boot-error p { color: var(--text-2); max-width: 60ch; }
