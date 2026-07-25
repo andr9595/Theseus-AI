@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -48,15 +49,21 @@ def _run(
     if index_file is not None:
         env["GIT_INDEX_FILE"] = str(index_file)
 
-    proc = subprocess.run(
-        ["git", *args],
-        cwd=str(cwd),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # GitError is this module's failure abstraction. A raw TimeoutExpired
+        # slips past every caller that catches GitError and surfaces as an
+        # unhandled crash instead of a message about git.
+        raise GitError(f"git {' '.join(args)} timed out after {timeout}s") from exc
     if check and proc.returncode != 0:
         raise GitError(
             f"git {' '.join(args)} failed ({proc.returncode}): "
@@ -110,7 +117,7 @@ def repo_root(path: str | Path) -> Optional[str]:
         return None
     try:
         proc = _run(["rev-parse", "--show-toplevel"], p, check=False)
-    except (OSError, subprocess.TimeoutExpired):
+    except (GitError, OSError):
         return None
     if proc.returncode != 0:
         return None
@@ -159,7 +166,7 @@ def status(path: str | Path) -> RepoStatus:
                 st.modified.append(name)
 
         st.clean = not (st.staged or st.modified or st.untracked)
-    except (GitError, OSError, subprocess.TimeoutExpired) as exc:
+    except (GitError, OSError) as exc:
         st.error = str(exc)
     return st
 
@@ -294,7 +301,16 @@ def _is_binary(path: Path, probe_bytes: int = 8000) -> bool:
 # --------------------------------------------------------------------------
 
 
-SNAPSHOT_REF = "refs/ai-council/snapshot"
+# One ref per snapshot, under a namespace of their own. A single shared ref
+# stops protecting an earlier run's commit the moment a later run overwrites
+# it, and two app instances pointed at one repository do exactly that.
+SNAPSHOT_REF_DIR = "refs/ai-council/snapshots"
+# Written by versions that kept exactly one snapshot ref. Nothing reads it any
+# more, and left alone it pins one commit alive forever.
+LEGACY_SNAPSHOT_REF = "refs/ai-council/snapshot"
+# How many snapshot anchors to keep. Unbounded, they would accumulate for the
+# life of the repository, each holding a whole worktree's objects alive.
+SNAPSHOT_REF_LIMIT = 20
 
 
 @dataclass
@@ -305,6 +321,7 @@ class Snapshot:
     head: str
     commit: str = ""  # commit whose tree is the exact pre-run worktree
     had_changes: bool = False
+    ref: str = ""  # anchor keeping `commit` reachable, so gc cannot reap it
 
     def to_dict(self) -> Dict:
         return {
@@ -312,6 +329,7 @@ class Snapshot:
             "head": self.head,
             "commit": self.commit,
             "had_changes": self.had_changes,
+            "ref": self.ref,
         }
 
 
@@ -334,6 +352,11 @@ def take_snapshot(path: str | Path) -> Optional[Snapshot]:
     ``add -A`` honours .gitignore, which pairs correctly with the ``git clean``
     in ``restore_snapshot``: ignored files (build output, virtualenvs) are
     neither captured nor deleted.
+
+    Returns None only when there is genuinely nothing to snapshot (no HEAD).
+    Every other failure raises: a Snapshot without a commit records no tree,
+    and handing one to ``restore_snapshot`` would reset the worktree to HEAD -
+    destroying the very work the snapshot exists to protect.
     """
     root = repo_root(path)
     if root is None:
@@ -344,36 +367,64 @@ def take_snapshot(path: str | Path) -> Optional[Snapshot]:
         return None  # empty repo: no HEAD to anchor a snapshot to
     snap = Snapshot(root=root, head=head_proc.stdout.strip())
 
-    tmp_index = Path(root) / ".git" / "ai-council-snapshot.index"
+    # A scratch index per snapshot, not a fixed path: the path is shared state
+    # between two app instances pointed at the same repository, and two
+    # concurrent `add -A` runs writing one index file corrupt each other.
+    git_dir = _run(["rev-parse", "--absolute-git-dir"], root).stdout.strip()
+    handle, tmp_name = tempfile.mkstemp(
+        prefix="ai-council-snapshot-", suffix=".index", dir=git_dir
+    )
+    os.close(handle)
+    tmp_index = Path(tmp_name)
+    # git wants the index file either absent or valid, never empty.
+    tmp_index.unlink()
     try:
         # Seed the scratch index from HEAD so `add -A` records deletions too.
         _run(["read-tree", snap.head], root, index_file=tmp_index)
         _run(["add", "-A", "."], root, index_file=tmp_index)
         tree = _run(["write-tree"], root, index_file=tmp_index).stdout.strip()
         if not tree:
-            return snap
-        commit = _run(
+            raise GitError("git write-tree produced no tree object")
+        snap.commit = _run(
             ["commit-tree", tree, "-p", snap.head, "-m", "ai-council snapshot"],
             root,
         ).stdout.strip()
-    except (GitError, OSError, subprocess.TimeoutExpired):
-        # A snapshot we cannot take is reported by the caller as a warning;
-        # the run continues without rollback rather than failing outright.
-        return snap
+        if not snap.commit:
+            raise GitError("git commit-tree produced no commit object")
     finally:
         try:
             tmp_index.unlink()
         except OSError:
             pass
 
-    if commit:
-        snap.commit = commit
-        snap.had_changes = tree != _run(
-            ["rev-parse", f"{snap.head}^{{tree}}"], root, check=False
-        ).stdout.strip()
-        # Anchor the commit under a ref so `git gc` cannot reap it mid-run.
-        _run(["update-ref", SNAPSHOT_REF, commit], root, check=False)
+    snap.had_changes = tree != _run(
+        ["rev-parse", f"{snap.head}^{{tree}}"], root, check=False
+    ).stdout.strip()
+    # Anchor the commit so `git gc` cannot reap it mid-run.
+    snap.ref = f"{SNAPSHOT_REF_DIR}/{snap.commit[:12]}"
+    _run(["update-ref", snap.ref, snap.commit], root, check=False)
+    _prune_snapshot_refs(root)
     return snap
+
+
+def _prune_snapshot_refs(root: str, keep: int = SNAPSHOT_REF_LIMIT) -> None:
+    """Drop all but the newest ``keep`` snapshot anchors.
+
+    Best-effort by design: failing to tidy up costs disk, not correctness, and
+    must never lose the snapshot that was just taken.
+    """
+    try:
+        _run(["update-ref", "-d", LEGACY_SNAPSHOT_REF], root, check=False)
+        listed = _run(
+            ["for-each-ref", "--sort=-creatordate", "--format=%(refname)",
+             SNAPSHOT_REF_DIR],
+            root,
+            check=False,
+        )
+        for ref in listed.stdout.split()[keep:]:
+            _run(["update-ref", "-d", ref], root, check=False)
+    except (GitError, OSError):
+        pass
 
 
 def restore_snapshot(snap: Snapshot) -> str:
@@ -391,9 +442,13 @@ def restore_snapshot(snap: Snapshot) -> str:
     """
     root = snap.root
     if not snap.commit:
-        _run(["reset", "--hard", snap.head], root)
-        _run(["clean", "-fdq"], root, check=False)
-        return f"Restored to clean {snap.head[:8]}."
+        # No commit means no captured tree, so there is nothing to restore
+        # *to*. Reading that as "the tree was clean" and resetting is how a
+        # failed snapshot turns into the data loss it exists to prevent.
+        raise GitError(
+            "This snapshot is incomplete - it captured no tree. Refusing to "
+            "reset the working tree."
+        )
 
     try:
         # Order is load-bearing. Clean must run *before* the snapshot is laid
@@ -405,7 +460,7 @@ def restore_snapshot(snap: Snapshot) -> str:
         # The snapshot's extra files are staged at this point; resetting the
         # index back to HEAD returns them to being untracked.
         _run(["reset", "--mixed", "-q", snap.head], root)
-    except (GitError, OSError, subprocess.TimeoutExpired) as exc:
+    except (GitError, OSError) as exc:
         raise GitError(f"Rollback failed: {exc}") from exc
 
     if snap.had_changes:

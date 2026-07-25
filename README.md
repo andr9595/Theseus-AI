@@ -8,8 +8,9 @@ across your existing AI subscriptions — with **zero per-token API cost**.
        |
        v
   ┌──────────────────┐   read-only     ┌──────────────────┐   writes to disk
-  │  Stage 1 · Codex │ ─── draft ───>  │ Stage 2 · Claude │ ──> your repo
+  │     Stage 1      │ ─── draft ───>  │     Stage 2      │ ──> your repo
   │   Junior Draft   │                 │  Senior Polish   │
+  │  (Codex, or…)    │                 │  (Claude, or…)   │
   └──────────────────┘                 └──────────────────┘
                             ^
                             └── approval gate (unless Zero-Touch is on)
@@ -19,6 +20,10 @@ Stage 1 shells out to the `codex` CLI (your ChatGPT Plus/Pro subscription) to
 survey the repository and write an implementation proposal. Stage 2 shells out
 to the `claude` CLI (your Claude Pro subscription) to verify that proposal
 against the real code, correct it, and apply the change.
+
+That pairing is the default, not a rule: **either agent can be assigned to
+either job** from Settings, including the same agent twice. See
+[Assigning agents to jobs](#assigning-agents-to-jobs).
 
 **Nothing in this application reads, stores or transmits an API key.** It
 drives the CLIs you have already authenticated, so the marginal cost of a run
@@ -82,8 +87,8 @@ AI Council v1.0.0
   target repo : (none selected)
 
 Providers:
-  [MISS] Codex    codex      -> not found on PATH
-  [MISS] Claude   claude     -> not found on PATH
+  [MISS] Junior Draft   Codex    codex      -> not found on PATH
+  [MISS] Senior Polish  Claude   claude     -> not found on PATH
 ```
 
 ### Launcher flags
@@ -157,15 +162,21 @@ Three properties hold in both modes, and they are covered by tests:
 | Toggle | Effect |
 |---|---|
 | **Safety snapshot** | Capture the worktree before Stage 2 so **Roll back** works. Leave on. |
-| **Solo mode** | Skip Stage 1 and send the task straight to Claude. Costs more quota; use for tasks too small to be worth a draft. |
+| **Solo mode** | Skip the draft and run a single agent. Costs more quota; use for tasks too small to be worth a draft. |
+| **Solo mode runs** | Which stage's configuration works alone — so Solo Mode can use a different agent than a full council run does. |
 | **Require clean tree** | Refuse to start if the repo has uncommitted changes. |
+
+Solo Mode still stops at the approval gate unless Zero-Touch is on: there is no
+draft to read, but the operator is still authorising an agent to write.
 
 ---
 
 ## How rollback works
 
 Before Stage 2 writes anything, the app records your worktree as a real commit
-object — reachable from `refs/ai-council/snapshot`, so `git gc` can't reap it:
+object — anchored under its own ref in `refs/ai-council/snapshots/`, so `git gc`
+can't reap it and a later run can't orphan an earlier one's snapshot (the
+twenty most recent are kept):
 
 ```
 GIT_INDEX_FILE=<scratch> git add -A     # tracked edits AND untracked files
@@ -183,6 +194,12 @@ Ignored files (`node_modules/`, `.venv/`, build output) are neither captured
 nor deleted. The one thing not reproduced is the staged/unstaged split:
 everything uncommitted before the run is uncommitted after it, but changes
 that were staged come back unstaged.
+
+Snapshotting **fails closed**. If any part of it fails — or the repository has
+no commits yet to anchor to — the run is told so in the live stream and
+**Roll back** is not offered at all. A snapshot that captured nothing cannot
+distinguish "your tree was clean" from "we recorded nothing", and resetting on
+that assumption would destroy the work the snapshot exists to protect.
 
 ---
 
@@ -250,10 +267,13 @@ drafter                       ← use "polisher" for Stage 2
 
 Each stage is just a command template. `{prompt}` is replaced with the
 generated prompt; it can appear anywhere, including inside a larger argument
-like `--message={prompt}`.
+like `--message={prompt}`. (A prompt over 96 KB has to move to stdin, and a
+decorated placeholder cannot follow it there — that combination is refused
+with an explanation rather than quietly sending an empty `--message=`.)
 
 | Field | Meaning |
 |---|---|
+| **Agent** | Which CLI runs this job. Changing it swaps the command and auto-approve arguments together. |
 | **Command** | argv, one argument per line. Never passed through a shell. |
 | **Auto-approve arguments** | Appended *only* when permission has been granted. |
 | **Model** | Blank means the CLI's own default. See below. |
@@ -261,6 +281,29 @@ like `--message={prompt}`.
 | **Selectable models** | The list offered in the picker, one per line. |
 | **Timeout** | Seconds before the child process group is killed. |
 | **Pipe the prompt on stdin** | For CLIs that prefer stdin. Automatic above 96 KB regardless. |
+
+### Assigning agents to jobs
+
+The *agent* (which CLI) and the *job* (Junior Draft / Senior Polish) are
+separate settings. Settings → each stage has an **Agent** dropdown: Codex,
+Claude, or Custom command. Claude can draft and Codex can be the senior; the
+same agent can hold both jobs.
+
+Picking one swaps that stage's command, display name, auto-approve argument and
+model flag **as a single unit**, because those only make sense together —
+`--dangerously-skip-permissions` on `codex` is rejected outright, and the
+reverse is worse: the CLI starts, finds no permission grant, and blocks on a
+prompt nothing in this pipeline can answer. The swap also clears the stage's
+model, since a Codex slug handed to `claude --model` fails at launch.
+
+Everything else about the stage — its job, prompt, timeout and approval
+behaviour — is untouched. Editing the command by hand still works and simply
+reads back as **Custom command**; the command is the source of truth, and the
+dropdown is derived from it, so the two can never disagree.
+
+Solo Mode picks its agent the same way: the **Solo mode runs** selector under
+the toggle chooses which stage's configuration works alone, so solo runs can
+use a different agent from a full council run.
 
 ### Choosing a model per stage
 
@@ -290,12 +333,13 @@ correct in six months.
 A practical split: put the cheap, generous-quota model on Stage 1 and spend the
 rationed one on Stage 2, which is where judgement actually matters.
 
-Defaults:
+Defaults — Codex drafts because its quota is the generous one, but the
+assignment is yours to change:
 
-| Stage | Command | Auto-approve |
-|---|---|---|
-| 1 · Codex | `codex exec {prompt}` | `--dangerously-bypass-approvals-and-sandbox` |
-| 2 · Claude | `claude -p {prompt}` | `--dangerously-skip-permissions` |
+| Stage | Default agent | Command | Auto-approve |
+|---|---|---|---|
+| 1 · Junior Draft | Codex | `codex exec {prompt}` | `--dangerously-bypass-approvals-and-sandbox` |
+| 2 · Senior Polish | Claude | `claude -p {prompt}` | `--dangerously-skip-permissions` |
 
 **Standing project rules** are appended to every prompt in both stages — a good
 place for "use tabs", "never add a dependency without asking", "all new code
@@ -357,7 +401,7 @@ than loopback is refused outright.
 python3 -m unittest discover -s tests -v
 ```
 
-58 tests, standard library only. They drive real subprocesses, real sockets and
+98 tests, standard library only. They drive real subprocesses, real sockets and
 real git repositories in temporary directories rather than mocking them — the
 parts most likely to break are exactly the ones a mock would paper over.
 
@@ -365,9 +409,14 @@ Coverage focuses on the properties that matter if they're wrong:
 
 - Auto-approve flags reach the child process **if and only if** permission was
   granted, and never reach Stage 1.
-- The approval gate is reached with a **pristine working tree**.
+- The approval gate is reached with a **pristine working tree**, and the
+  configuration approved there is the one that runs — a settings change at the
+  gate cannot swap the command about to be granted write permission.
 - Rollback restores agent changes **without destroying pre-existing uncommitted
-  work** — the regression that made `git stash create` unusable here.
+  work** — the regression that made `git stash create` unusable here — and a
+  snapshot that failed is never offered as a rollback point.
+- Assigning an agent to a job moves its command **and** its permission flag
+  together, so the two can never be mismatched.
 - Cross-origin and bad-token requests are rejected; path traversal is blocked.
 
 ---

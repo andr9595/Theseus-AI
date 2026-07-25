@@ -69,9 +69,14 @@
         <span class="track" aria-hidden="true"><span class="thumb"></span></span>
         <span class="toggle-text">
           <strong>Solo mode</strong>
-          <em>Skip the draft, use Claude only</em>
+          <em>Skip the draft, run a single agent</em>
         </span>
       </label>
+
+      <div id="solo-target" class="field solo-target hidden">
+        <label for="solo-stage">Solo mode runs</label>
+        <select id="solo-stage"></select>
+      </div>
 
       <label class="toggle" for="clean-worktree">
         <input type="checkbox" id="clean-worktree">

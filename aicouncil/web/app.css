@@ -392,6 +392,10 @@ html, body {
 .toggle-text strong { font-size: 12.5px; font-weight: 600; }
 .toggle-text em { font-size: 10.5px; font-style: normal; color: var(--text-3); }
 
+/* Which stage Solo mode runs. Indented under its toggle, since it only
+   qualifies that toggle rather than standing on its own. */
+.solo-target { margin: 0 8px 4px 50px; }
+
 .inline-warning {
   padding: 8px 10px;
   font-size: 11px; line-height: 1.45;
@@ -975,6 +979,7 @@ kbd {
 
 .field input[type="text"],
 .field input[type="number"],
+.field select,
 .field textarea {
   padding: 8px 10px;
   font-family: var(--mono); font-size: 11.5px;
@@ -984,7 +989,10 @@ kbd {
   border-radius: var(--radius-sm);
   resize: vertical;
 }
-.field input:focus, .field textarea:focus { outline: none; border-color: var(--accent); }
+.field select { cursor: pointer; }
+.field input:focus, .field select:focus, .field textarea:focus {
+  outline: none; border-color: var(--accent);
+}
 .field input.invalid { border-color: var(--red); }
 
 .checkline {

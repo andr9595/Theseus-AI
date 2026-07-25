@@ -10,6 +10,10 @@ Design notes
   token ``{prompt}`` is substituted with the rendered prompt. This keeps the
   app agnostic to CLI flag churn - if the `claude` or `codex` CLI changes its
   interface, the user edits the template in Settings instead of the source.
+* The *agent* (which CLI) and the *job* (Junior Draft / Senior Polish) are
+  separate concerns. ``AGENTS`` holds the CLI-specific half of a provider and
+  either agent can be assigned to either job; the defaults below are a
+  starting pairing, not a rule.
 * ``auto_approve_args`` are appended only when Zero-Touch Mode is enabled, so
   the dangerous flags are impossible to pass by accident.
 * Nothing here ever holds an API key. The CLIs carry their own subscription
@@ -23,7 +27,7 @@ import json
 import os
 import threading
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 # --------------------------------------------------------------------------
 # Paths
@@ -60,21 +64,81 @@ def runs_dir() -> Path:
 
 
 # --------------------------------------------------------------------------
+# Agents
+# --------------------------------------------------------------------------
+
+# The CLI-specific half of a provider: which binary to launch, which flag
+# grants it permission to write, and how it takes a model name.
+#
+# These three fields travel together and must never be mixed between agents:
+# Claude's `--dangerously-skip-permissions` handed to `codex` is rejected
+# outright, and the reverse is worse - the CLI starts, finds no permission
+# grant, and blocks on a prompt nothing in this pipeline can answer.
+AGENTS: Dict[str, Dict[str, Any]] = {
+    # `codex exec` is the non-interactive entry point of the Codex CLI. The
+    # prompt is a trailing argument; the CLI carries its own subscription auth.
+    "codex": {
+        "label": "Codex",
+        "command": ["codex", "exec", "{prompt}"],
+        "auto_approve_args": ["--dangerously-bypass-approvals-and-sandbox"],
+        # argv fragment used to pass the model. `{model}` is substituted.
+        "model_args": ["--model", "{model}"],
+    },
+    "claude": {
+        "label": "Claude",
+        "command": ["claude", "-p", "{prompt}"],
+        "auto_approve_args": ["--dangerously-skip-permissions"],
+        "model_args": ["--model", "{model}"],
+    },
+}
+
+# Reported for a command that matches no catalogued agent: a hand-written
+# template, or the bundled mock agent.
+CUSTOM_AGENT = "custom"
+
+
+def agent_for(provider: Dict[str, Any]) -> str:
+    """Which catalogued agent a provider runs, judged by its executable.
+
+    Derived from the command rather than stored beside it. A stored field can
+    disagree with the command after a hand edit in Settings, and that
+    disagreement is invisible right up until a run hands one CLI's permission
+    flag to the other CLI's binary.
+    """
+    command = provider.get("command") or []
+    exe = os.path.basename(str(command[0])) if command else ""
+    for name in AGENTS:
+        if name in exe:
+            return name
+    return CUSTOM_AGENT
+
+
+def agent_catalog() -> List[Dict[str, Any]]:
+    """The selectable agents, for the Settings dropdown.
+
+    Served to the UI so the browser never carries its own copy of a command
+    or a permission flag - one source of truth, in Python.
+    """
+    catalog = [dict(copy.deepcopy(preset), id=name) for name, preset in AGENTS.items()]
+    catalog.append({
+        "id": CUSTOM_AGENT,
+        "label": "Custom command",
+        "command": [],
+        "auto_approve_args": [],
+        "model_args": [],
+    })
+    return catalog
+
+
+# --------------------------------------------------------------------------
 # Defaults
 # --------------------------------------------------------------------------
 
 # Stage 1 - the "junior". Cheap, fast, generous quota. Drafts the solution.
-#
-# `codex exec` is the non-interactive entry point of the Codex CLI. We pass the
-# prompt as a trailing argument and rely on the CLI's own subscription auth.
 DEFAULT_DRAFTER = {
     "id": "drafter",
-    "label": "Codex",
     "role": "Junior Draft",
     "enabled": True,
-    "command": ["codex", "exec", "{prompt}"],
-    # Appended only in Zero-Touch Mode.
-    "auto_approve_args": ["--dangerously-bypass-approvals-and-sandbox"],
     # When true the prompt is piped on stdin and `{prompt}` is dropped from
     # argv. Useful for very long prompts that would blow the ARG_MAX limit.
     "prompt_on_stdin": False,
@@ -89,18 +153,17 @@ DEFAULT_DRAFTER = {
     # would be both stale and wrong for accounts with different entitlements
     # (a ChatGPT-account login cannot run every model an API key can).
     "models": [],
-    # argv fragment used to pass the model. `{model}` is substituted.
-    "model_args": ["--model", "{model}"],
+    # --- Agent -------------------------------------------------------------
+    # Codex drafts by default because its quota is the generous one. Reassign
+    # it in Settings; nothing else about this stage has to change.
+    **copy.deepcopy(AGENTS["codex"]),
 }
 
 # Stage 2 - the "senior". Expensive, rationed. Reviews and applies.
 DEFAULT_POLISHER = {
     "id": "polisher",
-    "label": "Claude",
     "role": "Senior Polish",
     "enabled": True,
-    "command": ["claude", "-p", "{prompt}"],
-    "auto_approve_args": ["--dangerously-skip-permissions"],
     "prompt_on_stdin": False,
     "timeout_seconds": 1800,
     "cwd_mode": "repo",
@@ -112,7 +175,8 @@ DEFAULT_POLISHER = {
     # this app cannot know which ones an account may use, and a stale pinned
     # ID is exactly the failure being avoided. Type one to use it anyway.
     "models": [],
-    "model_args": ["--model", "{model}"],
+    # --- Agent -------------------------------------------------------------
+    **copy.deepcopy(AGENTS["claude"]),
 }
 
 DEFAULTS: Dict[str, Any] = {
@@ -127,8 +191,11 @@ DEFAULTS: Dict[str, Any] = {
     "safety_snapshot": True,
     # Refuse to run against a repo with uncommitted changes unless overridden.
     "require_clean_worktree": False,
-    # Skip Stage 1 and send the task straight to Claude.
+    # Skip Stage 1 and run the task through a single agent.
     "solo_mode": False,
+    # Which stage's configuration that single agent comes from. Either slot
+    # can hold either agent, so this is how Solo Mode picks who works alone.
+    "solo_stage": "polisher",
     # --- Target -------------------------------------------------------------
     "target_repo": "",
     "recent_repos": [],
@@ -165,6 +232,40 @@ def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]
             out[key] = _deep_merge(out[key], value)
         else:
             out[key] = value
+    return out
+
+
+def _resolve_agent_choices(
+    current: Dict[str, Any], patch: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Expand any ``providers.<job>.agent`` key into the real provider fields.
+
+    The UI sends an agent id when the operator picks one from the dropdown.
+    Expanding it here rather than in the browser keeps every command and
+    permission flag in one place, and makes the swap atomic: a stale command
+    submitted by the same form cannot re-pair one CLI's binary with the
+    other's auto-approve flag.
+
+    ``agent`` is never persisted - it is derived from the command by
+    ``agent_for()``, so there is nothing to keep in sync.
+    """
+    if not isinstance(patch.get("providers"), dict):
+        return patch
+    out = copy.deepcopy(patch)
+    for pid, changes in out["providers"].items():
+        if not isinstance(changes, dict):
+            continue
+        chosen = changes.pop("agent", None)
+        preset = AGENTS.get(str(chosen or ""))
+        if preset is None:
+            continue
+        if chosen == agent_for((current.get("providers") or {}).get(pid) or {}):
+            continue  # unchanged: whatever else this patch carries wins
+        changes.update(copy.deepcopy(preset))
+        # Model names are not interchangeable between CLIs - a Codex slug
+        # handed to `claude --model` fails at launch - so the swap clears them.
+        changes["model"] = ""
+        changes["models"] = []
     return out
 
 
@@ -227,9 +328,14 @@ class ConfigStore:
         approval gate off, or rollback protection off, without anyone touching
         that toggle. Re-reading narrows last-write-wins from the whole file to
         the individual keys actually being changed.
+
+        A ``providers.<job>.agent`` key is resolved against that same freshly
+        read copy, so assigning an agent swaps its command and permission
+        flags as one unit.
         """
         with self._lock:
-            self._data = _deep_merge(self._load(), patch)
+            current = self._load()
+            self._data = _deep_merge(current, _resolve_agent_choices(current, patch))
             self._write()
             return copy.deepcopy(self._data)
 

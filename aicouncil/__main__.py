@@ -97,9 +97,11 @@ def _print_doctor(store: cfg.ConfigStore) -> int:
         mark = "OK  " if info["available"] else "MISS"
         version = f"  [{info['version']}]" if info["version"] else ""
         location = info["path"] or "not found on PATH"
+        # The job comes first: either agent can be assigned to either job, so
+        # which CLI is doing what is the part worth reading at a glance.
         print(
-            f"  [{mark}] {info['label']:<8} {info['executable']:<10} "
-            f"-> {location}{version}"
+            f"  [{mark}] {provider.get('role', key):<14} {info['label']:<8} "
+            f"{info['executable']:<10} -> {location}{version}"
         )
         if not info["available"]:
             missing.append(info["executable"])

@@ -96,6 +96,7 @@ class Run:
     repo: str
     zero_touch: bool
     solo: bool
+    solo_stage: str = "polisher"  # which provider Solo Mode runs
     state: str = IDLE
     created_at: float = field(default_factory=time.time)
     ended_at: float = 0.0
@@ -106,14 +107,23 @@ class Run:
     reviewer_note: str = ""
     error: str = ""
     rollback_note: str = ""
+    # The configuration this run was started with, read once. Settings changed
+    # while the run is parked at the approval gate - including by a second app
+    # instance sharing the config file - must not swap the command the human
+    # approved, nor the flags it is about to be handed.
+    config: Dict[str, Any] = field(default_factory=dict, repr=False)
 
     def to_dict(self) -> Dict[str, Any]:
+        # `config` is deliberately absent: transcripts are rendered in the
+        # browser and replayed from disk, and a full copy of every provider
+        # command in each one is noise rather than history.
         return {
             "id": self.id,
             "task": self.task,
             "repo": self.repo,
             "zero_touch": self.zero_touch,
             "solo": self.solo,
+            "solo_stage": self.solo_stage,
             "state": self.state,
             "created_at": self.created_at,
             "ended_at": self.ended_at,
@@ -164,6 +174,9 @@ class Pipeline:
             "run": run,
             "busy": self.is_busy(),
             "config": self.store.all(),
+            # The agents assignable to either job. Served rather than hardcoded
+            # in the browser so commands and permission flags have one home.
+            "agents": cfg.agent_catalog(),
             "providers_status": [
                 probe(providers[k]) for k in ("drafter", "polisher") if k in providers
             ],
@@ -205,6 +218,9 @@ class Pipeline:
             solo = bool(conf.get("solo_mode"))
             zero_touch = bool(conf.get("zero_touch"))
             providers = conf.get("providers", {})
+            solo_stage = str(conf.get("solo_stage") or "polisher")
+            if solo_stage not in providers:
+                solo_stage = "polisher"
 
             run = Run(
                 id=uuid.uuid4().hex[:12],
@@ -212,8 +228,21 @@ class Pipeline:
                 repo=root,
                 zero_touch=zero_touch,
                 solo=solo,
+                solo_stage=solo_stage,
+                config=conf,
             )
-            if not solo:
+            if solo:
+                # One stage, and it is whichever provider the operator chose -
+                # it does the senior's job, so it is labelled for that, not for
+                # the slot it happens to be configured in.
+                p = providers.get(solo_stage, {})
+                run.stages[solo_stage] = StageRecord(
+                    id=solo_stage,
+                    label=p.get("label", solo_stage),
+                    role="Solo",
+                    model=str(p.get("model") or ""),
+                )
+            else:
                 d = providers.get("drafter", {})
                 run.stages["drafter"] = StageRecord(
                     id="drafter",
@@ -221,13 +250,13 @@ class Pipeline:
                     role=d.get("role", "Junior Draft"),
                     model=str(d.get("model") or ""),
                 )
-            p = providers.get("polisher", {})
-            run.stages["polisher"] = StageRecord(
-                id="polisher",
-                label=p.get("label", "Claude"),
-                role=p.get("role", "Senior Polish"),
-                model=str(p.get("model") or ""),
-            )
+                p = providers.get("polisher", {})
+                run.stages["polisher"] = StageRecord(
+                    id="polisher",
+                    label=p.get("label", "Claude"),
+                    role=p.get("role", "Senior Polish"),
+                    model=str(p.get("model") or ""),
+                )
 
             self._run = run
             self._cancel_requested = False
@@ -322,10 +351,11 @@ class Pipeline:
         self,
         run: Run,
         stage_id: str,
+        provider: Dict[str, Any],
         prompt: str,
         auto_approve: bool,
     ) -> ProviderResult:
-        provider = self.store.get("providers", {}).get(stage_id, {})
+        """Run one stage. ``provider`` comes from the run's frozen config."""
         stage = run.stages[stage_id]
         stage.model = str(provider.get("model") or "")
         stage.state = "running"
@@ -360,9 +390,13 @@ class Pipeline:
 
     def _execute(self, run: Run) -> None:
         """Worker-thread body for one run."""
-        conf = self.store.all()
+        conf = run.config
+        providers = conf.get("providers", {})
         house_rules = conf.get("house_rules", "")
         repo_status = gitutil.status(run.repo).to_dict()
+        # In Solo Mode the single stage is whichever provider the operator
+        # picked; otherwise the stage that writes is always the polisher slot.
+        final_stage = run.solo_stage if run.solo else "polisher"
 
         try:
             draft_text = ""
@@ -381,7 +415,13 @@ class Pipeline:
                 )
                 # Stage 1 is read-only by instruction, so it never receives the
                 # auto-approve flags regardless of the Zero-Touch setting.
-                result = self._run_stage(run, "drafter", draft_prompt, auto_approve=False)
+                result = self._run_stage(
+                    run,
+                    "drafter",
+                    providers.get("drafter", {}),
+                    draft_prompt,
+                    auto_approve=False,
+                )
 
                 if self._is_cancelled():
                     self._finish_cancelled(run)
@@ -430,11 +470,27 @@ class Pipeline:
                             level="info",
                             message=f"Safety snapshot taken at {run.snapshot.head[:8]}.",
                         )
+                    else:
+                        self.bus.publish(
+                            "log",
+                            level="warn",
+                            message=(
+                                "No safety snapshot: this repository has no commits "
+                                "yet, so there is no state to restore. Rollback is "
+                                "unavailable for this run."
+                            ),
+                        )
                 except (gitutil.GitError, OSError) as exc:
+                    # Leave no half-snapshot behind: an object that cannot
+                    # restore anything must not be offered as a rollback point.
+                    run.snapshot = None
                     self.bus.publish(
                         "log",
                         level="warn",
-                        message=f"Could not take a safety snapshot: {exc}",
+                        message=(
+                            f"Could not take a safety snapshot ({exc}). "
+                            f"Rollback is unavailable for this run."
+                        ),
                     )
 
             if self._is_cancelled():
@@ -458,7 +514,11 @@ class Pipeline:
                 )
 
             result = self._run_stage(
-                run, "polisher", polish_prompt, auto_approve=execute_approved
+                run,
+                final_stage,
+                providers.get(final_stage, {}),
+                polish_prompt,
+                auto_approve=execute_approved,
             )
 
             # ---- Collect the diff ---------------------------------------

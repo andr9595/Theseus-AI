@@ -520,6 +520,9 @@ const state = {
   config: null,
   run: null,
   providers: [],
+  // Agents assignable to either job, served by /api/state. The browser never
+  // holds its own copy of a command or a permission flag.
+  agents: [],
   repoStatus: null,
   busy: false,
   streamLines: [],
@@ -586,6 +589,14 @@ function renderStatus() {
   }
 }
 
+/** Which catalogued agent a provider runs, judged by its executable — the
+ *  same rule the server applies in `config.agent_for`. */
+function agentOf(provider) {
+  const exe = String(((provider || {}).command || [])[0] || '').split('/').pop();
+  const hit = state.agents.find(a => (a.command || []).length && exe.includes(a.id));
+  return hit ? hit.id : 'custom';
+}
+
 function renderAgents() {
   const rail = $('#agent-rail');
   const run = state.run;
@@ -595,7 +606,13 @@ function renderAgents() {
   // entirely, which reads as "Codex is missing" rather than "you switched this
   // off" - a disabled stage should look disabled, not absent.
   const order = ['drafter', 'polisher'];
-  const soloSkipped = (id) => id === 'drafter' && conf.solo_mode && !run;
+  // A run carries the stage it was started with; outside a run, whatever is
+  // configured now. Either way it is the *other* slot that sits idle.
+  const solo = run ? run.solo : !!conf.solo_mode;
+  const finalStage = solo
+    ? ((run && run.solo_stage) || conf.solo_stage || 'polisher')
+    : 'polisher';
+  const soloSkipped = (id) => solo && id !== finalStage;
 
   const probeFor = (id) => state.providers.find(p => p.id === id);
 
@@ -606,7 +623,7 @@ function renderAgents() {
     const available = !info || info.available;
 
     let stageState = stage ? stage.state : 'pending';
-    if (run && run.state === 'awaiting_approval' && id === 'polisher') stageState = 'waiting';
+    if (run && run.state === 'awaiting_approval' && id === finalStage) stageState = 'waiting';
     if (soloSkipped(id)) stageState = 'skipped';
 
     const label = soloSkipped(id) ? 'solo · off'
@@ -689,6 +706,16 @@ function renderToggles() {
   $('#solo-mode').checked = !!c.solo_mode;
   $('#clean-worktree').checked = !!c.require_clean_worktree;
   $('#zero-touch-warning').classList.toggle('hidden', !c.zero_touch);
+
+  // Which stage's configuration runs alone. Only worth showing once Solo mode
+  // is actually on.
+  const providers = c.providers || {};
+  const soloStage = c.solo_stage || 'polisher';
+  $('#solo-stage').innerHTML = ['drafter', 'polisher'].map((id, idx) =>
+    `<option value="${id}"${id === soloStage ? ' selected' : ''}>` +
+    `Stage ${idx + 1} · ${esc((providers[id] || {}).label || id)}</option>`
+  ).join('');
+  $('#solo-target').classList.toggle('hidden', !c.solo_mode);
 }
 
 function renderOutputs() {
@@ -995,9 +1022,21 @@ function renderSettings() {
       `<div class="provider-form" data-provider="${id}">` +
         `<h4><span class="stage-num">Stage ${idx + 1}</span> ` +
           `${esc(p.role || id)} ${probeHtml}</h4>` +
-        `<div class="field">` +
-          `<label>Display name</label>` +
-          `<input type="text" data-field="label" value="${esc(p.label || '')}">` +
+        `<div class="field-row">` +
+          `<div class="field">` +
+            `<label>Agent ` +
+              `<span class="field-hint">— swaps command and flags</span></label>` +
+            `<select data-field="agent">` +
+              state.agents.map(a =>
+                `<option value="${esc(a.id)}"` +
+                `${a.id === agentOf(p) ? ' selected' : ''}>${esc(a.label)}</option>`
+              ).join('') +
+            `</select>` +
+          `</div>` +
+          `<div class="field">` +
+            `<label>Display name</label>` +
+            `<input type="text" data-field="label" value="${esc(p.label || '')}">` +
+          `</div>` +
         `</div>` +
         `<div class="field">` +
           `<label>Command (one argument per line, <code>{prompt}</code> is substituted)</label>` +
@@ -1066,6 +1105,10 @@ async function saveSettings() {
 
     providers[id] = {
       id,
+      // The server expands this into the agent's command and permission
+      // flags when it differs from what the stage runs today, and ignores it
+      // otherwise - so a hand-edited command below still wins.
+      agent: field('agent').value,
       label: field('label').value.trim() || id,
       command,
       auto_approve_args: lines('auto_approve_args'),
@@ -1238,8 +1281,11 @@ function connect() {
   });
 
   on('stage_output', (d) => {
+    // Tag with the stage's own label: either agent can hold either job, so a
+    // hardcoded "codex"/"claude" would mislabel half the stream.
+    const stage = state.run && state.run.stages ? state.run.stages[d.stage] : null;
     pushLine(`${d.stage} ${d.stream === 'stderr' ? 'stderr' : ''}`,
-             d.stage === 'drafter' ? 'codex' : 'claude', d.line);
+             (stage && stage.label) || d.stage, d.line);
   });
 
   on('stage_finished', (d) => {
@@ -1296,6 +1342,7 @@ async function loadState() {
     state.config = data.config;
     state.run = data.run;
     state.busy = data.busy;
+    state.agents = data.agents || [];
     state.providers = data.providers_status || [];
     state.repoStatus = data.repo_status;
     renderAll();
@@ -1379,6 +1426,8 @@ function wire() {
     patchConfig({ safety_snapshot: e.target.checked }));
   $('#solo-mode').addEventListener('change', e =>
     patchConfig({ solo_mode: e.target.checked }));
+  $('#solo-stage').addEventListener('change', e =>
+    patchConfig({ solo_stage: e.target.value }));
   $('#clean-worktree').addEventListener('change', e =>
     patchConfig({ require_clean_worktree: e.target.checked }));
 
@@ -1432,6 +1481,26 @@ function wire() {
     openModal('settings');
   });
   $('#save-settings').addEventListener('click', saveSettings);
+
+  // Picking an agent fills in its command and flags straight away, so the form
+  // shows what will actually be saved. The server performs the same swap on
+  // save; this is the preview, not the source of truth. Delegated because the
+  // provider forms are rebuilt every time Settings opens.
+  $('#provider-forms').addEventListener('change', (e) => {
+    if (e.target.dataset.field !== 'agent') return;
+    const preset = state.agents.find(a => a.id === e.target.value);
+    if (!preset || !(preset.command || []).length) return;  // "Custom": leave it
+    const form = e.target.closest('.provider-form');
+    $('[data-field="label"]', form).value = preset.label;
+    $('[data-field="command"]', form).value = preset.command.join('\n');
+    $('[data-field="auto_approve_args"]', form).value =
+      (preset.auto_approve_args || []).join('\n');
+    $('[data-field="model_args"]', form).value = (preset.model_args || []).join(' ');
+    // Model names are not interchangeable between CLIs.
+    $('[data-field="model"]', form).value = '';
+    $('[data-field="models"]', form).value = '';
+  });
+
   $('#run-doctor').addEventListener('click', () => refreshDoctor(true));
   $('#reset-config').addEventListener('click', async () => {
     if (!confirm('Reset every setting to its default?')) return;

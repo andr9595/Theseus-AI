@@ -100,13 +100,34 @@ def build_argv(
     passed as an argument instead.
 
     The ``{prompt}`` token may appear anywhere in the template, including
-    embedded in a larger string (e.g. ``--message={prompt}``).
+    embedded in a larger string (e.g. ``--message={prompt}``) - the one
+    exception being a prompt too large for argv, which has to move to stdin
+    and cannot take a decorated placeholder with it.
     """
     template: List[str] = list(provider.get("command") or [])
     if not template:
         raise ProviderUnavailable("No command configured for this provider")
 
-    use_stdin = bool(provider.get("prompt_on_stdin")) or len(prompt) > ARGV_PROMPT_LIMIT
+    placeholders = [t for t in template if PROMPT_TOKEN in t]
+    configured_stdin = bool(provider.get("prompt_on_stdin"))
+    oversized = len(prompt) > ARGV_PROMPT_LIMIT
+    if (
+        oversized
+        and not configured_stdin
+        and placeholders
+        and placeholders[0].strip() != PROMPT_TOKEN
+    ):
+        # Emptying out `--message={prompt}` and piping the prompt instead is a
+        # silent lie: a CLI that takes the prompt as an option value is not
+        # necessarily reading stdin at all, so it would run on an empty task
+        # and report success. Fail loudly rather than do nothing convincingly.
+        raise ProviderUnavailable(
+            f"The prompt is {len(prompt):,} characters, past the {ARGV_PROMPT_LIMIT:,} "
+            f"argv limit, and `{placeholders[0]}` cannot be moved to stdin on its "
+            f"own. Use a bare {PROMPT_TOKEN} argument, or enable 'Pipe the prompt "
+            f"on stdin' in Settings."
+        )
+    use_stdin = configured_stdin or oversized
 
     argv: List[str] = []
     # Where the auto-approve flags belong: immediately before the prompt
@@ -118,7 +139,12 @@ def build_argv(
 
     for token in template:
         if PROMPT_TOKEN in token:
-            prompt_index = len(argv)
+            # The *first* placeholder: flags belong ahead of every prompt
+            # argument, and anchoring on a later one would leave them behind
+            # the first - where a CLI reading a positional prompt has already
+            # stopped looking for options.
+            if prompt_index is None:
+                prompt_index = len(argv)
             if use_stdin:
                 # Drop a bare placeholder; keep a decorated one with the token
                 # emptied out so flags like `--message=` are not malformed.
@@ -227,7 +253,28 @@ class ProviderRunner:
         auto_approve: bool,
     ) -> ProviderResult:
         pid = str(self.provider.get("id", "provider"))
-        argv, stdin_text = build_argv(self.provider, prompt, auto_approve)
+        started = time.monotonic()
+
+        # Everything derived from configuration is fallible, and it all has to
+        # come back as a *result*: the caller has already marked the stage
+        # running, and only a result carries the reason back to the UI. An
+        # exception here leaves the stage running forever with no error on it.
+        try:
+            argv, stdin_text = build_argv(self.provider, prompt, auto_approve)
+            timeout = int(self.provider.get("timeout_seconds") or 900)
+            if timeout <= 0:
+                raise ValueError(f"timeout_seconds must be positive, got {timeout!r}")
+        except (ProviderUnavailable, TypeError, ValueError) as exc:
+            return ProviderResult(
+                provider_id=pid,
+                ok=False,
+                exit_code=126,
+                stdout="",
+                stderr="",
+                duration=time.monotonic() - started,
+                command=[],
+                error=f"This provider is misconfigured: {exc}",
+            )
         echo = redact_argv(argv, prompt)
 
         if resolve_binary(argv) is None:
@@ -237,7 +284,7 @@ class ProviderRunner:
                 exit_code=127,
                 stdout="",
                 stderr="",
-                duration=0.0,
+                duration=time.monotonic() - started,
                 command=echo,
                 error=(
                     f"`{argv[0]}` is not installed or not on PATH. "
@@ -246,7 +293,6 @@ class ProviderRunner:
                 ),
             )
 
-        timeout = int(self.provider.get("timeout_seconds") or 900)
         env = dict(os.environ)
         # Ask the CLIs for plain, unstyled output: ANSI escapes would have to
         # be stripped again before rendering as Markdown in the browser.
@@ -255,7 +301,6 @@ class ProviderRunner:
         env["CI"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
 
-        started = time.monotonic()
         stdout_lines: List[str] = []
         stderr_lines: List[str] = []
 

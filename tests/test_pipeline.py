@@ -141,6 +141,87 @@ class TestZeroTouch(PipelineTestBase):
         self.assertIn("edited by hand", (self.repo / "README.md").read_text())
 
 
+class TestSnapshots(PipelineTestBase):
+    def test_an_incomplete_snapshot_refuses_to_reset_the_tree(self):
+        # A snapshot that captured nothing used to be indistinguishable from
+        # "the tree was clean at HEAD", and restoring it reset and cleaned the
+        # user's own uncommitted work away - the exact loss it exists to stop.
+        scratch = self.repo / "my_work_in_progress.txt"
+        scratch.write_text("do not lose me\n")
+        snap = gitutil.Snapshot(root=str(self.repo), head=gitutil.status(self.repo).head)
+
+        with self.assertRaises(gitutil.GitError):
+            gitutil.restore_snapshot(snap)
+        self.assertTrue(scratch.exists(), "an incomplete snapshot destroyed work")
+
+    def test_each_snapshot_anchors_its_own_ref(self):
+        # One shared ref stops protecting the first run's commit as soon as a
+        # second run overwrites it.
+        first = gitutil.take_snapshot(self.repo)
+        (self.repo / "later.txt").write_text("more work\n")
+        second = gitutil.take_snapshot(self.repo)
+
+        self.assertNotEqual(first.ref, second.ref)
+        for snap in (first, second):
+            resolved = subprocess.run(
+                ["git", "rev-parse", snap.ref], cwd=self.repo,
+                capture_output=True, text=True, check=True,
+            )
+            self.assertEqual(resolved.stdout.strip(), snap.commit)
+
+    def test_a_failed_snapshot_leaves_no_rollback_point(self):
+        scratch = self.repo / "my_work_in_progress.txt"
+        scratch.write_text("do not lose me\n")
+
+        def unwritable(path):
+            raise gitutil.GitError("git add -A failed (1): scratch index is read-only")
+
+        original = gitutil.take_snapshot
+        gitutil.take_snapshot = unwritable
+        self.addCleanup(setattr, gitutil, "take_snapshot", original)
+
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("write the artifact", str(self.repo))
+        self.wait_terminal()
+
+        self.assertIsNone(run.snapshot)
+        self.assertFalse(run.to_dict()["can_rollback"])
+        with self.assertRaises(ValueError):
+            self.pipeline.rollback()
+        self.assertEqual(scratch.read_text(), "do not lose me\n")
+
+
+class TestSoloMode(PipelineTestBase):
+    def test_solo_mode_runs_the_stage_it_was_pointed_at(self):
+        # Either slot can hold either agent, so Solo Mode must be able to run
+        # the drafter slot - with the write permission the lone stage needs.
+        writer = mock_provider("drafter", "Junior Draft")
+        writer["command"] = [sys.executable, MOCK, "--role", "polisher", "{prompt}"]
+        self.store.update({
+            "zero_touch": True,
+            "solo_mode": True,
+            "solo_stage": "drafter",
+            "providers": {"drafter": writer},
+        })
+        run = self.pipeline.start("write the artifact", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertNotIn("polisher", run.stages)
+        self.assertEqual(run.stages["drafter"].state, "done")
+        self.assertIn("--dangerously-skip-permissions", run.stages["drafter"].command)
+        self.assertTrue((self.repo / "AI_COUNCIL_DEMO.md").exists())
+
+    def test_an_unknown_solo_stage_falls_back_to_the_polisher(self):
+        self.store.update({
+            "zero_touch": True, "solo_mode": True, "solo_stage": "nonesuch",
+        })
+        run = self.pipeline.start("do a thing", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(list(run.stages), ["polisher"])
+
+
 class TestDiffStat(PipelineTestBase):
     def test_binary_untracked_files_are_counted_but_not_line_counted(self):
         # Regression: an agent that imports a module to verify its work leaves
@@ -213,6 +294,28 @@ class TestApprovalGate(PipelineTestBase):
         self.wait_terminal()
         self.assertEqual(run.reviewer_note, "MAGIC-REVIEWER-TOKEN")
 
+    def test_settings_changed_at_the_gate_do_not_reach_the_run(self):
+        # What the operator approved is what runs. A run reads its
+        # configuration once, so a settings change - from this window or a
+        # second instance - cannot swap the command about to be granted write
+        # permission.
+        self.store.update({"zero_touch": False})
+        run = self.pipeline.start("do the thing", str(self.repo))
+        self.wait_for(lambda: run.state == "awaiting_approval")
+
+        self.store.update({
+            "providers": {
+                "polisher": {"command": ["definitely-not-the-approved-command"]},
+            },
+        })
+        self.pipeline.approve()
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertNotIn(
+            "definitely-not-the-approved-command", run.stages["polisher"].command
+        )
+
     def test_solo_mode_still_gates(self):
         # No draft to review, but the operator must still authorise writes.
         self.store.update({"zero_touch": False, "solo_mode": True})
@@ -265,6 +368,29 @@ class TestFailureHandling(PipelineTestBase):
         self.wait_terminal()
         self.assertEqual(run.state, "failed")
         self.assertIn("not installed", run.stages["polisher"].error)
+
+    def test_unusable_provider_config_finishes_the_stage(self):
+        # A stage that cannot be launched must still end. It used to be left
+        # marked "running" forever, with no end time and no error on it.
+        self.store.update({
+            "zero_touch": True,
+            "providers": {
+                "polisher": {
+                    "id": "polisher",
+                    "label": "Broken",
+                    "role": "Senior",
+                    "command": [],
+                    "timeout_seconds": "not a number",
+                }
+            },
+        })
+        run = self.pipeline.start("go", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "failed")
+        self.assertEqual(run.stages["polisher"].state, "failed")
+        self.assertTrue(run.stages["polisher"].ended_at)
+        self.assertIn("misconfigured", run.stages["polisher"].error)
 
     def test_non_repository_target_is_rejected(self):
         plain = self.tmp / "not-a-repo"

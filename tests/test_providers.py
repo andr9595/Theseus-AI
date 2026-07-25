@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from aicouncil.providers import (  # noqa: E402
     ARGV_PROMPT_LIMIT,
     discover_models,
+    ProviderRunner,
     ProviderUnavailable,
     build_argv,
     redact_argv,
@@ -94,6 +95,34 @@ class TestBuildArgv(unittest.TestCase):
         argv, stdin = build_argv(CLAUDE, big, auto_approve=False)
         self.assertEqual(stdin, big)
         self.assertNotIn(big, argv)
+
+    def test_oversized_prompt_is_piped_when_stdin_was_configured(self):
+        # An explicit choice is honoured even for a decorated placeholder.
+        provider = {"id": "x", "command": ["tool", "--message={prompt}"],
+                    "prompt_on_stdin": True}
+        big = "x" * (ARGV_PROMPT_LIMIT + 1)
+        argv, stdin = build_argv(provider, big, auto_approve=False)
+        self.assertEqual(argv, ["tool", "--message="])
+        self.assertEqual(stdin, big)
+
+    def test_oversized_prompt_in_a_decorated_placeholder_is_refused(self):
+        # Emptying `--message=` and piping the prompt instead would hand the
+        # CLI an empty task and let it report success.
+        provider = {"id": "x", "command": ["tool", "--message={prompt}"]}
+        with self.assertRaises(ProviderUnavailable) as ctx:
+            build_argv(provider, "x" * (ARGV_PROMPT_LIMIT + 1), auto_approve=False)
+        self.assertIn("stdin", str(ctx.exception))
+
+    def test_flags_precede_the_first_prompt_placeholder(self):
+        # Anchoring on a later placeholder would put the flags behind a
+        # positional prompt, where most CLIs have stopped reading options.
+        provider = {
+            "id": "x",
+            "command": ["tool", "{prompt}", "--also={prompt}"],
+            "auto_approve_args": ["--yes"],
+        }
+        argv, _ = build_argv(provider, "task", auto_approve=True)
+        self.assertEqual(argv, ["tool", "--yes", "task", "--also=task"])
 
     def test_embedded_placeholder_is_substituted_in_place(self):
         provider = {"id": "x", "command": ["tool", "--message={prompt}"]}
@@ -182,6 +211,41 @@ class TestRedaction(unittest.TestCase):
 
     def test_empty_prompt_is_a_no_op(self):
         self.assertEqual(redact_argv(["a", "b"], ""), ["a", "b"])
+
+
+class TestRunnerConfiguration(unittest.TestCase):
+    """A provider that cannot even be assembled must come back as a result.
+
+    The caller has already marked the stage running by this point, and only a
+    ProviderResult carries the reason back to the UI - an exception here left
+    the stage running forever with no error and no end time on it.
+    """
+
+    def run_with(self, provider):
+        return ProviderRunner(provider, lambda *_: None).run(
+            "hi", cwd=str(Path(__file__).parent), auto_approve=False
+        )
+
+    def test_empty_command_returns_a_failed_result(self):
+        result = self.run_with({"id": "polisher", "command": []})
+        self.assertFalse(result.ok)
+        self.assertEqual(result.exit_code, 126)
+        self.assertIn("misconfigured", result.error)
+
+    def test_unparseable_timeout_returns_a_failed_result(self):
+        result = self.run_with(
+            {"id": "polisher", "command": ["sh", "-c", "true"],
+             "timeout_seconds": "half an hour"}
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("misconfigured", result.error)
+
+    def test_negative_timeout_returns_a_failed_result(self):
+        result = self.run_with(
+            {"id": "polisher", "command": ["sh", "-c", "true"], "timeout_seconds": -5}
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("positive", result.error)
 
 
 class TestResolveBinary(unittest.TestCase):
