@@ -676,6 +676,12 @@ function renderAgents() {
 
 /** Quota chip. Shows the vendor's own percentage, or says plainly that the
  *  agent cannot report one — never a number this app inferred. */
+function fmtAge(minutes) {
+  if (minutes < 90) return `${Math.round(minutes)} min`;
+  const h = minutes / 60;
+  return h < 36 ? `${Math.round(h)} h` : `${Math.round(h / 24)} d`;
+}
+
 function usageChipHtml(providerId) {
   const u = (state.usage || {})[providerId];
   if (!u) return '';
@@ -688,14 +694,21 @@ function usageChipHtml(providerId) {
   }
   const pct = Math.round(u.worst.percent);
   const level = pct >= 90 ? 'crit' : pct >= 75 ? 'warn' : 'ok';
+  // Codex's figure comes from its last run's log, not a live query. Mark it
+  // once it is old enough to mislead, rather than presenting stale as current.
+  const ageMin = u.worst.as_of ? (Date.now() / 1000 - u.worst.as_of) / 60 : 0;
+  const stale = ageMin > 30;
   const tip = u.limits.map(l =>
     `${l.label}: ${l.percent}% used${l.resets ? ` · resets ${l.resets}` : ''}`
-  ).join('\n') + (u.error ? `\n\n(last poll failed: ${u.error})` : '');
+  ).join('\n')
+    + (u.note ? `\n\n${u.note}` : '')
+    + (stale ? `\n(measured ${fmtAge(ageMin)} ago)` : '')
+    + (u.error ? `\n\n(last poll failed: ${u.error})` : '');
   return (
     `<button class="usage-chip ${level}" type="button" data-usage-for="${providerId}" ` +
       `title="${esc(tip)}">` +
       `<span class="usage-bar"><span data-fill="${Math.min(100, pct)}"></span></span>` +
-      `${pct}%` +
+      `${pct}%${stale ? '<span class="usage-stale">*</span>' : ''}` +
     `</button>`
   );
 }

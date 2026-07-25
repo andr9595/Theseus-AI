@@ -337,6 +337,25 @@ If a future CLI release renames these flags, edit the field; nothing here is
 compiled into the app. Clearing it is safe too — you simply get the old
 all-at-the-end behaviour back, and the app stops trying to parse events.
 
+### Quota
+
+Each agent card carries a percentage chip showing the vendor's own figure, read
+two different ways because the CLIs differ:
+
+| Agent | Source | Freshness |
+|---|---|---|
+| Claude | `claude -p "/usage"` — the slash command, answered locally with no model call | Live; polled at launch and every 5 min |
+| Codex | the `rate_limits` headers it writes to `$CODEX_HOME/sessions/*.jsonl` | As of the last Codex run; marked `*` when older than 30 min |
+
+Hover for every window; click to force a refresh. The chip shows whichever
+window is closest to exhaustion and turns amber at 75%, red at 90%. At 85% a
+run warns first — a warning only, always forceable, because the reading is a
+snapshot and only you know what the task is worth.
+
+`codex exec "/status"` is **not** how to get this: Codex has no non-interactive
+slash commands, so the text goes to the model as a prompt, costs ~16k tokens,
+and comes back with the model explaining it cannot see account limits.
+
 ### Choosing a model per stage
 
 Click the model chip on either agent card to switch that stage's model. The

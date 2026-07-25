@@ -1154,3 +1154,7 @@ kbd {
   color: var(--text);
 }
 .boot-error p { color: var(--text-2); max-width: 60ch; }
+
+/* Marks a quota figure that was measured a while ago rather than just now —
+   Codex's comes from its last run's log, so it can lag. */
+.usage-stale { margin-left: 1px; opacity: .65; }

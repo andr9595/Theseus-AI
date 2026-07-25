@@ -12,15 +12,26 @@ That is the vendor's own number, which is the only trustworthy source: the
 denominator of a Pro plan is not published, so anything computed locally would
 be a guess dressed up as a measurement.
 
-Codex has no equivalent. ``codex exec "/status"`` does not run a slash command
-- it sends the text to the model as a prompt, which costs ~16k tokens and
-returns the model's apology for not knowing. Polling that would burn the very
-quota it claims to measure, so this module refuses to try and says why. An
-agent with no data shows "no data", never an invented percentage.
+Codex answers differently. ``codex exec "/status"`` does not run a slash
+command - it sends the text to the model as a prompt, which costs ~16k tokens
+and returns the model's apology for not knowing. But the CLI records the
+server's rate-limit headers into its session rollout logs under
+``$CODEX_HOME/sessions/``:
+
+    {"limit_id": "codex", "plan_type": "plus",
+     "primary": {"used_percent": 1.0, "window_minutes": 10080,
+                 "resets_at": 1785544255}}
+
+Reading the newest of those is free and needs no subprocess at all. The
+tradeoff is freshness: it is the figure from the last Codex run rather than
+this instant, so readings carry the time they were captured and the UI says
+"as of" rather than implying live. A slightly stale real number beats both an
+invented one and a blank.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -53,9 +64,17 @@ class Limit:
     label: str
     percent: float
     resets: str = ""
+    # When the figure was measured. Claude's is read live; Codex's comes from
+    # its last run's log, and conflating the two would overstate the second.
+    as_of: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"label": self.label, "percent": self.percent, "resets": self.resets}
+        return {
+            "label": self.label,
+            "percent": self.percent,
+            "resets": self.resets,
+            "as_of": self.as_of,
+        }
 
 
 @dataclass
@@ -102,10 +121,19 @@ def parse_usage(text: str) -> List[Limit]:
     return limits
 
 
+def agent_kind(provider: Dict[str, Any]) -> str:
+    """Which quota source applies to this agent: 'claude', 'codex' or ''."""
+    exe = os.path.basename(str((provider.get("command") or [""])[0]))
+    if "claude" in exe:
+        return "claude"
+    if "codex" in exe:
+        return "codex"
+    return ""
+
+
 def supports_usage(provider: Dict[str, Any]) -> bool:
-    """Whether this agent can be asked for its quota at all."""
-    exe = (provider.get("command") or [""])[0]
-    return "claude" in os.path.basename(str(exe))
+    """Whether this agent's quota can be read at all."""
+    return bool(agent_kind(provider))
 
 
 def read_usage(provider: Dict[str, Any], cwd: Optional[str] = None) -> UsageReading:
@@ -113,16 +141,19 @@ def read_usage(provider: Dict[str, Any], cwd: Optional[str] = None) -> UsageRead
     pid = str(provider.get("id", "provider"))
     command = list(provider.get("command") or [])
 
-    if not supports_usage(provider):
+    kind = agent_kind(provider)
+    if not kind:
         return UsageReading(
             provider_id=pid,
             supported=False,
             note=(
-                f"{(command or ['this CLI'])[0]} does not report quota "
-                f"non-interactively. Its slash commands are sent to the model "
-                f"as prompts, which would spend quota rather than measure it."
+                f"No quota source known for "
+                f"`{(command or ['this command'])[0]}`."
             ),
         )
+
+    if kind == "codex":
+        return read_codex_usage(pid)
 
     exe = resolve_binary(command)
     if exe is None:
@@ -163,6 +194,130 @@ def read_usage(provider: Dict[str, Any], cwd: Optional[str] = None) -> UsageRead
             ),
         )
     return UsageReading(provider_id=pid, limits=limits, checked_at=time.time())
+
+
+def _window_label(minutes: Optional[float]) -> str:
+    """Name a rate-limit window from its length in minutes."""
+    try:
+        mins = float(minutes)
+    except (TypeError, ValueError):
+        return "limit"
+    if mins >= 10000:  # 10080 = 7 days
+        return "week"
+    if mins >= 1400:  # 1440 = 1 day
+        return "day"
+    if mins >= 60:
+        hours = mins / 60
+        return f"{hours:g}-hour window"
+    return f"{mins:g}-minute window"
+
+
+def _codex_session_files(home: str, limit: int = 40) -> List[str]:
+    """Newest rollout logs first, capped so a long history is not walked."""
+    root = os.path.join(home, "sessions")
+    found: List[tuple] = []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            if not name.endswith(".jsonl"):
+                continue
+            path = os.path.join(dirpath, name)
+            try:
+                found.append((os.path.getmtime(path), path))
+            except OSError:
+                continue
+    found.sort(reverse=True)
+    return [p for _mtime, p in found[:limit]]
+
+
+def _parse_codex_rate_limits(payload: Dict[str, Any], as_of: float) -> List[Limit]:
+    """Turn one ``rate_limits`` payload into the limits worth showing."""
+    limits: List[Limit] = []
+    for slot in ("primary", "secondary"):
+        entry = payload.get(slot)
+        if not isinstance(entry, dict):
+            continue
+        pct = entry.get("used_percent")
+        if pct is None:
+            continue
+        try:
+            pct = float(pct)
+        except (TypeError, ValueError):
+            continue
+        resets = ""
+        stamp = entry.get("resets_at")
+        if stamp:
+            try:
+                resets = time.strftime("%b %-d, %-I:%M%p", time.localtime(float(stamp)))
+            except (TypeError, ValueError, OSError):
+                resets = ""
+        limits.append(
+            Limit(
+                label=_window_label(entry.get("window_minutes")),
+                percent=pct,
+                resets=resets,
+                as_of=as_of,
+            )
+        )
+    return limits
+
+
+def read_codex_usage(provider_id: str, home: Optional[str] = None) -> UsageReading:
+    """Read Codex's quota from the rate-limit headers it logs per run.
+
+    Free and instant - no subprocess, no tokens. The figure is as of the last
+    Codex run, which the caller surfaces rather than hides.
+    """
+    home = home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    files = _codex_session_files(home)
+    if not files:
+        return UsageReading(
+            provider_id=provider_id,
+            note=(
+                "No Codex session logs yet. Quota appears here after the first "
+                "Codex run, which is when the CLI records the server's limits."
+            ),
+        )
+
+    for path in files:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                # Last occurrence in the file is the most recent in that run.
+                newest: Optional[Dict[str, Any]] = None
+                for line in fh:
+                    if '"rate_limits"' not in line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    payload = (record.get("payload") or {}).get("rate_limits")
+                    if isinstance(payload, dict):
+                        newest = payload
+        except OSError:
+            continue
+
+        if newest:
+            as_of = os.path.getmtime(path)
+            limits = _parse_codex_rate_limits(newest, as_of)
+            if limits:
+                plan = newest.get("plan_type")
+                return UsageReading(
+                    provider_id=provider_id,
+                    limits=limits,
+                    checked_at=time.time(),
+                    note=(
+                        f"From the last Codex run"
+                        + (f" · {plan} plan" if plan else "")
+                    ),
+                )
+
+    return UsageReading(
+        provider_id=provider_id,
+        note=(
+            "Codex session logs contain no rate-limit record yet. It appears "
+            "after a run that reaches the server."
+        ),
+    )
 
 
 class UsagePoller:

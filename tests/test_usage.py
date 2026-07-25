@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from aicouncil.config import ConfigStore  # noqa: E402
 from aicouncil.usage import (  # noqa: E402
     UsagePoller,
+    read_codex_usage,
     parse_usage,
     read_usage,
     supports_usage,
@@ -80,18 +81,18 @@ class TestSupport(unittest.TestCase):
             supports_usage({"command": ["/home/me/.local/bin/claude", "-p"]})
         )
 
-    def test_codex_is_not(self):
-        # `codex exec "/status"` sends the text to the model as a prompt: it
-        # costs ~16k tokens and cannot answer. Polling it would spend the
-        # quota it claims to measure.
-        self.assertFalse(supports_usage({"command": ["codex", "exec", "{prompt}"]}))
+    def test_codex_is_supported_via_its_session_logs(self):
+        # `codex exec "/status"` cannot answer - it sends the text to the model
+        # as a prompt. But the CLI writes the server's rate-limit headers into
+        # its rollout logs, which is free to read. See TestCodexUsage.
+        self.assertTrue(supports_usage({"command": ["codex", "exec", "{prompt}"]}))
 
-    def test_an_unsupported_agent_reports_no_data_not_zero(self):
-        reading = read_usage({"id": "drafter", "command": ["codex", "exec"]})
+    def test_an_agent_with_no_known_source_says_so_rather_than_zero(self):
+        reading = read_usage({"id": "x", "command": ["some-other-agent", "run"]})
         self.assertFalse(reading.supported)
         self.assertEqual(reading.limits, [])
         self.assertIsNone(reading.worst)
-        self.assertIn("quota", reading.note.lower())
+        self.assertIn("no quota source", reading.note.lower())
 
     def test_a_missing_binary_is_an_error_not_a_reading(self):
         reading = read_usage({"id": "x", "command": ["claude-not-installed-xyz"]})
@@ -157,6 +158,90 @@ class TestPoller(unittest.TestCase):
     def test_worst_percent_is_none_when_unknown(self):
         self.assertIsNone(UsagePoller(self.store).worst_percent("polisher"))
 
+
+
+class TestCodexUsage(unittest.TestCase):
+    """Codex's quota comes from the rate-limit headers it logs per run."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-codex-"))
+        self.sessions = self.tmp / "sessions" / "2026" / "07" / "25"
+        self.sessions.mkdir(parents=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _rollout(self, name, rate_limits):
+        import json as _json
+        path = self.sessions / name
+        path.write_text(
+            _json.dumps({"type": "event_msg", "payload": {"other": 1}}) + "\n"
+            + _json.dumps({"type": "event_msg",
+                           "payload": {"rate_limits": rate_limits}}) + "\n"
+        )
+        return path
+
+    def test_reads_the_real_payload_shape(self):
+        # Verbatim from a rollout log on 2026-07-25.
+        self._rollout("a.jsonl", {
+            "limit_id": "codex", "limit_name": None, "plan_type": "plus",
+            "primary": {"used_percent": 1.0, "window_minutes": 10080,
+                        "resets_at": 1785544255},
+            "secondary": None,
+        })
+        r = read_codex_usage("drafter", home=str(self.tmp))
+        self.assertTrue(r.supported)
+        self.assertEqual(len(r.limits), 1)
+        self.assertEqual(r.limits[0].percent, 1.0)
+        self.assertEqual(r.limits[0].label, "week")   # 10080 min = 7 days
+        self.assertIn("plus", r.note)
+        self.assertTrue(r.limits[0].as_of, "reading must carry its age")
+
+    def test_both_windows_are_reported(self):
+        self._rollout("b.jsonl", {
+            "primary": {"used_percent": 12.0, "window_minutes": 10080},
+            "secondary": {"used_percent": 71.5, "window_minutes": 300},
+        })
+        r = read_codex_usage("drafter", home=str(self.tmp))
+        self.assertEqual(len(r.limits), 2)
+        self.assertEqual(r.worst.percent, 71.5)
+        self.assertEqual(r.worst.label, "5-hour window")
+
+    def test_newest_log_wins(self):
+        import os as _os, time as _time
+        old = self._rollout("old.jsonl",
+                            {"primary": {"used_percent": 5.0, "window_minutes": 10080}})
+        new = self._rollout("new.jsonl",
+                            {"primary": {"used_percent": 40.0, "window_minutes": 10080}})
+        _os.utime(old, (1, 1))
+        _os.utime(new, (_time.time(), _time.time()))
+        self.assertEqual(read_codex_usage("drafter", home=str(self.tmp)).worst.percent, 40.0)
+
+    def test_last_record_in_a_file_wins(self):
+        import json as _json
+        (self.sessions / "c.jsonl").write_text(
+            _json.dumps({"payload": {"rate_limits": {"primary": {"used_percent": 3.0, "window_minutes": 10080}}}}) + "\n"
+            + _json.dumps({"payload": {"rate_limits": {"primary": {"used_percent": 9.0, "window_minutes": 10080}}}}) + "\n"
+        )
+        self.assertEqual(read_codex_usage("drafter", home=str(self.tmp)).worst.percent, 9.0)
+
+    def test_no_logs_explains_itself_without_inventing_a_number(self):
+        empty = Path(tempfile.mkdtemp(prefix="aicouncil-empty-"))
+        try:
+            r = read_codex_usage("drafter", home=str(empty))
+            self.assertEqual(r.limits, [])
+            self.assertIsNone(r.worst)
+            self.assertIn("first Codex run", r.note)
+        finally:
+            shutil.rmtree(empty, ignore_errors=True)
+
+    def test_a_corrupt_log_is_skipped_not_fatal(self):
+        (self.sessions / "bad.jsonl").write_text('{"payload": {"rate_limits": ')
+        r = read_codex_usage("drafter", home=str(self.tmp))
+        self.assertEqual(r.limits, [])   # nothing usable, but no exception
+
+    def test_codex_is_now_a_supported_source(self):
+        self.assertTrue(supports_usage({"command": ["codex", "exec", "{prompt}"]}))
 
 if __name__ == "__main__":
     unittest.main()
