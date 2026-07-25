@@ -119,6 +119,54 @@ class TestStaticFiles(ServerTestBase):
             self.assertIn(exc.code, (400, 403, 404))
 
 
+class TestConcurrentConfigWriters(unittest.TestCase):
+    """Two app instances sharing one config file must not clobber each other.
+
+    Running a second window (or leaving an old server up) previously reverted
+    the first one's settings — including the approval gate and rollback
+    protection — to whatever the second instance loaded at startup.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-cfg-"))
+        self.path = self.tmp / "config.json"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_second_instance_does_not_revert_the_first(self):
+        a = ConfigStore(self.path)
+        b = ConfigStore(self.path)  # started before A's change, stale copy
+
+        a.update({"zero_touch": True})
+        b.update({"port": 9999})  # unrelated key
+
+        self.assertTrue(
+            ConfigStore(self.path).get("zero_touch"),
+            "an unrelated write from a second instance reverted zero_touch",
+        )
+        self.assertEqual(ConfigStore(self.path).get("port"), 9999)
+
+    def test_safety_toggles_survive_a_stale_writer(self):
+        a = ConfigStore(self.path)
+        b = ConfigStore(self.path)
+
+        a.update({"safety_snapshot": False, "zero_touch": True})
+        b.update({"house_rules": "use tabs"})
+
+        fresh = ConfigStore(self.path).all()
+        self.assertFalse(fresh["safety_snapshot"])
+        self.assertTrue(fresh["zero_touch"])
+        self.assertEqual(fresh["house_rules"], "use tabs")
+
+    def test_same_key_written_twice_takes_the_later_value(self):
+        a = ConfigStore(self.path)
+        b = ConfigStore(self.path)
+        a.update({"zero_touch": True})
+        b.update({"zero_touch": False})
+        self.assertFalse(ConfigStore(self.path).get("zero_touch"))
+
+
 class TestApi(ServerTestBase):
     def test_config_round_trips(self):
         status, data = self.request(

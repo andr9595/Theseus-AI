@@ -224,10 +224,26 @@ class ConfigStore:
             return copy.deepcopy(self._data.get(key, default))
 
     def update(self, patch: Dict[str, Any]) -> Dict[str, Any]:
-        """Deep-merge ``patch`` into the config, persist, return the result."""
+        """Deep-merge ``patch`` into the config, persist, return the result.
+
+        Re-reads from disk first. Without that, two running instances each hold
+        their own in-memory copy and every write ships the whole file, so the
+        last saver silently reverts the other's settings to whatever it loaded
+        at startup. That is bad for a port number and genuinely unsafe for
+        ``zero_touch`` and ``safety_snapshot`` - a second window could turn the
+        approval gate off, or rollback protection off, without anyone touching
+        that toggle. Re-reading narrows last-write-wins from the whole file to
+        the individual keys actually being changed.
+        """
         with self._lock:
-            self._data = _deep_merge(self._data, patch)
+            self._data = _deep_merge(self._load(), patch)
             self._write()
+            return copy.deepcopy(self._data)
+
+    def reload(self) -> Dict[str, Any]:
+        """Discard the in-memory copy and re-read from disk."""
+        with self._lock:
+            self._data = self._load()
             return copy.deepcopy(self._data)
 
     def reset(self) -> Dict[str, Any]:
