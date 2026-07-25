@@ -68,12 +68,13 @@ def runs_dir() -> Path:
 # --------------------------------------------------------------------------
 
 # The CLI-specific half of a provider: which binary to launch, which flag
-# grants it permission to write, and how it takes a model name.
+# grants it permission to write, how it takes a model name, and how it is asked
+# to narrate its work.
 #
-# These three fields travel together and must never be mixed between agents:
-# Claude's `--dangerously-skip-permissions` handed to `codex` is rejected
-# outright, and the reverse is worse - the CLI starts, finds no permission
-# grant, and blocks on a prompt nothing in this pipeline can answer.
+# These fields travel together and must never be mixed between agents: Claude's
+# `--dangerously-skip-permissions` handed to `codex` is rejected outright, and
+# the reverse is worse - the CLI starts, finds no permission grant, and blocks
+# on a prompt nothing in this pipeline can answer.
 AGENTS: Dict[str, Dict[str, Any]] = {
     # `codex exec` is the non-interactive entry point of the Codex CLI. The
     # prompt is a trailing argument; the CLI carries its own subscription auth.
@@ -83,12 +84,23 @@ AGENTS: Dict[str, Dict[str, Any]] = {
         "auto_approve_args": ["--dangerously-bypass-approvals-and-sandbox"],
         # argv fragment used to pass the model. `{model}` is substituted.
         "model_args": ["--model", "{model}"],
+        # Empty on purpose: `codex exec` already narrates its work on stdout as
+        # it goes. Present all the same, so assigning this agent to a job
+        # clears the other's streaming flags instead of leaving them behind on
+        # a binary that does not accept them.
+        "stream_args": [],
     },
     "claude": {
         "label": "Claude",
         "command": ["claude", "-p", "{prompt}"],
         "auto_approve_args": ["--dangerously-skip-permissions"],
         "model_args": ["--model", "{model}"],
+        # `claude -p` in its default text mode prints nothing at all until the
+        # run is over, so the live stream sat empty for minutes and then filled
+        # with the conclusion in one go. This asks for one JSON event per step
+        # instead; `providers.py` translates them back into readable lines.
+        # `--verbose` is not decoration - the CLI refuses stream-json without it.
+        "stream_args": ["--output-format", "stream-json", "--verbose"],
     },
 }
 
@@ -126,6 +138,7 @@ def agent_catalog() -> List[Dict[str, Any]]:
         "command": [],
         "auto_approve_args": [],
         "model_args": [],
+        "stream_args": [],
     })
     return catalog
 

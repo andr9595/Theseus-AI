@@ -243,6 +243,27 @@ class TestAgentAssignment(unittest.TestCase):
             conf["providers"]["polisher"]["command"], ["claude", "--print", "{prompt}"]
         )
 
+    def test_switching_agents_swaps_the_streaming_flags_too(self):
+        # `--output-format stream-json` is Claude's way of narrating its work;
+        # left behind on `codex exec` it is simply an unknown flag.
+        conf = self.store.update({"providers": {"polisher": {"agent": "codex"}}})
+        self.assertEqual(conf["providers"]["polisher"]["stream_args"], [])
+
+        conf = self.store.update({"providers": {"drafter": {"agent": "claude"}}})
+        self.assertIn("stream-json", conf["providers"]["drafter"]["stream_args"])
+
+    def test_an_existing_config_picks_up_the_streaming_flags(self):
+        # A config written before this field existed must gain it, or Claude
+        # goes on printing nothing until the run is over.
+        (self.tmp / "config.json").write_text(json.dumps({
+            "providers": {"polisher": {
+                "command": ["claude", "-p", "{prompt}"],
+                "auto_approve_args": ["--dangerously-skip-permissions"],
+            }},
+        }))
+        conf = ConfigStore(self.tmp / "config.json").all()
+        self.assertIn("stream-json", conf["providers"]["polisher"]["stream_args"])
+
     def test_an_uncatalogued_command_reads_as_custom(self):
         conf = self.store.update({
             "providers": {"drafter": {"command": ["python3", "mock-agent.py", "{prompt}"]}}

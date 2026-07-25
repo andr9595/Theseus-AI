@@ -276,6 +276,7 @@ with an explanation rather than quietly sending an empty `--message=`.)
 | **Agent** | Which CLI runs this job. Changing it swaps the command and auto-approve arguments together. |
 | **Command** | argv, one argument per line. Never passed through a shell. |
 | **Auto-approve arguments** | Appended *only* when permission has been granted. |
+| **Streaming arguments** | Always appended. How this CLI is asked to narrate its work. See below. |
 | **Model** | Blank means the CLI's own default. See below. |
 | **Model flag** | How the model is passed — `--model {model}`, `-m {model}`, `--model={model}`. |
 | **Selectable models** | The list offered in the picker, one per line. |
@@ -289,8 +290,9 @@ separate settings. Settings → each stage has an **Agent** dropdown: Codex,
 Claude, or Custom command. Claude can draft and Codex can be the senior; the
 same agent can hold both jobs.
 
-Picking one swaps that stage's command, display name, auto-approve argument and
-model flag **as a single unit**, because those only make sense together —
+Picking one swaps that stage's command, display name, auto-approve argument,
+streaming arguments and model flag **as a single unit**, because those only
+make sense together —
 `--dangerously-skip-permissions` on `codex` is rejected outright, and the
 reverse is worse: the CLI starts, finds no permission grant, and blocks on a
 prompt nothing in this pipeline can answer. The swap also clears the stage's
@@ -304,6 +306,36 @@ dropdown is derived from it, so the two can never disagree.
 Solo Mode picks its agent the same way: the **Solo mode runs** selector under
 the toggle chooses which stage's configuration works alone, so solo runs can
 use a different agent from a full council run.
+
+### Why the stream needs "streaming arguments"
+
+A CLI only narrates its work if you ask it to. `claude -p` in its default text
+mode prints **nothing at all** until the run is over, then prints the finished
+answer in one block — so the Live stream sat empty for the whole run and filled
+up at the end. `codex exec` narrates by default and needs nothing extra.
+
+So Claude is launched with `--output-format stream-json --verbose`, which emits
+one JSON object per step as it happens, and the app translates those events back
+into lines:
+
+```
+· model claude-opus-4-8            the model actually in use
+· <text>                           the agent's reasoning as it thinks
+<text>                             the agent's own words
+→ Read aicouncil/server.py         a tool call, with its main argument
+← def do_GET(self): (+118 lines)   what came back, summarised
+```
+
+Measured on a three-tool-call task: first output at **1.2s** with the streaming
+flags, versus **8.7s of a 9.3s run** without them.
+
+The **Draft** and **Senior review** tabs still show the agent's final answer
+alone, not this transcript — the events carry both, and each pane gets the one
+it wants.
+
+If a future CLI release renames these flags, edit the field; nothing here is
+compiled into the app. Clearing it is safe too — you simply get the old
+all-at-the-end behaviour back, and the app stops trying to parse events.
 
 ### Choosing a model per stage
 

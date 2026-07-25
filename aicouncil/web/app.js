@@ -1046,6 +1046,12 @@ function renderSettings() {
           `<label>Auto-approve arguments (added only when execution is approved)</label>` +
           `<textarea rows="2" data-field="auto_approve_args">${esc((p.auto_approve_args || []).join('\n'))}</textarea>` +
         `</div>` +
+        `<div class="field">` +
+          `<label>Streaming arguments ` +
+            `<span class="field-hint">— always added; make the CLI report ` +
+            `progress as it works instead of only at the end</span></label>` +
+          `<textarea rows="2" data-field="stream_args">${esc((p.stream_args || []).join('\n'))}</textarea>` +
+        `</div>` +
         `<div class="field-row">` +
           `<div class="field">` +
             `<label>Model (blank = the CLI's own default)</label>` +
@@ -1112,6 +1118,7 @@ async function saveSettings() {
       label: field('label').value.trim() || id,
       command,
       auto_approve_args: lines('auto_approve_args'),
+      stream_args: lines('stream_args'),
       model: field('model').value.trim(),
       // Space-separated on this form, since a model flag is always short.
       model_args: field('model_args').value.trim().split(/\s+/).filter(Boolean),
@@ -1495,6 +1502,8 @@ function wire() {
     $('[data-field="command"]', form).value = preset.command.join('\n');
     $('[data-field="auto_approve_args"]', form).value =
       (preset.auto_approve_args || []).join('\n');
+    $('[data-field="stream_args"]', form).value =
+      (preset.stream_args || []).join('\n');
     $('[data-field="model_args"]', form).value = (preset.model_args || []).join(' ');
     // Model names are not interchangeable between CLIs.
     $('[data-field="model"]', form).value = '';

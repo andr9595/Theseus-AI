@@ -6,7 +6,7 @@ launches the `codex` and `claude` binaries that are already authenticated
 against the user's ChatGPT Plus/Pro and Claude Pro subscriptions, and streams
 their stdout back to the UI line by line.
 
-Two behaviours are worth calling out:
+Three behaviours are worth calling out:
 
 * **Auto-approve flags are injected, never hardcoded into the template.** The
   dangerous flags (``--dangerously-skip-permissions``,
@@ -18,6 +18,11 @@ Two behaviours are worth calling out:
 * **No shell.** Commands are executed as argv lists with ``shell=False``, so a
   prompt containing backticks, ``$(...)`` or a semicolon is inert data rather
   than something the shell will interpret.
+
+* **"Line by line" needs the CLI's cooperation.** ``claude -p`` buffers its
+  entire answer and prints it once, at the end. Its ``stream_args`` turn that
+  into one JSON event per step, and ``ClaudeStreamReader`` turns those back
+  into text so the stream stays readable.
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 PROMPT_TOKEN = "{prompt}"
 MODEL_TOKEN = "{model}"
@@ -161,9 +166,17 @@ def build_argv(
         prompt_index = len(argv)
         argv.append(prompt)
 
-    # Flags to splice in ahead of the prompt. Model first so the final argv
-    # reads `cli --model X --auto-approve <prompt>` rather than interleaved.
+    # Flags to splice in ahead of the prompt, grouped so the final argv reads
+    # `cli --output-format X --model Y --auto-approve <prompt>` rather than
+    # interleaved.
     extra: List[str] = []
+
+    # Unconditional, unlike the auto-approve flags: these only change how the
+    # CLI reports its progress, never what it is allowed to do. Without them
+    # `claude -p` prints one block at the very end of the run and the live
+    # stream sits empty until then. ProviderRunner translates whatever they
+    # turn on back into readable lines.
+    extra.extend(a for a in (provider.get("stream_args") or []) if a)
 
     model = str(provider.get("model") or "").strip()
     if model:
@@ -199,6 +212,198 @@ def redact_argv(argv: List[str], prompt: str) -> List[str]:
         else:
             out.append(token)
     return out
+
+
+# --------------------------------------------------------------------------
+# Streaming output
+# --------------------------------------------------------------------------
+
+# Longest line the translator will emit. Tool inputs and results are arbitrary
+# blobs; a 40 KB file read has no business becoming one line in the browser.
+STREAM_LINE_LIMIT = 400
+
+# How much of a tool call or its result to show. Shorter than a line of prose:
+# these are context for the agent's own words, not the point of the stream.
+TOOL_DETAIL_LIMIT = 200
+
+# The field of a tool's input worth putting on screen, most specific first.
+# Whatever a tool calls its principal argument, one of these is usually it.
+TOOL_SUMMARY_KEYS = (
+    "command",
+    "file_path",
+    "path",
+    "pattern",
+    "url",
+    "query",
+    "description",
+    "prompt",
+)
+
+
+def _one_line(value: Any, limit: int = STREAM_LINE_LIMIT) -> str:
+    """Collapse a value into a single bounded line of text."""
+    flat = " ".join(str(value).split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
+class ClaudeStreamReader:
+    """Turns ``claude --output-format stream-json`` events into readable lines.
+
+    Why this exists: ``claude -p`` in its default text mode emits nothing until
+    the run has finished - measured here at 8.7s into a 9.3s run - so the live
+    stream stayed blank and then filled with the conclusion all at once. The
+    streaming format emits one JSON object per step as it happens, which is what
+    the UI needs; raw JSON on screen is no improvement over nothing, so this is
+    the cost of getting it.
+
+    The reader also keeps the run's final answer to one side. That, and not the
+    transcript, is what the next stage's prompt and the Draft/Final panes want.
+
+    Every accessor is defensive about shapes. A malformed or newly-invented
+    event must not raise: the exception would kill the pump thread and take the
+    rest of the run's output with it.
+    """
+
+    def __init__(self) -> None:
+        self.result = ""  # the final assistant message, once it arrives
+        self.error = ""  # set when the CLI reports a failed result
+
+    def feed(self, line: str) -> List[str]:
+        """Translate one line of CLI output into zero or more display lines."""
+        stripped = line.strip()
+        if not stripped:
+            return []
+        if not stripped.startswith("{"):
+            # Not an event - a banner or a warning the CLI wrote to stdout
+            # anyway. Pass it through rather than swallowing it.
+            return [line]
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            return [line]
+        if not isinstance(event, dict):
+            return [line]
+
+        kind = event.get("type")
+        if kind == "system":
+            # The only detail here a human needs, and the only place it appears
+            # when the stage is configured to use the CLI's default model.
+            model = event.get("model")
+            return [f"· model {model}"] if model else []
+        if kind == "assistant":
+            return self._assistant_lines(event.get("message"))
+        if kind == "user":
+            return self._tool_result_lines(event.get("message"))
+        if kind == "result":
+            text = str(event.get("result") or "")
+            if event.get("is_error"):
+                self.error = _one_line(text) or "The CLI reported a failed result."
+                return [f"✗ {self.error}"]
+            self.result = text
+            return []
+        # `rate_limit_event`, partial-message chunks, and whatever a future
+        # version adds: nothing anyone needs to watch mid-run.
+        return []
+
+    # -- event shapes ------------------------------------------------------
+
+    def _assistant_lines(self, message: Any) -> List[str]:
+        if not isinstance(message, dict):
+            return []
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.splitlines()
+        if not isinstance(content, list):
+            return []
+
+        out: List[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if kind == "text":
+                out.extend(str(block.get("text") or "").splitlines())
+            elif kind == "thinking":
+                # The reasoning is the half of the run the operator most wants
+                # to watch, so it goes through in full, marked as thinking.
+                out.extend(
+                    f"· {ln}" for ln in str(block.get("thinking") or "").splitlines()
+                )
+            elif kind == "tool_use":
+                name = block.get("name") or "tool"
+                out.append(f"→ {name}{self._tool_detail(block.get('input'))}")
+        return out
+
+    @staticmethod
+    def _tool_detail(payload: Any) -> str:
+        if not isinstance(payload, dict) or not payload:
+            return ""
+        for key in TOOL_SUMMARY_KEYS:
+            if payload.get(key):
+                return " " + _one_line(payload[key], TOOL_DETAIL_LIMIT)
+        return " " + _one_line(json.dumps(payload, default=str), TOOL_DETAIL_LIMIT)
+
+    @staticmethod
+    def _tool_result_lines(message: Any) -> List[str]:
+        """One summary line per tool result: its first line and how much more.
+
+        Tool output is the bulkiest thing in the stream and the least worth
+        reading in full - a single file read would bury the agent's own words.
+        """
+        if not isinstance(message, dict):
+            return []
+        content = message.get("content")
+        if not isinstance(content, list):
+            return []
+
+        out: List[str] = []
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            body = block.get("content")
+            if isinstance(body, list):
+                body = "\n".join(
+                    str(part.get("text") or "")
+                    for part in body
+                    if isinstance(part, dict)
+                )
+            lines = str(body or "").splitlines()
+            head = _one_line(lines[0], TOOL_DETAIL_LIMIT) if lines else ""
+            more = f" (+{len(lines) - 1} lines)" if len(lines) > 1 else ""
+            out.append(f"{'✗' if block.get('is_error') else '←'} {head}{more}".rstrip())
+        return out
+
+
+def _asks_for_stream_json(argv: List[str]) -> bool:
+    """Whether this argv turns on the streaming event format.
+
+    Only flag-shaped tokens are considered. The prompt is an argument in this
+    same list, and a task that happens to mention stream-json must not switch a
+    JSON parser on over what is still plain prose.
+    """
+    for index, token in enumerate(argv):
+        if not token.startswith("-"):
+            continue
+        if "stream-json" in token:  # --output-format=stream-json
+            return True
+        if token == "--output-format" and argv[index + 1 : index + 2] == ["stream-json"]:
+            return True
+    return False
+
+
+def stream_reader_for(argv: List[str]) -> Optional[ClaudeStreamReader]:
+    """The translator for a command's output format, or None if it needs none.
+
+    Keyed on the argv actually being run rather than on the configured
+    template: a hand-edited command that drops the streaming flags produces
+    plain text again, and parsing that as JSON would mangle it.
+    """
+    if not argv:
+        return None
+    exe = os.path.basename(str(argv[0]))
+    if "claude" in exe and _asks_for_stream_json(argv):
+        return ClaudeStreamReader()
+    return None
 
 
 class ProviderRunner:
@@ -301,6 +506,9 @@ class ProviderRunner:
         env["CI"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
 
+        # Non-None when this CLI reports structured events instead of prose.
+        reader = stream_reader_for(argv)
+
         stdout_lines: List[str] = []
         stderr_lines: List[str] = []
 
@@ -348,14 +556,17 @@ class ProviderRunner:
                 pass
 
         def pump(stream, name: str, sink: List[str]) -> None:
+            # Only stdout carries structured events; stderr is always prose.
+            translate = reader.feed if reader and name == "stdout" else None
             try:
-                for line in iter(stream.readline, ""):
-                    line = line.rstrip("\n")
-                    sink.append(line)
-                    try:
-                        self.on_output(name, line)
-                    except Exception:  # a UI callback must never kill the pump
-                        pass
+                for raw in iter(stream.readline, ""):
+                    raw = raw.rstrip("\n")
+                    for line in translate(raw) if translate else (raw,):
+                        sink.append(line)
+                        try:
+                            self.on_output(name, line)
+                        except Exception:  # a UI callback must never kill the pump
+                            pass
             except (ValueError, OSError):
                 pass
             finally:
@@ -396,6 +607,12 @@ class ProviderRunner:
         duration = time.monotonic() - started
         stdout = "\n".join(stdout_lines)
         stderr = "\n".join(stderr_lines)
+        if reader is not None and reader.result:
+            # What was pumped is a transcript of the run; the next stage's
+            # prompt and the Draft/Final panes want the answer itself. Falls
+            # back to the transcript when no final answer arrived, which is the
+            # only evidence a crashed or killed run leaves behind.
+            stdout = reader.result
 
         error = ""
         if timed_out:
@@ -403,9 +620,11 @@ class ProviderRunner:
         elif cancelled:
             error = "Cancelled by user."
         elif exit_code != 0:
-            error = stderr.strip().splitlines()[-1] if stderr.strip() else (
-                f"Exited with status {exit_code}."
-            )
+            last_stderr = stderr.strip().splitlines()[-1] if stderr.strip() else ""
+            # A CLI reporting its own failure in the event stream can leave
+            # stderr empty, and that reason beats a bare exit status.
+            reported = reader.error if reader is not None else ""
+            error = last_stderr or reported or f"Exited with status {exit_code}."
 
         return ProviderResult(
             provider_id=pid,

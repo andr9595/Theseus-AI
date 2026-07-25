@@ -16,12 +16,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from aicouncil.providers import (  # noqa: E402
     ARGV_PROMPT_LIMIT,
+    ClaudeStreamReader,
     discover_models,
     ProviderRunner,
     ProviderUnavailable,
     build_argv,
     redact_argv,
     resolve_binary,
+    stream_reader_for,
 )
 
 CLAUDE = {
@@ -199,6 +201,255 @@ class TestModelSelection(unittest.TestCase):
         provider = dict(CLAUDE, model="a; rm -rf /")
         argv, _ = build_argv(provider, "hi", auto_approve=False)
         self.assertIn("a; rm -rf /", argv)  # one literal argv entry
+
+
+class TestStreamingArgs(unittest.TestCase):
+    """The flags that make a CLI narrate its work, rather than only its result.
+
+    Unlike the auto-approve flags these are unconditional: they change how the
+    CLI reports, never what it may do.
+    """
+
+    STREAMING = dict(CLAUDE, stream_args=["--output-format", "stream-json", "--verbose"])
+
+    def test_streaming_flags_are_passed_without_any_grant(self):
+        argv, _ = build_argv(self.STREAMING, "hi", auto_approve=False)
+        self.assertEqual(argv, [
+            "claude", "-p",
+            "--output-format", "stream-json", "--verbose",
+            "hi",
+        ])
+
+    def test_streaming_flags_precede_the_model_and_the_grant(self):
+        provider = dict(self.STREAMING, model="opus")
+        argv, _ = build_argv(provider, "hi", auto_approve=True)
+        self.assertEqual(argv, [
+            "claude", "-p",
+            "--output-format", "stream-json", "--verbose",
+            "--model", "opus",
+            "--dangerously-skip-permissions",
+            "hi",
+        ])
+
+    def test_no_streaming_flags_configured_changes_nothing(self):
+        argv, _ = build_argv(CODEX, "task", auto_approve=False)
+        self.assertEqual(argv, ["codex", "exec", "task"])
+
+    def test_blank_streaming_entries_are_dropped(self):
+        provider = dict(CLAUDE, stream_args=["", "--verbose"])
+        argv, _ = build_argv(provider, "hi", auto_approve=False)
+        self.assertEqual(argv, ["claude", "-p", "--verbose", "hi"])
+
+    def test_streaming_flags_go_last_when_the_prompt_is_on_stdin(self):
+        provider = dict(self.STREAMING, prompt_on_stdin=True)
+        argv, stdin = build_argv(provider, "hi", auto_approve=False)
+        self.assertEqual(argv, [
+            "claude", "-p", "--output-format", "stream-json", "--verbose",
+        ])
+        self.assertEqual(stdin, "hi")
+
+
+class TestStreamReaderSelection(unittest.TestCase):
+    """Which output format to expect is decided by the argv actually run.
+
+    Reading it from the configured template instead would misjudge a
+    hand-edited command, and parsing plain prose as JSON mangles it.
+    """
+
+    def test_claude_asked_for_events_gets_a_reader(self):
+        argv = ["claude", "-p", "--output-format", "stream-json", "--verbose", "hi"]
+        self.assertIsInstance(stream_reader_for(argv), ClaudeStreamReader)
+
+    def test_claude_in_plain_text_mode_gets_none(self):
+        self.assertIsNone(stream_reader_for(["claude", "-p", "hi"]))
+
+    def test_an_absolute_path_is_still_recognised(self):
+        argv = ["/home/someone/.local/bin/claude", "-p", "--output-format=stream-json", "hi"]
+        self.assertIsInstance(stream_reader_for(argv), ClaudeStreamReader)
+
+    def test_another_cli_is_left_alone(self):
+        argv = ["codex", "exec", "--output-format", "stream-json", "task"]
+        self.assertIsNone(stream_reader_for(argv))
+
+    def test_empty_argv_gets_none(self):
+        self.assertIsNone(stream_reader_for([]))
+
+    def test_a_prompt_mentioning_the_format_does_not_enable_a_reader(self):
+        # The prompt is data. Only a flag turns the format on, and the flag is
+        # never the last positional argument.
+        self.assertIsNone(
+            stream_reader_for(["claude", "-p", "explain stream-json to me"])
+        )
+
+
+class TestClaudeStreamReader(unittest.TestCase):
+    """Events in, readable lines out - and the final answer kept separately."""
+
+    def setUp(self):
+        self.reader = ClaudeStreamReader()
+
+    def feed(self, event):
+        return self.reader.feed(json.dumps(event))
+
+    def test_thinking_is_shown_as_it_arrives(self):
+        # The whole point of the change: the reasoning must reach the stream
+        # during the run, not after it.
+        lines = self.feed({"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "first thought\nsecond thought"},
+        ]}})
+        self.assertEqual(lines, ["· first thought", "· second thought"])
+
+    def test_assistant_text_passes_through_unmarked(self):
+        lines = self.feed({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "I will edit two files."},
+        ]}})
+        self.assertEqual(lines, ["I will edit two files."])
+
+    def test_tool_calls_name_their_main_argument(self):
+        lines = self.feed({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "a/b.py"}},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "pytest -q"}},
+        ]}})
+        self.assertEqual(lines, ["→ Read a/b.py", "→ Bash pytest -q"])
+
+    def test_a_tool_with_no_recognised_field_still_says_something(self):
+        lines = self.feed({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Odd", "input": {"unheard_of": "value"}},
+        ]}})
+        self.assertEqual(len(lines), 1)
+        self.assertIn("unheard_of", lines[0])
+
+    def test_tool_results_are_summarised_not_dumped(self):
+        # A file read would otherwise bury the agent's own words.
+        body = "\n".join(f"line {i}" for i in range(400))
+        lines = self.feed({"type": "user", "message": {"content": [
+            {"type": "tool_result", "content": body},
+        ]}})
+        self.assertEqual(lines, ["← line 0 (+399 lines)"])
+
+    def test_a_failed_tool_result_is_marked(self):
+        lines = self.feed({"type": "user", "message": {"content": [
+            {"type": "tool_result", "content": "No such file", "is_error": True},
+        ]}})
+        self.assertEqual(lines, ["✗ No such file"])
+
+    def test_block_shaped_tool_result_content_is_handled(self):
+        lines = self.feed({"type": "user", "message": {"content": [
+            {"type": "tool_result", "content": [{"type": "text", "text": "ok"}]},
+        ]}})
+        self.assertEqual(lines, ["← ok"])
+
+    def test_long_lines_are_bounded(self):
+        lines = self.feed({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "x" * 5000}},
+        ]}})
+        self.assertLess(len(lines[0]), 300)
+
+    def test_the_session_model_is_reported_once(self):
+        # The only place it appears when the stage runs the CLI's own default.
+        lines = self.feed({"type": "system", "subtype": "init", "model": "opus-x"})
+        self.assertEqual(lines, ["· model opus-x"])
+
+    def test_the_final_result_is_collected_not_streamed(self):
+        self.assertEqual(self.feed({"type": "result", "result": "all done"}), [])
+        self.assertEqual(self.reader.result, "all done")
+        self.assertEqual(self.reader.error, "")
+
+    def test_a_failed_result_becomes_an_error_and_a_line(self):
+        lines = self.feed(
+            {"type": "result", "is_error": True, "result": "usage limit reached"}
+        )
+        self.assertEqual(lines, ["✗ usage limit reached"])
+        self.assertEqual(self.reader.error, "usage limit reached")
+
+    def test_noise_events_produce_nothing(self):
+        self.assertEqual(self.feed({"type": "rate_limit_event"}), [])
+        self.assertEqual(self.feed({"type": "some_future_event", "x": 1}), [])
+
+    def test_non_json_output_passes_through(self):
+        # A banner or a deprecation warning is still worth seeing.
+        self.assertEqual(self.reader.feed("npm notice: update available"),
+                         ["npm notice: update available"])
+        self.assertEqual(self.reader.feed("{not json after all"),
+                         ["{not json after all"])
+
+    def test_malformed_events_do_not_raise(self):
+        # An exception here would kill the pump thread and silently truncate
+        # the rest of the run's output.
+        for event in (
+            {"type": "assistant", "message": "not a dict"},
+            {"type": "assistant", "message": {"content": "plain string"}},
+            {"type": "assistant", "message": {"content": [None, 7]}},
+            {"type": "user", "message": {"content": [{"type": "tool_result"}]}},
+            {"type": "result"},
+            [1, 2, 3],
+        ):
+            self.reader.feed(json.dumps(event))
+
+
+class TestStreamingRunnerIntegration(unittest.TestCase):
+    """The pump translates as it goes, and the result replaces the transcript.
+
+    Driven through a real subprocess named so the reader recognises it, because
+    the wiring between pump, translator and ProviderResult is the part a unit
+    test on the translator alone would miss.
+    """
+
+    SHIM = """#!/usr/bin/env python3
+import json, sys
+def emit(obj):
+    print(json.dumps(obj), flush=True)
+emit({"type": "system", "subtype": "init", "model": "test-model"})
+emit({"type": "assistant", "message": {"content": [
+    {"type": "thinking", "thinking": "considering"},
+    {"type": "tool_use", "name": "Read", "input": {"file_path": "x.py"}}]}})
+emit({"type": "user", "message": {"content": [
+    {"type": "tool_result", "content": "one\\ntwo"}]}})
+emit({"type": "result", "is_error": False, "result": "THE ANSWER"})
+"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-stream-"))
+        # The basename decides whether events are expected, so it has to read
+        # as a claude binary.
+        self.exe = self.tmp / "claude-shim"
+        self.exe.write_text(self.SHIM)
+        self.exe.chmod(0o755)
+        self.lines = []
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_shim(self, stream_args):
+        provider = {
+            "id": "polisher",
+            "command": [str(self.exe), "{prompt}"],
+            "stream_args": stream_args,
+            "timeout_seconds": 60,
+        }
+        runner = ProviderRunner(provider, lambda s, ln: self.lines.append(ln))
+        return runner.run("hi", cwd=str(self.tmp), auto_approve=False)
+
+    def test_events_reach_the_callback_as_readable_lines(self):
+        result = self.run_shim(["--output-format", "stream-json", "--verbose"])
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(self.lines, [
+            "· model test-model",
+            "· considering",
+            "→ Read x.py",
+            "← one (+1 lines)",
+        ])
+
+    def test_the_final_answer_becomes_the_stage_output(self):
+        # Not the transcript: this text is what the next stage's prompt and the
+        # Draft/Final panes are built from.
+        result = self.run_shim(["--output-format", "stream-json"])
+        self.assertEqual(result.stdout, "THE ANSWER")
+
+    def test_without_the_flags_the_raw_output_is_untouched(self):
+        result = self.run_shim([])
+        self.assertIn('"type": "result"', result.stdout)
+        self.assertEqual(len(self.lines), 4)
 
 
 class TestRedaction(unittest.TestCase):
