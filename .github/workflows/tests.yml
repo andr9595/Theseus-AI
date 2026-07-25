@@ -1,0 +1,83 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The app targets the system Python on a stock Pop!_OS/Ubuntu box, so
+        # the floor matters more than the ceiling. 3.9 is the documented
+        # minimum; 3.12 is what ships on 24.04.
+        python-version: ['3.9', '3.12', '3.13']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # No install step: the app is standard library only. If a dependency
+      # ever sneaks in, this job is where it will be noticed.
+      - name: Assert no third-party imports crept in
+        # sys.stdlib_module_names is 3.10+, so this check runs once on a
+        # modern interpreter rather than across the whole matrix.
+        if: matrix.python-version == '3.12'
+        run: |
+          python -c "
+          import ast, pathlib, sys
+          stdlib = set(sys.stdlib_module_names)
+          bad = []
+          for f in pathlib.Path('aicouncil').rglob('*.py'):
+              tree = ast.parse(f.read_text())
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Import):
+                      mods = [a.name.split('.')[0] for a in node.names]
+                  elif isinstance(node, ast.ImportFrom):
+                      mods = [] if node.level else [(node.module or '').split('.')[0]]
+                  else:
+                      continue
+                  for m in mods:
+                      if m and m not in stdlib and m != 'aicouncil':
+                          bad.append(f'{f}: {m}')
+          if bad:
+              print('Third-party imports found:'); print(*bad, sep='\n'); sys.exit(1)
+          print('Standard library only - confirmed.')
+          "
+
+      - name: Configure git
+        # gitutil tests build real repositories; git refuses to commit without
+        # an identity, and CI runners have none by default.
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "CI"
+          git config --global init.defaultBranch main
+
+      - name: Run tests
+        env:
+          MOCK_AGENT_DELAY: '0'
+        run: python -m unittest discover -s tests -v
+
+      - name: Doctor smoke test
+        run: python -m aicouncil --doctor
+
+      - name: Server smoke test
+        # Prove the server actually binds and serves before calling it green.
+        run: |
+          python -m aicouncil --no-browser --port 0 --print-url > url.txt 2>&1 &
+          for i in $(seq 1 30); do [ -s url.txt ] && break; sleep 0.5; done
+          URL=$(cat url.txt)
+          echo "serving at $URL"
+          code=$(curl -s -o /dev/null -w '%{http_code}' "${URL%%\?*}")
+          test "$code" = "200" || { echo "expected 200, got $code"; exit 1; }
+          echo "index served OK"

@@ -407,7 +407,11 @@ def make_server(
     """Build a ready-to-serve instance. Returns ``(server, state, url)``."""
     store = store or cfg.ConfigStore()
     state = AppState(store)
-    chosen = find_free_port(port or int(store.get("port", 8760)), host)
+    # `port is None` means "unset, use the configured default". Port 0 is a
+    # real request for an OS-assigned ephemeral port, so `port or default`
+    # would be wrong - it treats 0 as unset.
+    preferred = port if port is not None else int(store.get("port", 8760))
+    chosen = find_free_port(preferred, host)
 
     handler = type("BoundHandler", (Handler,), {"app": state})
     server = Server((host, chosen), handler)
