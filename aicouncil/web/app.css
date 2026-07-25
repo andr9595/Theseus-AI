@@ -319,6 +319,20 @@ html, body {
   font-family: var(--mono);
 }
 
+.agent-hint {
+  margin-top: 2px; padding: 0;
+  font: inherit; font-size: 9.5px; text-align: left;
+  color: var(--yellow);
+  background: none; border: 0;
+  border-bottom: 1px dashed rgba(234, 179, 8, .4);
+  cursor: pointer;
+}
+.agent-hint:hover { color: #ffd75e; border-bottom-color: var(--yellow); }
+
+/* A stage skipped by a setting stays legible — dimming it to 50% (as a
+   genuinely skipped stage is) would bury the explanation with it. */
+.agent-card.skipped:has(.agent-hint) { opacity: .78; }
+
 /* ---- Toggles ---- */
 
 .toggle {

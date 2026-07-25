@@ -591,7 +591,11 @@ function renderAgents() {
   const run = state.run;
   const conf = state.config || {};
   const providers = conf.providers || {};
-  const order = conf.solo_mode && !run ? ['polisher'] : ['drafter', 'polisher'];
+  // Always render both stages. Solo Mode used to drop the drafter card
+  // entirely, which reads as "Codex is missing" rather than "you switched this
+  // off" - a disabled stage should look disabled, not absent.
+  const order = ['drafter', 'polisher'];
+  const soloSkipped = (id) => id === 'drafter' && conf.solo_mode && !run;
 
   const probeFor = (id) => state.providers.find(p => p.id === id);
 
@@ -603,10 +607,12 @@ function renderAgents() {
 
     let stageState = stage ? stage.state : 'pending';
     if (run && run.state === 'awaiting_approval' && id === 'polisher') stageState = 'waiting';
+    if (soloSkipped(id)) stageState = 'skipped';
 
-    const label = { pending: 'idle', running: 'working', done: 'done',
-                    failed: 'failed', skipped: 'skipped',
-                    waiting: 'gated' }[stageState] || stageState;
+    const label = soloSkipped(id) ? 'solo · off'
+      : { pending: 'idle', running: 'working', done: 'done',
+          failed: 'failed', skipped: 'skipped',
+          waiting: 'gated' }[stageState] || stageState;
 
     const duration = stage && stage.duration ? ` · ${fmtDuration(stage.duration)}` : '';
     const initial = (provider.label || id).slice(0, 2).toUpperCase();
@@ -621,6 +627,12 @@ function renderAgents() {
           `<div class="agent-role">${idx + 1}. ${esc(provider.role || '')}</div>` +
           (available ? '' :
             `<div class="agent-missing">${esc(provider.command ? provider.command[0] : '?')} not found</div>`) +
+          // Say *why* the stage is inert, and how to undo it — an unexplained
+          // greyed-out card is barely better than a missing one.
+          (soloSkipped(id)
+            ? `<button class="agent-hint" type="button" data-disable-solo="1">` +
+              `Skipped by Solo mode — click to re-enable</button>`
+            : '') +
         `</div>` +
         `<div class="agent-right">` +
           `<div class="agent-state">${esc(label)}${esc(duration)}</div>` +
@@ -1349,6 +1361,11 @@ function wire() {
   // -- model picker -----------------------------------------------------
   // Delegated: the agent rail is re-rendered on every state change.
   $('#agent-rail').addEventListener('click', (e) => {
+    if (e.target.closest('[data-disable-solo]')) {
+      patchConfig({ solo_mode: false });
+      toast('Solo mode off — the draft stage is back in the pipeline.', 'ok', 3600);
+      return;
+    }
     const chip = e.target.closest('.model-chip');
     if (!chip) return;
     e.stopPropagation();
