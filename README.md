@@ -188,22 +188,44 @@ that were staged come back unstaged.
 
 ## Installing the agent CLIs
 
-The pipeline needs `codex` and `claude` on your `PATH`. On Pop!\_OS / Ubuntu:
+The pipeline needs `codex` and `claude` on your `PATH`. Both vendors ship a
+first-party installer that drops a standalone binary into `~/.local/bin` — **no
+Node, no npm, no sudo**:
 
 ```bash
-./scripts/install-deps.sh          # add --vscode to also install VS Code
+curl -fsSL https://chatgpt.com/codex/install.sh | bash
+curl -fsSL https://claude.ai/install.sh | bash
+source ~/.bashrc
 ```
 
-It installs Node.js (the CLIs ship as npm packages), the two CLIs into a
-user-owned npm prefix, and `gh`. Run `./scripts/install-deps.sh --check` first
-to see what it would do. It uses `sudo` — read it before running it.
+Or let the bundled script do it, which is the same thing plus a PATH check:
+
+```bash
+./scripts/install-deps.sh              # CLIs only, no sudo
+./scripts/install-deps.sh --check      # report what's present, install nothing
+./scripts/install-deps.sh --extras     # also gh + python3-pip/venv (needs sudo)
+./scripts/install-deps.sh --vscode     # also VS Code (implies --extras)
+```
+
+> Both installers pipe a remote script to `bash`. They are the official
+> sources, but you can read them first:
+> `curl -fsSL https://chatgpt.com/codex/install.sh | less`
+
+Avoid `npm install -g @anthropic-ai/claude-code` unless you already run Node —
+it now requires Node ≥ 22, which pulls in a whole toolchain for no benefit over
+the standalone binary. The Codex installer also places `codex-code-mode-host`
+next to the main binary, which downloading a release asset by hand misses.
 
 Then authenticate each CLI once, interactively:
 
 ```bash
-claude          # browser login for Claude Pro
 codex login     # browser login for ChatGPT Plus/Pro
+claude          # browser login for Claude Pro
 ```
+
+These are **subscription logins, not API keys** — that is what keeps runs at
+zero per-token cost. Setting an API key instead would put every run on metered
+billing.
 
 Confirm the app can see them with `./run.sh --doctor`.
 
