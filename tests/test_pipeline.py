@@ -5,6 +5,9 @@ than mocking them out - the parts most likely to break are exactly the ones a
 mock would paper over.
 """
 
+import json
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -16,6 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from aicouncil import config as cfg  # noqa: E402
 from aicouncil import gitutil  # noqa: E402
 from aicouncil.config import ConfigStore  # noqa: E402
 from aicouncil.events import EventBus  # noqa: E402
@@ -47,6 +51,20 @@ def git(args, cwd):
 class PipelineTestBase(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-test-"))
+        # Transcripts go to `config_dir()/runs`, which is derived from the
+        # environment rather than from the store's path - without this every
+        # test run would file its fixtures in the developer's real history.
+        previous_xdg = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = str(self.tmp / "xdg")
+
+        def restore_xdg():
+            if previous_xdg is None:
+                os.environ.pop("XDG_CONFIG_HOME", None)
+            else:
+                os.environ["XDG_CONFIG_HOME"] = previous_xdg
+
+        self.addCleanup(restore_xdg)
+
         self.repo = self.tmp / "repo"
         self.repo.mkdir()
         git(["init", "-q"], self.repo)
@@ -434,6 +452,135 @@ class TestCancellation(PipelineTestBase):
         self.assertFalse((self.repo / "AI_COUNCIL_DEMO.md").exists())
 
 
+class TestContinuedConversation(PipelineTestBase):
+    """A follow-up run must carry the earlier exchange to the agents.
+
+    Continuation is council-level and provider-neutral: the transcript this
+    app already keeps is replayed into the next prompt, rather than resuming a
+    CLI's private session - which a custom configured command does not have.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.store.update({"zero_touch": True})
+
+    def first_run(self, task="remember MAGIC-THREAD-TOKEN"):
+        run = self.pipeline.start(task, str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+        return run
+
+    def prompt_size(self, run, stage):
+        """How long a prompt the stage was actually launched with.
+
+        The recorded command redacts the prompt down to its length, so that
+        length is the only direct evidence of what reached the CLI.
+        """
+        match = re.search(r"<prompt: (\d+) chars>", " ".join(run.stages[stage].command))
+        self.assertIsNotNone(match, "the stage recorded no prompt")
+        return int(match.group(1))
+
+    def test_a_follow_up_reaches_both_agents(self):
+        first = self.first_run()
+        second = self.pipeline.start(
+            "now do the follow-up", str(self.repo),
+            continue_from=first.transcript_name,
+        )
+        self.wait_terminal()
+
+        self.assertEqual(second.parent_run_id, first.id)
+        # The task itself stays the new message; the thread rides alongside it.
+        self.assertEqual(second.task, "now do the follow-up")
+        self.assertEqual(len(second.conversation), 1)
+        self.assertIn("MAGIC-THREAD-TOKEN", second.conversation[0]["task"])
+        self.assertTrue(second.conversation[0]["replies"])
+
+        # And it reached the CLIs, not just the Run object: both stages were
+        # launched with a materially longer prompt than the same task alone.
+        for stage in ("drafter", "polisher"):
+            self.assertGreater(
+                self.prompt_size(second, stage), self.prompt_size(first, stage) + 200,
+                f"the {stage} stage was not told what came before",
+            )
+
+    def test_the_thread_grows_with_each_follow_up(self):
+        first = self.first_run()
+        second = self.pipeline.start(
+            "second message", str(self.repo), continue_from=first.transcript_name
+        )
+        self.wait_terminal()
+        third = self.pipeline.start(
+            "third message", str(self.repo), continue_from=second.transcript_name
+        )
+        self.wait_terminal()
+
+        self.assertEqual([t["task"] for t in third.conversation],
+                         ["remember MAGIC-THREAD-TOKEN", "second message"])
+
+    def test_an_ordinary_run_carries_no_conversation(self):
+        run = self.first_run()
+        self.assertEqual(run.conversation, [])
+        self.assertEqual(run.parent_run_id, "")
+
+    def test_continuing_a_missing_transcript_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "no longer exists"):
+            self.pipeline.start(
+                "follow up", str(self.repo), continue_from="1700000000-nope.json"
+            )
+
+    def test_a_transcript_outside_the_runs_directory_is_refused(self):
+        # `continue_from` arrives from an HTTP body; it names a file, not a path.
+        with self.assertRaises(ValueError):
+            self.pipeline.start(
+                "follow up", str(self.repo), continue_from="../../config.json"
+            )
+
+    def test_a_run_cannot_be_continued_in_another_repository(self):
+        first = self.first_run()
+        other = self.tmp / "other"
+        other.mkdir()
+        git(["init", "-q"], other)
+
+        with self.assertRaisesRegex(ValueError, "repository it started in"):
+            self.pipeline.start(
+                "follow up", str(other), continue_from=first.transcript_name
+            )
+
+    def test_a_transcript_from_before_this_feature_can_still_be_continued(self):
+        # Older transcripts have no `conversation` or `parent_run_id` key. They
+        # are still one turn of a conversation - the first one.
+        legacy = cfg.runs_dir() / "1700000000-legacyrun.json"
+        legacy.write_text(json.dumps({
+            "id": "legacyrun",
+            "task": "the original request",
+            "repo": str(self.repo),
+            "state": "complete",
+            "stages": {"polisher": {"label": "Claude", "output": "I did the thing."}},
+        }), encoding="utf-8")
+
+        run = self.pipeline.start(
+            "follow up", str(self.repo), continue_from=legacy.name
+        )
+        self.wait_terminal()
+
+        self.assertEqual(run.parent_run_id, "legacyrun")
+        self.assertEqual(len(run.conversation), 1)
+        self.assertEqual(run.conversation[0]["replies"][0]["output"], "I did the thing.")
+
+    def test_a_long_reply_is_trimmed_before_it_is_stored(self):
+        # A thread copies its predecessor's turns into every later transcript,
+        # so an unbounded reply would be duplicated for as long as it runs.
+        from aicouncil.pipeline import MAX_TURN_CHARS, _conversation_turn
+
+        turn = _conversation_turn({
+            "id": "x",
+            "task": "t",
+            "stages": {"polisher": {"label": "Claude", "output": "x" * 90_000}},
+            "stage_order": ["polisher"],
+        })
+        self.assertLess(len(turn["replies"][0]["output"]), MAX_TURN_CHARS + 200)
+
+
 class TestEventStream(PipelineTestBase):
     def test_subscribers_observe_the_whole_run(self):
         q = self.bus.subscribe()
@@ -610,6 +757,68 @@ class TestRoleTemplates(unittest.TestCase):
         )
         self.assertIn("Custom behaviour.", prompt)
         self.assertIn("ALWAYS USE TABS", prompt)
+
+
+class TestConversationPrompt(unittest.TestCase):
+    """How an earlier exchange is rendered into the next prompt."""
+
+    TURNS = [{
+        "task": "add a login route",
+        "replies": [{"stage": "polisher", "label": "Claude", "output": "Added it."}],
+        "reviewer_note": "use tabs",
+        "outcome": "complete, 1 file(s) changed (+9/-0)",
+    }]
+
+    def test_nothing_is_added_when_there_is_no_thread(self):
+        from aicouncil import prompts
+
+        for conversation in (None, []):
+            prompt = prompts.build_draft_prompt("do it", "/tmp/r", None, "", conversation)
+            self.assertNotIn("Earlier in this conversation", prompt)
+
+    def test_the_earlier_exchange_precedes_the_current_task(self):
+        from aicouncil import prompts
+
+        prompt = prompts.build_draft_prompt("do it", "/tmp/r", None, "", self.TURNS)
+        self.assertIn("add a login route", prompt)
+        self.assertIn("Claude answered", prompt)
+        self.assertIn("Added it.", prompt)
+        self.assertIn("use tabs", prompt)
+        self.assertLess(
+            prompt.index("add a login route"), prompt.index("# Task"),
+            "the thread must read as context, not as the task",
+        )
+
+    def test_every_stage_can_be_handed_the_thread(self):
+        from aicouncil import prompts
+
+        solo = prompts.build_solo_prompt("do it", "/tmp/r", None, "", self.TURNS)
+        polish = prompts.build_polish_prompt(
+            "do it", "a draft", "/tmp/r", None, "", "", self.TURNS
+        )
+        for prompt in (solo, polish):
+            self.assertIn("add a login route", prompt)
+
+    def test_the_repository_is_named_as_the_authority_over_the_transcript(self):
+        # A remembered run may have been rolled back or edited over since.
+        from aicouncil import prompts
+
+        prompt = prompts.build_solo_prompt("do it", "/tmp/r", None, "", self.TURNS)
+        self.assertIn("repository as it stands now", prompt)
+
+    def test_an_over_long_thread_keeps_its_recent_end(self):
+        from aicouncil import prompts
+
+        turns = [
+            {"task": "ancient history", "replies": [
+                {"label": "Claude", "output": "x" * prompts.MAX_HISTORY_CHARS}]},
+            {"task": "what I just asked", "replies": [
+                {"label": "Claude", "output": "the answer that matters"}]},
+        ]
+        prompt = prompts.build_draft_prompt("do it", "/tmp/r", None, "", turns)
+        self.assertIn("the answer that matters", prompt)
+        self.assertNotIn("ancient history", prompt)
+        self.assertIn("older turns dropped", prompt)
 
 
 class TestRoleReachesTheRun(PipelineTestBase):

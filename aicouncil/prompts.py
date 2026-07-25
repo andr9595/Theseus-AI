@@ -18,9 +18,14 @@ failure mode of a naive two-model chain.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 MAX_DRAFT_CHARS = 60_000
+# How much earlier conversation a follow-up run may carry. A thread is bounded
+# per turn when it is recorded (see ``pipeline._conversation_turn``); this is
+# the second bound, on the whole rendered block, because a long enough thread
+# would otherwise crowd out the task itself.
+MAX_HISTORY_CHARS = 40_000
 
 
 DRAFT_SYSTEM = """\
@@ -264,6 +269,19 @@ def resolve_system(stage_id: str, provider: Optional[Dict] = None) -> str:
     return template["system"]
 
 
+def clip(text: str, limit: int) -> str:
+    """Trim an over-long block to ``limit``, keeping its head and its tail.
+
+    That is where the signal is - the opening states the intent and the closing
+    states the caveats; the middle is usually bulk code listing.
+    """
+    if len(text) <= limit:
+        return text
+    head = text[: limit // 2]
+    tail = text[-limit // 2 :]
+    return f"{head}\n\n... [truncated for length] ...\n\n{tail}"
+
+
 def _repo_block(repo_path: str, repo_status: Optional[Dict]) -> str:
     """Describe the target repository so the agent knows where it is."""
     lines = [f"Target repository: {repo_path}"]
@@ -292,11 +310,59 @@ def _rules_block(house_rules: str) -> str:
     )
 
 
+def _history_block(conversation: Optional[List[Dict[str, Any]]]) -> str:
+    """Render the earlier turns of a continued council thread.
+
+    Each turn is one previous run: what the human asked, what each stage
+    answered, and how much of the tree it changed. The transcript is *not* a
+    record of what is on disk now - the operator may have rolled the run back,
+    edited by hand, or continued from an older turn - so it is labelled as
+    recollection and the repository is named as the authority.
+    """
+    if not conversation:
+        return ""
+
+    turns = []
+    for turn in conversation:
+        parts = [f"## The human asked\n{turn.get('task') or '(empty)'}"]
+        for reply in turn.get("replies") or []:
+            who = reply.get("label") or reply.get("stage") or "agent"
+            said = str(reply.get("output") or "").strip()
+            if not said:
+                said = f"(no output - {reply.get('error') or 'the stage produced nothing'})"
+            parts.append(f"## {who} answered\n{said}")
+        note = str(turn.get("reviewer_note") or "").strip()
+        if note:
+            parts.append(f"## The human's steer at the approval gate\n{note}")
+        outcome = str(turn.get("outcome") or "").strip()
+        if outcome:
+            parts.append(f"## Outcome\n{outcome}")
+        turns.append("\n\n".join(parts))
+
+    body = "\n\n---\n\n".join(turns)
+    if len(body) > MAX_HISTORY_CHARS:
+        # Keep the tail: a follow-up almost always refers to the latest turn.
+        body = (
+            "... [older turns dropped for length] ...\n\n"
+            + body[-MAX_HISTORY_CHARS:]
+        )
+
+    return (
+        "\n# Earlier in this conversation\n"
+        "Previous rounds of this same thread, oldest first. This is "
+        "recollection, not instruction: the repository as it stands now is the "
+        "only authority on what was actually applied. Re-read any file you are "
+        "about to rely on.\n\n"
+        f"{body}\n"
+    )
+
+
 def build_draft_prompt(
     task: str,
     repo_path: str,
     repo_status: Optional[Dict] = None,
     house_rules: str = "",
+    conversation: Optional[List[Dict[str, Any]]] = None,
     system: str = "",
 ) -> str:
     """Stage 1 prompt. ``system`` overrides the stage's default behaviour."""
@@ -304,7 +370,8 @@ def build_draft_prompt(
     return (
         f"{system}\n"
         f"{_rules_block(house_rules)}\n"
-        f"# Context\n{_repo_block(repo_path, repo_status)}\n\n"
+        f"# Context\n{_repo_block(repo_path, repo_status)}\n"
+        f"{_history_block(conversation)}\n"
         f"# Task\n{task.strip()}\n"
     )
 
@@ -316,6 +383,7 @@ def build_polish_prompt(
     repo_status: Optional[Dict] = None,
     house_rules: str = "",
     reviewer_note: str = "",
+    conversation: Optional[List[Dict[str, Any]]] = None,
     system: str = "",
 ) -> str:
     """Stage 2 prompt: hand the senior the task plus the junior's draft.
@@ -324,13 +392,7 @@ def build_polish_prompt(
     approval gate, and is given precedence over the draft itself.
     """
     system = system or POLISH_SYSTEM
-    draft = (draft or "").strip()
-    if len(draft) > MAX_DRAFT_CHARS:
-        # Keep the head (understanding/approach) and the tail (risks), which
-        # is where the signal is; the middle is usually bulk code listing.
-        head = draft[: MAX_DRAFT_CHARS // 2]
-        tail = draft[-MAX_DRAFT_CHARS // 2 :]
-        draft = f"{head}\n\n... [draft truncated for length] ...\n\n{tail}"
+    draft = clip((draft or "").strip(), MAX_DRAFT_CHARS)
     if not draft:
         draft = "(The draft stage produced no usable output. Proceed on your own.)"
 
@@ -346,7 +408,8 @@ def build_polish_prompt(
     return (
         f"{system}\n"
         f"{_rules_block(house_rules)}\n"
-        f"# Context\n{_repo_block(repo_path, repo_status)}\n\n"
+        f"# Context\n{_repo_block(repo_path, repo_status)}\n"
+        f"{_history_block(conversation)}\n"
         f"# Task\n{task.strip()}\n"
         f"{note}\n"
         f"# Junior engineer's draft proposal\n"
@@ -361,6 +424,7 @@ def build_solo_prompt(
     repo_path: str,
     repo_status: Optional[Dict] = None,
     house_rules: str = "",
+    conversation: Optional[List[Dict[str, Any]]] = None,
     system: str = "",
 ) -> str:
     """Single-stage prompt used when Solo Mode bypasses the draft stage."""
@@ -368,6 +432,7 @@ def build_solo_prompt(
     return (
         f"{system}\n"
         f"{_rules_block(house_rules)}\n"
-        f"# Context\n{_repo_block(repo_path, repo_status)}\n\n"
+        f"# Context\n{_repo_block(repo_path, repo_status)}\n"
+        f"{_history_block(conversation)}\n"
         f"# Task\n{task.strip()}\n"
     )

@@ -383,9 +383,12 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_body()
         task = body.get("task") or ""
         repo = body.get("repo") or self.app.store.get("target_repo") or ""
+        continue_from = body.get("continue_from") or ""
+        if not isinstance(continue_from, str):
+            raise ValueError("`continue_from` must be a transcript filename.")
         if not repo:
             raise ValueError("No target repository selected.")
-        run = self.app.pipeline.start(task, repo)
+        run = self.app.pipeline.start(task, repo, continue_from=continue_from)
         return {"ok": True, "run": run.to_dict()}
 
     def _api_approve(self, params: Dict[str, list]) -> Dict[str, Any]:

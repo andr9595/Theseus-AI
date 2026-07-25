@@ -529,6 +529,11 @@ const state = {
   busy: false,
   streamLines: [],
   activeTab: 'stream',
+  // The transcript the next run continues, if any. Held as a filename because
+  // that is what the server accepts; the task text is kept alongside it purely
+  // so the composer can name what is being continued.
+  continueFrom: '',
+  continueTask: '',
 };
 
 const STATE_LABELS = {
@@ -568,6 +573,10 @@ function renderStatus() {
 
   $('#cancel-btn').classList.toggle('hidden', !state.busy);
   $('#rollback-btn').classList.toggle('hidden', !(run && run.can_rollback));
+  // A finished run is the one an operator most often wants to follow up on,
+  // so it is offered here rather than only from History.
+  $('#continue-btn').classList.toggle('hidden', !(run && !state.busy && run.file));
+  renderContinuation();
 
   const runBtn = $('#run-btn');
   const hasRepo = !!(state.config && state.config.target_repo);
@@ -589,6 +598,30 @@ function renderStatus() {
         'written to disk yet.</b> Approving lets the senior stage apply changes ' +
         'to your repository.';
   }
+}
+
+/** Show what the next run will be handed, if it is a follow-up. Standing state
+ *  the operator can see and undo — a placeholder would vanish on the first
+ *  keystroke and leave the attachment invisible. */
+function renderContinuation() {
+  $('#continue-banner').classList.toggle('hidden', !state.continueFrom);
+  $('#continue-task').textContent = state.continueTask || 'an earlier run';
+}
+
+/** Attach a transcript to the next run. */
+function continueRun(file, task) {
+  state.continueFrom = file;
+  state.continueTask = (task || '').slice(0, 90);
+  closeModal('history');
+  renderStatus();
+  $('#task-input').focus();
+  toast('That conversation is attached. Type your follow-up.', 'ok', 4200);
+}
+
+function clearContinuation() {
+  state.continueFrom = '';
+  state.continueTask = '';
+  renderContinuation();
 }
 
 /** Which catalogued agent a provider runs, judged by its executable — the
@@ -693,15 +726,25 @@ function usageChipHtml(providerId) {
     const why = u.error || 'Not checked yet.';
     return `<span class="usage-chip none" title="${esc(why)}">quota ?</span>`;
   }
-  const pct = Math.round(u.worst.percent);
-  const level = pct >= 90 ? 'crit' : pct >= 75 ? 'warn' : 'ok';
+  // Lead with the shortest window — Claude's 5-hour session is what actually
+  // stops work; its weekly moves slowly and is the wrong number to read at a
+  // glance. Codex has only a weekly, so that is what it leads with.
+  const lead = u.primary || u.worst;
+  const pct = Math.round(lead.percent);
+  // Colour tracks the *worst* limit, not the one on display: a weekly at 95%
+  // must turn the chip red even while the session sits at 10%.
+  const worstPct = Math.round(u.worst.percent);
+  const level = worstPct >= 90 ? 'crit' : worstPct >= 75 ? 'warn' : 'ok';
+  // Flag when the colour is being driven by a limit other than the number.
+  const hidden = u.worst !== lead && worstPct >= 75 && u.worst.label !== lead.label;
   // Codex's figure comes from its last run's log, not a live query. Mark it
   // once it is old enough to mislead, rather than presenting stale as current.
-  const ageMin = u.worst.as_of ? (Date.now() / 1000 - u.worst.as_of) / 60 : 0;
+  const ageMin = lead.as_of ? (Date.now() / 1000 - lead.as_of) / 60 : 0;
   const stale = ageMin > 30;
-  const tip = u.limits.map(l =>
-    `${l.label}: ${l.percent}% used${l.resets ? ` · resets ${l.resets}` : ''}`
-  ).join('\n')
+  const line = l => `${l.label === lead.label ? '▸ ' : '  '}${l.label}: `
+    + `${l.percent}% used${l.resets ? ` · resets ${l.resets}` : ''}`;
+  const tip = u.limits.map(line).join('\n')
+    + (hidden ? `\n\n${u.worst.label} is the constraint right now.` : '')
     + (u.note ? `\n\n${u.note}` : '')
     + (stale ? `\n(measured ${fmtAge(ageMin)} ago)` : '')
     + (u.error ? `\n\n(last poll failed: ${u.error})` : '');
@@ -709,7 +752,7 @@ function usageChipHtml(providerId) {
     `<button class="usage-chip ${level}" type="button" data-usage-for="${providerId}" ` +
       `title="${esc(tip)}">` +
       `<span class="usage-bar"><span data-fill="${Math.min(100, pct)}"></span></span>` +
-      `${pct}%${stale ? '<span class="usage-stale">*</span>' : ''}` +
+      `${pct}%${hidden ? '<span class="usage-other">!</span>' : ''}${stale ? '<span class="usage-stale">*</span>' : ''}` +
     `</button>`
   );
 }
@@ -1286,8 +1329,12 @@ async function refreshDoctor(show = false) {
 
 /* ---- History ---- */
 
+/** The transcript currently open in the detail pane, with its filename. */
+let openTranscript = null;
+
 async function showHistory() {
   openModal('history');
+  showHistoryList();
   const list = $('#history-list');
   list.innerHTML = '<div class="picker-empty">Loading…</div>';
   try {
@@ -1302,18 +1349,89 @@ async function showHistory() {
         ? `<span class="history-stat"><span class="stat-add">+${stat.insertions || 0}</span> ` +
           `<span class="stat-del">&minus;${stat.deletions || 0}</span></span>`
         : '';
+      // A follow-up is one message in a longer exchange, not a standalone
+      // task; saying so is the difference between a log and a conversation.
+      const thread = r.turns
+        ? `<span class="history-thread">follow-up · ${r.turns + 1} messages</span>`
+        : '';
       return (
-        `<div class="history-row ${esc(r.state)}">` +
+        `<button class="history-row ${esc(r.state)}" type="button" ` +
+          `data-history-file="${esc(r.file)}">` +
           `<div class="history-main">` +
             `<div class="history-task">${esc(r.task || '(no task)')}</div>` +
             `<div class="history-sub">${fmtWhen(r.created_at)} · ${esc(r.state)} ` +
               `${r.zero_touch ? '· zero-touch ' : ''}· ${esc(r.repo || '')}</div>` +
-          `</div>${changed}` +
-        `</div>`
+          `</div>${thread}${changed}` +
+        `</button>`
       );
     }).join('');
   } catch (err) {
     list.innerHTML = `<div class="picker-empty">${esc(err.message)}</div>`;
+  }
+}
+
+function showHistoryList() {
+  openTranscript = null;
+  $('#history-title').textContent = 'Run history';
+  $('#history-detail').classList.add('hidden');
+  $('#history-list').classList.remove('hidden');
+}
+
+function historySection(title, bodyHtml, cls = 'markdown') {
+  if (!bodyHtml) return '';
+  return (
+    `<section class="history-block"><h3>${esc(title)}</h3>` +
+    `<div class="${cls}">${bodyHtml}</div></section>`
+  );
+}
+
+/** One exchange: what the human asked, then what each agent answered. */
+function historyTurn(task, replies, prefix = '') {
+  return (
+    historySection(`${prefix}You asked`, renderMarkdown(task || '(no message)')) +
+    replies.map(r => historySection(
+      `${prefix}${r.label || r.stage || 'Agent'}`,
+      renderMarkdown(r.output || '') ||
+        `<p class="history-none">${esc(r.error || `(${r.state || 'no output'})`)}</p>`
+    )).join('')
+  );
+}
+
+/** Open one persisted run: the whole thread it belongs to, then its result. */
+async function openHistoryRun(file) {
+  const transcript = $('#history-transcript');
+  $('#history-list').classList.add('hidden');
+  $('#history-detail').classList.remove('hidden');
+  $('#history-continue').disabled = true;
+  transcript.innerHTML = '<div class="picker-empty">Loading…</div>';
+
+  try {
+    const { run } = await api(`/api/run?file=${encodeURIComponent(file)}`);
+    openTranscript = { file, run };
+    $('#history-title').textContent =
+      `${fmtWhen(run.created_at)} · ${run.state}`;
+    $('#history-continue').disabled = false;
+
+    // Earlier turns of the same thread travel inside the transcript, so a
+    // follow-up reads as the conversation it was rather than a lone message.
+    const earlier = (run.conversation || [])
+      .map(t => historyTurn(t.task, t.replies || [], 'Earlier · '))
+      .join('');
+    const stages = (run.stage_order || Object.keys(run.stages || {}))
+      .map(id => (run.stages || {})[id])
+      .filter(Boolean);
+
+    transcript.innerHTML =
+      earlier +
+      historyTurn(run.task, stages) +
+      historySection('Your note at the approval gate',
+        renderMarkdown(run.reviewer_note || '')) +
+      historySection('Repository changes',
+        run.diff ? renderDiff(run.diff, run.diff_stat) : '', 'diff-view') +
+      historySection('Rolled back', renderMarkdown(run.rollback_note || '')) +
+      historySection('Error', renderMarkdown(run.error || ''));
+  } catch (err) {
+    transcript.innerHTML = `<div class="picker-empty">${esc(err.message)}</div>`;
   }
 }
 
@@ -1507,7 +1625,13 @@ async function startRun() {
     if (!ok) return;
   }
   try {
-    await api('/api/start', { method: 'POST', body: { task, repo: conf.target_repo } });
+    await api('/api/start', {
+      method: 'POST',
+      body: { task, repo: conf.target_repo, continue_from: state.continueFrom },
+    });
+    // Only once the server has accepted it: a rejected start leaves the
+    // attachment in place so the operator can fix the task and try again.
+    clearContinuation();
   } catch (err) {
     toast(err.message, 'error', 9000);
   }
@@ -1682,6 +1806,32 @@ function wire() {
 
   // -- history ----------------------------------------------------------
   $('#history-btn').addEventListener('click', showHistory);
+  // Delegated: the list is rebuilt every time History opens.
+  $('#history-list').addEventListener('click', (e) => {
+    const row = e.target.closest('[data-history-file]');
+    if (row) openHistoryRun(row.dataset.historyFile);
+  });
+  $('#history-back').addEventListener('click', showHistoryList);
+  $('#history-continue').addEventListener('click', () => {
+    if (!openTranscript) return;
+    // The server enforces this too; checking here turns a rejected run into
+    // an answerable message before anything is started.
+    const repo = (state.config || {}).target_repo || '';
+    if (openTranscript.run.repo !== repo) {
+      toast(
+        `That run was in ${openTranscript.run.repo}. Select it as the target ` +
+        `repository to continue it.`, 'error', 9000
+      );
+      return;
+    }
+    continueRun(openTranscript.file, openTranscript.run.task);
+  });
+
+  // -- continuation -----------------------------------------------------
+  $('#continue-btn').addEventListener('click', () => {
+    if (state.run) continueRun(state.run.file, state.run.task);
+  });
+  $('#continue-clear').addEventListener('click', clearContinuation);
 
   // -- modal dismissal --------------------------------------------------
   $$('[data-close]').forEach(btn =>

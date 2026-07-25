@@ -115,12 +115,21 @@
           <span class="conn-dot"></span><span class="conn-text">connecting</span>
         </span>
         <button id="cancel-btn" class="btn btn-quiet hidden" type="button">Cancel run</button>
+        <button id="continue-btn" class="btn btn-quiet hidden" type="button">Continue this run</button>
         <button id="rollback-btn" class="btn btn-quiet hidden" type="button">Roll back</button>
       </div>
     </header>
 
     <!-- Task composer -->
     <section class="composer" id="composer">
+      <div id="continue-banner" class="continue-banner hidden">
+        <span class="continue-icon" aria-hidden="true">&#8618;</span>
+        <span class="continue-text">
+          Continuing <b id="continue-task"></b> &mdash; the council will be given
+          that exchange as context.
+        </span>
+        <button id="continue-clear" class="link-btn" type="button">Start fresh instead</button>
+      </div>
       <textarea id="task-input" class="task-input" rows="3" spellcheck="false"
         placeholder="Describe the change you want. Be specific about files, behaviour and edge cases&hellip;
 Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP, with tests."></textarea>
@@ -261,10 +270,18 @@ Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP
 <div id="history" class="modal hidden" role="dialog" aria-modal="true" aria-label="Run history">
   <div class="modal-card modal-card-tall">
     <header class="modal-head">
-      <h3>Run history</h3>
+      <h3 id="history-title">Run history</h3>
       <button class="icon-btn" data-close="history" type="button" aria-label="Close">&times;</button>
     </header>
     <div id="history-list" class="history-list"></div>
+    <section id="history-detail" class="history-detail hidden">
+      <div id="history-transcript" class="history-transcript"></div>
+      <footer class="modal-foot">
+        <button id="history-back" class="btn btn-quiet" type="button">&larr; All runs</button>
+        <span class="modal-foot-spacer"></span>
+        <button id="history-continue" class="btn btn-primary" type="button">Continue this run</button>
+      </footer>
+    </section>
   </div>
 </div>
 

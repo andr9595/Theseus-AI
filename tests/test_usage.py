@@ -245,3 +245,89 @@ class TestCodexUsage(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPrimaryLimit(unittest.TestCase):
+    """The chip leads with the window that bites first, not the fullest one.
+
+    Claude's 5-hour session is what actually stops work mid-afternoon; the
+    weekly moves slowly. Codex reports only a weekly, so that is its lead.
+    """
+
+    def _claude(self, session_pct, week_pct):
+        from aicouncil.usage import UsageReading
+
+        return UsageReading(
+            provider_id="polisher",
+            limits=parse_usage(
+                f"Current session: {session_pct}% used · resets Jul 25, 10:49pm\n"
+                f"Current week (all models): {week_pct}% used · resets Jul 31, 2am\n"
+            ),
+        )
+
+    def test_claude_leads_with_the_five_hour_session(self):
+        r = self._claude(38, 22)
+        self.assertEqual(r.primary.label, "session")
+        self.assertEqual(r.primary.percent, 38.0)
+
+    def test_the_session_leads_even_when_the_week_is_fuller(self):
+        # This is the whole point: a 91% weekly must not displace the session
+        # number, but it must still be visible.
+        r = self._claude(12, 91)
+        self.assertEqual(r.primary.label, "session")
+        self.assertEqual(r.primary.percent, 12.0)
+        self.assertEqual(r.worst.label, "week (all models)")
+        self.assertEqual(r.worst.percent, 91.0)
+
+    def test_the_weekly_is_still_reported(self):
+        r = self._claude(38, 22)
+        labels = [l.label for l in r.limits]
+        self.assertIn("week (all models)", labels)
+        self.assertEqual(len(r.limits), 2)
+
+    def test_window_lengths_are_inferred_from_claude_labels(self):
+        from aicouncil.usage import window_for_label
+
+        self.assertEqual(window_for_label("session"), 300.0)
+        self.assertEqual(window_for_label("week (all models)"), 10080.0)
+        self.assertEqual(window_for_label("week (Opus)"), 10080.0)
+        self.assertIsNone(window_for_label("something new"))
+
+    def test_a_shorter_window_would_take_the_lead_automatically(self):
+        # Ranking by length rather than matching the word "session" means a
+        # plan that gains an hourly window is handled without a code change.
+        from aicouncil.usage import Limit, UsageReading
+
+        r = UsageReading(
+            provider_id="polisher",
+            limits=[
+                Limit("session", 40.0, window_minutes=300.0),
+                Limit("hour", 5.0, window_minutes=60.0),
+            ],
+        )
+        self.assertEqual(r.primary.label, "hour")
+
+    def test_codex_leads_with_its_weekly(self):
+        from aicouncil.usage import Limit, UsageReading
+
+        r = UsageReading(
+            provider_id="drafter",
+            limits=[Limit("week", 1.0, window_minutes=10080.0)],
+        )
+        self.assertEqual(r.primary.label, "week")
+
+    def test_unknown_windows_fall_back_to_the_worst(self):
+        from aicouncil.usage import Limit, UsageReading
+
+        r = UsageReading(
+            provider_id="x",
+            limits=[Limit("odd", 10.0), Limit("stranger", 60.0)],
+        )
+        self.assertEqual(r.primary.percent, 60.0)
+
+    def test_both_limits_reach_the_ui_payload(self):
+        payload = self._claude(12, 91).to_dict()
+        self.assertEqual(payload["primary"]["label"], "session")
+        self.assertEqual(payload["worst"]["label"], "week (all models)")
+        self.assertEqual(len(payload["limits"]), 2)
+        self.assertEqual(payload["primary"]["window_minutes"], 300.0)

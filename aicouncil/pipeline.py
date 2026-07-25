@@ -51,6 +51,56 @@ CANCELLED = "cancelled"
 
 TERMINAL_STATES = {COMPLETE, FAILED, CANCELLED}
 
+# How much of one stage's answer a follow-up run carries forward. Bounded here,
+# where the turn is recorded, rather than only at prompt time: a thread copies
+# its predecessor's turns into every new transcript, so an unbounded reply
+# would be duplicated into each one for as long as the thread runs.
+MAX_TURN_CHARS = 12_000
+
+
+def _conversation_turn(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Reduce a persisted transcript to the one turn a follow-up needs.
+
+    Deliberately not the whole transcript: the diff is left behind because the
+    repository already carries it far more accurately than a snapshot taken at
+    the end of a run that may since have been rolled back or hand-edited.
+    """
+    stages = data.get("stages") or {}
+    order = data.get("stage_order") or list(stages)
+    replies = []
+    for stage_id in order:
+        stage = stages.get(stage_id) or {}
+        output = str(stage.get("output") or "").strip()
+        error = str(stage.get("error") or "").strip()
+        if not output and not error:
+            continue
+        replies.append(
+            {
+                "stage": stage_id,
+                "label": str(stage.get("label") or stage_id),
+                "output": prompts.clip(output, MAX_TURN_CHARS),
+                "error": error,
+            }
+        )
+
+    stat = data.get("diff_stat") or {}
+    outcome = str(data.get("state") or "")
+    if stat.get("files"):
+        outcome += (
+            f", {stat['files']} file(s) changed "
+            f"(+{stat.get('insertions', 0)}/-{stat.get('deletions', 0)})"
+        )
+    if data.get("rollback_note"):
+        outcome += ", then rolled back"
+
+    return {
+        "run_id": str(data.get("id") or ""),
+        "task": str(data.get("task") or "").strip(),
+        "replies": replies,
+        "reviewer_note": str(data.get("reviewer_note") or "").strip(),
+        "outcome": outcome,
+    }
+
 
 @dataclass
 class StageRecord:
@@ -107,11 +157,25 @@ class Run:
     reviewer_note: str = ""
     error: str = ""
     rollback_note: str = ""
+    # Continuation lineage. A follow-up run is a new, independently auditable
+    # run that carries the earlier turns of its thread rather than reopening
+    # the transcript it came from.
+    parent_run_id: str = ""
+    conversation: List[Dict[str, Any]] = field(default_factory=list)
     # The configuration this run was started with, read once. Settings changed
     # while the run is parked at the approval gate - including by a second app
     # instance sharing the config file - must not swap the command the human
     # approved, nor the flags it is about to be handed.
     config: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @property
+    def transcript_name(self) -> str:
+        """The filename this run's transcript is persisted under.
+
+        Served with the run so the UI can offer "continue" on a run that has
+        just finished, without having to reconstruct the name itself.
+        """
+        return f"{int(self.created_at)}-{self.id}.json"
 
     def to_dict(self) -> Dict[str, Any]:
         # `config` is deliberately absent: transcripts are rendered in the
@@ -119,6 +183,7 @@ class Run:
         # command in each one is noise rather than history.
         return {
             "id": self.id,
+            "file": self.transcript_name,
             "task": self.task,
             "repo": self.repo,
             "zero_touch": self.zero_touch,
@@ -136,6 +201,8 @@ class Run:
             "reviewer_note": self.reviewer_note,
             "error": self.error,
             "rollback_note": self.rollback_note,
+            "parent_run_id": self.parent_run_id,
+            "conversation": self.conversation,
         }
 
 
@@ -191,8 +258,16 @@ class Pipeline:
 
     # -- control -----------------------------------------------------------
 
-    def start(self, task: str, repo: str) -> Run:
-        """Kick off a new run. Raises PipelineBusy if one is already active."""
+    def start(self, task: str, repo: str, continue_from: str = "") -> Run:
+        """Kick off a new run. Raises PipelineBusy if one is already active.
+
+        ``continue_from`` is the filename of a persisted transcript to continue.
+        Its thread is carried into the new run's prompts, so the agents see
+        what was asked and answered before. Continuation is deliberately
+        provider-neutral - it replays the council's own transcript rather than
+        resuming a CLI's private session, which not every configurable agent
+        has and none of them expose.
+        """
         task = (task or "").strip()
         if not task:
             raise ValueError("Task description is empty.")
@@ -214,6 +289,28 @@ class Pipeline:
                     f"Commit or stash them first."
                 )
 
+        parent_run_id = ""
+        conversation: List[Dict[str, Any]] = []
+        if continue_from:
+            previous = self.load_run(continue_from)
+            if previous is None:
+                raise ValueError(
+                    "That run transcript no longer exists, so there is nothing "
+                    "to continue."
+                )
+            # Both paths came out of `git rev-parse --show-toplevel`, so this
+            # compares canonical roots rather than whatever the operator typed.
+            if str(previous.get("repo") or "") != root:
+                raise ValueError(
+                    "A run can only be continued against the repository it "
+                    "started in."
+                )
+            earlier = previous.get("conversation")
+            if isinstance(earlier, list):
+                conversation.extend(t for t in earlier if isinstance(t, dict))
+            conversation.append(_conversation_turn(previous))
+            parent_run_id = str(previous.get("id") or "")
+
         with self._lock:
             if self.is_busy():
                 raise PipelineBusy("A run is already in progress.")
@@ -232,6 +329,8 @@ class Pipeline:
                 zero_touch=zero_touch,
                 solo=solo,
                 solo_stage=solo_stage,
+                parent_run_id=parent_run_id,
+                conversation=conversation,
                 config=conf,
             )
             if solo:
@@ -417,6 +516,7 @@ class Pipeline:
                 self._set_state(run, DRAFTING)
                 draft_prompt = prompts.build_draft_prompt(
                     run.task, run.repo, repo_status, house_rules,
+                    run.conversation,
                     system=prompts.resolve_system(
                         "drafter", providers.get("drafter", {})
                     ),
@@ -527,6 +627,7 @@ class Pipeline:
             if run.solo:
                 polish_prompt = prompts.build_solo_prompt(
                     run.task, run.repo, repo_status, house_rules,
+                    run.conversation,
                     system=prompts.resolve_system(
                         run.solo_stage, providers.get(run.solo_stage, {})
                     ),
@@ -539,6 +640,7 @@ class Pipeline:
                     repo_status,
                     house_rules,
                     run.reviewer_note,
+                    run.conversation,
                     system=prompts.resolve_system(
                         "polisher", providers.get("polisher", {})
                     ),
@@ -599,7 +701,7 @@ class Pipeline:
     def _persist(self, run: Run) -> None:
         """Write the run transcript to disk for later inspection."""
         try:
-            path = cfg.runs_dir() / f"{int(run.created_at)}-{run.id}.json"
+            path = cfg.runs_dir() / run.transcript_name
             path.write_text(
                 json.dumps(run.to_dict(), indent=2, default=str), encoding="utf-8"
             )
@@ -627,6 +729,10 @@ class Pipeline:
                     "created_at": data.get("created_at"),
                     "zero_touch": data.get("zero_touch"),
                     "diff_stat": data.get("diff_stat") or {},
+                    # How many earlier turns this run was handed, so the list
+                    # can show a follow-up as part of a thread rather than as
+                    # an unrelated one-line task.
+                    "turns": len(data.get("conversation") or []),
                     "file": f.name,
                 }
             )

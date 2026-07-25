@@ -117,6 +117,8 @@ Providers:
 6. **Inspect the result.** The **Diff** tab renders the actual `git diff` of
    your working tree, per file, with line numbers.
 7. **Roll back** if you don't like it. One click restores the tree exactly.
+8. **Or keep going.** **Continue this run** turns the finished run into the
+   first message of a conversation — see [Continuing a run](#continuing-a-run).
 
 ### The tabs
 
@@ -126,6 +128,40 @@ Providers:
 | **Draft** | Stage 1's proposal, rendered as Markdown with highlighted code |
 | **Senior review** | Stage 2's review, change summary and verification notes |
 | **Diff** | The real working-tree diff, syntax-marked and collapsible per file |
+
+---
+
+## Continuing a run
+
+A single task is rarely the whole conversation. **History** in the sidebar
+lists every run; open one to read the exchange it was — your message, what each
+agent answered, the note you left at the approval gate, and the diff that
+resulted. If the run was itself a follow-up, the earlier messages are there
+above it, so the whole thread reads in one place.
+
+**Continue this run** — on the open transcript, or in the top bar as soon as a
+run finishes — attaches that exchange to your next message. The composer says
+what is attached and offers to drop it again. The follow-up is a **new run**
+with its own transcript, approval gate and rollback point; nothing about the
+earlier one is overwritten.
+
+Both stages are given the thread, so the junior drafts with the earlier
+reasoning in view and the senior sees what it already told you.
+
+Two deliberate limits:
+
+- **It replays the council's transcript, not the CLI's session.** `codex` and
+  `claude` each keep their own private session state, but a stage can be any
+  command you configure, and a custom one has no session to resume. Replaying
+  the transcript works for every agent identically.
+- **The repository is the authority, not the recollection.** The prompt says
+  so explicitly, because a remembered run may since have been rolled back or
+  edited over by hand. The old diff is deliberately *not* replayed for the same
+  reason — the working tree already carries it, more accurately.
+
+A thread is bounded at both ends: each stage's answer is trimmed when it is
+recorded, and a long thread is trimmed again when rendered, keeping the most
+recent turns. Continuation only works within the repository the run started in.
 
 ---
 
@@ -378,10 +414,19 @@ two different ways because the CLIs differ:
 | Claude | `claude -p "/usage"` — the slash command, answered locally with no model call | Live; polled at launch and every 5 min |
 | Codex | the `rate_limits` headers it writes to `$CODEX_HOME/sessions/*.jsonl` | As of the last Codex run; marked `*` when older than 30 min |
 
-Hover for every window; click to force a refresh. The chip shows whichever
-window is closest to exhaustion and turns amber at 75%, red at 90%. At 85% a
-run warns first — a warning only, always forceable, because the reading is a
-snapshot and only you know what the task is worth.
+The chip leads with the **shortest window**, because that is the one that
+bites first: Claude's 5-hour session, Codex's weekly. Hover for every window —
+Claude's weekly is listed underneath, with `▸` marking the one on display.
+Click to force a refresh.
+
+Colour comes from the *worst* limit rather than the one displayed, so a weekly
+at 91% turns the chip red even while the session sits at 12%, and a `!` says a
+different limit is the constraint. Showing the short window without that would
+be a comfortable number hiding an imminent wall.
+
+Amber at 75%, red at 90%. At 85% a run warns first — a warning only, always
+forceable, because the reading is a snapshot and only you know what the task
+is worth.
 
 `codex exec "/status"` is **not** how to get this: Codex has no non-interactive
 slash commands, so the text goes to the model as a prompt, costs ~16k tokens,
@@ -428,7 +473,8 @@ place for "use tabs", "never add a dependency without asking", "all new code
 needs tests".
 
 Config lives at `~/.config/ai-council/config.json`. Run transcripts are written
-to `~/.config/ai-council/runs/` and surfaced in the History panel.
+to `~/.config/ai-council/runs/` and surfaced in the History panel, where a run
+can be read in full or [continued](#continuing-a-run).
 
 ---
 
@@ -483,7 +529,7 @@ than loopback is refused outright.
 python3 -m unittest discover -s tests -v
 ```
 
-98 tests, standard library only. They drive real subprocesses, real sockets and
+180 tests, standard library only. They drive real subprocesses, real sockets and
 real git repositories in temporary directories rather than mocking them — the
 parts most likely to break are exactly the ones a mock would paper over.
 
@@ -499,6 +545,9 @@ Coverage focuses on the properties that matter if they're wrong:
   snapshot that failed is never offered as a rollback point.
 - Assigning an agent to a job moves its command **and** its permission flag
   together, so the two can never be mismatched.
+- A continued run carries the earlier exchange to **both** stages, refuses a
+  transcript from another repository, and still works on transcripts written
+  before continuation existed.
 - Cross-origin and bad-token requests are rejected; path traversal is blocked.
 
 ---

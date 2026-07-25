@@ -330,6 +330,24 @@ class TestApi(ServerTestBase):
         status, _ = self.request("/api/approve", method="POST", body={})
         self.assertEqual(status, 400)
 
+    def test_start_rejects_a_continue_from_that_is_not_a_filename(self):
+        status, data = self.request(
+            "/api/start", method="POST",
+            body={"task": "follow up", "repo": str(Path(__file__).parent.parent),
+                  "continue_from": ["not", "a", "filename"]},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("continue_from", data["error"])
+
+    def test_start_rejects_an_unknown_transcript(self):
+        status, data = self.request(
+            "/api/start", method="POST",
+            body={"task": "follow up", "repo": str(Path(__file__).parent.parent),
+                  "continue_from": "1700000000-nosuchrun.json"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("no longer exists", data["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

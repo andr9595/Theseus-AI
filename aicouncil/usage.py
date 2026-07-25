@@ -64,6 +64,10 @@ class Limit:
     label: str
     percent: float
     resets: str = ""
+    # Length of the quota window in minutes, where known. Codex reports it
+    # directly; for Claude it is inferred from the label. Used to decide which
+    # limit the chip leads with - see UsageReading.primary.
+    window_minutes: Optional[float] = None
     # When the figure was measured. Claude's is read live; Codex's comes from
     # its last run's log, and conflating the two would overstate the second.
     as_of: float = 0.0
@@ -74,6 +78,7 @@ class Limit:
             "percent": self.percent,
             "resets": self.resets,
             "as_of": self.as_of,
+            "window_minutes": self.window_minutes,
         }
 
 
@@ -90,20 +95,63 @@ class UsageReading:
 
     @property
     def worst(self) -> Optional[Limit]:
-        """The limit closest to exhaustion - the one worth showing on a chip."""
+        """The limit closest to exhaustion."""
         return max(self.limits, key=lambda l: l.percent) if self.limits else None
+
+    @property
+    def primary(self) -> Optional[Limit]:
+        """The limit to lead with: the shortest window that is known.
+
+        For Claude that is the 5-hour session, which is what actually stops
+        work mid-afternoon; the weekly moves slowly and is the wrong number to
+        read at a glance. Codex reports only a weekly, so it leads with that.
+        Ranking by window length rather than matching the word "session" means
+        a plan that gains a new short window is handled without a change here.
+
+        The chip shows this figure but takes its colour from ``worst``, so a
+        nearly-exhausted weekly still turns it red rather than hiding behind a
+        comfortable session number.
+        """
+        if not self.limits:
+            return None
+        known = [l for l in self.limits if l.window_minutes]
+        if known:
+            return min(known, key=lambda l: l.window_minutes)
+        return self.worst
 
     def to_dict(self) -> Dict[str, Any]:
         worst = self.worst
+        primary = self.primary
         return {
             "provider_id": self.provider_id,
             "supported": self.supported,
             "limits": [l.to_dict() for l in self.limits],
             "worst": worst.to_dict() if worst else None,
+            "primary": primary.to_dict() if primary else None,
             "checked_at": self.checked_at,
             "error": self.error,
             "note": self.note,
         }
+
+
+# Claude reports a label, not a duration. These are the windows those labels
+# correspond to, so the shortest-window rule below can rank them against
+# Codex's numeric ones.
+CLAUDE_WINDOWS = (
+    ("session", 300.0),   # the 5-hour rolling window
+    ("day", 1440.0),
+    ("week", 10080.0),
+    ("month", 43200.0),
+)
+
+
+def window_for_label(label: str) -> Optional[float]:
+    """Best guess at a window length from a Claude usage label."""
+    low = (label or "").lower()
+    for token, minutes in CLAUDE_WINDOWS:
+        if token in low:
+            return minutes
+    return None
 
 
 def parse_usage(text: str) -> List[Limit]:
@@ -115,8 +163,14 @@ def parse_usage(text: str) -> List[Limit]:
         except (TypeError, ValueError):
             continue
         resets = (m.group("resets") or "").strip()
+        label = m.group("label").strip()
         limits.append(
-            Limit(label=m.group("label").strip(), percent=pct, resets=resets)
+            Limit(
+                label=label,
+                percent=pct,
+                resets=resets,
+                window_minutes=window_for_label(label),
+            )
         )
     return limits
 
@@ -250,12 +304,17 @@ def _parse_codex_rate_limits(payload: Dict[str, Any], as_of: float) -> List[Limi
                 resets = time.strftime("%b %-d, %-I:%M%p", time.localtime(float(stamp)))
             except (TypeError, ValueError, OSError):
                 resets = ""
+        try:
+            window = float(entry.get("window_minutes"))
+        except (TypeError, ValueError):
+            window = None
         limits.append(
             Limit(
                 label=_window_label(entry.get("window_minutes")),
                 percent=pct,
                 resets=resets,
                 as_of=as_of,
+                window_minutes=window,
             )
         )
     return limits
