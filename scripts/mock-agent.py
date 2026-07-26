@@ -49,11 +49,15 @@ def read_prompt(argv_prompt: str | None) -> str:
 
 
 def summarise_task(prompt: str) -> str:
-    """Pull the task text back out of the generated prompt."""
-    marker = "# Task"
-    if marker in prompt:
-        tail = prompt.split(marker, 1)[1].strip()
-        return tail.splitlines()[0] if tail else "(empty task)"
+    """Pull the task text back out of the generated prompt.
+
+    Solo Mode sends the message on its own when nothing else is configured, so
+    the fall-through is the answer there rather than a last resort.
+    """
+    for marker in ("# Task", "# Message"):
+        if marker in prompt:
+            tail = prompt.split(marker, 1)[1].strip()
+            return tail.splitlines()[0] if tail else "(empty task)"
     return (prompt.strip().splitlines() or ["(empty task)"])[0]
 
 
@@ -166,9 +170,30 @@ def run_polisher(task: str, write: bool) -> int:
     return 0
 
 
+def run_solo(task: str) -> int:
+    """Answer the message. Solo Mode is a conversation, so nothing is written."""
+    emit(f"You asked: **{task}**")
+    emit()
+    emit(
+        "I am the mock assistant. Solo Mode runs one agent with no draft "
+        "stage, no approval gate and no write permission, so this is a reply "
+        "rather than a change to your repository."
+    )
+    files = repo_files(6)
+    if files:
+        emit()
+        emit("From here I can see:")
+        emit()
+        for f in files:
+            emit(f"- `{f}`")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Mock agent CLI for AI Council.")
-    parser.add_argument("--role", choices=["drafter", "polisher"], default="drafter")
+    parser.add_argument(
+        "--role", choices=["drafter", "polisher", "solo"], default="drafter"
+    )
     parser.add_argument("--version", action="version", version="mock-agent 1.0.0")
     parser.add_argument("prompt", nargs="?", default=None)
     # Accept and ignore the auto-approve flags so the Zero-Touch code path can
@@ -198,6 +223,8 @@ def main() -> int:
         print("mock-agent: simulated failure", file=sys.stderr, flush=True)
         return 3
 
+    if args.role == "solo":
+        return run_solo(task)
     if args.role == "drafter":
         return run_drafter(task)
     # The senior stage only writes when it has been granted permission, which

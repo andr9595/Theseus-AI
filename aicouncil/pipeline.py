@@ -1,12 +1,15 @@
 """The Junior Draft / Senior Polish orchestration engine.
 
-State machine
--------------
+Two modes, and they share only their start: Council is the pipeline below,
+Solo is one assistant answering one message.
+
+State machine (Council)
+-----------------------
 
     idle
       |  start()
       v
-    drafting                (skipped in Solo Mode)
+    drafting
       |
       v
     awaiting_approval       (skipped in Zero-Touch Mode)
@@ -16,6 +19,16 @@ State machine
       |
       +--> complete  (exit 0)
       +--> failed    (non-zero exit, timeout, or an unhandled error)
+
+State machine (Solo)
+--------------------
+
+    idle -> running -> complete | failed | cancelled
+
+Solo has no gate, no delivery branch, no safety snapshot and no diff, because
+it never writes: its provider is invoked with ``read_only_args`` instead of
+ever being granted the auto-approve flags. What it is for is a conversation
+with one agent about a repository, and what it produces is an answer.
 
 Permission to write to disk is carried by ``execute_approved``. It is true
 only when Zero-Touch Mode granted it up front or a human granted it at the
@@ -51,6 +64,9 @@ IDLE = "idle"
 DRAFTING = "drafting"
 AWAITING_APPROVAL = "awaiting_approval"
 POLISHING = "polishing"
+# Solo's only working state. Its own rather than a reused POLISHING: nothing
+# is being polished, and a state name that lies shows up in the status pill.
+RUNNING = "running"
 COMPLETE = "complete"
 FAILED = "failed"
 CANCELLED = "cancelled"
@@ -156,7 +172,7 @@ def _pull_request_text(run: Run) -> Tuple[str, str]:
     if len(task) > MAX_PR_TITLE_CHARS:
         title = title.rsplit(" ", 1)[0] + "..."
 
-    stage = run.stages.get(run.solo_stage if run.solo else "polisher")
+    stage = run.stages.get("polisher")
     summary = prompts.clip((stage.output if stage else "").strip(), MAX_PR_BODY_CHARS)
 
     lines = [f"**Task**\n\n{task}", ""]
@@ -218,8 +234,7 @@ class Run:
     task: str
     repo: str
     zero_touch: bool
-    solo: bool
-    solo_stage: str = "polisher"  # which provider Solo Mode runs
+    mode: str = "council"  # "council" | "solo"
     # Pull-request delivery. The branch is named at start but only created
     # after write permission is granted, so a rejected run leaves no trace.
     pull_request_mode: bool = False
@@ -252,6 +267,11 @@ class Run:
     config: Dict[str, Any] = field(default_factory=dict, repr=False)
 
     @property
+    def solo(self) -> bool:
+        """Whether this is a Solo conversation rather than a council run."""
+        return self.mode == "solo"
+
+    @property
     def transcript_name(self) -> str:
         """The filename this run's transcript is persisted under.
 
@@ -270,8 +290,10 @@ class Run:
             "task": self.task,
             "repo": self.repo,
             "zero_touch": self.zero_touch,
+            "mode": self.mode,
+            # Kept alongside `mode` for transcripts written by, and read by,
+            # a version that only knew the boolean.
             "solo": self.solo,
-            "solo_stage": self.solo_stage,
             "pull_request_mode": self.pull_request_mode,
             "base_branch": self.base_branch,
             "work_branch": self.work_branch,
@@ -280,7 +302,9 @@ class Run:
             "created_at": self.created_at,
             "ended_at": self.ended_at,
             "stages": {k: v.to_dict() for k, v in self.stages.items()},
-            "stage_order": [s for s in ("drafter", "polisher") if s in self.stages],
+            "stage_order": [
+                s for s in ("solo", "drafter", "polisher") if s in self.stages
+            ],
             "diff": self.diff,
             "diff_stat": self.diff_stat,
             "snapshot": self.snapshot.to_dict() if self.snapshot else None,
@@ -362,7 +386,9 @@ class Pipeline:
             # duplicated in the browser, so the shipped text has one home.
             "roles": prompts.role_catalog(self.store.get("roles", {})),
             "providers_status": [
-                probe(providers[k]) for k in ("drafter", "polisher") if k in providers
+                probe(providers[k])
+                for k in ("drafter", "polisher", "solo")
+                if k in providers
             ],
         }
 
@@ -406,7 +432,13 @@ class Pipeline:
             )
 
         conf = self.store.all()
-        pull_request_mode = bool(conf.get("pull_request_mode"))
+        mode = str(conf.get("mode") or "council")
+        if mode not in ("council", "solo"):
+            mode = "council"
+        # Delivery is council machinery. Solo never writes, never branches and
+        # never commits, so there is nothing here for these to protect - and
+        # refusing a conversation because the tree is dirty would be absurd.
+        pull_request_mode = mode == "council" and bool(conf.get("pull_request_mode"))
         if pull_request_mode:
             # Stricter than the toggle below and checked whether or not it is
             # on: every precondition for committing, pushing and opening the PR
@@ -414,7 +446,7 @@ class Pipeline:
             blocker = gitutil.pull_request_blocker(root)
             if blocker:
                 raise ValueError(blocker)
-        elif conf.get("require_clean_worktree"):
+        elif mode == "council" and conf.get("require_clean_worktree"):
             st = gitutil.status(root)
             if not st.clean:
                 raise ValueError(
@@ -439,6 +471,18 @@ class Pipeline:
                     "A run can only be continued against the repository it "
                     "started in."
                 )
+            # A council thread replayed into a plain conversation reads as an
+            # agent talking to itself about a draft that no longer exists, and
+            # the reverse hands the council a transcript with no stages in it.
+            # `solo` covers transcripts written before `mode` existed.
+            previous_mode = str(previous.get("mode") or "") or (
+                "solo" if previous.get("solo") else "council"
+            )
+            if previous_mode != mode:
+                raise ValueError(
+                    f"That is a {previous_mode} conversation. Switch to "
+                    f"{previous_mode.title()} mode to continue it."
+                )
             earlier = previous.get("conversation")
             if isinstance(earlier, list):
                 conversation.extend(t for t in earlier if isinstance(t, dict))
@@ -454,12 +498,9 @@ class Pipeline:
             if self.is_busy():
                 raise PipelineBusy("A run is already in progress.")
 
-            solo = bool(conf.get("solo_mode"))
-            zero_touch = bool(conf.get("zero_touch"))
+            # Zero-Touch grants write permission, and Solo has none to grant.
+            zero_touch = mode == "council" and bool(conf.get("zero_touch"))
             providers = conf.get("providers", {})
-            solo_stage = str(conf.get("solo_stage") or "polisher")
-            if solo_stage not in providers:
-                solo_stage = "polisher"
 
             run_id = uuid.uuid4().hex[:12]
             run = Run(
@@ -467,8 +508,7 @@ class Pipeline:
                 task=task,
                 repo=root,
                 zero_touch=zero_touch,
-                solo=solo,
-                solo_stage=solo_stage,
+                mode=mode,
                 pull_request_mode=pull_request_mode,
                 # Whatever is checked out is what the pull request targets, so
                 # this works for main, master or a release branch without
@@ -484,15 +524,15 @@ class Pipeline:
                 ),
                 config=conf,
             )
-            if solo:
-                # One stage, and it is whichever provider the operator chose -
-                # it does the senior's job, so it is labelled for that, not for
-                # the slot it happens to be configured in.
-                p = providers.get(solo_stage, {})
-                run.stages[solo_stage] = StageRecord(
-                    id=solo_stage,
-                    label=p.get("label", solo_stage),
-                    role="Solo",
+            if mode == "solo":
+                # One agent with a configuration of its own. Recorded as a
+                # stage because that is how output, timings and the command
+                # echo are carried to the UI - not because it is one.
+                p = providers.get("solo", {})
+                run.stages["solo"] = StageRecord(
+                    id="solo",
+                    label=p.get("label", "Assistant"),
+                    role="Assistant",
                     model=str(p.get("model") or ""),
                     effort=str(p.get("effort") or ""),
                 )
@@ -626,6 +666,7 @@ class Pipeline:
         provider: Dict[str, Any],
         prompt: str,
         auto_approve: bool,
+        read_only: bool = False,
     ) -> ProviderResult:
         """Run one stage. ``provider`` comes from the run's frozen config."""
         stage = run.stages[stage_id]
@@ -641,7 +682,9 @@ class Pipeline:
             if self._cancel_requested:
                 runner.cancel()
 
-        result = runner.run(prompt, cwd=run.repo, auto_approve=auto_approve)
+        result = runner.run(
+            prompt, cwd=run.repo, auto_approve=auto_approve, read_only=read_only
+        )
 
         with self._lock:
             self._runner = None
@@ -662,213 +705,232 @@ class Pipeline:
         return result
 
     def _execute(self, run: Run) -> None:
-        """Worker-thread body for one run."""
-        conf = run.config
-        providers = conf.get("providers", {})
-        house_rules = conf.get("house_rules", "")
-        repo_status = gitutil.status(run.repo).to_dict()
-        # In Solo Mode the single stage is whichever provider the operator
-        # picked; otherwise the stage that writes is always the polisher slot.
-        final_stage = run.solo_stage if run.solo else "polisher"
-
+        """Worker-thread body for one run, in whichever mode it was started."""
         try:
-            draft_text = ""
-            # Whether Stage 2 may modify files. Zero-Touch grants this up
-            # front; otherwise it is granted by the human at the approval
-            # gate. Reaching Stage 2 without it would hand the CLI a task it
-            # cannot complete: it would block on an interactive permission
-            # prompt that nothing in this pipeline can answer.
-            execute_approved = run.zero_touch
-            # Set when Stage 1 fails, which forces the gate back on.
-            draft_failed = False
-
-            # ---- Stage 1: Junior Draft ----------------------------------
-            if not run.solo:
-                self._set_state(run, DRAFTING)
-                draft_prompt = prompts.build_draft_prompt(
-                    run.task, run.repo, repo_status, house_rules,
-                    run.conversation,
-                    system=prompts.resolve_system(
-                        "drafter", providers.get("drafter", {}),
-                        conf.get("roles", {}),
-                    ),
-                )
-                # Stage 1 is read-only by instruction, so it never receives the
-                # auto-approve flags regardless of the Zero-Touch setting.
-                result = self._run_stage(
-                    run,
-                    "drafter",
-                    providers.get("drafter", {}),
-                    draft_prompt,
-                    auto_approve=False,
-                )
-
-                if self._is_cancelled():
-                    self._finish_cancelled(run)
-                    return
-
-                if not result.ok:
-                    # A failed junior is recoverable - the senior can work from
-                    # the task alone - but it is not what the operator asked
-                    # for. Continuing unattended would turn "junior drafts,
-                    # senior verifies" into a solo agent writing to the repo
-                    # with no draft and nobody watching, which is a combination
-                    # nobody selected. Degrade to the approval gate instead of
-                    # escalating past it; the operator can still approve.
-                    draft_failed = True
-                    self.bus.publish(
-                        "log",
-                        level="warn",
-                        message=(
-                            f"Draft stage failed ({result.error}). "
-                            + (
-                                "Pausing for approval: Zero-Touch assumes a "
-                                "draft to verify, and there is none."
-                                if run.zero_touch
-                                else "The senior stage can continue alone."
-                            )
-                        ),
-                    )
-                draft_text = result.stdout
-
-            # ---- Approval gate ----------------------------------------------
-            # Shown whenever Zero-Touch is off, including in Solo Mode where
-            # there is no draft to read - the operator is still approving that
-            # an agent may write to their repository.
-            if not run.zero_touch or draft_failed:
-                self._set_state(run, AWAITING_APPROVAL, draft=draft_text)
-                self.bus.publish(
-                    "log",
-                    level="info",
-                    message=(
-                        "Paused for review. Nothing has been written to disk yet."
-                        if not draft_failed
-                        else "Paused for review: the draft stage failed, so there "
-                             "is nothing to verify. Approving runs the senior "
-                             "stage alone against your task."
-                    ),
-                )
-                self._gate.wait()
-                with self._lock:
-                    decision = self._gate_decision
-                if decision != "approve" or self._is_cancelled():
-                    self._finish_cancelled(run, "Rejected at the approval gate.")
-                    return
-                execute_approved = True
-
-            # ---- Delivery branch ----------------------------------------
-            # Created here, after permission to write has been granted, so
-            # rejecting at the gate still leaves the repository untouched.
-            if run.pull_request_mode:
-                gitutil.create_branch(run.repo, run.work_branch)
-                self.bus.publish(
-                    "log",
-                    level="info",
-                    message=(
-                        f"Working on {run.work_branch}. {run.base_branch} will "
-                        f"not change until you merge the pull request."
-                    ),
-                )
-
-            # ---- Safety snapshot ----------------------------------------
-            # Taken immediately before the only stage that writes to disk.
-            if conf.get("safety_snapshot", True):
-                try:
-                    run.snapshot = gitutil.take_snapshot(run.repo)
-                    if run.snapshot:
-                        self.bus.publish(
-                            "log",
-                            level="info",
-                            message=f"Safety snapshot taken at {run.snapshot.head[:8]}.",
-                        )
-                    else:
-                        self.bus.publish(
-                            "log",
-                            level="warn",
-                            message=(
-                                "No safety snapshot: this repository has no commits "
-                                "yet, so there is no state to restore. Rollback is "
-                                "unavailable for this run."
-                            ),
-                        )
-                except (gitutil.GitError, OSError) as exc:
-                    # Leave no half-snapshot behind: an object that cannot
-                    # restore anything must not be offered as a rollback point.
-                    run.snapshot = None
-                    self.bus.publish(
-                        "log",
-                        level="warn",
-                        message=(
-                            f"Could not take a safety snapshot ({exc}). "
-                            f"Rollback is unavailable for this run."
-                        ),
-                    )
-
-            if self._is_cancelled():
-                self._finish_cancelled(run)
-                return
-
-            # ---- Stage 2: Senior Polish ---------------------------------
-            self._set_state(run, POLISHING)
             if run.solo:
-                polish_prompt = prompts.build_solo_prompt(
-                    run.task, run.repo, repo_status, house_rules,
-                    run.conversation,
-                    system=prompts.resolve_system(
-                        run.solo_stage, providers.get(run.solo_stage, {}),
-                        conf.get("roles", {}),
-                    ),
-                )
+                self._execute_solo(run)
             else:
-                polish_prompt = prompts.build_polish_prompt(
-                    run.task,
-                    draft_text,
-                    run.repo,
-                    repo_status,
-                    house_rules,
-                    run.reviewer_note,
-                    run.conversation,
-                    system=prompts.resolve_system(
-                        "polisher", providers.get("polisher", {}),
-                        conf.get("roles", {}),
-                    ),
-                )
-
-            result = self._run_stage(
-                run,
-                final_stage,
-                providers.get(final_stage, {}),
-                polish_prompt,
-                auto_approve=execute_approved,
-            )
-
-            # ---- Collect the diff ---------------------------------------
-            try:
-                run.diff = gitutil.working_diff(run.repo)
-                run.diff_stat = gitutil.diff_stat(run.repo)
-            except (gitutil.GitError, OSError) as exc:
-                self.bus.publish(
-                    "log", level="warn", message=f"Could not read the diff: {exc}"
-                )
-
-            if self._is_cancelled():
-                self._finish_cancelled(run)
-                return
-
-            if not result.ok:
-                run.error = result.error or "The senior stage failed."
-                self._set_state(run, FAILED)
-            elif run.pull_request_mode:
-                self._publish(run)
-                self._set_state(run, FAILED if run.error else COMPLETE)
-            else:
-                self._set_state(run, COMPLETE)
-
+                self._execute_council(run)
         except Exception as exc:  # a crash here must not wedge the engine
             run.error = f"{type(exc).__name__}: {exc}"
             self._set_state(run, FAILED)
         finally:
             self._persist(run)
+
+    def _execute_solo(self, run: Run) -> None:
+        """One assistant, one message, one answer.
+
+        No gate, no branch, no snapshot and no diff: there is nothing between
+        the message and the reply to review, and the provider is invoked
+        read-only so there is nothing to recover from either.
+        """
+        provider = (run.config.get("providers") or {}).get("solo", {})
+        self._set_state(run, RUNNING)
+        result = self._run_stage(
+            run,
+            "solo",
+            provider,
+            prompts.build_chat_prompt(
+                run.task,
+                run.conversation,
+                behavior=str(provider.get("behavior") or ""),
+            ),
+            auto_approve=False,
+            read_only=True,
+        )
+
+        if self._is_cancelled():
+            self._finish_cancelled(run)
+        elif not result.ok:
+            run.error = result.error or "The assistant failed."
+            self._set_state(run, FAILED)
+        else:
+            self._set_state(run, COMPLETE)
+
+    def _execute_council(self, run: Run) -> None:
+        """Worker-thread body for one council run: draft, gate, polish, deliver."""
+        conf = run.config
+        providers = conf.get("providers", {})
+        house_rules = conf.get("house_rules", "")
+        repo_status = gitutil.status(run.repo).to_dict()
+
+        draft_text = ""
+        # Whether Stage 2 may modify files. Zero-Touch grants this up front;
+        # otherwise it is granted by the human at the approval gate. Reaching
+        # Stage 2 without it would hand the CLI a task it cannot complete: it
+        # would block on an interactive permission prompt that nothing in this
+        # pipeline can answer.
+        execute_approved = run.zero_touch
+        # Set when Stage 1 fails, which forces the gate back on.
+        draft_failed = False
+
+        # ---- Stage 1: Junior Draft --------------------------------------
+        self._set_state(run, DRAFTING)
+        draft_prompt = prompts.build_draft_prompt(
+            run.task, run.repo, repo_status, house_rules,
+            run.conversation,
+            system=prompts.resolve_system(
+                "drafter", providers.get("drafter", {}),
+                conf.get("roles", {}),
+            ),
+        )
+        # Stage 1 is read-only by instruction, so it never receives the
+        # auto-approve flags regardless of the Zero-Touch setting.
+        result = self._run_stage(
+            run,
+            "drafter",
+            providers.get("drafter", {}),
+            draft_prompt,
+            auto_approve=False,
+        )
+
+        if self._is_cancelled():
+            self._finish_cancelled(run)
+            return
+
+        if not result.ok:
+            # A failed junior is recoverable - the senior can work from the
+            # task alone - but it is not what the operator asked for.
+            # Continuing unattended would turn "junior drafts, senior
+            # verifies" into a lone agent writing to the repo with no draft
+            # and nobody watching, which is a combination nobody selected.
+            # Degrade to the approval gate instead of escalating past it; the
+            # operator can still approve.
+            draft_failed = True
+            self.bus.publish(
+                "log",
+                level="warn",
+                message=(
+                    f"Draft stage failed ({result.error}). "
+                    + (
+                        "Pausing for approval: Zero-Touch assumes a draft to "
+                        "verify, and there is none."
+                        if run.zero_touch
+                        else "The senior stage can continue alone."
+                    )
+                ),
+            )
+        draft_text = result.stdout
+
+        # ---- Approval gate ----------------------------------------------
+        if not run.zero_touch or draft_failed:
+            self._set_state(run, AWAITING_APPROVAL, draft=draft_text)
+            self.bus.publish(
+                "log",
+                level="info",
+                message=(
+                    "Paused for review. Nothing has been written to disk yet."
+                    if not draft_failed
+                    else "Paused for review: the draft stage failed, so there "
+                         "is nothing to verify. Approving runs the senior "
+                         "stage alone against your task."
+                ),
+            )
+            self._gate.wait()
+            with self._lock:
+                decision = self._gate_decision
+            if decision != "approve" or self._is_cancelled():
+                self._finish_cancelled(run, "Rejected at the approval gate.")
+                return
+            execute_approved = True
+
+        # ---- Delivery branch --------------------------------------------
+        # Created here, after permission to write has been granted, so
+        # rejecting at the gate still leaves the repository untouched.
+        if run.pull_request_mode:
+            gitutil.create_branch(run.repo, run.work_branch)
+            self.bus.publish(
+                "log",
+                level="info",
+                message=(
+                    f"Working on {run.work_branch}. {run.base_branch} will "
+                    f"not change until you merge the pull request."
+                ),
+            )
+
+        # ---- Safety snapshot --------------------------------------------
+        # Taken immediately before the only stage that writes to disk.
+        if conf.get("safety_snapshot", True):
+            try:
+                run.snapshot = gitutil.take_snapshot(run.repo)
+                if run.snapshot:
+                    self.bus.publish(
+                        "log",
+                        level="info",
+                        message=f"Safety snapshot taken at {run.snapshot.head[:8]}.",
+                    )
+                else:
+                    self.bus.publish(
+                        "log",
+                        level="warn",
+                        message=(
+                            "No safety snapshot: this repository has no commits "
+                            "yet, so there is no state to restore. Rollback is "
+                            "unavailable for this run."
+                        ),
+                    )
+            except (gitutil.GitError, OSError) as exc:
+                # Leave no half-snapshot behind: an object that cannot restore
+                # anything must not be offered as a rollback point.
+                run.snapshot = None
+                self.bus.publish(
+                    "log",
+                    level="warn",
+                    message=(
+                        f"Could not take a safety snapshot ({exc}). "
+                        f"Rollback is unavailable for this run."
+                    ),
+                )
+
+        if self._is_cancelled():
+            self._finish_cancelled(run)
+            return
+
+        # ---- Stage 2: Senior Polish -------------------------------------
+        self._set_state(run, POLISHING)
+        polish_prompt = prompts.build_polish_prompt(
+            run.task,
+            draft_text,
+            run.repo,
+            repo_status,
+            house_rules,
+            run.reviewer_note,
+            run.conversation,
+            system=prompts.resolve_system(
+                "polisher", providers.get("polisher", {}),
+                conf.get("roles", {}),
+            ),
+        )
+
+        result = self._run_stage(
+            run,
+            "polisher",
+            providers.get("polisher", {}),
+            polish_prompt,
+            auto_approve=execute_approved,
+        )
+
+        # ---- Collect the diff -------------------------------------------
+        try:
+            run.diff = gitutil.working_diff(run.repo)
+            run.diff_stat = gitutil.diff_stat(run.repo)
+        except (gitutil.GitError, OSError) as exc:
+            self.bus.publish(
+                "log", level="warn", message=f"Could not read the diff: {exc}"
+            )
+
+        if self._is_cancelled():
+            self._finish_cancelled(run)
+            return
+
+        if not result.ok:
+            run.error = result.error or "The senior stage failed."
+            self._set_state(run, FAILED)
+        elif run.pull_request_mode:
+            self._publish(run)
+            self._set_state(run, FAILED if run.error else COMPLETE)
+        else:
+            self._set_state(run, COMPLETE)
 
     def _publish(self, run: Run) -> None:
         """Commit, push and open the pull request. Records failure on the run.
@@ -939,11 +1001,15 @@ class Pipeline:
                     f"{run.base_branch} is unchanged."
                 ),
             )
-        try:
-            run.diff = gitutil.working_diff(run.repo)
-            run.diff_stat = gitutil.diff_stat(run.repo)
-        except (gitutil.GitError, OSError):
-            pass
+        # Only a council run can have changed the tree. Reading a diff after a
+        # cancelled conversation would attribute the operator's own
+        # uncommitted work to an agent that never had permission to write.
+        if not run.solo:
+            try:
+                run.diff = gitutil.working_diff(run.repo)
+                run.diff_stat = gitutil.diff_stat(run.repo)
+            except (gitutil.GitError, OSError):
+                pass
         self._set_state(run, CANCELLED)
         self._persist(run)
 
@@ -1013,6 +1079,11 @@ class Pipeline:
                     "repo": data.get("repo"),
                     "state": data.get("state"),
                     "created_at": data.get("created_at"),
+                    # Served so the browser can switch to the right mode before
+                    # continuing, rather than let the server refuse it after.
+                    # `solo` covers transcripts written before `mode` existed.
+                    "mode": str(data.get("mode") or "")
+                            or ("solo" if data.get("solo") else "council"),
                     "zero_touch": data.get("zero_touch"),
                     "diff_stat": data.get("diff_stat") or {},
                     # Every earlier turn, plus this run's own message.

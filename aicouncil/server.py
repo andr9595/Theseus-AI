@@ -334,6 +334,11 @@ class Handler(BaseHTTPRequestHandler):
         # These are derived/runtime values; refuse to let the client set them.
         for protected in ("version",):
             patch.pop(protected, None)
+        # Mode decides which pipeline a run takes and which controls the UI
+        # shows. An unknown value would be stored, read back as "not council"
+        # by nothing and as council by everything, so refuse it here.
+        if "mode" in patch and patch["mode"] not in ("council", "solo"):
+            raise ValueError("Mode must be either 'council' or 'solo'.")
         conf = self.app.store.update(patch)
         self.app.bus.publish("config", config=conf)
         return {"ok": True, "config": conf}
@@ -377,7 +382,9 @@ class Handler(BaseHTTPRequestHandler):
             "runs_path": str(self.app.pipeline.runs_dir),
             "uptime": round(time.time() - self.app.started_at, 1),
             "providers": [
-                probe(providers[k]) for k in ("drafter", "polisher") if k in providers
+                probe(providers[k])
+                for k in ("drafter", "polisher", "solo")
+                if k in providers
             ],
         }
 

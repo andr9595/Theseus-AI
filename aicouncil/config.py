@@ -95,6 +95,12 @@ AGENTS: Dict[str, Dict[str, Any]] = {
         # clears the other's streaming flags instead of leaving them behind on
         # a binary that does not accept them.
         "stream_args": [],
+        # The mirror image of `auto_approve_args`, appended only in Solo Mode.
+        # A solo conversation has no approval gate, no snapshot and no diff, so
+        # it is never granted write permission - and a CLI that discovers that
+        # halfway through a task stalls on a prompt nothing here can answer.
+        # Saying so up front turns that into an answer instead.
+        "read_only_args": ["--sandbox", "read-only"],
     },
     "claude": {
         "label": "Claude",
@@ -111,6 +117,10 @@ AGENTS: Dict[str, Dict[str, Any]] = {
         # instead; `providers.py` translates them back into readable lines.
         # `--verbose` is not decoration - the CLI refuses stream-json without it.
         "stream_args": ["--output-format", "stream-json", "--verbose"],
+        # Claude's read-only mode. It still reads the repository and still
+        # answers; what it will not do is edit, which is the whole difference
+        # between a conversation and a run.
+        "read_only_args": ["--permission-mode", "plan"],
     },
 }
 
@@ -150,6 +160,7 @@ def agent_catalog() -> List[Dict[str, Any]]:
         "model_args": [],
         "effort_args": [],
         "stream_args": [],
+        "read_only_args": [],
     })
     return catalog
 
@@ -226,9 +237,40 @@ DEFAULT_POLISHER = {
     **copy.deepcopy(AGENTS["claude"]),
 }
 
+# Solo Mode's single assistant. Not a third council stage: it has no draft to
+# receive, nothing to hand on to, and therefore no role in the pipeline sense.
+DEFAULT_SOLO = {
+    "id": "solo",
+    # --- Behaviour ----------------------------------------------------------
+    # Free text put in front of the message, and the only instruction this
+    # assistant ever carries. Empty by default and left empty until the
+    # operator writes something: opening a plain conversation should not
+    # quietly enrol the agent in a persona nobody asked for. That is the
+    # difference between this and a stage's `role_system`, where blank means
+    # "fall back to the template".
+    "behavior": "",
+    "prompt_on_stdin": False,
+    "timeout_seconds": 1800,
+    "cwd_mode": "repo",
+    # --- Model selection ----------------------------------------------------
+    "model": "",
+    "models": [],
+    # --- Reasoning effort ---------------------------------------------------
+    "effort": "",
+    # --- Agent --------------------------------------------------------------
+    **copy.deepcopy(AGENTS["claude"]),
+}
+
 DEFAULTS: Dict[str, Any] = {
     "version": 1,
-    # --- Pipeline behaviour -------------------------------------------------
+    # --- Mode ---------------------------------------------------------------
+    # Which of the two products the next message starts. Council is the
+    # Junior Draft / Senior Polish pipeline; Solo is one assistant answering
+    # directly. Not a modifier on the pipeline - Solo has no draft, no gate,
+    # no delivery and no diff, and the two share only the target repository
+    # and the conversation store.
+    "mode": "council",
+    # --- Pipeline behaviour (Council only) ----------------------------------
     # Zero-Touch: run start-to-finish with no human gate, passing the CLIs'
     # auto-approve flags. OFF by default - opting in to autonomous file
     # modification should always be a deliberate act.
@@ -243,11 +285,6 @@ DEFAULTS: Dict[str, Any] = {
     # base branch is then only ever changed by a human merging that PR. Implies
     # a clean starting tree regardless of the toggle above - see gitutil.
     "pull_request_mode": False,
-    # Skip Stage 1 and run the task through a single agent.
-    "solo_mode": False,
-    # Which stage's configuration that single agent comes from. Either slot
-    # can hold either agent, so this is how Solo Mode picks who works alone.
-    "solo_stage": "polisher",
     # --- Target -------------------------------------------------------------
     "target_repo": "",
     "recent_repos": [],
@@ -255,9 +292,11 @@ DEFAULTS: Dict[str, Any] = {
     "providers": {
         "drafter": DEFAULT_DRAFTER,
         "polisher": DEFAULT_POLISHER,
+        "solo": DEFAULT_SOLO,
     },
     # --- Prompting ----------------------------------------------------------
-    # Extra standing instructions appended to both stages.
+    # Extra standing instructions appended to both council stages. Solo does
+    # not get them: it is a conversation, not a run against this project.
     "house_rules": "",
     # What the context meter's percentage is measured against. A figure to edit
     # rather than one to trust: no CLI reports the window its model was given,
@@ -309,6 +348,37 @@ def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]
         else:
             out[key] = value
     return out
+
+
+def _migrate(merged: Dict[str, Any], raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Carry a config written before ``mode`` existed forward.
+
+    Solo used to be a toggle that skipped Stage 1 and borrowed one council
+    stage's configuration. What is worth keeping out of that is the operator's
+    choice of CLI, model and reasoning level, so the stage they pointed it at
+    is copied onto the new ``solo`` provider - but deliberately not its council
+    role, which is precisely the part Solo no longer has.
+
+    ``raw`` is the file as written rather than the merged result: after
+    ``_deep_merge`` every new default is present, and a missing legacy key
+    would be indistinguishable from one the operator set to the same value.
+    """
+    if "mode" not in raw:
+        merged["mode"] = "solo" if raw.get("solo_mode") else "council"
+        source = (merged.get("providers") or {}).get(str(raw.get("solo_stage") or ""))
+        if raw.get("solo_mode") and isinstance(source, dict):
+            carried = copy.deepcopy(source)
+            for key in ("id", "role", "role_template", "role_system", "enabled"):
+                carried.pop(key, None)
+            merged["providers"]["solo"] = _deep_merge(DEFAULT_SOLO, carried)
+
+    # Dropped rather than left to rot: a stale key that no longer decides
+    # anything is worse than an absent one, because it still reads as a setting.
+    merged.pop("solo_mode", None)
+    merged.pop("solo_stage", None)
+    if merged.get("mode") not in ("council", "solo"):
+        merged["mode"] = "council"
+    return merged
 
 
 def _resolve_agent_choices(
@@ -375,7 +445,7 @@ class ConfigStore:
             return copy.deepcopy(DEFAULTS)
         if not isinstance(raw, dict):
             return copy.deepcopy(DEFAULTS)
-        return _deep_merge(DEFAULTS, raw)
+        return _migrate(_deep_merge(DEFAULTS, raw), raw)
 
     def _write(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)

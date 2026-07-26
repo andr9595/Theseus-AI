@@ -14,6 +14,11 @@ Stage 2 is instructed to treat the draft as *untrusted input* - a suggestion
 from a colleague, not a specification. That framing matters: it keeps the
 senior stage from rubber-stamping a confidently-wrong draft, which is the main
 failure mode of a naive two-model chain.
+
+Solo Mode is the exception to all of the above and lives here only for the
+company: ``build_chat_prompt`` adds no persona, no house rules and no
+repository preamble, because a plain conversation is supposed to reach the CLI
+as the operator typed it.
 """
 
 from __future__ import annotations
@@ -108,7 +113,7 @@ How you confirmed this works, or precisely what you could not verify.\
 """
 
 
-SOLO_SYSTEM = """\
+DIRECT_SYSTEM = """\
 You are a SENIOR STAFF ARCHITECT working directly on the task below, with no \
 draft stage preceding you.
 
@@ -221,10 +226,13 @@ ROLE_TEMPLATES: Dict[str, Dict] = {
         "system": POLISH_SYSTEM,
         "writes": True,
     },
+    # Named for what it does rather than for Solo Mode, which no longer has a
+    # role at all - this is a council behaviour for a stage asked to work
+    # without a draft in front of it.
     "solo": {
-        "name": "Solo Architect",
+        "name": "Direct Implementer",
         "summary": "Works the task directly, with no draft to review.",
-        "system": SOLO_SYSTEM,
+        "system": DIRECT_SYSTEM,
         "writes": True,
     },
     "adversarial_review": {
@@ -606,20 +614,42 @@ def build_polish_prompt(
     )
 
 
-def build_solo_prompt(
+def _chat_history_block(conversation: Optional[List[Dict[str, Any]]]) -> str:
+    """Render the earlier turns of a Solo conversation as plain dialogue.
+
+    Deliberately thinner than the council's own history block: there is no
+    draft to distinguish from a review, no gate to quote a steer from and no
+    diff to warn about, so what is left is what was said.
+    """
+    if not conversation:
+        return ""
+
+    context = conversation_context(conversation)
+    if not context.rendered:
+        return ""
+
+    return f"# Earlier in this conversation\n{context.rendered}"
+
+
+def build_chat_prompt(
     task: str,
-    repo_path: str,
-    repo_status: Optional[Dict] = None,
-    house_rules: str = "",
     conversation: Optional[List[Dict[str, Any]]] = None,
-    system: str = "",
+    behavior: str = "",
 ) -> str:
-    """Single-stage prompt used when Solo Mode bypasses the draft stage."""
-    system = system or SOLO_SYSTEM
-    return (
-        f"{system}\n"
-        f"{_rules_block(house_rules)}\n"
-        f"# Context\n{_repo_block(repo_path, repo_status)}\n"
-        f"{_history_block(conversation)}\n"
-        f"# Task\n{task.strip()}\n"
-    )
+    """The whole prompt for one Solo Mode turn.
+
+    Nothing is added that the operator did not put there. With no behaviour
+    configured and no thread to replay this returns the message itself - which
+    is the point of Solo Mode, and the one thing the council-shaped version it
+    replaces could not do: that one always injected a persona, the house rules
+    and a repository preamble, so a plain question never arrived as one.
+    """
+    message = task.strip()
+    behavior = behavior.strip()
+    history = _chat_history_block(conversation)
+    if not behavior and not history:
+        return message
+
+    parts = [p for p in (behavior, history) if p]
+    parts.append(f"# Message\n{message}")
+    return "\n\n".join(parts) + "\n"

@@ -302,6 +302,70 @@ class TestAgentAssignment(unittest.TestCase):
         })
         self.assertEqual(agent_for(conf["providers"]["drafter"]), "custom")
 
+    def test_switching_agents_swaps_the_read_only_flags_too(self):
+        # Codex's `--sandbox read-only` handed to `claude` is an unknown flag,
+        # which is the pairing this swap exists to make impossible.
+        conf = self.store.update({"providers": {"solo": {"agent": "codex"}}})
+        self.assertEqual(
+            conf["providers"]["solo"]["read_only_args"],
+            ["--sandbox", "read-only"],
+        )
+        conf = self.store.update({"providers": {"solo": {"agent": "claude"}}})
+        self.assertEqual(
+            conf["providers"]["solo"]["read_only_args"],
+            ["--permission-mode", "plan"],
+        )
+
+
+class TestSoloConfigMigration(unittest.TestCase):
+    """A config written when Solo was a toggle over one council stage."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-migrate-"))
+        self.path = self.tmp / "config.json"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def load(self, raw):
+        self.path.write_text(json.dumps(raw))
+        return ConfigStore(self.path).all()
+
+    def test_the_old_toggle_becomes_the_mode(self):
+        self.assertEqual(self.load({"solo_mode": True})["mode"], "solo")
+        self.assertEqual(self.load({"solo_mode": False})["mode"], "council")
+
+    def test_a_config_that_never_saw_solo_defaults_to_council(self):
+        self.assertEqual(self.load({"port": 9000})["mode"], "council")
+
+    def test_the_chosen_stage_becomes_the_assistant_without_its_role(self):
+        conf = self.load({
+            "solo_mode": True,
+            "solo_stage": "drafter",
+            "providers": {"drafter": {
+                "command": ["codex", "exec", "{prompt}"],
+                "model": "chosen-model",
+                "role": "Junior Draft",
+                "role_template": "junior_draft",
+            }},
+        })
+        solo = conf["providers"]["solo"]
+        self.assertEqual(solo["model"], "chosen-model")
+        self.assertEqual(solo["command"][0], "codex")
+        self.assertEqual(solo["id"], "solo")
+        # Blank means blank here, and the council role does not come with it.
+        self.assertEqual(solo["behavior"], "")
+        self.assertNotIn("role", solo)
+        self.assertNotIn("role_template", solo)
+
+    def test_the_dead_keys_do_not_survive(self):
+        conf = self.load({"solo_mode": True, "solo_stage": "polisher"})
+        self.assertNotIn("solo_mode", conf)
+        self.assertNotIn("solo_stage", conf)
+
+    def test_an_unknown_mode_falls_back_to_council(self):
+        self.assertEqual(self.load({"mode": "committee"})["mode"], "council")
+
 
 class TestApi(ServerTestBase):
     def test_config_round_trips(self):
@@ -320,6 +384,18 @@ class TestApi(ServerTestBase):
         self.assertTrue(data["config"]["zero_touch"])
         self.request("/api/config", method="POST", body={"zero_touch": False})
 
+    def test_mode_round_trips(self):
+        _, data = self.request("/api/config", method="POST", body={"mode": "solo"})
+        self.assertEqual(data["config"]["mode"], "solo")
+        self.request("/api/config", method="POST", body={"mode": "council"})
+
+    def test_an_unknown_mode_is_refused(self):
+        status, data = self.request(
+            "/api/config", method="POST", body={"mode": "committee"}
+        )
+        self.assertEqual(status, 400)
+        self.assertFalse(data["ok"])
+
     def test_state_serves_the_agent_catalog(self):
         # The browser renders the Agent dropdown from this; it never carries
         # its own copy of a command or a permission flag.
@@ -331,7 +407,7 @@ class TestApi(ServerTestBase):
         status, data = self.request("/api/doctor")
         self.assertEqual(status, 200)
         ids = {p["id"] for p in data["providers"]}
-        self.assertEqual(ids, {"drafter", "polisher"})
+        self.assertEqual(ids, {"drafter", "polisher", "solo"})
         for p in data["providers"]:
             self.assertIn("available", p)
 

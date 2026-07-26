@@ -299,17 +299,52 @@ Three properties hold in both modes, and they are covered by tests:
 
 The sidebar splits them by what they decide. **Run** is how the next run
 behaves; **Delivery & recovery** is where the work lands and how to get it back.
+Both groups are Council-only and are hidden in Solo Mode, which has nothing for
+them to decide.
 
 | Toggle | Group | Effect |
 |---|---|---|
-| **Solo mode** | Run | Skip the draft and run a single agent. Costs more quota; use for tasks too small to be worth a draft. |
-| **Solo mode runs** | Run | Which stage's configuration works alone — so Solo Mode can use a different agent than a full council run does. |
 | **Pull request** | Delivery | Deliver the run on a branch of its own and open a GitHub PR instead of writing to the checked-out branch. See below. |
 | **Require clean tree** | Delivery | Refuse to start if the repo has uncommitted changes. Pull-request mode enforces this itself, on or off. |
 | **Safety snapshot** | Delivery | Capture the worktree before Stage 2 so **Roll back** works. Leave on. |
 
-Solo Mode still stops at the approval gate unless Zero-Touch is on: there is no
-draft to read, but the operator is still authorising an agent to write.
+---
+
+## Council or Solo
+
+The switch at the top of the sidebar decides which of two things your next
+message starts. It is the first choice, above everything it changes, because
+the two share almost nothing.
+
+**Council** is the pipeline this README is mostly about: Junior Draft →
+approval gate → Senior Polish, with Live stream, Draft, Senior review and Diff
+views, delivery controls, snapshots and rollback.
+
+**Solo** is one assistant answering one message, the way opening `claude` or
+ChatGPT is. It has:
+
+- **Its own agent**, configured under Settings → Agents. It borrows neither
+  council stage, so Solo can run Codex while the council runs Claude.
+- **No behaviour by default.** With the **Behaviour** box empty and no thread
+  to replay, your message reaches the CLI *exactly as typed* — no persona, no
+  house rules, no repository preamble. Type something into that box and it is
+  put in front of the message; that is the whole of it.
+- **No council furniture.** No draft, no approval gate, no Zero-Touch, no
+  pull request, no snapshot, no rollback, and none of the four output tabs —
+  just the message and the reply.
+- **No write permission.** Solo is invoked with its agent's read-only
+  arguments (`--sandbox read-only` for `codex`, `--permission-mode plan` for
+  `claude`) and never receives an auto-approve flag. It reads the selected
+  repository and talks about it; Council is the path for changing it.
+
+Conversations from the two modes are kept apart: continuing one switches the
+selector to the mode it was held in, and the server refuses the mismatch
+outright rather than replay a council transcript into a plain chat.
+
+Configurations written before this existed are migrated on load. The old
+**Solo mode** toggle becomes the mode; the stage the old **Solo mode runs**
+selector pointed at becomes the initial Solo assistant, keeping its CLI, model
+and reasoning level but not its council role.
 
 ---
 
@@ -461,8 +496,9 @@ behaviour — is untouched. Editing the command by hand still works and simply
 reads back as **Custom command**; the command is the source of truth, and the
 dropdown is derived from it, so the two can never disagree.
 
-Solo Mode picks its agent the same way: the **Solo mode runs** selector under
-the toggle chooses which stage's configuration works alone.
+The Solo assistant has its own entry in the same list, with its own Agent
+dropdown, display name, model, reasoning effort, command and optional
+**Behaviour**. It has no Role, because it is not a stage in anything.
 
 ### Roles
 
@@ -473,7 +509,7 @@ stage → **Role**:
 |---|---|---|
 | Junior Draft | Surveys the repo, proposes a change | no |
 | Senior Polish | Verifies the draft, corrects it, applies it | yes |
-| Solo Architect | Works the task directly, no draft to review | yes |
+| Direct Implementer | Works the task directly, no draft to review | yes |
 | Adversarial Reviewer | Hunts for defects, fixes nothing | no |
 | Test Writer | Writes tests that would have caught real bugs | yes |
 | Security Reviewer | Findings with a real attacker and a real path | no |

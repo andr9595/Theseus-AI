@@ -145,6 +145,13 @@ class PipelineTestBase(unittest.TestCase):
 
     def wait_terminal(self, timeout=60):
         self.wait_for(lambda: not self.pipeline.is_busy(), timeout, "a terminal state")
+        # The worker writes the transcript *after* the run reaches a terminal
+        # state, so a test that reads one back - by name, or by continuing it -
+        # is racing the thread unless it waits for the thread itself.
+        self.assertTrue(
+            self.pipeline.wait_for_worker(timeout),
+            "the run worker thread did not wind down",
+        )
 
 
 class TestZeroTouch(PipelineTestBase):
@@ -253,34 +260,102 @@ class TestSnapshots(PipelineTestBase):
 
 
 class TestSoloMode(PipelineTestBase):
-    def test_solo_mode_runs_the_stage_it_was_pointed_at(self):
-        # Either slot can hold either agent, so Solo Mode must be able to run
-        # the drafter slot - with the write permission the lone stage needs.
-        writer = mock_provider("drafter", "Junior Draft")
-        writer["command"] = [sys.executable, MOCK, "--role", "polisher", "{prompt}"]
-        self.store.update({
-            "zero_touch": True,
-            "solo_mode": True,
-            "solo_stage": "drafter",
-            "providers": {"drafter": writer},
-        })
-        run = self.pipeline.start("write the artifact", str(self.repo))
+    """Solo is its own product, not the council with a stage switched off."""
+
+    def setUp(self):
+        super().setUp()
+        assistant = mock_provider("solo", "Assistant")
+        assistant["read_only_args"] = ["--read-only"]
+        assistant["behavior"] = ""
+        self.store.update({"mode": "solo", "providers": {"solo": assistant}})
+
+    def test_solo_runs_its_own_provider_and_nothing_else(self):
+        run = self.pipeline.start("what does this repo do?", str(self.repo))
         self.wait_terminal()
 
         self.assertEqual(run.state, "complete", run.error)
-        self.assertNotIn("polisher", run.stages)
-        self.assertEqual(run.stages["drafter"].state, "done")
-        self.assertIn("--dangerously-skip-permissions", run.stages["drafter"].command)
-        self.assertTrue((self.repo / "AI_COUNCIL_DEMO.md").exists())
+        self.assertEqual(list(run.stages), ["solo"])
+        self.assertEqual(run.mode, "solo")
+        self.assertTrue(run.stages["solo"].output.strip())
 
-    def test_an_unknown_solo_stage_falls_back_to_the_polisher(self):
-        self.store.update({
-            "zero_touch": True, "solo_mode": True, "solo_stage": "nonesuch",
-        })
-        run = self.pipeline.start("do a thing", str(self.repo))
+    def test_the_assistant_is_never_granted_write_permission(self):
+        # No gate to approve it at, and Zero-Touch is council machinery that
+        # must not leak across - so the flag can arrive by neither route.
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("what does this repo do?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertFalse(run.zero_touch)
+        self.assertNotIn(
+            "--dangerously-skip-permissions", run.stages["solo"].command
+        )
+        self.assertIn("--read-only", run.stages["solo"].command)
+        self.assertTrue(gitutil.status(self.repo).clean)
+
+    def test_no_gate_is_reached(self):
+        self.store.update({"zero_touch": False})
+        run = self.pipeline.start("what does this repo do?", str(self.repo))
         self.wait_terminal()
         self.assertEqual(run.state, "complete", run.error)
-        self.assertEqual(list(run.stages), ["polisher"])
+
+    def test_no_delivery_state_is_collected(self):
+        # Nothing was written, so a diff, a snapshot or a rollback offer would
+        # all be attributing the operator's own tree to the assistant.
+        (self.repo / "scratch.txt").write_text("mine, not the assistant's\n")
+        run = self.pipeline.start("what does this repo do?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.diff, "")
+        self.assertEqual(run.diff_stat, {})
+        self.assertIsNone(run.snapshot)
+        self.assertFalse(run.to_dict()["can_rollback"])
+
+    def test_council_delivery_settings_do_not_block_a_conversation(self):
+        # Refusing to answer a question because the tree is dirty would be
+        # absurd, and there is no branch for pull-request mode to create.
+        self.store.update({
+            "require_clean_worktree": True, "pull_request_mode": True,
+        })
+        (self.repo / "scratch.txt").write_text("uncommitted\n")
+        run = self.pipeline.start("what does this repo do?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertFalse(run.pull_request_mode)
+        self.assertEqual(run.work_branch, "")
+
+    def test_a_plain_message_reaches_the_agent_exactly_as_typed(self):
+        # The command echo records the prompt's length, so this pins that no
+        # persona, house rules or repository preamble were wrapped around it.
+        message = "MAGIC-PLAIN-MESSAGE"
+        self.store.update({"house_rules": "always use tabs"})
+        run = self.pipeline.start(message, str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertIn(f"<prompt: {len(message)} chars>", run.stages["solo"].command)
+
+    def test_a_conversation_cannot_change_mode_mid_thread(self):
+        first = self.pipeline.start("hello", str(self.repo))
+        self.wait_terminal()
+        self.store.update({"mode": "council"})
+
+        with self.assertRaisesRegex(ValueError, "solo conversation"):
+            self.pipeline.start(
+                "and now?", str(self.repo), continue_from=first.transcript_name
+            )
+
+    def test_a_council_run_cannot_be_continued_as_a_conversation(self):
+        self.store.update({"mode": "council", "zero_touch": True})
+        first = self.pipeline.start("do a thing", str(self.repo))
+        self.wait_terminal()
+        self.store.update({"mode": "solo"})
+
+        with self.assertRaisesRegex(ValueError, "council conversation"):
+            self.pipeline.start(
+                "and now?", str(self.repo), continue_from=first.transcript_name
+            )
 
 
 class TestDiffStat(PipelineTestBase):
@@ -376,16 +451,6 @@ class TestApprovalGate(PipelineTestBase):
         self.assertNotIn(
             "definitely-not-the-approved-command", run.stages["polisher"].command
         )
-
-    def test_solo_mode_still_gates(self):
-        # No draft to review, but the operator must still authorise writes.
-        self.store.update({"zero_touch": False, "solo_mode": True})
-        run = self.pipeline.start("do a thing", str(self.repo))
-        self.wait_for(lambda: run.state == "awaiting_approval")
-        self.assertNotIn("drafter", run.stages)
-        self.pipeline.approve()
-        self.wait_terminal()
-        self.assertEqual(run.state, "complete", run.error)
 
 
 class TestPullRequestMode(PipelineTestBase):
@@ -1201,18 +1266,21 @@ class TestConversationPrompt(unittest.TestCase):
     def test_every_stage_can_be_handed_the_thread(self):
         from aicouncil import prompts
 
-        solo = prompts.build_solo_prompt("do it", "/tmp/r", None, "", self.TURNS)
+        draft = prompts.build_draft_prompt("do it", "/tmp/r", None, "", self.TURNS)
         polish = prompts.build_polish_prompt(
             "do it", "a draft", "/tmp/r", None, "", "", self.TURNS
         )
-        for prompt in (solo, polish):
+        chat = prompts.build_chat_prompt("do it", self.TURNS)
+        for prompt in (draft, polish, chat):
             self.assertIn("add a login route", prompt)
 
     def test_the_repository_is_named_as_the_authority_over_the_transcript(self):
         # A remembered run may have been rolled back or edited over since.
         from aicouncil import prompts
 
-        prompt = prompts.build_solo_prompt("do it", "/tmp/r", None, "", self.TURNS)
+        prompt = prompts.build_polish_prompt(
+            "do it", "a draft", "/tmp/r", None, "", "", self.TURNS
+        )
         self.assertIn("repository as it stands now", prompt)
 
     def test_an_over_long_thread_compacts_its_oldest_turns(self):
@@ -1291,6 +1359,38 @@ class TestConversationPrompt(unittest.TestCase):
             context.estimated_tokens,
             -(-context.characters // prompts.ESTIMATED_CHARS_PER_TOKEN),
         )
+
+
+class TestSoloPrompt(unittest.TestCase):
+    """Solo Mode adds nothing the operator did not put there."""
+
+    def test_a_plain_message_is_sent_exactly_as_typed(self):
+        from aicouncil import prompts
+
+        self.assertEqual(prompts.build_chat_prompt("  what is this repo?  "),
+                         "what is this repo?")
+
+    def test_no_council_persona_arrives_uninvited(self):
+        from aicouncil import prompts
+
+        prompt = prompts.build_chat_prompt("what is this repo?")
+        self.assertNotIn("ARCHITECT", prompt)
+        self.assertNotIn("Target repository", prompt)
+        self.assertNotIn("Standing project rules", prompt)
+
+    def test_a_behaviour_is_added_only_when_one_is_set(self):
+        from aicouncil import prompts
+
+        prompt = prompts.build_chat_prompt("hello", behavior="  Answer briefly.  ")
+        self.assertIn("Answer briefly.", prompt)
+        self.assertLess(prompt.index("Answer briefly."), prompt.index("hello"))
+
+    def test_the_thread_precedes_the_message(self):
+        from aicouncil import prompts
+
+        prompt = prompts.build_chat_prompt("and now?", TestConversationPrompt.TURNS)
+        self.assertIn("add a login route", prompt)
+        self.assertLess(prompt.index("add a login route"), prompt.index("and now?"))
 
 
 class TestRoleReachesTheRun(PipelineTestBase):

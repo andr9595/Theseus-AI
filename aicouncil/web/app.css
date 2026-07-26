@@ -94,10 +94,42 @@ html, body {
    panel's content gets. Without this they are the first things flexbox
    compresses. */
 .brand,
+.mode-switch,
 .sidebar-tabs,
 .sidebar-foot { flex-shrink: 0; }
 
 .sidebar-spacer { flex: 1; min-height: 8px; }
+
+/* ---- Mode switch ---- */
+
+/* Sits above the sidebar tabs and looks heavier than them on purpose: this is
+   the decision everything below it depends on. */
+.mode-switch {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  padding: 4px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+
+.mode-switch button {
+  padding: 8px;
+  font: inherit; font-size: 12.5px; font-weight: 600;
+  color: var(--text-3);
+  background: none;
+  border: 0;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.mode-switch button:hover:not(:disabled) { color: var(--text-2); }
+.mode-switch button:disabled { cursor: not-allowed; }
+.mode-switch button.active {
+  color: var(--text);
+  background: var(--bg-4);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
 
 /* ---- Sidebar tabs ---- */
 
@@ -305,6 +337,7 @@ html, body {
 }
 .agent-card[data-agent="drafter"]  { --agent-color: var(--cyan); }
 .agent-card[data-agent="polisher"] { --agent-color: var(--amber); }
+.agent-card[data-agent="solo"]     { --agent-color: var(--accent-2); }
 
 .agent-avatar {
   grid-area: avatar;
@@ -526,10 +559,6 @@ html, body {
 .toggle-text { display: flex; flex-direction: column; line-height: 1.35; }
 .toggle-text strong { font-size: 12.5px; font-weight: 600; }
 .toggle-text em { font-size: 10.5px; font-style: normal; color: var(--text-3); }
-
-/* Which stage Solo mode runs. Indented under its toggle, since it only
-   qualifies that toggle rather than standing on its own. */
-.solo-target { margin: 0 8px 4px 50px; }
 
 .inline-warning {
   padding: 8px 10px;
@@ -1219,6 +1248,53 @@ kbd {
   white-space: pre-wrap;
 }
 .doctor:empty { display: none; }
+
+/* ==========================================================================
+   Solo output
+   The whole of Solo's main pane. No tabs: a conversation has no draft, no
+   review and no diff to switch between.
+   ========================================================================== */
+
+.solo-output {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  /* Centred on a readable column, the way the answer wants to be read, but
+     never narrower than the padding on a small window. */
+  padding: 8px max(20px, calc((100% - 820px) / 2)) 40px;
+}
+
+.solo-empty { max-width: 60ch; margin: 12vh auto 0; text-align: center; }
+
+.solo-turn { display: flex; flex-direction: column; gap: 22px; }
+
+/* The message is a bubble and the answer is not: one is a line of input, the
+   other is a document, and giving them the same frame flattens both. */
+.user-message {
+  align-self: flex-end;
+  max-width: 80%;
+  padding: 10px 15px;
+  background: var(--bg-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.user-message .markdown { padding-bottom: 0; font-size: 13px; }
+
+.assistant-message { align-self: stretch; min-width: 0; }
+
+.chat-speaker {
+  margin-bottom: 7px;
+  font-size: 10px; font-weight: 600;
+  color: var(--text-3);
+  letter-spacing: .07em; text-transform: uppercase;
+}
+
+/* Streaming lands here as plain text before the finished Markdown replaces
+   it, so it has to stay readable as-is rather than collapse into one line. */
+.assistant-message .markdown { white-space: pre-wrap; }
+.assistant-message .markdown :is(p, h1, h2, h3, h4, ul, ol, pre, table, blockquote) {
+  white-space: normal;
+}
 
 /* ---- Saved conversation, read in the main pane ---- */
 

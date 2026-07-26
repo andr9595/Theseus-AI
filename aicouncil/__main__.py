@@ -86,6 +86,7 @@ def _print_doctor(store: cfg.ConfigStore) -> int:
     print(f"  python      : {sys.version.split()[0]} ({sys.executable})")
     print(f"  config      : {store.path}")
     print(f"  runs        : {cfg.runs_dir()}")
+    print(f"  mode        : {store.get('mode', 'council')}")
     print(f"  zero-touch  : {'ON' if store.get('zero_touch') else 'off'}")
     repo = store.get("target_repo") or ""
     print(f"  target repo : {repo or '(none selected)'}")
@@ -100,7 +101,7 @@ def _print_doctor(store: cfg.ConfigStore) -> int:
         print("  pull request: off")
     print("\nProviders:")
     missing = []
-    for key in ("drafter", "polisher"):
+    for key in ("drafter", "polisher", "solo"):
         provider = store.get("providers", {}).get(key)
         if not provider:
             continue
@@ -109,9 +110,11 @@ def _print_doctor(store: cfg.ConfigStore) -> int:
         version = f"  [{info['version']}]" if info["version"] else ""
         location = info["path"] or "not found on PATH"
         # The job comes first: either agent can be assigned to either job, so
-        # which CLI is doing what is the part worth reading at a glance.
+        # which CLI is doing what is the part worth reading at a glance. Solo
+        # has no council role, so it is named for the mode it serves.
+        job = provider.get("role") or ("Solo assistant" if key == "solo" else key)
         print(
-            f"  [{mark}] {provider.get('role', key):<14} {info['label']:<8} "
+            f"  [{mark}] {job:<14} {info['label']:<8} "
             f"{info['executable']:<10} -> {location}{version}"
         )
         if not info["available"]:

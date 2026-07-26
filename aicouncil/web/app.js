@@ -548,10 +548,27 @@ const STATE_LABELS = {
   drafting: 'Drafting',
   awaiting_approval: 'Awaiting your approval',
   polishing: 'Applying changes',
+  running: 'Thinking',
   complete: 'Complete',
   failed: 'Failed',
   cancelled: 'Cancelled',
 };
+
+const WORKING_STATES = ['drafting', 'polishing', 'running'];
+
+/** The mode the *next* message starts, from config. */
+function selectedMode() {
+  return ((state.config || {}).mode === 'solo') ? 'solo' : 'council';
+}
+
+/** The mode the main pane should be showing. A run in flight owns the screen —
+ *  it carries the mode it was started with, and switching the selector under a
+ *  running agent must not swap the output surface out from under it. */
+function visibleMode() {
+  const run = state.run;
+  if (state.busy && run) return run.mode || (run.solo ? 'solo' : 'council');
+  return selectedMode();
+}
 
 function renderStatus() {
   const run = state.run;
@@ -559,7 +576,7 @@ function renderStatus() {
   const s = run ? run.state : 'idle';
 
   pill.className = 'status-pill';
-  if (s === 'drafting' || s === 'polishing') pill.classList.add('active');
+  if (WORKING_STATES.includes(s)) pill.classList.add('active');
   else if (s === 'awaiting_approval') pill.classList.add('waiting');
   else if (s === 'complete') pill.classList.add('ok');
   else if (s === 'failed' || s === 'cancelled') pill.classList.add('bad');
@@ -588,24 +605,24 @@ function renderStatus() {
   renderContinuation();
 
   const runBtn = $('#run-btn');
+  const solo = visibleMode() === 'solo';
   const hasRepo = !!(state.config && state.config.target_repo);
   const hasTask = $('#task-input').value.trim().length > 0;
   runBtn.disabled = state.busy || !hasRepo || !hasTask;
   runBtn.classList.toggle('busy', state.busy);
-  $('.btn-label', runBtn).textContent = state.busy ? 'Council in session' : 'Convene the council';
+  $('.btn-label', runBtn).textContent = state.busy
+    ? (solo ? 'Thinking' : 'Council in session')
+    : (solo ? 'Send' : 'Convene the council');
 
-  const gated = !!(run && run.state === 'awaiting_approval');
+  // Solo never reaches the gate: it is never granted permission to write, so
+  // there is nothing for the operator to authorise.
+  const gated = !!(run && !run.solo && run.state === 'awaiting_approval');
   $('#approval-gate').classList.toggle('hidden', !gated);
   if (gated) {
-    // Solo Mode has no draft to show, so the gate is approving the run itself
-    // rather than a proposal.
-    $('#approval-copy').innerHTML = run.solo
-      ? 'Solo Mode: there is no draft to review. <b>Nothing has been written to ' +
-        'disk yet.</b> Approving lets the senior stage work directly on your ' +
-        'repository.'
-      : 'The draft is ready — see the <b>Draft</b> tab. <b>Nothing has been ' +
-        'written to disk yet.</b> Approving lets the senior stage apply changes ' +
-        'to your repository.';
+    $('#approval-copy').innerHTML =
+      'The draft is ready — see the <b>Draft</b> tab. <b>Nothing has been ' +
+      'written to disk yet.</b> Approving lets the senior stage apply changes ' +
+      'to your repository.';
   }
 }
 
@@ -674,8 +691,13 @@ function renderContinuation() {
           'full, and it is the only one here.';
 }
 
-/** Attach a transcript to the next run, and measure what that will replay. */
-async function continueRun(file, task) {
+/** Attach a transcript to the next run, and measure what that will replay.
+ *  ``mode`` is the mode that conversation was held in; the server refuses to
+ *  continue it in the other one, so switch first rather than fail later. */
+async function continueRun(file, task, mode = '') {
+  if (mode && mode !== selectedMode()) {
+    await patchConfig({ mode });
+  }
   state.continueFrom = file;
   state.continueTask = (task || '').slice(0, 90);
   state.continueContext = null;
@@ -717,17 +739,12 @@ function renderAgents() {
   const run = state.run;
   const conf = state.config || {};
   const providers = conf.providers || {};
-  // Always render both stages. Solo Mode used to drop the drafter card
-  // entirely, which reads as "Codex is missing" rather than "you switched this
-  // off" - a disabled stage should look disabled, not absent.
-  const order = ['drafter', 'polisher'];
-  // A run carries the stage it was started with; outside a run, whatever is
-  // configured now. Either way it is the *other* slot that sits idle.
-  const solo = run ? run.solo : !!conf.solo_mode;
-  const finalStage = solo
-    ? ((run && run.solo_stage) || conf.solo_stage || 'polisher')
-    : 'polisher';
-  const soloSkipped = (id) => solo && id !== finalStage;
+  // Solo is one agent with a configuration of its own, so the council's two
+  // cards are not shown greyed out beside it - they belong to the other mode
+  // entirely, and the rail is titled for whichever one is on screen.
+  const solo = visibleMode() === 'solo';
+  const order = solo ? ['solo'] : ['drafter', 'polisher'];
+  $('#agent-panel-title').textContent = solo ? 'Assistant' : 'Council';
 
   const probeFor = (id) => state.providers.find(p => p.id === id);
 
@@ -738,13 +755,11 @@ function renderAgents() {
     const available = !info || info.available;
 
     let stageState = stage ? stage.state : 'pending';
-    if (run && run.state === 'awaiting_approval' && id === finalStage) stageState = 'waiting';
-    if (soloSkipped(id)) stageState = 'skipped';
+    if (run && run.state === 'awaiting_approval' && id === 'polisher') stageState = 'waiting';
 
-    const label = soloSkipped(id) ? 'solo · off'
-      : { pending: 'idle', running: 'working', done: 'done',
-          failed: 'failed', skipped: 'skipped',
-          waiting: 'gated' }[stageState] || stageState;
+    const label = { pending: 'idle', running: 'working', done: 'done',
+                    failed: 'failed', skipped: 'skipped',
+                    waiting: 'gated' }[stageState] || stageState;
 
     const duration = stage && stage.duration ? ` · ${fmtDuration(stage.duration)}` : '';
     const initial = (provider.label || id).slice(0, 2).toUpperCase();
@@ -767,15 +782,15 @@ function renderAgents() {
         `<div class="agent-avatar">${esc(initial)}</div>` +
         `<div class="agent-body">` +
           `<div class="agent-name">${esc(provider.label || id)}</div>` +
-          `<div class="agent-role">${idx + 1}. ${esc(provider.role || '')}</div>` +
+          `<div class="agent-role">${
+            solo
+              // Solo has no council role, so the card says what it does carry:
+              // whether the operator has given it a behaviour at all.
+              ? (provider.behavior ? 'Custom behaviour' : 'No behaviour')
+              : `${idx + 1}. ${esc(provider.role || '')}`
+          }</div>` +
           (available ? '' :
             `<div class="agent-missing">${esc(provider.command ? provider.command[0] : '?')} not found</div>`) +
-          // Say *why* the stage is inert, and how to undo it — an unexplained
-          // greyed-out card is barely better than a missing one.
-          (soloSkipped(id)
-            ? `<button class="agent-hint" type="button" data-disable-solo="1">` +
-              `Skipped by Solo mode — click to re-enable</button>`
-            : '') +
         `</div>` +
         `<div class="agent-right">` +
           `<div class="agent-state">${esc(label)}${esc(duration)}</div>` +
@@ -1069,11 +1084,36 @@ function renderRepo() {
   ).join('');
 }
 
+function renderMode() {
+  const mode = selectedMode();
+  $$('#mode-switch [data-mode]').forEach(btn => {
+    const active = btn.dataset.mode === mode;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-checked', String(active));
+    // Changing mode mid-run would leave the selector and the output pane
+    // describing different things.
+    btn.disabled = state.busy;
+  });
+  $('#brand-sub').textContent = mode === 'solo'
+    ? 'One agent, one conversation' : 'Draft → Polish pipeline';
+  $('#council-controls').classList.toggle('hidden', mode !== 'council');
+  $('#continue-copy').textContent = mode === 'solo'
+    ? 'the assistant will be given that exchange as context.'
+    : 'the council will be given that exchange as context.';
+  $('#task-input').placeholder = mode === 'solo'
+    ? 'Ask anything about this repository…'
+    : 'Describe the change you want. Be specific about files, behaviour and ' +
+      'edge cases…\nExample: Add rate limiting to the /api/login route, ' +
+      '5 attempts per minute per IP, with tests.';
+  $('.hint').innerHTML = mode === 'solo'
+    ? '<kbd>Ctrl</kbd>+<kbd>Enter</kbd> to send'
+    : '<kbd>Ctrl</kbd>+<kbd>Enter</kbd> to run';
+}
+
 function renderToggles() {
   const c = state.config || {};
   $('#zero-touch').checked = !!c.zero_touch;
   $('#safety-snapshot').checked = c.safety_snapshot !== false;
-  $('#solo-mode').checked = !!c.solo_mode;
   $('#clean-worktree').checked = !!c.require_clean_worktree;
   $('#pull-request-mode').checked = !!c.pull_request_mode;
   $('#zero-touch-warning').classList.toggle('hidden', !c.zero_touch);
@@ -1089,20 +1129,40 @@ function renderToggles() {
   $('#snapshot-note').textContent = pr
     ? 'Rollback until the pull request is open'
     : 'Enable one-click rollback';
+}
 
-  // Which stage's configuration runs alone. Only worth showing once Solo mode
-  // is actually on.
-  const providers = c.providers || {};
-  const soloStage = c.solo_stage || 'polisher';
-  $('#solo-stage').innerHTML = ['drafter', 'polisher'].map((id, idx) =>
-    `<option value="${id}"${id === soloStage ? ' selected' : ''}>` +
-    `Stage ${idx + 1} · ${esc((providers[id] || {}).label || id)}</option>`
-  ).join('');
-  $('#solo-target').classList.toggle('hidden', !c.solo_mode);
+/** Solo's whole output: the message, then the reply. Rendered from the run
+ *  rather than accumulated, so a reload mid-answer picks up where it was. */
+function renderSoloOutput() {
+  const run = state.run;
+  const stage = run && run.stages ? run.stages.solo : null;
+  $('#solo-empty').classList.toggle('hidden', !!run);
+  $('#solo-turn').classList.toggle('hidden', !run);
+  if (!run) return;
+
+  $('#solo-question').innerHTML = renderMarkdown(run.task || '');
+  $('#solo-speaker').textContent = (stage && stage.label) || 'Assistant';
+  const answer = (stage && stage.output) || '';
+  // While the CLI is still talking the pane holds partial text put there by
+  // `stage_output`; replacing it with an empty stage record would blank the
+  // answer being read. The finished output always wins once it exists.
+  if (answer.trim()) {
+    $('#solo-answer').innerHTML = renderMarkdown(answer);
+  } else if (run.error || (stage && stage.error)) {
+    $('#solo-answer').textContent = run.error || stage.error;
+  }
 }
 
 function renderOutputs() {
   const run = state.run;
+  const solo = visibleMode() === 'solo';
+  $('#council-output').classList.toggle('hidden', solo || !!state.openChat);
+  $('#solo-output').classList.toggle('hidden', !solo || !!state.openChat);
+  if (solo) {
+    renderSoloOutput();
+    return;
+  }
+
   const draft = run && run.stages && run.stages.drafter ? run.stages.drafter.output : '';
   const final = run && run.stages && run.stages.polisher ? run.stages.polisher.output : '';
 
@@ -1144,6 +1204,7 @@ function setBadge(sel, text, positive = false) {
 
 function renderAll() {
   renderStatus();
+  renderMode();
   renderAgents();
   renderRepo();
   renderToggles();
@@ -1513,7 +1574,17 @@ function renderSettings() {
   const providers = conf.providers || {};
   const host = $('#provider-forms');
 
-  host.innerHTML = ['drafter', 'polisher'].map((id, idx) => {
+  // The council's two stages and Solo's one assistant, configured
+  // independently. `council` decides which half of the form each one gets:
+  // a stage is told what job to do, the assistant is only ever given a
+  // behaviour the operator typed.
+  const FORMS = [
+    { id: 'drafter', num: 'Stage 1', council: true },
+    { id: 'polisher', num: 'Stage 2', council: true },
+    { id: 'solo', num: 'Solo', council: false },
+  ];
+
+  host.innerHTML = FORMS.map(({ id, num, council }) => {
     const p = providers[id] || {};
     const info = state.providers.find(x => x.id === id);
     const probeHtml = info
@@ -1521,9 +1592,10 @@ function renderSettings() {
         `${info.available ? 'found' : 'not found'}</span>`
       : '';
     return (
-      `<div class="provider-form" data-provider="${id}">` +
-        `<h4><span class="stage-num">Stage ${idx + 1}</span> ` +
-          `${esc(p.role || id)} ${probeHtml}</h4>` +
+      `<div class="provider-form" data-provider="${id}" ` +
+        `data-council="${council ? '1' : ''}">` +
+        `<h4><span class="stage-num">${esc(num)}</span> ` +
+          `${esc(p.role || (council ? id : 'Assistant'))} ${probeHtml}</h4>` +
         `<div class="field-row">` +
           `<div class="field">` +
             `<label>Agent ` +
@@ -1540,27 +1612,38 @@ function renderSettings() {
             `<input type="text" data-field="label" value="${esc(p.label || '')}">` +
           `</div>` +
         `</div>` +
-        `<div class="field">` +
-          `<label>Role — what this stage is told to do` +
-            `<span class="field-hint"> — the shipped text is a starting point</span>` +
-          `</label>` +
-          `<select data-field="role_template">` +
-            (state.roles || []).map(r =>
-              `<option value="${esc(r.id)}"${r.id === (p.role_template || '') ? ' selected' : ''}>` +
-                `${esc(r.name)} — ${esc(r.summary)}</option>`
-            ).join('') +
-          `</select>` +
-        `</div>` +
-        `<div class="field">` +
-          `<label>Behaviour ` +
-            `<button class="link-btn" type="button" data-reset-role="${id}">` +
-              `reset to the template</button>` +
-          `</label>` +
-          `<textarea rows="5" class="role-system" data-field="role_system" ` +
-            `placeholder="Using the template above. Type here to override it.">` +
-            `${esc(p.role_system || '')}</textarea>` +
-          `<span class="field-hint" data-role-warn="${id}"></span>` +
-        `</div>` +
+        (council
+          ? `<div class="field">` +
+              `<label>Role — what this stage is told to do` +
+                `<span class="field-hint"> — the shipped text is a starting point</span>` +
+              `</label>` +
+              `<select data-field="role_template">` +
+                (state.roles || []).map(r =>
+                  `<option value="${esc(r.id)}"${r.id === (p.role_template || '') ? ' selected' : ''}>` +
+                    `${esc(r.name)} — ${esc(r.summary)}</option>`
+                ).join('') +
+              `</select>` +
+            `</div>` +
+            `<div class="field">` +
+              `<label>Behaviour ` +
+                `<button class="link-btn" type="button" data-reset-role="${id}">` +
+                  `reset to the template</button>` +
+              `</label>` +
+              `<textarea rows="5" class="role-system" data-field="role_system" ` +
+                `placeholder="Using the template above. Type here to override it.">` +
+                `${esc(p.role_system || '')}</textarea>` +
+              `<span class="field-hint" data-role-warn="${id}"></span>` +
+            `</div>`
+          // No role, no template and no fallback: blank here means blank, so a
+          // new Solo conversation reaches the CLI as the message alone.
+          : `<div class="field">` +
+              `<label>Behaviour ` +
+                `<span class="field-hint">— optional; blank sends your message ` +
+                `on its own</span></label>` +
+              `<textarea rows="5" class="role-system" data-field="behavior" ` +
+                `placeholder="e.g. Answer briefly, and always show the code.">` +
+                `${esc(p.behavior || '')}</textarea>` +
+            `</div>`) +
         // Everything below is the CLI plumbing the Agent dropdown fills in for
         // you. Folded away because reading it is how you check a custom CLI,
         // not how you configure a stage.
@@ -1575,6 +1658,14 @@ function renderSettings() {
               `<label>Auto-approve arguments (added only when execution is approved)</label>` +
               `<textarea rows="2" data-field="auto_approve_args">${esc((p.auto_approve_args || []).join('\n'))}</textarea>` +
             `</div>` +
+            (council ? '' :
+              `<div class="field">` +
+                `<label>Read-only arguments ` +
+                  `<span class="field-hint">— always added; Solo has no ` +
+                  `approval gate, diff or rollback, so it never writes</span></label>` +
+                `<textarea rows="2" data-field="read_only_args">` +
+                  `${esc((p.read_only_args || []).join('\n'))}</textarea>` +
+              `</div>`) +
             `<div class="field">` +
               `<label>Streaming arguments ` +
                 `<span class="field-hint">— always added; make the CLI report ` +
@@ -1637,7 +1728,9 @@ function renderSettings() {
  *  permission. Not resolved automatically: guessing which of the two the
  *  operator meant is how a safety setting stops being trustworthy. */
 function updateRoleWarning(form) {
-  if (!form) return;
+  // Solo has no role and no per-stage permission, so there is no mismatch it
+  // could be in.
+  if (!form || !form.dataset.council) return;
   const id = form.dataset.provider;
   const chosen = $('[data-field="role_template"]', form).value;
   const role = (state.roles || []).find(r => r.id === chosen);
@@ -1694,8 +1787,18 @@ async function saveSettings() {
       command,
       auto_approve_args: lines('auto_approve_args'),
       stream_args: lines('stream_args'),
-      role_template: field('role_template').value,
-      role_system: field('role_system').value.trim(),
+      // A council stage has a role; the Solo assistant has a behaviour and
+      // nothing else. Writing the other one's keys would leave a dead setting
+      // behind that still reads as though it decided something.
+      ...(form.dataset.council
+        ? {
+            role_template: field('role_template').value,
+            role_system: field('role_system').value.trim(),
+          }
+        : {
+            behavior: field('behavior').value.trim(),
+            read_only_args: lines('read_only_args'),
+          }),
       model: field('model').value.trim(),
       // Space-separated on this form, since a model flag is always short.
       model_args: field('model_args').value.trim().split(/\s+/).filter(Boolean),
@@ -1789,6 +1892,7 @@ function renderChats() {
       `<span class="chat-row-title">${esc(c.title || c.task || '(no task)')}</span>` +
       `<span class="chat-row-meta">${fmtWhen(c.created_at)} · ` +
         `${c.messages} message${c.messages === 1 ? '' : 's'}` +
+        `${c.mode === 'solo' ? ' · solo' : ''}` +
         `${c.zero_touch ? ' · zero-touch' : ''}</span>` +
     `</button>`
   ).join('');
@@ -1822,7 +1926,12 @@ function historyTurn(task, replies, prefix = '', compacted = false) {
  *  cleared, so closing this puts it back untouched. */
 async function openChat(file) {
   const transcript = $('#chat-transcript');
-  $('.output').classList.add('hidden');
+  // Marked open before the fetch, not after: `renderOutputs` decides which
+  // pane is visible from this, and an event arriving mid-load would otherwise
+  // put the run's output back on top of the transcript being read.
+  state.openChat = { file, run: null };
+  $('#council-output').classList.add('hidden');
+  $('#solo-output').classList.add('hidden');
   $('#chat-view').classList.remove('hidden');
   $('#chat-continue').disabled = true;
   $('#chat-context').textContent = '';
@@ -1872,7 +1981,8 @@ async function openChat(file) {
 function closeChat() {
   state.openChat = null;
   $('#chat-view').classList.add('hidden');
-  $('.output').classList.remove('hidden');
+  // Which pane comes back depends on the mode, so let the renderer decide.
+  renderOutputs();
   renderChats();
 }
 
@@ -1931,31 +2041,37 @@ function connect() {
   on('run_started', (d) => {
     state.run = d.run;
     state.busy = true;
-    // A saved conversation is hiding the output pane the stream renders into,
-    // and a run starting is where the operator's attention belongs.
+    // A saved conversation is hiding the pane the answer renders into, and a
+    // run starting is where the operator's attention belongs.
     closeChat();
-    clearStream();
-    pushDivider('Run started');
-    pushLine('sys', 'system', `Task: ${d.run.task}`);
-    pushLine('sys', 'system', `Repo: ${d.run.repo}`);
-    if (d.run.zero_touch) {
-      pushLine('warn', 'system', 'Zero-Touch Mode: approvals will be skipped.');
+    if (d.run.solo) {
+      // The stream is a council view. Solo's progress goes into the answer
+      // bubble, which starts empty and fills as the CLI talks.
+      $('#solo-answer').textContent = '';
+    } else {
+      clearStream();
+      pushDivider('Run started');
+      pushLine('sys', 'system', `Task: ${d.run.task}`);
+      pushLine('sys', 'system', `Repo: ${d.run.repo}`);
+      if (d.run.zero_touch) {
+        pushLine('warn', 'system', 'Zero-Touch Mode: approvals will be skipped.');
+      }
+      switchTab('stream');
     }
-    switchTab('stream');
     renderAll();
   });
 
   on('state', (d) => {
     state.run = d.run;
     state.busy = !['complete', 'failed', 'cancelled'].includes(d.state);
+    const solo = !!d.run && d.run.solo;
     if (d.state === 'awaiting_approval') {
-      // Solo Mode produces no draft, so leave the operator on the live stream.
-      if (!(d.run && d.run.solo)) switchTab('draft');
+      switchTab('draft');
       toast('Approval needed. Nothing has been written yet.', 'warn', 8000);
     }
     if (d.state === 'complete') {
-      switchTab(d.run && d.run.diff ? 'diff' : 'final');
-      toast('Run complete.', 'ok');
+      if (!solo) switchTab(d.run && d.run.diff ? 'diff' : 'final');
+      toast(solo ? 'Reply complete.' : 'Run complete.', 'ok');
     }
     if (d.state === 'failed') toast(d.run.error || 'Run failed.', 'error', 9000);
     if (d.state === 'cancelled') toast('Run cancelled.', 'warn');
@@ -1968,15 +2084,24 @@ function connect() {
 
   on('stage_started', (d) => {
     state.run = d.run;
-    const stage = d.run.stages[d.stage];
-    pushDivider(`${stage.label} · ${stage.role}`);
-    if (stage.command && stage.command.length) {
-      pushLine('sys', 'exec', stage.command.join(' '));
+    if (!d.run.solo) {
+      const stage = d.run.stages[d.stage];
+      pushDivider(`${stage.label} · ${stage.role}`);
+      if (stage.command && stage.command.length) {
+        pushLine('sys', 'exec', stage.command.join(' '));
+      }
     }
     renderAll();
   });
 
   on('stage_output', (d) => {
+    if (state.run && state.run.solo) {
+      // Progressive, and provisional: `stage_finished` replaces this with the
+      // CLI's own final answer, which is prose rather than a transcript of it.
+      const answer = $('#solo-answer');
+      answer.textContent += `${d.line}\n`;
+      return;
+    }
     // Tag with the stage's own label: either agent can hold either job, so a
     // hardcoded "codex"/"claude" would mislabel half the stream.
     const stage = state.run && state.run.stages ? state.run.stages[d.stage] : null;
@@ -1986,14 +2111,19 @@ function connect() {
 
   on('stage_finished', (d) => {
     state.run = d.run;
-    const stage = d.run.stages[d.stage];
-    pushLine(d.ok ? 'sys' : 'err', 'exit',
-      `${stage.label} finished in ${fmtDuration(stage.duration)}` +
-      (d.ok ? '' : ` — ${stage.error || 'failed'}`));
+    if (!d.run.solo) {
+      const stage = d.run.stages[d.stage];
+      pushLine(d.ok ? 'sys' : 'err', 'exit',
+        `${stage.label} finished in ${fmtDuration(stage.duration)}` +
+        (d.ok ? '' : ` — ${stage.error || 'failed'}`));
+    }
     renderAll();
   });
 
   on('log', (d) => {
+    // Every log line the engine emits is about council machinery — gates,
+    // branches, snapshots — none of which Solo has.
+    if (state.run && state.run.solo) return;
     pushLine(d.level === 'warn' ? 'warn' : d.level === 'error' ? 'err' : 'sys',
              'system', d.message);
   });
@@ -2068,10 +2198,11 @@ async function startRun() {
   if (!task) return;
   const conf = state.config || {};
 
+  const solo = selectedMode() === 'solo';
+
   // Quota warning. Advisory only: the reading is a snapshot, and only the
   // operator knows whether this particular task is worth the remaining budget.
-  const stages = conf.solo_mode ? [conf.solo_stage || 'polisher'] : ['drafter', 'polisher'];
-  const worst = worstUsageFor(stages);
+  const worst = worstUsageFor(solo ? ['solo'] : ['drafter', 'polisher']);
   const threshold = Number(conf.usage_warn_percent ?? 85);
   if (worst && worst.percent >= threshold) {
     const ok = confirm(
@@ -2083,7 +2214,7 @@ async function startRun() {
     if (!ok) return;
   }
 
-  if (conf.zero_touch) {
+  if (!solo && conf.zero_touch) {
     const ok = confirm(
       'Zero-Touch Mode is ON.\n\n' +
       'The pipeline will run to completion without pausing, and the senior ' +
@@ -2111,6 +2242,16 @@ async function startRun() {
 }
 
 function wire() {
+  // -- mode -------------------------------------------------------------
+  $('#mode-switch').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-mode]');
+    if (!btn || state.busy || btn.dataset.mode === selectedMode()) return;
+    // A conversation belongs to the mode it was started in, so switching
+    // detaches whatever is attached rather than continuing it in the other.
+    if (state.continueFrom) clearContinuation();
+    patchConfig({ mode: btn.dataset.mode });
+  });
+
   // -- composer ---------------------------------------------------------
   $('#task-input').addEventListener('input', renderStatus);
   $('#task-input').addEventListener('keydown', (e) => {
@@ -2168,10 +2309,6 @@ function wire() {
   });
   $('#safety-snapshot').addEventListener('change', e =>
     patchConfig({ safety_snapshot: e.target.checked }));
-  $('#solo-mode').addEventListener('change', e =>
-    patchConfig({ solo_mode: e.target.checked }));
-  $('#solo-stage').addEventListener('change', e =>
-    patchConfig({ solo_stage: e.target.value }));
   $('#clean-worktree').addEventListener('change', e =>
     patchConfig({ require_clean_worktree: e.target.checked }));
   $('#pull-request-mode').addEventListener('change', (e) => {
@@ -2194,11 +2331,6 @@ function wire() {
   // -- model picker -----------------------------------------------------
   // Delegated: the agent rail is re-rendered on every state change.
   $('#agent-rail').addEventListener('click', (e) => {
-    if (e.target.closest('[data-disable-solo]')) {
-      patchConfig({ solo_mode: false });
-      toast('Solo mode off — the draft stage is back in the pipeline.', 'ok', 3600);
-      return;
-    }
     const usageChip = e.target.closest('[data-usage-for]');
     if (usageChip) {
       usageChip.classList.add('checking');
@@ -2295,6 +2427,10 @@ function wire() {
       (preset.auto_approve_args || []).join('\n');
     $('[data-field="stream_args"]', form).value =
       (preset.stream_args || []).join('\n');
+    // Solo only. Codex's `--sandbox read-only` left behind on `claude` is an
+    // unknown flag, which is exactly the pairing the swap exists to prevent.
+    const readOnly = $('[data-field="read_only_args"]', form);
+    if (readOnly) readOnly.value = (preset.read_only_args || []).join('\n');
     $('[data-field="model_args"]', form).value = (preset.model_args || []).join(' ');
     $('[data-field="effort_args"]', form).value = (preset.effort_args || []).join(' ');
     // Neither model names nor effort levels are interchangeable between CLIs.
@@ -2332,7 +2468,7 @@ function wire() {
   $('#chat-close').addEventListener('click', closeChat);
   $('#chat-continue').addEventListener('click', () => {
     const open = state.openChat;
-    if (!open) return;
+    if (!open || !open.run) return;
     // The server enforces this too; checking here turns a rejected run into
     // an answerable message before anything is started.
     const repo = (state.config || {}).target_repo || '';
@@ -2343,7 +2479,8 @@ function wire() {
       );
       return;
     }
-    continueRun(open.file, open.run.task);
+    continueRun(open.file, open.run.task,
+      open.run.mode || (open.run.solo ? 'solo' : 'council'));
     closeChat();
   });
   $('#new-chat').addEventListener('click', () => {
@@ -2355,7 +2492,7 @@ function wire() {
 
   // -- continuation -----------------------------------------------------
   $('#continue-btn').addEventListener('click', () => {
-    if (state.run) continueRun(state.run.file, state.run.task);
+    if (state.run) continueRun(state.run.file, state.run.task, state.run.mode);
   });
   $('#continue-clear').addEventListener('click', clearContinuation);
   // Compaction applies to the run about to start; the transcript on disk is

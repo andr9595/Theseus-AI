@@ -128,7 +128,7 @@ class TestPoller(unittest.TestCase):
     def test_poll_records_a_reading_per_provider(self):
         poller = UsagePoller(self.store)
         snap = poller.poll_once()
-        self.assertEqual(set(snap), {"drafter", "polisher"})
+        self.assertEqual(set(snap), {"drafter", "polisher", "solo"})
 
     def test_interval_has_a_floor(self):
         # A mistyped 1 would spawn a process every second forever.

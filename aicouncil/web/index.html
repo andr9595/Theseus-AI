@@ -17,8 +17,17 @@
       </div>
       <div class="brand-text">
         <h1>AI Council</h1>
-        <span class="brand-sub">Draft &rarr; Polish pipeline</span>
+        <span class="brand-sub" id="brand-sub">Draft &rarr; Polish pipeline</span>
       </div>
+    </div>
+
+    <!-- The first decision, above everything it changes: a two-stage council
+         run, or one assistant answering directly. -->
+    <div id="mode-switch" class="mode-switch" role="radiogroup" aria-label="Mode">
+      <button type="button" role="radio" data-mode="council" aria-checked="true">
+        Council</button>
+      <button type="button" role="radio" data-mode="solo" aria-checked="false">
+        Solo</button>
     </div>
 
     <!-- Two halves of the sidebar: how the next run behaves, and which
@@ -26,7 +35,7 @@
          does not reload the panels. -->
     <div class="sidebar-tabs" role="tablist" aria-label="Sidebar">
       <button class="sidebar-tab active" type="button" role="tab"
-        aria-selected="true" data-sidebar-tab="council">Council</button>
+        aria-selected="true" data-sidebar-tab="council">Setup</button>
       <button class="sidebar-tab" type="button" role="tab"
         aria-selected="false" data-sidebar-tab="chats">Chats
         <span class="sidebar-tab-count hidden" id="chat-count"></span></button>
@@ -51,9 +60,15 @@
 
     <!-- Live agent rail -->
     <section class="panel">
-      <h2 class="panel-title">Council</h2>
+      <h2 class="panel-title" id="agent-panel-title">Council</h2>
       <div id="agent-rail" class="agent-rail"></div>
     </section>
+
+    <!-- Everything below decides how a council run behaves. None of it applies
+         to Solo, which has no gate, no branch and nothing to roll back, so it
+         is hidden there rather than shown doing nothing. Hidden, not cleared:
+         switching back restores the operator's choices untouched. -->
+    <div id="council-controls">
 
     <!-- How the next run behaves -->
     <section class="panel">
@@ -73,19 +88,6 @@
         confirmation.
       </div>
 
-      <label class="toggle" for="solo-mode">
-        <input type="checkbox" id="solo-mode">
-        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
-        <span class="toggle-text">
-          <strong>Solo mode</strong>
-          <em>Skip the draft, run a single agent</em>
-        </span>
-      </label>
-
-      <div id="solo-target" class="field solo-target hidden">
-        <label for="solo-stage">Solo mode runs</label>
-        <select id="solo-stage"></select>
-      </div>
     </section>
 
     <!-- Where the work lands, and how to get it back -->
@@ -119,6 +121,8 @@
         </span>
       </label>
     </section>
+
+    </div><!-- /council-controls -->
 
     <div class="sidebar-spacer"></div>
 
@@ -161,8 +165,9 @@
       <div id="continue-banner" class="continue-banner hidden">
         <span class="continue-icon" aria-hidden="true">&#8618;</span>
         <span class="continue-text">
-          Continuing <b id="continue-task"></b> &mdash; the council will be given
-          that exchange as context.
+          Continuing <b id="continue-task"></b> &mdash;
+          <span id="continue-copy">the council will be given that exchange as
+          context.</span>
           <span id="continue-context" class="context-meter"></span>
         </span>
         <button id="compact-btn" class="link-btn hidden" type="button">Compact</button>
@@ -202,8 +207,9 @@ Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP
       </div>
     </section>
 
-    <!-- Output -->
-    <section class="output">
+    <!-- Output. Council only: Live stream, Draft, Senior review and Diff are
+         all artefacts of the pipeline, and a conversation has none of them. -->
+    <section class="output" id="council-output">
       <div class="tabs" role="tablist">
         <button class="tab active" data-tab="stream" role="tab">Live stream</button>
         <button class="tab" data-tab="draft" role="tab">Draft <span class="tab-badge hidden" id="badge-draft"></span></button>
@@ -242,6 +248,23 @@ Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP
           </div>
         </div>
       </div>
+    </section>
+
+    <!-- Solo's output: the message and the reply, and nothing else. -->
+    <section id="solo-output" class="solo-output hidden" aria-live="polite">
+      <div id="solo-empty" class="empty-state solo-empty">
+        Ask your assistant anything about this repository. One agent, no draft
+        stage and no approval gate &mdash; and it cannot change your files.
+      </div>
+      <article id="solo-turn" class="solo-turn hidden">
+        <div class="chat-message user-message">
+          <div id="solo-question" class="markdown"></div>
+        </div>
+        <div class="chat-message assistant-message">
+          <div id="solo-speaker" class="chat-speaker">Assistant</div>
+          <div id="solo-answer" class="markdown"></div>
+        </div>
+      </article>
     </section>
 
     <!-- A saved conversation, read in place of the live run's output rather
@@ -294,7 +317,7 @@ Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP
     <!-- One destination per kind of setting, so no panel is scrolled past to
          reach another. Every panel stays in the DOM: Save reads them all. -->
     <div class="settings-tabs" role="tablist">
-      <button class="settings-tab active" data-settings-tab="stages" role="tab">Stages</button>
+      <button class="settings-tab active" data-settings-tab="stages" role="tab">Agents</button>
       <button class="settings-tab" data-settings-tab="roles" role="tab">Roles</button>
       <button class="settings-tab" data-settings-tab="project" role="tab">Project</button>
       <button class="settings-tab" data-settings-tab="app" role="tab">App</button>
@@ -302,8 +325,10 @@ Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP
     <div class="modal-body">
       <section class="settings-panel active" data-settings-panel="stages">
         <p class="settings-note">
-          Each stage shells out to a locally installed CLI that carries your own
-          subscription auth. No API keys are stored or sent.
+          Each one shells out to a locally installed CLI that carries your own
+          subscription auth. No API keys are stored or sent. The two council
+          stages and the Solo assistant are configured independently &mdash;
+          Solo's behaviour is optional and blank by default.
         </p>
         <div id="provider-forms"></div>
         <div id="doctor-out" class="doctor"></div>

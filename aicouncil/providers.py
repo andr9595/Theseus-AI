@@ -13,7 +13,8 @@ Three behaviours are worth calling out:
   ``--dangerously-bypass-approvals-and-sandbox``) live in a separate config
   field and are appended only when ``auto_approve`` is set. The pipeline sets
   it in exactly two cases: Zero-Touch Mode is on, or a human clicked "Approve
-  & execute" at the gate. Stage 1 never receives them - it is read-only.
+  & execute" at the gate. Stage 1 never receives them - it is read-only, and
+  neither does Solo Mode, which is invoked with ``read_only_args`` instead.
 
 * **No shell.** Commands are executed as argv lists with ``shell=False``, so a
   prompt containing backticks, ``$(...)`` or a semicolon is inert data rather
@@ -100,11 +101,16 @@ def build_argv(
     provider: Dict,
     prompt: str,
     auto_approve: bool,
+    read_only: bool = False,
 ) -> tuple[List[str], Optional[str]]:
     """Assemble the argv for a provider invocation.
 
     Returns ``(argv, stdin_text)``. ``stdin_text`` is None when the prompt is
     passed as an argument instead.
+
+    ``auto_approve`` and ``read_only`` are opposite grants and never both set:
+    the first is what the pipeline hands a stage the human approved, the second
+    is what Solo Mode hands an assistant that will never be approved at all.
 
     The ``{prompt}`` token may appear anywhere in the template, including
     embedded in a larger string (e.g. ``--message={prompt}``) - the one
@@ -202,6 +208,12 @@ def build_argv(
             if not token:
                 continue
             extra.append(token.replace(EFFORT_TOKEN, effort))
+
+    if read_only:
+        # Stated rather than assumed. Withholding the auto-approve flags is
+        # enough to stop a CLI writing, but not enough to stop it *trying* -
+        # and a solo conversation has no gate to answer the resulting prompt.
+        extra.extend(a for a in (provider.get("read_only_args") or []) if a)
 
     if auto_approve:
         extra.extend(a for a in (provider.get("auto_approve_args") or []) if a)
@@ -470,6 +482,7 @@ class ProviderRunner:
         prompt: str,
         cwd: str,
         auto_approve: bool,
+        read_only: bool = False,
     ) -> ProviderResult:
         pid = str(self.provider.get("id", "provider"))
         started = time.monotonic()
@@ -479,7 +492,9 @@ class ProviderRunner:
         # running, and only a result carries the reason back to the UI. An
         # exception here leaves the stage running forever with no error on it.
         try:
-            argv, stdin_text = build_argv(self.provider, prompt, auto_approve)
+            argv, stdin_text = build_argv(
+                self.provider, prompt, auto_approve, read_only=read_only
+            )
             timeout = int(self.provider.get("timeout_seconds") or 900)
             if timeout <= 0:
                 raise ValueError(f"timeout_seconds must be positive, got {timeout!r}")

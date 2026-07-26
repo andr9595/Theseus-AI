@@ -149,6 +149,28 @@ class TestBuildArgv(unittest.TestCase):
         self.assertEqual(argv[-1], nasty)
         self.assertEqual(len(argv), 3)
 
+    def test_read_only_flags_are_absent_unless_asked_for(self):
+        provider = dict(CODEX, read_only_args=["--sandbox", "read-only"])
+        argv, _ = build_argv(provider, "explain this", auto_approve=False)
+        self.assertNotIn("--sandbox", argv)
+
+    def test_read_only_flags_precede_the_prompt(self):
+        provider = dict(CODEX, read_only_args=["--sandbox", "read-only"])
+        argv, _ = build_argv(
+            provider, "explain this", auto_approve=False, read_only=True
+        )
+        self.assertEqual(
+            argv, ["codex", "exec", "--sandbox", "read-only", "explain this"]
+        )
+
+    def test_read_only_does_not_imply_auto_approve(self):
+        # Solo Mode passes one and never the other; a provider that acquired
+        # both would be told to stay out of the tree and handed the key to it.
+        provider = dict(CLAUDE, read_only_args=["--permission-mode", "plan"])
+        argv, _ = build_argv(provider, "hi", auto_approve=False, read_only=True)
+        self.assertIn("plan", argv)
+        self.assertNotIn("--dangerously-skip-permissions", argv)
+
     def test_blank_auto_approve_entries_are_dropped(self):
         provider = dict(CLAUDE, auto_approve_args=["", "  ", "--yes"])
         argv, _ = build_argv(provider, "hi", auto_approve=True)
