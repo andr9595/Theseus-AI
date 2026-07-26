@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch the AI Council dashboard.
+# Launch the Theseus AI dashboard.
 #
 # Deliberately dependency-free: the app is pure Python 3 standard library, so
 # there is no virtualenv to create, no packages to install and nothing to

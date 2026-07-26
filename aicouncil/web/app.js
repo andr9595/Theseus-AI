@@ -1,5 +1,5 @@
 /* ==========================================================================
-   AI Council - dashboard client
+   Theseus AI - dashboard client
    Vanilla ES2020, no framework, no bundler. Loaded as a classic script so it
    satisfies the `script-src 'self'` CSP with no inline handlers anywhere.
 

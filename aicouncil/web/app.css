@@ -1,5 +1,5 @@
 /* ==========================================================================
-   AI Council - dark developer dashboard
+   Theseus AI - dark developer dashboard
    No build step, no CDN, no external fonts. Everything ships from disk so the
    strict CSP in server.py holds and the app works fully offline.
    ========================================================================== */

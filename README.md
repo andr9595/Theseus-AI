@@ -1,4 +1,4 @@
-# AI Council
+# Theseus AI
 
 A local, dark-themed desktop dashboard that runs a **two-stage coding pipeline**
 across your existing AI subscriptions — with **zero per-token API cost**.
@@ -71,7 +71,7 @@ Check what the app can see:
 ```
 
 ```text
-AI Council v1.0.0
+Theseus AI v1.0.0
   python      : 3.12.3 (/usr/bin/python3)
   config      : /home/you/.config/ai-council/config.json
   runs        : /home/you/.config/ai-council/runs

@@ -109,7 +109,7 @@ def run_drafter(task: str) -> int:
     emit("Create `AI_COUNCIL_DEMO.md`:")
     emit()
     emit("```markdown")
-    emit("# AI Council demo artifact")
+    emit("# Theseus AI demo artifact")
     emit()
     emit(f"Task: {task}")
     emit("```")
@@ -143,7 +143,7 @@ def run_polisher(task: str, write: bool) -> int:
     existed = target.exists()
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     body = (
-        "# AI Council demo artifact\n\n"
+        "# Theseus AI demo artifact\n\n"
         f"This file was written by the mock senior stage at {stamp}.\n\n"
         f"**Task:** {task}\n\n"
         "It exists to demonstrate that the pipeline can modify a real working\n"
@@ -190,7 +190,7 @@ def run_solo(task: str) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Mock agent CLI for AI Council.")
+    parser = argparse.ArgumentParser(description="Mock agent CLI for Theseus AI.")
     parser.add_argument(
         "--role", choices=["drafter", "polisher", "solo"], default="drafter"
     )

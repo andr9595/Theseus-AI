@@ -113,7 +113,7 @@ class TestStaticFiles(ServerTestBase):
         with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
             self.assertEqual(res.status, 200)
             body = res.read().decode()
-        self.assertIn("AI Council", body)
+        self.assertIn("Theseus AI", body)
 
     def test_security_headers_are_present(self):
         with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:

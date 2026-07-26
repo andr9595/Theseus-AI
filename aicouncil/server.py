@@ -68,7 +68,7 @@ class AppState:
 class Handler(BaseHTTPRequestHandler):
     """Routes requests to the API or the static bundle."""
 
-    server_version = f"AICouncil/{__version__}"
+    server_version = f"TheseusAI/{__version__}"
     protocol_version = "HTTP/1.1"
     app: AppState  # injected by make_server
 

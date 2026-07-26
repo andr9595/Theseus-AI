@@ -183,7 +183,7 @@ def _pull_request_text(run: Run) -> Tuple[str, str]:
     lines += [
         "---",
         "",
-        f"Opened by AI Council, run `{run.id}`. Deliberately not merged: "
+        f"Opened by Theseus AI, run `{run.id}`. Deliberately not merged: "
         f"review the diff before it reaches `{run.base_branch}`.",
     ]
     return title, "\n".join(lines)

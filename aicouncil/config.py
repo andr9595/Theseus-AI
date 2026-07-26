@@ -1,4 +1,4 @@
-"""Persistent configuration for AI Council.
+"""Persistent configuration for Theseus AI.
 
 Config lives at ``~/.config/ai-council/config.json`` (XDG-aware). A repo-local
 ``config.local.json`` overrides it when present, which makes development and

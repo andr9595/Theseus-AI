@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Dependency installer for AI Council on Pop!_OS / Ubuntu 24.04.
+# Dependency installer for Theseus AI on Pop!_OS / Ubuntu 24.04.
 #
 # The application itself needs none of this - it is pure Python 3 standard
 # library and runs with `./run.sh` on a stock install.
@@ -104,7 +104,7 @@ fi
 
 # --------------------------------------------------------------------------
 # Everything past this point is optional and needs root. The agent CLIs above
-# are what AI Council actually requires, and they are already installed, so a
+# are what Theseus AI actually requires, and they are already installed, so a
 # machine without passwordless sudo is not blocked from a working pipeline.
 # --------------------------------------------------------------------------
 if [[ "$WANT_EXTRAS" -eq 0 ]]; then
@@ -120,7 +120,7 @@ else
     # ----------------------------------------------------------------------
     say "APT packages"
     # ----------------------------------------------------------------------
-    # None of these are needed to run AI Council; they fill in the gaps in
+    # None of these are needed to run Theseus AI; they fill in the gaps in
     # this machine's unusually bare base image.
     APT_PKGS=(git curl ca-certificates python3-pip python3-venv python3-tk)
     sudo apt-get update
@@ -184,7 +184,7 @@ Next steps:
      Council at zero per-token cost - setting an API key instead would put
      every run on metered billing.
 
-  3. Confirm AI Council can see both CLIs:
+  3. Confirm Theseus AI can see both CLIs:
        ./run.sh --doctor
 
   4. Launch:
