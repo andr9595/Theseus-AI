@@ -348,6 +348,25 @@ class TestApi(ServerTestBase):
         self.assertEqual(status, 400)
         self.assertIn("no longer exists", data["error"])
 
+    def test_start_rejects_a_compaction_flag_that_is_not_a_boolean(self):
+        status, data = self.request(
+            "/api/start", method="POST",
+            body={"task": "follow up", "repo": str(Path(__file__).parent.parent),
+                  "compact_context": "yes"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("compact_context", data["error"])
+
+    def test_context_needs_a_file_to_measure(self):
+        status, data = self.request("/api/context")
+        self.assertEqual(status, 400)
+        self.assertIn("file", data["error"])
+
+    def test_context_rejects_an_unknown_transcript(self):
+        status, data = self.request("/api/context?file=1700000000-nosuchrun.json")
+        self.assertEqual(status, 400)
+        self.assertIn("No such run transcript", data["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

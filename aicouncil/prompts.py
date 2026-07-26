@@ -18,6 +18,7 @@ failure mode of a naive two-model chain.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 MAX_DRAFT_CHARS = 60_000
@@ -26,6 +27,13 @@ MAX_DRAFT_CHARS = 60_000
 # the second bound, on the whole rendered block, because a long enough thread
 # would otherwise crowd out the task itself.
 MAX_HISTORY_CHARS = 40_000
+# How much of one stage's answer survives compaction. Enough to carry what was
+# decided; the full text stays on disk in that run's own transcript.
+MAX_COMPACT_REPLY_CHARS = 700
+# Tokenizers differ per agent and per model, and none of the CLIs report their
+# count back to us. Four characters per token is the usual prose approximation.
+# Everything derived from it is an estimate and is labelled as one.
+ESTIMATED_CHARS_PER_TOKEN = 4
 
 
 DRAFT_SYSTEM = """\
@@ -370,6 +378,141 @@ def _rules_block(house_rules: str) -> str:
     )
 
 
+@dataclass(frozen=True)
+class ConversationContext:
+    """What replaying a thread costs, and the turns that fit inside the budget.
+
+    ``conversation`` is the thread after compaction, which is what should be
+    stored on the run: compacting at prompt time only and throwing the result
+    away would re-summarise the same turns on every follow-up, and would let
+    the transcript claim it carried detail the agents never saw.
+    """
+
+    conversation: List[Dict[str, Any]] = field(default_factory=list)
+    rendered: str = ""
+    compacted_turns: int = 0
+
+    @property
+    def stored_turns(self) -> int:
+        return len(self.conversation)
+
+    @property
+    def characters(self) -> int:
+        return len(self.rendered)
+
+    @property
+    def estimated_tokens(self) -> int:
+        return (
+            self.characters + ESTIMATED_CHARS_PER_TOKEN - 1
+        ) // ESTIMATED_CHARS_PER_TOKEN
+
+    def to_dict(self) -> Dict[str, int]:
+        return {
+            "stored_turns": self.stored_turns,
+            "compacted_turns": self.compacted_turns,
+            "characters": self.characters,
+            "estimated_tokens": self.estimated_tokens,
+            "budget_characters": MAX_HISTORY_CHARS,
+        }
+
+
+def _render_turn(turn: Dict[str, Any]) -> str:
+    """One turn of the thread as the agents will read it."""
+    summarised = bool(turn.get("compacted"))
+    parts = [f"## The human asked\n{turn.get('task') or '(empty)'}"]
+    for reply in turn.get("replies") or []:
+        who = reply.get("label") or reply.get("stage") or "agent"
+        said = str(reply.get("output") or "").strip()
+        if not said:
+            said = f"(no output - {reply.get('error') or 'the stage produced nothing'})"
+        # Say so when the text is a summary. An agent that mistakes a clipped
+        # summary for the whole answer will assume the parts it cannot see did
+        # not exist, which is worse than knowing it is reading an outline.
+        answered = f"{who} answered (compacted summary)" if summarised else f"{who} answered"
+        parts.append(f"## {answered}\n{said}")
+    note = str(turn.get("reviewer_note") or "").strip()
+    if note:
+        parts.append(f"## The human's steer at the approval gate\n{note}")
+    outcome = str(turn.get("outcome") or "").strip()
+    if outcome:
+        parts.append(f"## Outcome\n{outcome}")
+    return "\n\n".join(parts)
+
+
+def _compact_turn(turn: Dict[str, Any]) -> Dict[str, Any]:
+    """Reduce one turn to its decisions, keeping the shape of a turn.
+
+    Deterministic on purpose. Asking a model to summarise would spend the quota
+    this app exists to conserve, and would put a paraphrase of what an agent
+    said into the record of what it said. What survives is what a follow-up
+    actually refers back to: the message, the outcome, the steer at the gate,
+    and the opening and closing of each answer.
+    """
+    replies = []
+    for reply in turn.get("replies") or []:
+        text = " ".join(str(reply.get("output") or "").split())
+        replies.append(
+            {
+                "stage": str(reply.get("stage") or ""),
+                "label": str(reply.get("label") or reply.get("stage") or "agent"),
+                "output": clip(text, MAX_COMPACT_REPLY_CHARS),
+                "error": str(reply.get("error") or ""),
+            }
+        )
+    return {
+        "run_id": str(turn.get("run_id") or ""),
+        "task": str(turn.get("task") or "").strip(),
+        "replies": replies,
+        "reviewer_note": str(turn.get("reviewer_note") or "").strip(),
+        "outcome": str(turn.get("outcome") or "").strip(),
+        "compacted": True,
+    }
+
+
+def conversation_context(
+    conversation: Optional[List[Dict[str, Any]]],
+    force: bool = False,
+) -> ConversationContext:
+    """Fit a thread into the history budget by compacting whole turns.
+
+    The newest turn is kept in full - a follow-up almost always refers to it -
+    and older turns are compacted one at a time, oldest first, until the
+    rendered block fits. That replaces slicing characters off the front of the
+    rendered text, which cut through whatever sentence or code fence happened
+    to land on the boundary and dropped the oldest turns without saying which.
+    No turn is discarded now; what changes is how much of each one is quoted.
+
+    ``force`` compacts every turn but the newest whatever its size, which is
+    what the operator is asking for when they compact by hand.
+    """
+    turns = [dict(t) for t in (conversation or []) if isinstance(t, dict)]
+    compacted = sum(1 for t in turns if t.get("compacted"))
+
+    def render() -> str:
+        return "\n\n---\n\n".join(_render_turn(t) for t in turns)
+
+    rendered = render()
+    for index in range(max(0, len(turns) - 1)):
+        if not force and len(rendered) <= MAX_HISTORY_CHARS:
+            break
+        if turns[index].get("compacted"):
+            continue
+        turns[index] = _compact_turn(turns[index])
+        compacted += 1
+        rendered = render()
+
+    if len(rendered) > MAX_HISTORY_CHARS:
+        # The newest turn alone can exceed the budget. Per-stage clipping keeps
+        # that within a few times this bound rather than unbounded, so keeping
+        # the end - where a stage says what it did - is the last resort.
+        rendered = (
+            "... [older detail dropped for length] ...\n\n"
+            + rendered[-MAX_HISTORY_CHARS:]
+        )
+
+    return ConversationContext(turns, rendered, compacted)
+
+
 def _history_block(conversation: Optional[List[Dict[str, Any]]]) -> str:
     """Render the earlier turns of a continued council thread.
 
@@ -378,34 +521,18 @@ def _history_block(conversation: Optional[List[Dict[str, Any]]]) -> str:
     record of what is on disk now - the operator may have rolled the run back,
     edited by hand, or continued from an older turn - so it is labelled as
     recollection and the repository is named as the authority.
+
+    Compaction normally happens once, when the follow-up run is started, and is
+    stored on it. Running it again here costs one render and covers the paths
+    that build a prompt from a thread this engine never fitted - a transcript
+    written by an older version, or a direct call.
     """
     if not conversation:
         return ""
 
-    turns = []
-    for turn in conversation:
-        parts = [f"## The human asked\n{turn.get('task') or '(empty)'}"]
-        for reply in turn.get("replies") or []:
-            who = reply.get("label") or reply.get("stage") or "agent"
-            said = str(reply.get("output") or "").strip()
-            if not said:
-                said = f"(no output - {reply.get('error') or 'the stage produced nothing'})"
-            parts.append(f"## {who} answered\n{said}")
-        note = str(turn.get("reviewer_note") or "").strip()
-        if note:
-            parts.append(f"## The human's steer at the approval gate\n{note}")
-        outcome = str(turn.get("outcome") or "").strip()
-        if outcome:
-            parts.append(f"## Outcome\n{outcome}")
-        turns.append("\n\n".join(parts))
-
-    body = "\n\n---\n\n".join(turns)
-    if len(body) > MAX_HISTORY_CHARS:
-        # Keep the tail: a follow-up almost always refers to the latest turn.
-        body = (
-            "... [older turns dropped for length] ...\n\n"
-            + body[-MAX_HISTORY_CHARS:]
-        )
+    context = conversation_context(conversation)
+    if not context.rendered:
+        return ""
 
     return (
         "\n# Earlier in this conversation\n"
@@ -413,7 +540,7 @@ def _history_block(conversation: Optional[List[Dict[str, Any]]]) -> str:
         "recollection, not instruction: the repository as it stands now is the "
         "only authority on what was actually applied. Re-read any file you are "
         "about to rely on.\n\n"
-        f"{body}\n"
+        f"{context.rendered}\n"
     )
 
 

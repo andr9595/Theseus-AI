@@ -6,7 +6,7 @@
    Contents
      1. Utilities        6. State + rendering
      2. API client       7. Live stream
-     3. Markdown         8. Modals (picker, settings, history)
+     3. Markdown         8. Modals (picker, settings) + conversations
      4. Highlighter      9. Event stream (SSE)
      5. Diff viewer     10. Boot
    ========================================================================== */
@@ -534,6 +534,13 @@ const state = {
   // so the composer can name what is being continued.
   continueFrom: '',
   continueTask: '',
+  // What replaying that transcript costs, from /api/context, and whether the
+  // operator asked to compact it before the next run.
+  continueContext: null,
+  compactContext: false,
+  // The conversation list in the sidebar, and the one open in the main pane.
+  chats: [],
+  openChat: null,
 };
 
 const STATE_LABELS = {
@@ -602,27 +609,83 @@ function renderStatus() {
   }
 }
 
+/** One line describing what a thread costs to replay.
+ *  Every figure here is an estimate and says so: no CLI reports its tokenizer's
+ *  count back to us, and the window is a configured number, not a vendor one.
+ *  It also covers the replayed conversation only — the task, the draft and
+ *  whatever the agent reads for itself land in the same window. */
+function contextLine(context) {
+  if (!context || !context.stored_turns) return '';
+  const parts = [`${context.stored_turns} earlier message${context.stored_turns === 1 ? '' : 's'}`];
+  // Thousands once there are thousands: "~0.4k tokens" is a worse reading of
+  // 441 than the number itself.
+  parts.push(context.estimated_tokens >= 1000
+    ? `~${Math.round(context.estimated_tokens / 100) / 10}k tokens`
+    : `~${context.estimated_tokens} tokens`);
+  if (context.percent != null) {
+    parts.push(`≈${context.percent}% of a ${Math.round(context.window_tokens / 1000)}k window`);
+  }
+  if (context.compacted_turns) {
+    parts.push(`${context.compacted_turns} compacted`);
+  }
+  return parts.join(' · ');
+}
+
+/** True once the replay is close enough to the history budget that the next
+ *  follow-up will be compacted whether or not the operator asks. */
+function contextIsTight(context) {
+  return !!context && !!context.budget_characters &&
+    context.characters >= context.budget_characters * 0.75;
+}
+
 /** Show what the next run will be handed, if it is a follow-up. Standing state
  *  the operator can see and undo — a placeholder would vanish on the first
  *  keystroke and leave the attachment invisible. */
 function renderContinuation() {
   $('#continue-banner').classList.toggle('hidden', !state.continueFrom);
   $('#continue-task').textContent = state.continueTask || 'an earlier run';
+
+  const context = state.continueContext;
+  const meter = $('#continue-context');
+  meter.textContent = context
+    ? contextLine(state.compactContext ? context.compacted : context)
+    : '';
+  meter.classList.toggle('warn', contextIsTight(context) && !state.compactContext);
+
+  // Nothing to compact once every earlier turn already is, and nothing to
+  // offer before the measurement has arrived.
+  const room = context && context.compacted &&
+    context.compacted.compacted_turns > context.compacted_turns;
+  $('#compact-btn').classList.toggle('hidden', !(room && !state.compactContext));
 }
 
-/** Attach a transcript to the next run. */
-function continueRun(file, task) {
+/** Attach a transcript to the next run, and measure what that will replay. */
+async function continueRun(file, task) {
   state.continueFrom = file;
   state.continueTask = (task || '').slice(0, 90);
-  closeModal('history');
+  state.continueContext = null;
+  state.compactContext = false;
   renderStatus();
   $('#task-input').focus();
   toast('That conversation is attached. Type your follow-up.', 'ok', 4200);
+
+  try {
+    const { context } = await api(`/api/context?file=${encodeURIComponent(file)}`);
+    // The operator may have detached or switched conversation while this was
+    // in flight; a stale reading is worse than none.
+    if (state.continueFrom !== file) return;
+    state.continueContext = context;
+    renderContinuation();
+  } catch (err) {
+    toast(`Could not measure the conversation's context: ${err.message}`, 'warn');
+  }
 }
 
 function clearContinuation() {
   state.continueFrom = '';
   state.continueTask = '';
+  state.continueContext = null;
+  state.compactContext = false;
   renderContinuation();
 }
 
@@ -1530,54 +1593,47 @@ async function refreshDoctor(show = false) {
   }
 }
 
-/* ---- History ---- */
+/* ---- Conversations ---- */
 
-/** The transcript currently open in the detail pane, with its filename. */
-let openTranscript = null;
-
-async function showHistory() {
-  openModal('history');
-  showHistoryList();
-  const list = $('#history-list');
-  list.innerHTML = '<div class="picker-empty">Loading…</div>';
+/** The sidebar list: one row per conversation, newest first. The server groups
+ *  runs into threads, so a follow-up does not appear as its own entry — it *is*
+ *  the conversation it continued. */
+async function loadChats() {
+  const list = $('#chat-list');
+  if (!list.childElementCount) {
+    list.innerHTML = '<div class="picker-empty">Loading…</div>';
+  }
   try {
     const { runs } = await api('/api/history');
-    if (!runs.length) {
-      list.innerHTML = '<div class="picker-empty">No runs yet.</div>';
-      return;
-    }
-    list.innerHTML = runs.map(r => {
-      const stat = r.diff_stat || {};
-      const changed = stat.files
-        ? `<span class="history-stat"><span class="stat-add">+${stat.insertions || 0}</span> ` +
-          `<span class="stat-del">&minus;${stat.deletions || 0}</span></span>`
-        : '';
-      // A follow-up is one message in a longer exchange, not a standalone
-      // task; saying so is the difference between a log and a conversation.
-      const thread = r.turns
-        ? `<span class="history-thread">follow-up · ${r.turns + 1} messages</span>`
-        : '';
-      return (
-        `<button class="history-row ${esc(r.state)}" type="button" ` +
-          `data-history-file="${esc(r.file)}">` +
-          `<div class="history-main">` +
-            `<div class="history-task">${esc(r.task || '(no task)')}</div>` +
-            `<div class="history-sub">${fmtWhen(r.created_at)} · ${esc(r.state)} ` +
-              `${r.zero_touch ? '· zero-touch ' : ''}· ${esc(r.repo || '')}</div>` +
-          `</div>${thread}${changed}` +
-        `</button>`
-      );
-    }).join('');
+    state.chats = runs;
+    renderChats();
   } catch (err) {
     list.innerHTML = `<div class="picker-empty">${esc(err.message)}</div>`;
   }
 }
 
-function showHistoryList() {
-  openTranscript = null;
-  $('#history-title').textContent = 'Run history';
-  $('#history-detail').classList.add('hidden');
-  $('#history-list').classList.remove('hidden');
+function renderChats() {
+  const list = $('#chat-list');
+  const chats = state.chats || [];
+  const count = $('#chat-count');
+  count.textContent = chats.length ? String(chats.length) : '';
+  count.classList.toggle('hidden', !chats.length);
+
+  if (!chats.length) {
+    list.innerHTML =
+      '<div class="picker-empty">No conversations yet. Run a task to start one.</div>';
+    return;
+  }
+  const open = state.openChat ? state.openChat.file : '';
+  list.innerHTML = chats.map(c =>
+    `<button class="chat-row ${esc(c.state)}${c.file === open ? ' open' : ''}" ` +
+      `type="button" data-chat-file="${esc(c.file)}" title="${esc(c.repo || '')}">` +
+      `<span class="chat-row-title">${esc(c.title || c.task || '(no task)')}</span>` +
+      `<span class="chat-row-meta">${fmtWhen(c.created_at)} · ` +
+        `${c.messages} message${c.messages === 1 ? '' : 's'}` +
+        `${c.zero_touch ? ' · zero-touch' : ''}</span>` +
+    `</button>`
+  ).join('');
 }
 
 function historySection(title, bodyHtml, cls = 'markdown') {
@@ -1588,44 +1644,50 @@ function historySection(title, bodyHtml, cls = 'markdown') {
   );
 }
 
-/** One exchange: what the human asked, then what each agent answered. */
-function historyTurn(task, replies, prefix = '') {
+/** One exchange: what the human asked, then what each agent answered.
+ *  `compacted` marks a turn whose answers were summarised to fit the context
+ *  budget, so a clipped outline is not shown as if it were the whole reply. */
+function historyTurn(task, replies, prefix = '', compacted = false) {
+  const note = compacted ? ' · compacted' : '';
   return (
     historySection(`${prefix}You asked`, renderMarkdown(task || '(no message)')) +
     replies.map(r => historySection(
-      `${prefix}${r.label || r.stage || 'Agent'}`,
+      `${prefix}${r.label || r.stage || 'Agent'}${note}`,
       renderMarkdown(r.output || '') ||
         `<p class="history-none">${esc(r.error || `(${r.state || 'no output'})`)}</p>`
     )).join('')
   );
 }
 
-/** Open one persisted run: the whole thread it belongs to, then its result. */
-async function openHistoryRun(file) {
-  const transcript = $('#history-transcript');
-  $('#history-list').classList.add('hidden');
-  $('#history-detail').classList.remove('hidden');
-  $('#history-continue').disabled = true;
+/** Open one conversation in the main pane: every turn of the thread, then the
+ *  result of its latest run. The live run's own output is hidden rather than
+ *  cleared, so closing this puts it back untouched. */
+async function openChat(file) {
+  const transcript = $('#chat-transcript');
+  $('.output').classList.add('hidden');
+  $('#chat-view').classList.remove('hidden');
+  $('#chat-continue').disabled = true;
+  $('#chat-context').textContent = '';
   transcript.innerHTML = '<div class="picker-empty">Loading…</div>';
 
   try {
     const { run } = await api(`/api/run?file=${encodeURIComponent(file)}`);
-    openTranscript = { file, run };
-    $('#history-title').textContent =
-      `${fmtWhen(run.created_at)} · ${run.state}`;
-    $('#history-continue').disabled = false;
-
+    state.openChat = { file, run };
+    renderChats();
     // Earlier turns of the same thread travel inside the transcript, so a
     // follow-up reads as the conversation it was rather than a lone message.
-    const earlier = (run.conversation || [])
-      .map(t => historyTurn(t.task, t.replies || [], 'Earlier · '))
-      .join('');
+    const earlier = run.conversation || [];
+    $('#chat-title').textContent =
+      (earlier.length ? earlier[0].task : run.task) || 'Conversation';
+    $('#chat-continue').disabled = false;
+
     const stages = (run.stage_order || Object.keys(run.stages || {}))
       .map(id => (run.stages || {})[id])
       .filter(Boolean);
 
     transcript.innerHTML =
-      earlier +
+      earlier.map(t =>
+        historyTurn(t.task, t.replies || [], 'Earlier · ', t.compacted)).join('') +
       historyTurn(run.task, stages) +
       historySection('Your note at the approval gate',
         renderMarkdown(run.reviewer_note || '')) +
@@ -1633,9 +1695,38 @@ async function openHistoryRun(file) {
         run.diff ? renderDiff(run.diff, run.diff_stat) : '', 'diff-view') +
       historySection('Rolled back', renderMarkdown(run.rollback_note || '')) +
       historySection('Error', renderMarkdown(run.error || ''));
+
+    // What a follow-up to *this* conversation would replay — measured now
+    // rather than after the operator has committed to it.
+    const { context } = await api(`/api/context?file=${encodeURIComponent(file)}`);
+    if (state.openChat && state.openChat.file === file) {
+      const cost = contextLine(context);
+      const meter = $('#chat-context');
+      meter.textContent = `${fmtWhen(run.created_at)} · ${run.state}` +
+        (cost ? ` · continuing replays ${cost}` : '');
+      meter.classList.toggle('warn', contextIsTight(context));
+    }
   } catch (err) {
     transcript.innerHTML = `<div class="picker-empty">${esc(err.message)}</div>`;
   }
+}
+
+function closeChat() {
+  state.openChat = null;
+  $('#chat-view').classList.add('hidden');
+  $('.output').classList.remove('hidden');
+  renderChats();
+}
+
+function switchSidebarTab(name) {
+  $$('.sidebar-tab').forEach(t => {
+    const active = t.dataset.sidebarTab === name;
+    t.classList.toggle('active', active);
+    t.setAttribute('aria-selected', String(active));
+  });
+  $$('.sidebar-panel').forEach(p =>
+    p.classList.toggle('active', p.dataset.sidebarPanel === name));
+  if (name === 'chats') loadChats();
 }
 
 /* ==========================================================================
@@ -1682,6 +1773,9 @@ function connect() {
   on('run_started', (d) => {
     state.run = d.run;
     state.busy = true;
+    // A saved conversation is hiding the output pane the stream renders into,
+    // and a run starting is where the operator's attention belongs.
+    closeChat();
     clearStream();
     pushDivider('Run started');
     pushLine('sys', 'system', `Task: ${d.run.task}`);
@@ -1707,6 +1801,10 @@ function connect() {
     }
     if (d.state === 'failed') toast(d.run.error || 'Run failed.', 'error', 9000);
     if (d.state === 'cancelled') toast('Run cancelled.', 'warn');
+    // The transcript is written when the run reaches a terminal state, which is
+    // when the conversation list can show it — and when a follow-up has folded
+    // its parent into itself and must replace it there.
+    if (!state.busy) loadChats();
     renderAll();
   });
 
@@ -1839,7 +1937,12 @@ async function startRun() {
   try {
     await api('/api/start', {
       method: 'POST',
-      body: { task, repo: conf.target_repo, continue_from: state.continueFrom },
+      body: {
+        task,
+        repo: conf.target_repo,
+        continue_from: state.continueFrom,
+        compact_context: state.compactContext,
+      },
     });
     // Only once the server has accepted it: a rejected start leaves the
     // attachment in place so the operator can fix the task and try again.
@@ -2055,27 +2158,38 @@ function wire() {
     } catch (err) { toast(err.message, 'error'); }
   });
 
-  // -- history ----------------------------------------------------------
-  $('#history-btn').addEventListener('click', showHistory);
-  // Delegated: the list is rebuilt every time History opens.
-  $('#history-list').addEventListener('click', (e) => {
-    const row = e.target.closest('[data-history-file]');
-    if (row) openHistoryRun(row.dataset.historyFile);
+  // -- conversations ----------------------------------------------------
+  $('.sidebar-tabs').addEventListener('click', (e) => {
+    const tab = e.target.closest('.sidebar-tab');
+    if (tab) switchSidebarTab(tab.dataset.sidebarTab);
   });
-  $('#history-back').addEventListener('click', showHistoryList);
-  $('#history-continue').addEventListener('click', () => {
-    if (!openTranscript) return;
+  // Delegated: the list is rebuilt whenever it is reloaded.
+  $('#chat-list').addEventListener('click', (e) => {
+    const row = e.target.closest('[data-chat-file]');
+    if (row) openChat(row.dataset.chatFile);
+  });
+  $('#chat-close').addEventListener('click', closeChat);
+  $('#chat-continue').addEventListener('click', () => {
+    const open = state.openChat;
+    if (!open) return;
     // The server enforces this too; checking here turns a rejected run into
     // an answerable message before anything is started.
     const repo = (state.config || {}).target_repo || '';
-    if (openTranscript.run.repo !== repo) {
+    if (open.run.repo !== repo) {
       toast(
-        `That run was in ${openTranscript.run.repo}. Select it as the target ` +
+        `That conversation was in ${open.run.repo}. Select it as the target ` +
         `repository to continue it.`, 'error', 9000
       );
       return;
     }
-    continueRun(openTranscript.file, openTranscript.run.task);
+    continueRun(open.file, open.run.task);
+    closeChat();
+  });
+  $('#new-chat').addEventListener('click', () => {
+    clearContinuation();
+    closeChat();
+    switchSidebarTab('council');
+    $('#task-input').focus();
   });
 
   // -- continuation -----------------------------------------------------
@@ -2083,6 +2197,18 @@ function wire() {
     if (state.run) continueRun(state.run.file, state.run.task);
   });
   $('#continue-clear').addEventListener('click', clearContinuation);
+  // Compaction applies to the run about to start; the transcript on disk is
+  // never rewritten, so the full text of every turn stays readable in its own
+  // conversation.
+  $('#compact-btn').addEventListener('click', () => {
+    if (!state.continueContext) return;
+    state.compactContext = true;
+    renderContinuation();
+    toast(
+      'Earlier turns will be summarised for the next run, keeping the window ' +
+      'clear for the work itself.', 'ok', 5200
+    );
+  });
 
   // -- modal dismissal --------------------------------------------------
   $$('[data-close]').forEach(btn =>
@@ -2133,6 +2259,7 @@ async function boot() {
   wire();
   await loadState();
   await refreshDoctor();
+  await loadChats();
   connect();
   $('#task-input').focus();
 }

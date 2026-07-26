@@ -730,6 +730,75 @@ class TestContinuedConversation(PipelineTestBase):
         self.assertEqual([t["task"] for t in third.conversation],
                          ["remember MAGIC-THREAD-TOKEN", "second message"])
 
+    def test_a_follow_up_records_what_its_thread_cost(self):
+        first = self.first_run()
+        second = self.pipeline.start(
+            "second message", str(self.repo), continue_from=first.transcript_name
+        )
+        self.wait_terminal()
+
+        self.assertEqual(second.context["stored_turns"], 1)
+        self.assertEqual(second.context["compacted_turns"], 0)
+        self.assertGreater(second.context["estimated_tokens"], 0)
+        # The percentage is measured against the configured window, not a
+        # figure any CLI reported.
+        self.assertEqual(second.context["window_tokens"], 200_000)
+        self.assertIsNotNone(second.context["percent"])
+
+    def test_compacting_on_request_summarises_the_earlier_turns(self):
+        first = self.first_run()
+        second = self.pipeline.start(
+            "second message", str(self.repo), continue_from=first.transcript_name
+        )
+        self.wait_terminal()
+        third = self.pipeline.start(
+            "third message", str(self.repo),
+            continue_from=second.transcript_name, compact_context=True,
+        )
+        self.wait_terminal()
+
+        # Nothing is lost from the thread; the oldest turns are summarised and
+        # the newest is kept whole.
+        self.assertEqual([t["task"] for t in third.conversation],
+                         ["remember MAGIC-THREAD-TOKEN", "second message"])
+        self.assertTrue(third.conversation[0]["compacted"])
+        self.assertFalse(third.conversation[-1].get("compacted"))
+        self.assertEqual(third.context["compacted_turns"], 1)
+
+    def test_a_window_of_zero_reports_tokens_without_a_percentage(self):
+        # An operator who does not know their model's window can say so rather
+        # than being shown a percentage of a number this app made up.
+        self.store.update({"context_window_tokens": 0})
+        first = self.first_run()
+        second = self.pipeline.start(
+            "second message", str(self.repo), continue_from=first.transcript_name
+        )
+        self.wait_terminal()
+
+        self.assertIsNone(second.context["percent"])
+        self.assertGreater(second.context["estimated_tokens"], 0)
+
+    def test_the_context_preview_prices_compaction_before_the_run(self):
+        first = self.first_run()
+        second = self.pipeline.start(
+            "second message", str(self.repo), continue_from=first.transcript_name
+        )
+        self.wait_terminal()
+
+        preview = self.pipeline.context_preview(second.transcript_name)
+        # Two turns would be replayed: the first run, and the one being
+        # continued - which is not yet a turn of any stored conversation.
+        self.assertEqual(preview["stored_turns"], 2)
+        self.assertEqual(preview["compacted_turns"], 0)
+        self.assertEqual(preview["compacted"]["compacted_turns"], 1)
+        self.assertLess(
+            preview["compacted"]["characters"], preview["characters"]
+        )
+
+    def test_the_context_preview_refuses_a_missing_transcript(self):
+        with self.assertRaisesRegex(ValueError, "No such run transcript"):
+            self.pipeline.context_preview("1700000000-nope.json")
+
     def test_an_ordinary_run_carries_no_conversation(self):
         run = self.first_run()
         self.assertEqual(run.conversation, [])
@@ -792,6 +861,75 @@ class TestContinuedConversation(PipelineTestBase):
             "stage_order": ["polisher"],
         })
         self.assertLess(len(turn["replies"][0]["output"]), MAX_TURN_CHARS + 200)
+
+
+class TestConversationList(PipelineTestBase):
+    """What the sidebar lists: conversations, not individual runs."""
+
+    def setUp(self):
+        super().setUp()
+        self.store.update({"zero_touch": True})
+
+    def run_once(self, task, continue_from=""):
+        run = self.pipeline.start(task, str(self.repo), continue_from=continue_from)
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+        return run
+
+    def test_one_run_is_one_conversation(self):
+        run = self.run_once("do the thing")
+        listed = self.pipeline.history()
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0]["file"], run.transcript_name)
+        self.assertEqual(listed[0]["messages"], 1)
+
+    def test_a_follow_up_replaces_its_parent_rather_than_joining_it(self):
+        first = self.run_once("the original request")
+        second = self.run_once("a follow-up", continue_from=first.transcript_name)
+        third = self.run_once("another follow-up", continue_from=second.transcript_name)
+
+        listed = self.pipeline.history()
+        self.assertEqual(len(listed), 1, "a thread is one conversation, not three")
+        self.assertEqual(listed[0]["file"], third.transcript_name)
+        self.assertEqual(listed[0]["messages"], 3)
+        # Named for what it was opened about, so the row does not rename itself
+        # every time the operator sends another message.
+        self.assertEqual(listed[0]["title"], "the original request")
+
+    def test_continuing_the_same_run_twice_lists_both_branches(self):
+        first = self.run_once("the original request")
+        left = self.run_once("down one path", continue_from=first.transcript_name)
+        right = self.run_once("down another", continue_from=first.transcript_name)
+
+        files = {c["file"] for c in self.pipeline.history()}
+        self.assertEqual(files, {left.transcript_name, right.transcript_name})
+
+    def test_unrelated_runs_stay_separate_conversations(self):
+        self.run_once("one thing")
+        self.run_once("a different thing")
+        self.assertEqual(len(self.pipeline.history()), 2)
+
+    def test_a_transcript_from_before_this_feature_is_its_own_conversation(self):
+        # No `parent_run_id` and no `conversation`: one message, listed as one
+        # conversation rather than guessed into somebody else's thread.
+        legacy = cfg.runs_dir() / "1700000000-legacyrun.json"
+        legacy.write_text(json.dumps({
+            "id": "legacyrun",
+            "task": "the original request",
+            "repo": str(self.repo),
+            "state": "complete",
+        }), encoding="utf-8")
+
+        listed = self.pipeline.history()
+        self.assertEqual([c["file"] for c in listed], [legacy.name])
+        self.assertEqual(listed[0]["messages"], 1)
+        self.assertEqual(listed[0]["title"], "the original request")
+
+    def test_an_unreadable_transcript_does_not_break_the_list(self):
+        run = self.run_once("do the thing")
+        (cfg.runs_dir() / "1700000001-broken.json").write_text("{oh no", encoding="utf-8")
+        self.assertEqual([c["file"] for c in self.pipeline.history()],
+                         [run.transcript_name])
 
 
 class TestEventStream(PipelineTestBase):
@@ -1019,7 +1157,7 @@ class TestConversationPrompt(unittest.TestCase):
         prompt = prompts.build_solo_prompt("do it", "/tmp/r", None, "", self.TURNS)
         self.assertIn("repository as it stands now", prompt)
 
-    def test_an_over_long_thread_keeps_its_recent_end(self):
+    def test_an_over_long_thread_compacts_its_oldest_turns(self):
         from aicouncil import prompts
 
         turns = [
@@ -1029,9 +1167,72 @@ class TestConversationPrompt(unittest.TestCase):
                 {"label": "Claude", "output": "the answer that matters"}]},
         ]
         prompt = prompts.build_draft_prompt("do it", "/tmp/r", None, "", turns)
+
         self.assertIn("the answer that matters", prompt)
-        self.assertNotIn("ancient history", prompt)
-        self.assertIn("older turns dropped", prompt)
+        # The old turn is summarised, not dropped: what was asked survives even
+        # when the answer no longer fits, which is what a follow-up refers to.
+        self.assertIn("ancient history", prompt)
+        self.assertIn("compacted summary", prompt)
+        self.assertLess(len(prompt), prompts.MAX_HISTORY_CHARS + 5_000)
+
+    def test_the_newest_turn_is_never_compacted(self):
+        from aicouncil import prompts
+
+        turns = [
+            {"task": "old", "replies": [
+                {"label": "Claude", "output": "y" * prompts.MAX_HISTORY_CHARS}]},
+            {"task": "new", "replies": [
+                {"label": "Claude", "output": "SENTINEL-" + "z" * 5_000}]},
+        ]
+        context = prompts.conversation_context(turns)
+
+        self.assertEqual(context.compacted_turns, 1)
+        self.assertEqual(context.stored_turns, 2)
+        self.assertFalse(context.conversation[1].get("compacted"))
+        self.assertIn("SENTINEL-" + "z" * 5_000, context.rendered)
+
+    def test_compacting_by_hand_needs_no_over_long_thread(self):
+        from aicouncil import prompts
+
+        # Well inside the budget, so nothing is compacted unless asked.
+        turns = [
+            {"task": "first", "replies": [{"label": "Claude", "output": "c" * 4_000}]},
+            {"task": "second", "replies": [{"label": "Claude", "output": "another one"}]},
+        ]
+        relaxed = prompts.conversation_context(turns)
+        forced = prompts.conversation_context(turns, force=True)
+
+        self.assertEqual(relaxed.compacted_turns, 0)
+        self.assertEqual(forced.compacted_turns, 1)
+        self.assertLess(forced.characters, relaxed.characters)
+        # Compaction rewrites turns; it must not mutate the caller's list.
+        self.assertNotIn("compacted", turns[0])
+
+    def test_an_already_compacted_turn_is_not_compacted_again(self):
+        from aicouncil import prompts
+
+        turns = [
+            prompts._compact_turn(
+                {"task": "first", "replies": [{"label": "Claude", "output": "b" * 40_000}]}
+            ),
+            {"task": "second", "replies": [{"label": "Claude", "output": "fresh"}]},
+        ]
+        context = prompts.conversation_context(turns, force=True)
+
+        # Counted once, for the state it is already in - not once per pass.
+        self.assertEqual(context.compacted_turns, 1)
+
+    def test_the_token_figure_is_derived_from_the_rendered_text(self):
+        # It is an estimate, and the only honest thing to pin is that it is
+        # computed from what the agents are actually given.
+        from aicouncil import prompts
+
+        context = prompts.conversation_context(self.TURNS)
+        self.assertEqual(context.characters, len(context.rendered))
+        self.assertEqual(
+            context.estimated_tokens,
+            -(-context.characters // prompts.ESTIMATED_CHARS_PER_TOKEN),
+        )
 
 
 class TestRoleReachesTheRun(PipelineTestBase):

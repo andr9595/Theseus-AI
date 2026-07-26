@@ -62,6 +62,12 @@ TERMINAL_STATES = {COMPLETE, FAILED, CANCELLED}
 # would be duplicated into each one for as long as the thread runs.
 MAX_TURN_CHARS = 12_000
 
+# How many transcripts a conversation listing reads. Threads are grouped by
+# lineage, and a child is always newer than its parent, so a window of the
+# newest files holds every thread whose latest run is in it. The cap is what
+# keeps opening the sidebar cheap for someone with a year of runs on disk.
+HISTORY_SCAN_LIMIT = 200
+
 # How much of the senior stage's own summary is quoted into the pull request
 # body. It is the description a reviewer reads first, but it is not the review
 # itself - the diff is.
@@ -113,6 +119,28 @@ def _conversation_turn(data: Dict[str, Any]) -> Dict[str, Any]:
         "reviewer_note": str(data.get("reviewer_note") or "").strip(),
         "outcome": outcome,
     }
+
+
+def _context_summary(
+    context: prompts.ConversationContext, window_tokens: int
+) -> Dict[str, Any]:
+    """The context reading the UI shows for a thread.
+
+    ``window_tokens`` is configured, not reported: no CLI tells us the size of
+    the window its model was given. The percentage is therefore an estimate
+    measured against an estimate, and the UI says so rather than presenting it
+    as a vendor figure. It also measures only the replayed conversation - the
+    task, the draft and whatever the agent reads for itself all land in the
+    same window, so this is a floor on the real usage, not the total.
+    """
+    out: Dict[str, Any] = dict(context.to_dict())
+    out["window_tokens"] = window_tokens
+    out["percent"] = (
+        round(100.0 * out["estimated_tokens"] / window_tokens, 1)
+        if window_tokens > 0
+        else None
+    )
+    return out
 
 
 def _pull_request_text(run: Run) -> Tuple[str, str]:
@@ -210,6 +238,10 @@ class Run:
     # the transcript it came from.
     parent_run_id: str = ""
     conversation: List[Dict[str, Any]] = field(default_factory=list)
+    # What that thread costs to replay, measured on the text the agents were
+    # actually given. Persisted so the transcript cannot later imply it carried
+    # turns in full that were compacted before either stage saw them.
+    context: Dict[str, Any] = field(default_factory=dict)
     # The configuration this run was started with, read once. Settings changed
     # while the run is parked at the approval gate - including by a second app
     # instance sharing the config file - must not swap the command the human
@@ -263,6 +295,7 @@ class Run:
             "rollback_note": self.rollback_note,
             "parent_run_id": self.parent_run_id,
             "conversation": self.conversation,
+            "context": self.context,
         }
 
 
@@ -318,7 +351,13 @@ class Pipeline:
 
     # -- control -----------------------------------------------------------
 
-    def start(self, task: str, repo: str, continue_from: str = "") -> Run:
+    def start(
+        self,
+        task: str,
+        repo: str,
+        continue_from: str = "",
+        compact_context: bool = False,
+    ) -> Run:
         """Kick off a new run. Raises PipelineBusy if one is already active.
 
         ``continue_from`` is the filename of a persisted transcript to continue.
@@ -326,7 +365,13 @@ class Pipeline:
         what was asked and answered before. Continuation is deliberately
         provider-neutral - it replays the council's own transcript rather than
         resuming a CLI's private session, which not every configurable agent
-        has and none of them expose.
+        has and none of them expose. That is also why compaction happens here,
+        on the council's own transcript, rather than being left to a CLI's
+        ``/compact``: only one of the configurable agents has one.
+
+        ``compact_context`` summarises every earlier turn up front instead of
+        waiting for the thread to reach the budget. A long thread is compacted
+        either way; this is the operator asking for it sooner.
         """
         task = (task or "").strip()
         if not task:
@@ -379,6 +424,11 @@ class Pipeline:
             conversation.append(_conversation_turn(previous))
             parent_run_id = str(previous.get("id") or "")
 
+        # Fit the thread before the run is built, so what is stored on it is
+        # what the prompts will render rather than an ideal it never used.
+        context = prompts.conversation_context(conversation, force=compact_context)
+        conversation = context.conversation
+
         with self._lock:
             if self.is_busy():
                 raise PipelineBusy("A run is already in progress.")
@@ -408,6 +458,9 @@ class Pipeline:
                 ),
                 parent_run_id=parent_run_id,
                 conversation=conversation,
+                context=_context_summary(
+                    context, int(conf.get("context_window_tokens") or 0)
+                ),
                 config=conf,
             )
             if solo:
@@ -863,35 +916,96 @@ class Pipeline:
         except OSError:
             pass  # a transcript we cannot save is not worth failing a run over
 
-    def history(self, limit: int = 25) -> List[Dict[str, Any]]:
-        """Summaries of recent runs, newest first."""
-        out: List[Dict[str, Any]] = []
+    def history(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """One summary per conversation, newest first.
+
+        A follow-up is not a separate entry in the list. It carries every
+        earlier turn of its thread inside its own transcript, so the newest run
+        of a thread *is* the conversation and its ancestors would only repeat
+        it. What is listed is therefore the leaves of the lineage - which is
+        also precisely what continuing the conversation should attach.
+
+        A run continued twice has two leaves, and both are listed: the data
+        model is a tree, and folding one branch away silently would lose work
+        the operator can still see no other way.
+        """
         try:
-            files = sorted(cfg.runs_dir().glob("*.json"), reverse=True)[:limit]
+            files = sorted(
+                cfg.runs_dir().glob("*.json"), reverse=True
+            )[:HISTORY_SCAN_LIMIT]
         except OSError:
-            return out
+            return []
+
+        # Read the whole window before picking leaves out of it. Two runs can
+        # share a timestamp, so the filename sort alone does not guarantee a
+        # child is seen before its parent, and a parent mistaken for a leaf
+        # would list the same conversation twice.
+        loaded: List[Tuple[str, Dict[str, Any]]] = []
+        parents: set = set()
         for f in files:
             try:
                 data = json.loads(f.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 continue
+            if not isinstance(data, dict):
+                continue
+            loaded.append((f.name, data))
+            parent = str(data.get("parent_run_id") or "")
+            if parent:
+                parents.add(parent)
+
+        out: List[Dict[str, Any]] = []
+        for name, data in loaded:
+            if str(data.get("id") or "") in parents:
+                continue
+            conversation = [
+                t for t in (data.get("conversation") or []) if isinstance(t, dict)
+            ]
+            first = conversation[0] if conversation else data
             out.append(
                 {
                     "id": data.get("id"),
+                    # A conversation is named for what it was opened about, so
+                    # the title is its first message and not its latest.
+                    "title": str(first.get("task") or "")[:200],
                     "task": (data.get("task") or "")[:200],
                     "repo": data.get("repo"),
                     "state": data.get("state"),
                     "created_at": data.get("created_at"),
                     "zero_touch": data.get("zero_touch"),
                     "diff_stat": data.get("diff_stat") or {},
-                    # How many earlier turns this run was handed, so the list
-                    # can show a follow-up as part of a thread rather than as
-                    # an unrelated one-line task.
-                    "turns": len(data.get("conversation") or []),
-                    "file": f.name,
+                    # Every earlier turn, plus this run's own message.
+                    "messages": len(conversation) + 1,
+                    "context": data.get("context") or {},
+                    "file": name,
                 }
             )
+            if len(out) >= limit:
+                break
         return out
+
+    def context_preview(self, name: str) -> Dict[str, Any]:
+        """What continuing a persisted transcript would replay, and what it costs.
+
+        Reported before the run starts, so the operator can compact first
+        rather than discover afterwards that the thread crowded out the task.
+        ``compacted`` is the same reading for the thread with every earlier turn
+        summarised - what the **Compact** button would buy.
+        """
+        previous = self.load_run(name)
+        if previous is None:
+            raise ValueError("No such run transcript.")
+        conversation = [
+            t for t in (previous.get("conversation") or []) if isinstance(t, dict)
+        ]
+        conversation.append(_conversation_turn(previous))
+        window = int(self.store.get("context_window_tokens") or 0)
+        return {
+            **_context_summary(prompts.conversation_context(conversation), window),
+            "compacted": _context_summary(
+                prompts.conversation_context(conversation, force=True), window
+            ),
+        }
 
     def load_run(self, name: str) -> Optional[Dict[str, Any]]:
         """Load a persisted transcript by filename."""

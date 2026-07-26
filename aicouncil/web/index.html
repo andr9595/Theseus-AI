@@ -21,6 +21,19 @@
       </div>
     </div>
 
+    <!-- Two halves of the sidebar: how the next run behaves, and which
+         conversation it belongs to. Both stay in the DOM so switching back
+         does not reload the panels. -->
+    <div class="sidebar-tabs" role="tablist" aria-label="Sidebar">
+      <button class="sidebar-tab active" type="button" role="tab"
+        aria-selected="true" data-sidebar-tab="council">Council</button>
+      <button class="sidebar-tab" type="button" role="tab"
+        aria-selected="false" data-sidebar-tab="chats">Chats
+        <span class="sidebar-tab-count hidden" id="chat-count"></span></button>
+    </div>
+
+    <div class="sidebar-panel active" data-sidebar-panel="council">
+
     <!-- Target repository -->
     <section class="panel">
       <h2 class="panel-title">Target repository</h2>
@@ -109,9 +122,17 @@
 
     <div class="sidebar-spacer"></div>
 
+    </div><!-- /council -->
+
+    <div class="sidebar-panel" data-sidebar-panel="chats">
+      <button id="new-chat" class="btn btn-quiet new-chat" type="button">
+        + New conversation
+      </button>
+      <div id="chat-list" class="chat-list"></div>
+    </div>
+
     <nav class="sidebar-foot">
       <button id="settings-btn" class="ghost-btn" type="button">Settings</button>
-      <button id="history-btn" class="ghost-btn" type="button">History</button>
     </nav>
   </aside>
 
@@ -142,7 +163,9 @@
         <span class="continue-text">
           Continuing <b id="continue-task"></b> &mdash; the council will be given
           that exchange as context.
+          <span id="continue-context" class="context-meter"></span>
         </span>
+        <button id="compact-btn" class="link-btn hidden" type="button">Compact</button>
         <button id="continue-clear" class="link-btn" type="button">Start fresh instead</button>
       </div>
       <textarea id="task-input" class="task-input" rows="3" spellcheck="false"
@@ -219,6 +242,24 @@ Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP
           </div>
         </div>
       </div>
+    </section>
+
+    <!-- A saved conversation, read in place of the live run's output rather
+         than in a modal over it. The live run keeps its rendered state. -->
+    <section id="chat-view" class="chat-view hidden">
+      <header class="chat-head">
+        <button id="chat-close" class="btn btn-quiet btn-sm" type="button">
+          &larr; Current run
+        </button>
+        <div class="chat-head-text">
+          <h2 id="chat-title">Conversation</h2>
+          <div id="chat-context" class="context-meter"></div>
+        </div>
+        <button id="chat-continue" class="btn btn-primary btn-sm" type="button">
+          Continue
+        </button>
+      </header>
+      <div id="chat-transcript" class="history-transcript"></div>
     </section>
   </main>
 </div>
@@ -317,25 +358,6 @@ Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP
       <button id="run-doctor" class="btn btn-quiet" type="button">Re-check CLIs</button>
       <button id="save-settings" class="btn btn-primary" type="button">Save</button>
     </footer>
-  </div>
-</div>
-
-<!-- ================= History ================= -->
-<div id="history" class="modal hidden" role="dialog" aria-modal="true" aria-label="Run history">
-  <div class="modal-card modal-card-tall">
-    <header class="modal-head">
-      <h3 id="history-title">Run history</h3>
-      <button class="icon-btn" data-close="history" type="button" aria-label="Close">&times;</button>
-    </header>
-    <div id="history-list" class="history-list"></div>
-    <section id="history-detail" class="history-detail hidden">
-      <div id="history-transcript" class="history-transcript"></div>
-      <footer class="modal-foot">
-        <button id="history-back" class="btn btn-quiet" type="button">&larr; All runs</button>
-        <span class="modal-foot-spacer"></span>
-        <button id="history-continue" class="btn btn-primary" type="button">Continue this run</button>
-      </footer>
-    </section>
   </div>
 </div>
 

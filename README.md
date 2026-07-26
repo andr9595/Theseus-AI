@@ -182,14 +182,20 @@ drafter                       ← use "polisher" for Stage 2
 
 ## Continuing a run
 
-A single task is rarely the whole conversation. **History** in the sidebar
-lists every run; open one to read the exchange it was — your message, what each
-agent answered, the note you left at the approval gate, and the diff that
-resulted. If the run was itself a follow-up, the earlier messages are there
-above it, so the whole thread reads in one place.
+A single task is rarely the whole conversation. The **Chats** tab in the
+sidebar lists your conversations, newest first, the way a chat client does.
+Select one to read it in the main pane — every message, what each agent
+answered, the note you left at the approval gate, and the diff that resulted.
+**+ New conversation** clears the attachment and puts you back at the composer.
 
-**Continue this run** — on the open transcript, or in the top bar as soon as a
-run finishes — attaches that exchange to your next message. The follow-up is a
+A follow-up is not a separate entry in that list. It carries the earlier turns
+inside its own transcript, so the newest run of a thread *is* the conversation,
+and the list shows one row per thread named for the message it opened with.
+Continue the same run twice and you get two rows, because the history really is
+a tree and folding one branch away silently would lose it.
+
+**Continue** — on the open conversation, or in the top bar as soon as a run
+finishes — attaches that exchange to your next message. The follow-up is a
 **new run** with its own transcript, approval gate and rollback point; nothing
 about the earlier one is overwritten. Both stages are given the thread, so the
 junior drafts with the earlier reasoning in view and the senior sees what it
@@ -205,9 +211,45 @@ Two deliberate limits:
   and the old diff is deliberately not replayed — the working tree already
   carries it, more accurately.
 
-A thread is bounded at both ends: each stage's answer is trimmed when it is
-recorded, and a long thread is trimmed again when rendered, keeping the most
-recent turns. Continuation only works within the repository the run started in.
+Continuation only works within the repository the run started in.
+
+### The context meter, and compaction
+
+Attaching a conversation shows what replaying it will cost, next to the banner
+in the composer and under the title in the conversation view:
+
+```
+3 earlier messages · ~7.4k tokens · ≈4% of a 200k window
+```
+
+Read all three figures as estimates, because that is what they are. No CLI
+reports its tokenizer's count back to this app, so the token figure is the usual
+four-characters-per-token approximation. The window is the
+`context_window_tokens` setting in your config — 200k by default, which suits
+current Claude and Codex models — and not a number any vendor told us. And it
+measures the replayed conversation only: your task, the junior's draft and
+whatever the agent reads for itself all land in the same window, so treat it as
+a floor rather than a total.
+
+A thread is bounded at both ends. Each stage's answer is trimmed when it is
+recorded, and once the rendered thread would exceed its budget the oldest turns
+are **compacted**: your message, the outcome, your steer at the gate and the
+opening and closing of each answer are kept, and the bulk of the older replies
+is dropped. Compaction works on whole turns at semantic boundaries, so it never
+cuts through the middle of a sentence or a code fence, and the newest turn is
+always carried in full. Nothing is silently discarded — a compacted answer is
+labelled as a summary both in the prompt and in the conversation view, so no
+agent mistakes an outline for the whole reply.
+
+**Compact** next to the banner does it early, before the thread gets that far.
+It applies to the run you are about to start; the transcripts already on disk
+are never rewritten.
+
+Compaction happens here, on the council's own transcript, rather than through a
+CLI's own `/compact`. Every stage is a fresh process replaying that transcript,
+either agent can hold either job, and a custom configured command may have no
+session to compact at all — so doing it once, in one place, is what keeps both
+council members working from the same conversation.
 
 ---
 
@@ -381,8 +423,9 @@ place for "use tabs", "never add a dependency without asking", "all new code
 needs tests".
 
 Config lives at `~/.config/ai-council/config.json`. Run transcripts are written
-to `~/.config/ai-council/runs/` and surfaced in the History panel, where a run
-can be read in full or [continued](#continuing-a-run).
+to `~/.config/ai-council/runs/` and grouped into threads under the **Chats**
+tab, where a conversation can be read in full or
+[continued](#continuing-a-run).
 
 ### Assigning agents to jobs
 

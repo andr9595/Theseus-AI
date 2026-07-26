@@ -237,6 +237,12 @@ DEFAULTS: Dict[str, Any] = {
     # --- Prompting ----------------------------------------------------------
     # Extra standing instructions appended to both stages.
     "house_rules": "",
+    # What the context meter's percentage is measured against. A figure to edit
+    # rather than one to trust: no CLI reports the window its model was given,
+    # and the aliases in Settings resolve to whatever the vendor ships today.
+    # 200k is the common case for both Claude and Codex models. Set it to 0 to
+    # show the token estimate on its own with no percentage.
+    "context_window_tokens": 200_000,
     # --- Roles ------------------------------------------------------------
     # Edits to the built-in roles and any roles the operator added, keyed by
     # id. Built-ins are merged over their shipped definition rather than

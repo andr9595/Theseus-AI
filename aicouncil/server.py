@@ -203,6 +203,7 @@ class Handler(BaseHTTPRequestHandler):
             ("GET", "/api/repo"): self._api_repo,
             ("GET", "/api/history"): self._api_history,
             ("GET", "/api/run"): self._api_run,
+            ("GET", "/api/context"): self._api_context,
             ("GET", "/api/doctor"): self._api_doctor,
             ("GET", "/api/models"): self._api_models,
             ("GET", "/api/usage"): lambda p: {
@@ -359,6 +360,13 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("No such run transcript.")
         return {"ok": True, "run": data}
 
+    def _api_context(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """How much context continuing this transcript would replay."""
+        name = (params.get("file") or [""])[0]
+        if not name:
+            raise ValueError("A `file` query parameter is required.")
+        return {"ok": True, "context": self.app.pipeline.context_preview(name)}
+
     def _api_doctor(self, params: Dict[str, list]) -> Dict[str, Any]:
         providers = self.app.store.get("providers", {})
         return {
@@ -393,11 +401,19 @@ class Handler(BaseHTTPRequestHandler):
         task = body.get("task") or ""
         repo = body.get("repo") or self.app.store.get("target_repo") or ""
         continue_from = body.get("continue_from") or ""
+        compact_context = body.get("compact_context", False)
         if not isinstance(continue_from, str):
             raise ValueError("`continue_from` must be a transcript filename.")
+        if not isinstance(compact_context, bool):
+            raise ValueError("`compact_context` must be true or false.")
         if not repo:
             raise ValueError("No target repository selected.")
-        run = self.app.pipeline.start(task, repo, continue_from=continue_from)
+        run = self.app.pipeline.start(
+            task,
+            repo,
+            continue_from=continue_from,
+            compact_context=compact_context,
+        )
         return {"ok": True, "run": run.to_dict()}
 
     def _api_approve(self, params: Dict[str, list]) -> Dict[str, Any]:
