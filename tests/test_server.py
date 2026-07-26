@@ -6,6 +6,7 @@ they get direct coverage.
 """
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -25,6 +26,12 @@ class ServerTestBase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-http-"))
+        # Set before the server is built, because that is when its pipeline
+        # binds the directory it will read and write transcripts in. No test
+        # here starts a run that reaches disk, but the server is a real one -
+        # nothing about it should be able to reach the operator's own history.
+        cls._previous_xdg = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = str(cls.tmp / "xdg")
         cls.store = ConfigStore(cls.tmp / "config.json")
         cls.server, cls.state, cls.url = make_server(cls.store, port=0)
         cls.thread = serve_forever_in_thread(cls.server)
@@ -36,6 +43,10 @@ class ServerTestBase(unittest.TestCase):
     def tearDownClass(cls):
         cls.server.shutdown()
         cls.server.server_close()
+        if cls._previous_xdg is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = cls._previous_xdg
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def request(self, path, method="GET", body=None, token=None, headers=None):

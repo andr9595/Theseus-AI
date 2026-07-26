@@ -38,6 +38,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import config as cfg
@@ -308,9 +309,22 @@ class PipelineBusy(RuntimeError):
 class Pipeline:
     """Owns the current run and drives it on a background thread."""
 
-    def __init__(self, store: cfg.ConfigStore, bus: EventBus) -> None:
+    def __init__(
+        self,
+        store: cfg.ConfigStore,
+        bus: EventBus,
+        runs_dir: Optional[Path] = None,
+    ) -> None:
         self.store = store
         self.bus = bus
+        # Bound once, here - never re-read from the environment on each write.
+        # A run persists from its worker thread, which can outlive the caller
+        # that started it; resolving the directory per write means a caller
+        # that changes XDG_CONFIG_HOME in between (a test restoring the real
+        # environment during cleanup) sends a late transcript somewhere the
+        # run was never meant to touch.
+        self._runs_dir = Path(runs_dir) if runs_dir else cfg.runs_dir()
+        self._runs_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._run: Optional[Run] = None
         self._thread: Optional[threading.Thread] = None
@@ -321,6 +335,11 @@ class Pipeline:
         self._cancel_requested = False
 
     # -- introspection -----------------------------------------------------
+
+    @property
+    def runs_dir(self) -> Path:
+        """The directory this pipeline persists transcripts to."""
+        return self._runs_dir
 
     @property
     def run(self) -> Optional[Run]:
@@ -543,6 +562,22 @@ class Pipeline:
         if waiting:
             self._gate.set()
         self.bus.publish("log", level="warn", message="Cancellation requested.")
+
+    def wait_for_worker(self, timeout: float = 30.0) -> bool:
+        """Block until the worker thread has fully wound down.
+
+        `is_busy()` goes false as soon as the run reaches a terminal state, but
+        the worker still has to write the transcript after that. Anything that
+        needs the run to be *finished* rather than merely settled - a test
+        tearing down its fixtures, a shutdown path - has to wait for the
+        thread itself. Returns False if it was still alive at the timeout.
+        """
+        with self._lock:
+            thread = self._thread
+        if thread is None or thread is threading.current_thread():
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
 
     def rollback(self) -> str:
         """Undo everything the run wrote, using the pre-Stage-2 snapshot."""
@@ -915,7 +950,7 @@ class Pipeline:
     def _persist(self, run: Run) -> None:
         """Write the run transcript to disk for later inspection."""
         try:
-            path = cfg.runs_dir() / run.transcript_name
+            path = self._runs_dir / run.transcript_name
             path.write_text(
                 json.dumps(run.to_dict(), indent=2, default=str), encoding="utf-8"
             )
@@ -937,7 +972,7 @@ class Pipeline:
         """
         try:
             files = sorted(
-                cfg.runs_dir().glob("*.json"), reverse=True
+                self._runs_dir.glob("*.json"), reverse=True
             )[:HISTORY_SCAN_LIMIT]
         except OSError:
             return []
@@ -1018,7 +1053,7 @@ class Pipeline:
         # Reject any path separator: this value comes from a query string.
         if "/" in name or "\\" in name or ".." in name:
             return None
-        path = cfg.runs_dir() / name
+        path = self._runs_dir / name
         if not path.exists():
             return None
         try:

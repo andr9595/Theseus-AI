@@ -374,7 +374,7 @@ class Handler(BaseHTTPRequestHandler):
             "ok": True,
             "version": __version__,
             "config_path": str(self.app.store.path),
-            "runs_path": str(cfg.runs_dir()),
+            "runs_path": str(self.app.pipeline.runs_dir),
             "uptime": round(time.time() - self.app.started_at, 1),
             "providers": [
                 probe(providers[k]) for k in ("drafter", "polisher") if k in providers

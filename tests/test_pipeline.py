@@ -82,9 +82,11 @@ def git_out(args, cwd):
 class PipelineTestBase(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-test-"))
-        # Transcripts go to `config_dir()/runs`, which is derived from the
-        # environment rather than from the store's path - without this every
-        # test run would file its fixtures in the developer's real history.
+        # Anything else in the app that derives a path from the environment
+        # stays pointed at the fixture too. Transcripts do not rely on this:
+        # the pipeline below is handed its runs directory outright, so a run
+        # winding down on its worker thread after this variable is restored
+        # still cannot reach the developer's real history.
         previous_xdg = os.environ.get("XDG_CONFIG_HOME")
         os.environ["XDG_CONFIG_HOME"] = str(self.tmp / "xdg")
 
@@ -118,10 +120,18 @@ class PipelineTestBase(unittest.TestCase):
             },
         })
         self.bus = EventBus()
-        self.pipeline = Pipeline(self.store, self.bus)
+        self.runs_dir = self.tmp / "xdg" / "ai-council" / "runs"
+        self.pipeline = Pipeline(self.store, self.bus, runs_dir=self.runs_dir)
 
     def tearDown(self):
         self.pipeline.cancel()
+        # Wait for the worker to actually exit, not just for the run to reach a
+        # terminal state - it writes the transcript after that. A test that
+        # returned mid-run would otherwise race its own fixture teardown.
+        self.assertTrue(
+            self.pipeline.wait_for_worker(),
+            "the run worker thread did not wind down",
+        )
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def wait_for(self, predicate, timeout=45, what="condition"):
@@ -665,6 +675,54 @@ class TestCancellation(PipelineTestBase):
         self.assertFalse((self.repo / "AI_COUNCIL_DEMO.md").exists())
 
 
+class TestTranscriptIsolation(PipelineTestBase):
+    """A run writes where it was told to, not where the environment points.
+
+    The transcript is written by the worker thread *after* the run reaches a
+    terminal state, so it can land arbitrarily late - after the caller that
+    started it has moved on and put the environment back. Re-reading
+    XDG_CONFIG_HOME on every write made that late transcript escape into the
+    operator's real history; the directory is bound once instead.
+    """
+
+    def test_a_late_transcript_ignores_a_changed_environment(self):
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+
+        self.store.update({"zero_touch": False})
+        run = self.pipeline.start("do the thing", str(self.repo))
+        self.wait_for(lambda: run.state == "awaiting_approval")
+
+        # The worker is parked at the gate. Move the environment out from under
+        # it - what a cleanup does - and only then let it wind down.
+        os.environ["XDG_CONFIG_HOME"] = str(elsewhere)
+        self.pipeline.cancel()
+        self.assertTrue(self.pipeline.wait_for_worker(), "worker did not exit")
+
+        self.assertEqual(run.state, "cancelled")
+        self.assertTrue(
+            (self.runs_dir / run.transcript_name).exists(),
+            "the transcript did not reach the directory the run was given",
+        )
+        self.assertEqual(
+            sorted(elsewhere.rglob("*.json")), [],
+            "the run wrote a transcript outside the directory it was given",
+        )
+
+    def test_the_worker_has_finished_writing_once_it_is_joined(self):
+        # `is_busy()` going false is not the same as the worker being done: the
+        # transcript is written after the terminal state is published.
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+        self.assertTrue(self.pipeline.wait_for_worker(), "worker did not exit")
+        self.assertTrue((self.runs_dir / run.transcript_name).exists())
+
+    def test_the_default_runs_directory_still_follows_the_config_dir(self):
+        # Not injecting one has to keep the production behaviour.
+        self.assertEqual(Pipeline(self.store, EventBus()).runs_dir, cfg.runs_dir())
+
+
 class TestContinuedConversation(PipelineTestBase):
     """A follow-up run must carry the earlier exchange to the agents.
 
@@ -831,7 +889,7 @@ class TestContinuedConversation(PipelineTestBase):
     def test_a_transcript_from_before_this_feature_can_still_be_continued(self):
         # Older transcripts have no `conversation` or `parent_run_id` key. They
         # are still one turn of a conversation - the first one.
-        legacy = cfg.runs_dir() / "1700000000-legacyrun.json"
+        legacy = self.pipeline.runs_dir / "1700000000-legacyrun.json"
         legacy.write_text(json.dumps({
             "id": "legacyrun",
             "task": "the original request",
@@ -912,7 +970,7 @@ class TestConversationList(PipelineTestBase):
     def test_a_transcript_from_before_this_feature_is_its_own_conversation(self):
         # No `parent_run_id` and no `conversation`: one message, listed as one
         # conversation rather than guessed into somebody else's thread.
-        legacy = cfg.runs_dir() / "1700000000-legacyrun.json"
+        legacy = self.pipeline.runs_dir / "1700000000-legacyrun.json"
         legacy.write_text(json.dumps({
             "id": "legacyrun",
             "task": "the original request",
@@ -927,7 +985,7 @@ class TestConversationList(PipelineTestBase):
 
     def test_an_unreadable_transcript_does_not_break_the_list(self):
         run = self.run_once("do the thing")
-        (cfg.runs_dir() / "1700000001-broken.json").write_text("{oh no", encoding="utf-8")
+        (self.pipeline.runs_dir / "1700000001-broken.json").write_text("{oh no", encoding="utf-8")
         self.assertEqual([c["file"] for c in self.pipeline.history()],
                          [run.transcript_name])
 
