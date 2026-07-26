@@ -323,8 +323,10 @@ views, delivery controls, snapshots and rollback.
 **Solo** is one assistant answering one message, the way opening `claude` or
 ChatGPT is. It has:
 
-- **Its own agent**, configured under Settings → Agents. It borrows neither
-  council stage, so Solo can run Codex while the council runs Claude.
+- **Its own agent**, picked from the first chip on the Assistant card, beside
+  its model and reasoning level — switching CLI mid-conversation is one click,
+  not a visit to Settings. It borrows neither council stage, so Solo can run
+  Codex while the council runs Claude.
 - **No behaviour by default.** With the **Behaviour** box empty and no thread
   to replay, your message reaches the CLI *exactly as typed* — no persona, no
   house rules, no repository preamble. Type something into that box and it is
@@ -496,9 +498,12 @@ behaviour — is untouched. Editing the command by hand still works and simply
 reads back as **Custom command**; the command is the source of truth, and the
 dropdown is derived from it, so the two can never disagree.
 
-The Solo assistant has its own entry in the same list, with its own Agent
-dropdown, display name, model, reasoning effort, command and optional
-**Behaviour**. It has no Role, because it is not a stage in anything.
+The Solo assistant has its own entry in the same list, with its own display
+name, command and optional **Behaviour**. It has no Role, because it is not a
+stage in anything, and no Agent dropdown: the CLI Solo runs is the first chip
+on its card, where the same swap happens on one click. Everything the dropdown
+would have written — command, permission flags, a cleared model and reasoning
+level — is written by the server either way.
 
 ### Roles
 

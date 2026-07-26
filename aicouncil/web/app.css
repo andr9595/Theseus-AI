@@ -389,15 +389,16 @@ html, body {
 .model-chip.set { color: var(--agent-color, var(--accent-2)); }
 .model-chip svg { flex: 0 0 auto; opacity: .7; }
 
-/* Model and effort sit together on the card's own row: they are two halves of
-   one decision, and reading them as a pair is the point. The model takes the
-   room it needs and truncates last, since a slug carries more meaning than a
-   one-word effort level. */
+/* Agent, model and effort sit together on the card's own row: they are three
+   parts of one decision, narrowing left to right, and reading them together is
+   the point. The model takes the room it needs and truncates last, since a
+   slug carries more meaning than a CLI's name or a one-word effort level. */
 .chip-row {
   grid-area: chips;
   display: flex; align-items: center; gap: 4px; min-width: 0;
 }
 .chip-row .model-chip { flex: 0 1 auto; }
+.chip-row .agent-chip,
 .chip-row .effort-chip { flex: 0 0 auto; }
 /* The label the chip carries, clipped rather than the whole button, so the
    caret stays visible on a chip that had to give up room. */

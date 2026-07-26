@@ -772,6 +772,14 @@ function renderAgents() {
     // Shown only when the command has the knob at all, so a hand-written
     // template does not sprout a chip that cannot do anything.
     const hasEffort = (provider.effort_args || []).length > 0;
+    // Which CLI answers is Solo's most-changed setting - it is the difference
+    // between two assistants, not a tuning knob - so it sits on the card with
+    // the model and effort. A council stage keeps its agent in Settings:
+    // swapping one there is a change to the pipeline, not to a message.
+    const agent = state.agents.find(a => a.id === agentOf(provider));
+    // "Custom command" is the catalogue's full name for it; on a chip this
+    // narrow the one word that matters is the one that fits.
+    const agentLabel = agent && (agent.command || []).length ? agent.label : 'custom';
     const caret =
       `<svg viewBox="0 0 24 24" width="9" height="9" fill="none" stroke="currentColor" ` +
       `stroke-width="3" stroke-linecap="round" stroke-linejoin="round">` +
@@ -799,6 +807,13 @@ function renderAgents() {
         // Its own row, spanning the card. Stacked in the column above it, the
         // pickers left the name and role no width at all.
         `<div class="chip-row">` +
+          (solo
+            ? `<button class="model-chip agent-chip set" type="button" ` +
+              `data-agent-for="${id}" ` +
+              `title="Which CLI answers — ${esc(agentLabel)}">` +
+              `<span class="chip-label">${esc(agentLabel)}</span>${caret}` +
+            `</button>`
+            : '') +
           `<button class="model-chip${provider.model ? ' set' : ''}" type="button" ` +
             `data-model-for="${id}" ` +
             `title="Model for this stage — ${esc(modelLabel)}">` +
@@ -1448,6 +1463,67 @@ async function setEffort(providerId, value) {
   );
 }
 
+/** Agent menu for the Solo card. Same chrome and the same gesture as the two
+ *  chips beside it. The list is the server's catalogue, so the browser still
+ *  carries no command and no permission flag of its own — it sends an id and
+ *  the server expands it. */
+function openAgentMenu(anchor, providerId) {
+  closeModelMenu();
+  const provider = ((state.config || {}).providers || {})[providerId] || {};
+  const current = agentOf(provider);
+
+  const menu = document.createElement('div');
+  menu.className = 'model-menu';
+  menu.innerHTML =
+    `<div class="model-menu-head">${esc(provider.label || providerId)} agent</div>` +
+    // "Custom command" is what a hand-edited template reads back as, not
+    // something this menu can apply: there is no preset behind it. Writing one
+    // stays in Settings, where the command itself is.
+    state.agents.filter(a => (a.command || []).length).map(a =>
+      `<button class="model-opt${a.id === current ? ' active' : ''}" ` +
+        `data-value="${esc(a.id)}">` +
+        `<span class="model-opt-name">${esc(a.label)}</span>` +
+        `<span class="model-opt-note">${esc(a.command[0])}</span>` +
+      `</button>`
+    ).join('') +
+    `<div class="model-menu-source">` +
+      (current === 'custom'
+        ? 'Running a hand-written command; picking one here replaces it.'
+        : 'Swaps the command and its permission flags together.') +
+    `</div>`;
+  document.body.appendChild(menu);
+  positionModelMenu(menu, anchor);
+
+  menu.addEventListener('click', (e) => {
+    const opt = e.target.closest('.model-opt');
+    if (!opt) return;
+    closeModelMenu();
+    setAgent(providerId, opt.dataset.value);
+  });
+
+  setTimeout(() => {
+    document.addEventListener('click', onDocClickCloseModel, { once: true });
+  }, 0);
+}
+
+async function setAgent(providerId, agentId) {
+  const provider = ((state.config || {}).providers || {})[providerId] || {};
+  if (agentId === agentOf(provider)) return;
+  // Only the id: the server pairs the command with its own permission flags,
+  // and clears the model and reasoning level, which are not interchangeable.
+  await patchConfig({ providers: { [providerId]: { agent: agentId } } });
+  // The quota on the card was the departing CLI's. Drop it rather than let it
+  // sit under the new one's name until the next reading lands.
+  if (state.usage) delete state.usage[providerId];
+  // A different executable, which may not be installed at all.
+  await refreshDoctor();
+  const now = ((state.config || {}).providers || {})[providerId] || {};
+  toast(`${provider.label || providerId} → ${now.label || agentId}`, 'ok', 2600);
+  api('/api/usage/refresh', { method: 'POST' })
+    .then(d => { state.usage = d.usage || {}; renderAgents(); })
+    .catch(() => {});
+}
+
 async function setModel(providerId, value) {
   const providers = (state.config || {}).providers || {};
   const provider = providers[providerId] || {};
@@ -1576,8 +1652,9 @@ function renderSettings() {
 
   // The council's two stages and Solo's one assistant, configured
   // independently. `council` decides which half of the form each one gets:
-  // a stage is told what job to do, the assistant is only ever given a
-  // behaviour the operator typed.
+  // a stage is told what job to do and picks its agent here, the assistant is
+  // only ever given a behaviour the operator typed and picks its agent from
+  // its own card, where changing it is a gesture rather than a visit.
   const FORMS = [
     { id: 'drafter', num: 'Stage 1', council: true },
     { id: 'polisher', num: 'Stage 2', council: true },
@@ -1596,22 +1673,31 @@ function renderSettings() {
         `data-council="${council ? '1' : ''}">` +
         `<h4><span class="stage-num">${esc(num)}</span> ` +
           `${esc(p.role || (council ? id : 'Assistant'))} ${probeHtml}</h4>` +
-        `<div class="field-row">` +
-          `<div class="field">` +
-            `<label>Agent ` +
-              `<span class="field-hint">— swaps command and flags</span></label>` +
-            `<select data-field="agent">` +
-              state.agents.map(a =>
-                `<option value="${esc(a.id)}"` +
-                `${a.id === agentOf(p) ? ' selected' : ''}>${esc(a.label)}</option>`
-              ).join('') +
-            `</select>` +
-          `</div>` +
-          `<div class="field">` +
-            `<label>Display name</label>` +
-            `<input type="text" data-field="label" value="${esc(p.label || '')}">` +
-          `</div>` +
-        `</div>` +
+        (council
+          ? `<div class="field-row">` +
+              `<div class="field">` +
+                `<label>Agent ` +
+                  `<span class="field-hint">— swaps command and flags</span></label>` +
+                `<select data-field="agent">` +
+                  state.agents.map(a =>
+                    `<option value="${esc(a.id)}"` +
+                    `${a.id === agentOf(p) ? ' selected' : ''}>${esc(a.label)}</option>`
+                  ).join('') +
+                `</select>` +
+              `</div>` +
+              `<div class="field">` +
+                `<label>Display name</label>` +
+                `<input type="text" data-field="label" value="${esc(p.label || '')}">` +
+              `</div>` +
+            `</div>`
+          // Solo's agent is the chip on its card. Two places to pick it would
+          // be two apparent sources of truth, and the modal is the slower one.
+          : `<div class="field">` +
+              `<label>Display name ` +
+                `<span class="field-hint">— the agent itself is the first chip ` +
+                `on the Assistant card</span></label>` +
+              `<input type="text" data-field="label" value="${esc(p.label || '')}">` +
+            `</div>`) +
         (council
           ? `<div class="field">` +
               `<label>Role — what this stage is told to do` +
@@ -1644,7 +1730,7 @@ function renderSettings() {
                 `placeholder="e.g. Answer briefly, and always show the code.">` +
                 `${esc(p.behavior || '')}</textarea>` +
             `</div>`) +
-        // Everything below is the CLI plumbing the Agent dropdown fills in for
+        // Everything below is the CLI plumbing the agent picker fills in for
         // you. Folded away because reading it is how you check a custom CLI,
         // not how you configure a stage.
         `<details class="advanced">` +
@@ -1781,8 +1867,10 @@ async function saveSettings() {
       id,
       // The server expands this into the agent's command and permission
       // flags when it differs from what the stage runs today, and ignores it
-      // otherwise - so a hand-edited command below still wins.
-      agent: field('agent').value,
+      // otherwise - so a hand-edited command below still wins. Solo has no
+      // field here: it picks its agent on its card, and a stale value carried
+      // by this form would quietly undo that on the next save.
+      ...(field('agent') ? { agent: field('agent').value } : {}),
       label: field('label').value.trim() || id,
       command,
       auto_approve_args: lines('auto_approve_args'),
@@ -2328,7 +2416,7 @@ function wire() {
   // -- tabs -------------------------------------------------------------
   $$('.tab').forEach(tab => tab.addEventListener('click', () => switchTab(tab.dataset.tab)));
 
-  // -- model picker -----------------------------------------------------
+  // -- agent, model and effort pickers ----------------------------------
   // Delegated: the agent rail is re-rendered on every state change.
   $('#agent-rail').addEventListener('click', (e) => {
     const usageChip = e.target.closest('[data-usage-for]');
@@ -2343,7 +2431,8 @@ function wire() {
     if (!chip) return;
     e.stopPropagation();
     if ($('.model-menu')) { closeModelMenu(); return; }  // toggle
-    if (chip.dataset.effortFor) openEffortMenu(chip, chip.dataset.effortFor);
+    if (chip.dataset.agentFor) openAgentMenu(chip, chip.dataset.agentFor);
+    else if (chip.dataset.effortFor) openEffortMenu(chip, chip.dataset.effortFor);
     else openModelMenu(chip, chip.dataset.modelFor);
   });
   window.addEventListener('resize', closeModelMenu);
@@ -2412,10 +2501,10 @@ function wire() {
 
   $('#save-settings').addEventListener('click', saveSettings);
 
-  // Picking an agent fills in its command and flags straight away, so the form
-  // shows what will actually be saved. The server performs the same swap on
-  // save; this is the preview, not the source of truth. Delegated because the
-  // provider forms are rebuilt every time Settings opens.
+  // Picking a council stage's agent fills in its command and flags straight
+  // away, so the form shows what will actually be saved. The server performs
+  // the same swap on save; this is the preview, not the source of truth.
+  // Delegated because the provider forms are rebuilt every time Settings opens.
   $('#provider-forms').addEventListener('change', (e) => {
     if (e.target.dataset.field !== 'agent') return;
     const preset = state.agents.find(a => a.id === e.target.value);
@@ -2427,10 +2516,9 @@ function wire() {
       (preset.auto_approve_args || []).join('\n');
     $('[data-field="stream_args"]', form).value =
       (preset.stream_args || []).join('\n');
-    // Solo only. Codex's `--sandbox read-only` left behind on `claude` is an
-    // unknown flag, which is exactly the pairing the swap exists to prevent.
-    const readOnly = $('[data-field="read_only_args"]', form);
-    if (readOnly) readOnly.value = (preset.read_only_args || []).join('\n');
+    // No read-only arguments to preview: they are Solo's, and Solo picks its
+    // agent on its card. The server still swaps them there, in one step with
+    // the command, which is the pairing that has to stay honest.
     $('[data-field="model_args"]', form).value = (preset.model_args || []).join(' ');
     $('[data-field="effort_args"]', form).value = (preset.effort_args || []).join(' ');
     // Neither model names nor effort levels are interchangeable between CLIs.
