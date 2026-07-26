@@ -350,6 +350,24 @@ html, body {
   border: 1px solid color-mix(in srgb, var(--agent-color) 28%, transparent);
 }
 
+/* Solo's monogram opens the agent menu. It is a <button> there, so undo the
+   UA's padding and font before the shared rule above is measured against it. */
+.agent-avatar.pickable {
+  padding: 0;
+  appearance: none;
+  cursor: pointer;
+  transition: background .12s ease, border-color .12s ease, transform .12s ease;
+}
+.agent-avatar.pickable:hover {
+  background: color-mix(in srgb, var(--agent-color) 26%, transparent);
+  border-color: color-mix(in srgb, var(--agent-color) 60%, transparent);
+  transform: translateY(-1px);
+}
+.agent-avatar.pickable:focus-visible {
+  outline: 2px solid var(--agent-color);
+  outline-offset: 2px;
+}
+
 .agent-body { grid-area: body; min-width: 0; }
 .agent-name {
   font-size: 12.5px; font-weight: 600;

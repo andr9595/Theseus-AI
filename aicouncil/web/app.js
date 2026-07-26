@@ -787,7 +787,16 @@ function renderAgents() {
 
     return (
       `<div class="agent-card ${stageState} ${available ? '' : 'unavailable'}" data-agent="${id}">` +
-        `<div class="agent-avatar">${esc(initial)}</div>` +
+        // The monogram is the CLI's own initials, so in Solo it is the most
+        // direct thing on the card to point at when swapping CLI. It opens the
+        // same menu as the chip below rather than a second way to choose:
+        // one code path, one list, one confirmation toast. Council cards keep
+        // it inert - their agent is a pipeline decision, made in Settings.
+        (solo
+          ? `<button class="agent-avatar pickable" type="button" ` +
+            `data-agent-for="${id}" ` +
+            `title="Which CLI answers — ${esc(agentLabel)}">${esc(initial)}</button>`
+          : `<div class="agent-avatar">${esc(initial)}</div>`) +
         `<div class="agent-body">` +
           `<div class="agent-name">${esc(provider.label || id)}</div>` +
           `<div class="agent-role">${
@@ -2427,7 +2436,9 @@ function wire() {
         .catch(err => toast(err.message, 'error'));
       return;
     }
-    const chip = e.target.closest('.model-chip');
+    // The Solo monogram is a fourth opener, not a fourth menu: it carries
+    // `data-agent-for` like the chip does and lands in the same branch below.
+    const chip = e.target.closest('.model-chip, .agent-avatar.pickable');
     if (!chip) return;
     e.stopPropagation();
     if ($('.model-menu')) { closeModelMenu(); return; }  // toggle
