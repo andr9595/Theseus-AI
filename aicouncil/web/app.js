@@ -564,6 +564,7 @@ function renderStatus() {
     meta.push(`run ${run.id}`);
     if (run.zero_touch) meta.push('ZERO-TOUCH');
     if (run.solo) meta.push('solo');
+    if (run.work_branch) meta.push(run.work_branch);
     if (run.diff_stat && run.diff_stat.files) {
       meta.push(`${run.diff_stat.files} file(s) +${run.diff_stat.insertions}/-${run.diff_stat.deletions}`);
     }
@@ -573,6 +574,7 @@ function renderStatus() {
 
   $('#cancel-btn').classList.toggle('hidden', !state.busy);
   $('#rollback-btn').classList.toggle('hidden', !(run && run.can_rollback));
+  $('#pr-btn').classList.toggle('hidden', !(run && run.pull_request && run.pull_request.url));
   // A finished run is the one an operator most often wants to follow up on,
   // so it is offered here rather than only from History.
   $('#continue-btn').classList.toggle('hidden', !(run && !state.busy && run.file));
@@ -808,6 +810,7 @@ function renderToggles() {
   $('#safety-snapshot').checked = c.safety_snapshot !== false;
   $('#solo-mode').checked = !!c.solo_mode;
   $('#clean-worktree').checked = !!c.require_clean_worktree;
+  $('#pull-request-mode').checked = !!c.pull_request_mode;
   $('#zero-touch-warning').classList.toggle('hidden', !c.zero_touch);
 
   // Which stage's configuration runs alone. Only worth showing once Solo mode
@@ -1659,6 +1662,11 @@ function wire() {
     } catch (err) { toast(err.message, 'error', 9000); }
   });
 
+  $('#pr-btn').addEventListener('click', () => {
+    const pr = state.run && state.run.pull_request;
+    if (pr && pr.url) window.open(pr.url, '_blank', 'noopener');
+  });
+
   $('#approve-btn').addEventListener('click', async () => {
     try {
       await api('/api/approve', { method: 'POST', body: { note: $('#approval-note').value } });
@@ -1696,6 +1704,19 @@ function wire() {
     patchConfig({ solo_stage: e.target.value }));
   $('#clean-worktree').addEventListener('change', e =>
     patchConfig({ require_clean_worktree: e.target.checked }));
+  $('#pull-request-mode').addEventListener('change', (e) => {
+    if (e.target.checked) {
+      const ok = confirm(
+        'Deliver runs as pull requests?\n\n' +
+        'Each run will start from a clean tree, work on a branch of its own, ' +
+        'then commit, push to origin and open a PR with the GitHub CLI. The ' +
+        'branch you started on is never written to, and nothing is merged ' +
+        'for you.'
+      );
+      if (!ok) { e.target.checked = false; return; }
+    }
+    patchConfig({ pull_request_mode: e.target.checked });
+  });
 
   // -- tabs -------------------------------------------------------------
   $$('.tab').forEach(tab => tab.addEventListener('click', () => switchTab(tab.dataset.tab)));

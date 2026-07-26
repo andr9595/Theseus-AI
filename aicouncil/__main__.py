@@ -19,6 +19,7 @@ from typing import List, Optional
 
 from . import APP_NAME, __version__
 from . import config as cfg
+from . import gitutil
 from .providers import probe
 from .server import make_server
 
@@ -86,7 +87,17 @@ def _print_doctor(store: cfg.ConfigStore) -> int:
     print(f"  config      : {store.path}")
     print(f"  runs        : {cfg.runs_dir()}")
     print(f"  zero-touch  : {'ON' if store.get('zero_touch') else 'off'}")
-    print(f"  target repo : {store.get('target_repo') or '(none selected)'}")
+    repo = store.get("target_repo") or ""
+    print(f"  target repo : {repo or '(none selected)'}")
+    if store.get("pull_request_mode"):
+        # PR mode's dependencies (a remote, `gh`, a git identity) are exactly
+        # the kind of thing this command exists to find before a run does.
+        blocker = (
+            gitutil.pull_request_blocker(repo) if repo else "no target repository"
+        )
+        print(f"  pull request: ON - {blocker or 'ready'}")
+    else:
+        print("  pull request: off")
     print("\nProviders:")
     missing = []
     for key in ("drafter", "polisher"):

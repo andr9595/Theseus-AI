@@ -87,6 +87,15 @@
         </span>
       </label>
 
+      <label class="toggle" for="pull-request-mode">
+        <input type="checkbox" id="pull-request-mode">
+        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+        <span class="toggle-text">
+          <strong>Pull request</strong>
+          <em>Commit to a new branch and open a PR to merge yourself</em>
+        </span>
+      </label>
+
       <div id="zero-touch-warning" class="inline-warning hidden">
         Auto-approve flags will be passed to the CLI. Files change without
         confirmation.
@@ -115,6 +124,7 @@
           <span class="conn-dot"></span><span class="conn-text">connecting</span>
         </span>
         <button id="cancel-btn" class="btn btn-quiet hidden" type="button">Cancel run</button>
+        <button id="pr-btn" class="btn btn-quiet hidden" type="button">Open pull request</button>
         <button id="continue-btn" class="btn btn-quiet hidden" type="button">Continue this run</button>
         <button id="rollback-btn" class="btn btn-quiet hidden" type="button">Roll back</button>
       </div>

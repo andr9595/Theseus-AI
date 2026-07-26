@@ -216,6 +216,11 @@ DEFAULTS: Dict[str, Any] = {
     "safety_snapshot": True,
     # Refuse to run against a repo with uncommitted changes unless overridden.
     "require_clean_worktree": False,
+    # Deliver the run on a branch of its own and open a GitHub pull request,
+    # instead of leaving the changes uncommitted on the checked-out branch. The
+    # base branch is then only ever changed by a human merging that PR. Implies
+    # a clean starting tree regardless of the toggle above - see gitutil.
+    "pull_request_mode": False,
     # Skip Stage 1 and run the task through a single agent.
     "solo_mode": False,
     # Which stage's configuration that single agent comes from. Either slot

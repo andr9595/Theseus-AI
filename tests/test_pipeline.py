@@ -28,6 +28,30 @@ from aicouncil.pipeline import Pipeline, PipelineBusy  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MOCK = str(REPO_ROOT / "scripts" / "mock-agent.py")
 
+# A stand-in for the GitHub CLI, written to a temporary PATH entry by the
+# pull-request tests. It records what it was asked to do, and prints the URL
+# the way gh does - after an unrelated line, so the code that has to pick the
+# URL out of the output is exercised rather than assumed.
+FAKE_GH = '''"""Stand-in `gh` for the pull-request tests."""
+import os
+import sys
+
+with open(os.environ["FAKE_GH_LOG"], "a", encoding="utf-8") as fh:
+    fh.write(" ".join(sys.argv[1:]) + "\\n")
+
+if sys.argv[1:3] == ["auth", "status"]:
+    if os.environ.get("FAKE_GH_UNAUTHENTICATED"):
+        sys.stderr.write("You are not logged into any GitHub hosts.\\n")
+        sys.exit(1)
+elif sys.argv[1:3] == ["pr", "create"]:
+    if os.environ.get("FAKE_GH_FAIL"):
+        sys.stderr.write("pull request create failed: HTTP 403\\n")
+        sys.exit(1)
+    print("Warning: 1 uncommitted change")
+    print("https://github.com/example/project/pull/7")
+sys.exit(0)
+'''
+
 
 def mock_provider(pid: str, role: str, extra=None):
     return {
@@ -46,6 +70,13 @@ def git(args, cwd):
         ["git", *args], cwd=cwd, check=True,
         capture_output=True, text=True,
     )
+
+
+def git_out(args, cwd):
+    return subprocess.run(
+        ["git", *args], cwd=cwd, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
 
 
 class PipelineTestBase(unittest.TestCase):
@@ -67,7 +98,9 @@ class PipelineTestBase(unittest.TestCase):
 
         self.repo = self.tmp / "repo"
         self.repo.mkdir()
-        git(["init", "-q"], self.repo)
+        # -b: the initial branch name is a host git setting, and the
+        # pull-request tests assert on which branch a run targeted.
+        git(["init", "-q", "-b", "main"], self.repo)
         git(["config", "user.email", "test@example.com"], self.repo)
         git(["config", "user.name", "Test"], self.repo)
         (self.repo / "README.md").write_text("# fixture\n")
@@ -343,6 +376,186 @@ class TestApprovalGate(PipelineTestBase):
         self.pipeline.approve()
         self.wait_terminal()
         self.assertEqual(run.state, "complete", run.error)
+
+
+class TestPullRequestMode(PipelineTestBase):
+    """The base branch must survive a run untouched.
+
+    The remote is a real bare repository and the push is a real push. Only the
+    GitHub CLI is a stand-in - it is the one part of this that cannot be run in
+    a temporary directory - and it records its argv so the tests can check what
+    it was actually asked to open.
+    """
+
+    def setUp(self):
+        super().setUp()
+
+        self.origin = self.tmp / "origin.git"
+        self.origin.mkdir()
+        git(["init", "--bare", "-q"], self.origin)
+        git(["remote", "add", "origin", str(self.origin)], self.repo)
+
+        bindir = self.tmp / "bin"
+        bindir.mkdir()
+        fake_gh = bindir / "gh"
+        fake_gh.write_text(f"#!{sys.executable}\n{FAKE_GH}", encoding="utf-8")
+        fake_gh.chmod(0o755)
+
+        self.gh_log = self.tmp / "gh.log"
+        self.set_env("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+        self.set_env("FAKE_GH_LOG", str(self.gh_log))
+
+        self.store.update({"zero_touch": True, "pull_request_mode": True})
+
+    def set_env(self, name, value):
+        previous = os.environ.get(name)
+
+        def restore():
+            if previous is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = previous
+
+        self.addCleanup(restore)
+        os.environ[name] = value
+
+    def gh_calls(self):
+        return self.gh_log.read_text().splitlines() if self.gh_log.exists() else []
+
+    def branches(self):
+        return git_out(["branch", "--format=%(refname:short)"], self.repo).split()
+
+    # -- the guarantee -----------------------------------------------------
+
+    def test_the_base_branch_is_left_exactly_as_it_was(self):
+        head_before = git_out(["rev-parse", "main"], self.repo)
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(run.base_branch, "main")
+        # Back where the operator started, with nothing of the run on it -
+        # otherwise the *next* run would silently branch from this one's work.
+        self.assertEqual(gitutil.status(self.repo).branch, "main")
+        self.assertEqual(git_out(["rev-parse", "main"], self.repo), head_before)
+        self.assertTrue(gitutil.status(self.repo).clean)
+        self.assertFalse((self.repo / "AI_COUNCIL_DEMO.md").exists())
+
+    def test_the_work_reaches_the_branch_and_the_remote(self):
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+
+        self.assertIn(run.work_branch, self.branches())
+        self.assertIn(
+            "AI_COUNCIL_DEMO.md",
+            git_out(["ls-tree", "-r", "--name-only", run.work_branch], self.repo),
+        )
+        # Pushed for real, to a real remote.
+        self.assertEqual(
+            git_out(["rev-parse", f"refs/heads/{run.work_branch}"], self.origin),
+            run.pull_request.commit,
+        )
+
+    def test_the_pull_request_targets_the_branch_that_was_checked_out(self):
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+
+        created = [c for c in self.gh_calls() if c.startswith("pr create")]
+        self.assertEqual(len(created), 1, self.gh_calls())
+        self.assertIn(f"--base main --head {run.work_branch}", created[0])
+        self.assertEqual(
+            run.pull_request.url, "https://github.com/example/project/pull/7"
+        )
+        self.assertEqual(
+            run.to_dict()["pull_request"]["url"], run.pull_request.url
+        )
+
+    def test_the_diff_shows_what_the_pull_request_contains(self):
+        # The worktree diff is empty once the work is committed; what the tab
+        # must show from then on is the branch against its base.
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertIn("AI_COUNCIL_DEMO.md", run.diff)
+        self.assertGreaterEqual(run.diff_stat["files"], 1)
+
+    def test_rollback_is_not_offered_once_a_pull_request_exists(self):
+        # Restoring the worktree would not close the PR or unpush the branch.
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+        self.assertIsNotNone(run.snapshot)
+        self.assertFalse(run.to_dict()["can_rollback"])
+
+    # -- preconditions -----------------------------------------------------
+
+    def test_a_dirty_tree_is_refused_even_with_the_clean_toggle_off(self):
+        # Whatever is in the tree at the start would be swept into the commit.
+        (self.repo / "dirty.txt").write_text("uncommitted\n")
+        self.store.update({"require_clean_worktree": False})
+        with self.assertRaises(ValueError) as ctx:
+            self.pipeline.start("add a demo artifact", str(self.repo))
+        self.assertIn("clean tree", str(ctx.exception))
+
+    def test_a_repository_with_no_origin_is_refused(self):
+        git(["remote", "remove", "origin"], self.repo)
+        with self.assertRaisesRegex(ValueError, "origin"):
+            self.pipeline.start("add a demo artifact", str(self.repo))
+
+    def test_an_unauthenticated_cli_is_caught_before_any_agent_runs(self):
+        self.set_env("FAKE_GH_UNAUTHENTICATED", "1")
+        with self.assertRaisesRegex(ValueError, "GitHub CLI is not ready"):
+            self.pipeline.start("add a demo artifact", str(self.repo))
+        self.assertEqual(self.branches(), ["main"])
+
+    def test_rejecting_at_the_gate_creates_no_branch(self):
+        self.store.update({"zero_touch": False})
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_for(lambda: run.state == "awaiting_approval")
+        self.pipeline.reject()
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "cancelled")
+        self.assertEqual(self.branches(), ["main"])
+        self.assertEqual(self.gh_calls(), ["auth status"])
+
+    # -- failure -----------------------------------------------------------
+
+    def test_a_failed_publish_says_where_the_work_is(self):
+        self.set_env("FAKE_GH_FAIL", "1")
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "failed")
+        self.assertIsNone(run.pull_request)
+        self.assertIn(run.work_branch, run.error)
+        self.assertIn("main is unchanged", run.error)
+        # The work is still there to recover, on the branch and in the tree.
+        self.assertEqual(gitutil.status(self.repo).branch, run.work_branch)
+        self.assertTrue((self.repo / "AI_COUNCIL_DEMO.md").exists())
+        self.assertTrue(run.to_dict()["can_rollback"])
+
+    def test_a_senior_stage_that_changes_nothing_opens_no_pull_request(self):
+        self.store.update({
+            "providers": {"polisher": mock_provider("polisher", "Senior", ["--fail"])},
+        })
+        run = self.pipeline.start("do nothing at all", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "failed")
+        self.assertIsNone(run.pull_request)
+        self.assertNotIn("pr create", " ".join(self.gh_calls()))
+
+    # -- naming ------------------------------------------------------------
+
+    def test_branch_names_carry_the_task_and_the_run_id(self):
+        self.assertEqual(
+            gitutil.branch_for("abc123", "Add rate limiting to /api/login!"),
+            "ai-council/add-rate-limiting-to-api-login-abc123",
+        )
+        # A task with nothing nameable in it still yields a valid ref.
+        self.assertEqual(gitutil.branch_for("abc123", "!!!"), "ai-council/abc123")
 
 
 class TestFailureHandling(PipelineTestBase):

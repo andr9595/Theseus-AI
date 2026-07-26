@@ -1,4 +1,4 @@
-"""Git helpers: repository inspection, diff capture, and run rollback.
+"""Git helpers: repository inspection, diff capture, rollback, and delivery.
 
 The safety model matters more than the convenience here. Zero-Touch Mode hands
 a coding agent a ``--dangerously-skip-permissions`` flag and lets it write to
@@ -8,11 +8,18 @@ untracked file. Rolling back restores that exact tree.
 
 The snapshot is written with ``git stash create``-style plumbing rather than
 ``git stash push`` so the user's own stash stack is never touched.
+
+Pull-request mode is the other half of that safety model: instead of leaving
+the senior stage's work uncommitted on whatever branch is checked out, it moves
+to a branch of its own, commits, pushes and opens a pull request - so the base
+branch only ever changes when a human merges it.
 """
 
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -20,10 +27,29 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 GIT_TIMEOUT = 60
+# Pushing and talking to GitHub crosses the network, so they get their own,
+# longer budget than local plumbing.
+REMOTE_TIMEOUT = 300
 
 
 class GitError(RuntimeError):
     """A git plumbing command failed."""
+
+
+def _child_env() -> Dict[str, str]:
+    """The environment every subprocess here runs under.
+
+    Never let a child block the pipeline on a credential, editor or pager
+    prompt: nothing in this app can answer one, so it would hang until the
+    timeout instead of failing with a message.
+    """
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_EDITOR"] = "true"
+    env["GIT_PAGER"] = "cat"
+    env.pop("GIT_DIR", None)
+    env.pop("GIT_WORK_TREE", None)
+    return env
 
 
 def _run(
@@ -39,13 +65,7 @@ def _run(
     performed without disturbing the user's real, possibly carefully-staged,
     index.
     """
-    env = dict(os.environ)
-    # Never let git block the pipeline on a credential or editor prompt.
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    env["GIT_EDITOR"] = "true"
-    env["GIT_PAGER"] = "cat"
-    env.pop("GIT_DIR", None)
-    env.pop("GIT_WORK_TREE", None)
+    env = _child_env()
     if index_file is not None:
         env["GIT_INDEX_FILE"] = str(index_file)
 
@@ -235,9 +255,12 @@ def working_diff(path: str | Path, max_bytes: int = 400_000) -> str:
 
     # Each chunk already ends with a newline; joining on "\n" would insert a
     # blank line between files that no diff parser expects.
-    diff = "".join(chunks)
+    return _clip_diff("".join(chunks), max_bytes)
+
+
+def _clip_diff(diff: str, max_bytes: int) -> str:
     if len(diff) > max_bytes:
-        diff = diff[:max_bytes] + "\n\n... diff truncated for display ...\n"
+        return diff[:max_bytes] + "\n\n... diff truncated for display ...\n"
     return diff
 
 
@@ -248,16 +271,10 @@ def _untracked_files(root: str) -> List[str]:
     return [f for f in proc.stdout.split("\0") if f]
 
 
-def diff_stat(path: str | Path) -> Dict[str, int]:
-    """Return ``{files, insertions, deletions}`` for the current changes."""
-    root = repo_root(path)
+def _numstat_totals(numstat: str) -> Dict[str, int]:
+    """Fold ``git diff --numstat`` output into ``{files, insertions, deletions}``."""
     result = {"files": 0, "insertions": 0, "deletions": 0}
-    if root is None:
-        return result
-
-    proc = _run(["diff", "HEAD", "--numstat"], root, check=False)
-    lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
-    for line in lines:
+    for line in numstat.splitlines():
         parts = line.split("\t")
         if len(parts) < 3:
             continue
@@ -268,7 +285,17 @@ def diff_stat(path: str | Path) -> Dict[str, int]:
             result["insertions"] += int(added)
         if removed.isdigit():
             result["deletions"] += int(removed)
+    return result
 
+
+def diff_stat(path: str | Path) -> Dict[str, int]:
+    """Return ``{files, insertions, deletions}`` for the current changes."""
+    root = repo_root(path)
+    if root is None:
+        return {"files": 0, "insertions": 0, "deletions": 0}
+
+    proc = _run(["diff", "HEAD", "--numstat"], root, check=False)
+    result = _numstat_totals(proc.stdout)
     for rel in _untracked_files(root):
         result["files"] += 1
         path = Path(root) / rel
@@ -469,6 +496,228 @@ def restore_snapshot(snap: Snapshot) -> str:
             f"changes reapplied (as unstaged)."
         )
     return f"Restored to clean {snap.head[:8]}."
+
+
+# --------------------------------------------------------------------------
+# Pull-request delivery
+# --------------------------------------------------------------------------
+
+
+# Every branch this app creates lives under one prefix, so a repository's
+# branch list stays legible and `git branch -d ai-council/...` cleans up.
+BRANCH_PREFIX = "ai-council"
+
+
+@dataclass
+class PullRequest:
+    """The branch, commit and pull request one run was delivered as."""
+
+    base: str
+    branch: str
+    commit: str = ""
+    url: str = ""
+
+    def to_dict(self) -> Dict[str, str]:
+        return {
+            "base": self.base,
+            "branch": self.branch,
+            "commit": self.commit,
+            "url": self.url,
+        }
+
+
+def _gh(
+    args: List[str], cwd: str | Path, timeout: int = REMOTE_TIMEOUT
+) -> subprocess.CompletedProcess:
+    """Run the GitHub CLI with the same guarantees ``_run`` gives git."""
+    env = _child_env()
+    # gh asks interactive questions when it is unsure - about the remote to
+    # use, about pushing - and there is nobody here to answer them.
+    env["GH_PROMPT_DISABLED"] = "1"
+    env["GH_PAGER"] = "cat"
+    env["NO_COLOR"] = "1"
+    try:
+        proc = subprocess.run(
+            ["gh", *args],
+            cwd=str(cwd),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise GitError("The GitHub CLI (`gh`) is not installed.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise GitError(f"gh {' '.join(args)} timed out after {timeout}s") from exc
+    if proc.returncode != 0:
+        raise GitError(
+            f"gh {' '.join(args)} failed ({proc.returncode}): "
+            f"{proc.stderr.strip() or proc.stdout.strip()}"
+        )
+    return proc
+
+
+def pull_request_blocker(path: str | Path) -> str:
+    """Why ``path`` cannot start a pull-request run, or "" if it can.
+
+    Everything checkable is checked *before* the agents run. The alternative is
+    discovering a missing identity or an unauthenticated CLI after a senior
+    stage has already spent its quota and written to disk, with the work
+    stranded on a branch nobody asked for.
+    """
+    st = status(path)
+    if not st.is_repo:
+        return st.error or "Not a git repository."
+    if st.error:
+        return st.error
+    if not st.head:
+        return (
+            "Pull-request mode needs a commit to branch from, and this "
+            "repository has none yet. Make an initial commit first."
+        )
+    if not st.branch or st.branch == "HEAD":
+        return (
+            "Pull-request mode branches from whatever is checked out, and this "
+            "repository is on a detached HEAD. Check out the branch the pull "
+            "request should target."
+        )
+    if not st.clean:
+        return (
+            f"Pull-request mode commits everything the run changes, so it needs "
+            f"a clean tree to start from - and this one has "
+            f"{len(st.staged) + len(st.modified) + len(st.untracked)} "
+            f"uncommitted change(s). Commit or stash them first, or they will "
+            f"end up in the pull request."
+        )
+
+    root = st.path
+    # `git var` fails exactly when git cannot assemble an identity, which is
+    # the same thing that would abort the commit at the end of the run.
+    if _run(["var", "GIT_COMMITTER_IDENT"], root, check=False).returncode != 0:
+        return (
+            "Pull-request mode has to commit, and git has no identity to commit "
+            "with. Set `git config user.name` and `git config user.email`."
+        )
+    if not st.remote:
+        return (
+            "Pull-request mode pushes to a remote named 'origin', and this "
+            "repository has none."
+        )
+    if shutil.which("gh") is None:
+        return (
+            "Pull-request mode opens the pull request with the GitHub CLI "
+            "(`gh`), which is not on PATH. Install it, or turn the toggle off."
+        )
+    # Authentication is the one precondition only GitHub can answer, and it is
+    # the one that would otherwise surface at the very end of the run.
+    try:
+        _gh(["auth", "status"], root, timeout=GIT_TIMEOUT)
+    except GitError as exc:
+        return f"The GitHub CLI is not ready: {exc}"
+    return ""
+
+
+def branch_for(run_id: str, task: str) -> str:
+    """Name the branch a run delivers on: ``ai-council/<task-slug>-<run-id>``.
+
+    The slug is for the human reading a pull-request list; the run id is what
+    makes the name unique and traceable back to a transcript.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", task.lower()).strip("-")[:48].strip("-")
+    return f"{BRANCH_PREFIX}/{slug}-{run_id}" if slug else f"{BRANCH_PREFIX}/{run_id}"
+
+
+def create_branch(path: str | Path, branch: str) -> None:
+    """Create ``branch`` at HEAD and check it out."""
+    _run(["checkout", "-q", "-b", branch], path)
+
+
+def checkout(path: str | Path, branch: str) -> None:
+    """Check out an existing branch."""
+    _run(["checkout", "-q", branch], path)
+
+
+def branch_diff(
+    path: str | Path, base: str, head: str = "HEAD", max_bytes: int = 400_000
+) -> str:
+    """The diff a pull request would show: ``base...head``.
+
+    Three dots, so the diff is against the merge base rather than the tip of
+    ``base`` - commits that landed on the base branch meanwhile are not part of
+    what this run changed.
+    """
+    root = repo_root(path)
+    if root is None:
+        return ""
+    proc = _run(["diff", "--no-color", f"{base}...{head}"], root, check=False)
+    return _clip_diff(proc.stdout, max_bytes)
+
+
+def branch_diff_stat(path: str | Path, base: str, head: str = "HEAD") -> Dict[str, int]:
+    """``{files, insertions, deletions}`` for ``base...head``."""
+    root = repo_root(path)
+    if root is None:
+        return {"files": 0, "insertions": 0, "deletions": 0}
+    return _numstat_totals(
+        _run(["diff", "--numstat", f"{base}...{head}"], root, check=False).stdout
+    )
+
+
+def publish_pull_request(
+    path: str | Path, base: str, branch: str, title: str, body: str
+) -> PullRequest:
+    """Commit the run's work, push ``branch`` and open a pull request.
+
+    Deliberately tolerant about who made the commit. Some agents commit their
+    own work and some leave it in the worktree; both are legitimate, so this
+    commits whatever is outstanding and then judges success on whether the
+    branch is actually ahead of ``base``.
+    """
+    root = repo_root(path)
+    if root is None:
+        raise GitError("Not a git repository.")
+
+    st = status(root)
+    if st.branch != branch:
+        raise GitError(
+            f"Expected to publish {branch!r}, but {st.branch or 'a detached HEAD'} "
+            f"is checked out. Nothing was pushed."
+        )
+    if not st.clean:
+        _run(["add", "-A"], root)
+        _run(["commit", "-q", "-m", title, "-m", body], root)
+
+    ahead = _run(["rev-list", "--count", f"{base}..{branch}"], root, check=False)
+    if ahead.stdout.strip() in ("", "0"):
+        raise GitError(
+            "The senior stage changed nothing, so there is no pull request to "
+            "open."
+        )
+
+    pr = PullRequest(
+        base=base,
+        branch=branch,
+        commit=_run(["rev-parse", "HEAD"], root).stdout.strip(),
+    )
+    _run(["push", "--set-upstream", "origin", branch], root, timeout=REMOTE_TIMEOUT)
+    result = _gh(
+        ["pr", "create", "--base", base, "--head", branch,
+         "--title", title, "--body", body],
+        root,
+    )
+    # gh prints progress lines before the URL, so take the last thing that
+    # looks like one rather than the last line.
+    for line in reversed(result.stdout.splitlines()):
+        if line.strip().startswith("http"):
+            pr.url = line.strip()
+            break
+    if not pr.url:
+        raise GitError(
+            f"gh reported no pull-request URL. {branch} is pushed; open the "
+            f"pull request by hand."
+        )
+    return pr
 
 
 def list_directory(path: str | Path) -> Dict:

@@ -22,6 +22,11 @@ only when Zero-Touch Mode granted it up front or a human granted it at the
 gate, and it is what decides whether the Stage 2 CLI receives its
 auto-approve flags. Stage 1 is read-only and never receives them.
 
+Pull-request mode changes where that permission lands, not whether it is
+granted: the branch is created after the gate, Stage 2 works on it, and a
+successful run is committed, pushed and opened as a pull request. The branch
+the operator started on is never written to.
+
 Only one run executes at a time. The engine owns a worker thread; every public
 method is safe to call from the HTTP handler threads.
 """
@@ -33,7 +38,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import config as cfg
 from . import gitutil, prompts
@@ -56,6 +61,14 @@ TERMINAL_STATES = {COMPLETE, FAILED, CANCELLED}
 # its predecessor's turns into every new transcript, so an unbounded reply
 # would be duplicated into each one for as long as the thread runs.
 MAX_TURN_CHARS = 12_000
+
+# How much of the senior stage's own summary is quoted into the pull request
+# body. It is the description a reviewer reads first, but it is not the review
+# itself - the diff is.
+MAX_PR_BODY_CHARS = 8_000
+# Git's own convention for a commit subject, and what GitHub shows before it
+# starts eliding a pull-request title.
+MAX_PR_TITLE_CHARS = 72
 
 
 def _conversation_turn(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -100,6 +113,35 @@ def _conversation_turn(data: Dict[str, Any]) -> Dict[str, Any]:
         "reviewer_note": str(data.get("reviewer_note") or "").strip(),
         "outcome": outcome,
     }
+
+
+def _pull_request_text(run: Run) -> Tuple[str, str]:
+    """The commit subject and pull-request body for a finished run.
+
+    The senior stage's own summary is quoted rather than paraphrased: it is the
+    only account of what was changed and why that was written by whoever made
+    the change.
+    """
+    task = " ".join(run.task.split())
+    title = task[:MAX_PR_TITLE_CHARS].rstrip()
+    if len(task) > MAX_PR_TITLE_CHARS:
+        title = title.rsplit(" ", 1)[0] + "..."
+
+    stage = run.stages.get(run.solo_stage if run.solo else "polisher")
+    summary = prompts.clip((stage.output if stage else "").strip(), MAX_PR_BODY_CHARS)
+
+    lines = [f"**Task**\n\n{task}", ""]
+    if run.reviewer_note:
+        lines += [f"**Reviewer note at the approval gate**\n\n{run.reviewer_note}", ""]
+    if summary:
+        lines += ["**What the senior stage reported**", "", summary, ""]
+    lines += [
+        "---",
+        "",
+        f"Opened by AI Council, run `{run.id}`. Deliberately not merged: "
+        f"review the diff before it reaches `{run.base_branch}`.",
+    ]
+    return title, "\n".join(lines)
 
 
 @dataclass
@@ -147,6 +189,12 @@ class Run:
     zero_touch: bool
     solo: bool
     solo_stage: str = "polisher"  # which provider Solo Mode runs
+    # Pull-request delivery. The branch is named at start but only created
+    # after write permission is granted, so a rejected run leaves no trace.
+    pull_request_mode: bool = False
+    base_branch: str = ""
+    work_branch: str = ""
+    pull_request: Optional[gitutil.PullRequest] = None
     state: str = IDLE
     created_at: float = field(default_factory=time.time)
     ended_at: float = 0.0
@@ -189,6 +237,10 @@ class Run:
             "zero_touch": self.zero_touch,
             "solo": self.solo,
             "solo_stage": self.solo_stage,
+            "pull_request_mode": self.pull_request_mode,
+            "base_branch": self.base_branch,
+            "work_branch": self.work_branch,
+            "pull_request": self.pull_request.to_dict() if self.pull_request else None,
             "state": self.state,
             "created_at": self.created_at,
             "ended_at": self.ended_at,
@@ -197,7 +249,15 @@ class Run:
             "diff": self.diff,
             "diff_stat": self.diff_stat,
             "snapshot": self.snapshot.to_dict() if self.snapshot else None,
-            "can_rollback": bool(self.snapshot) and self.state in TERMINAL_STATES,
+            # Not offered once a pull request exists: rollback restores a
+            # worktree, and the branch this run's work now lives on has already
+            # been pushed. Undoing half of that and calling it a rollback is
+            # worse than saying plainly that the PR has to be closed by hand.
+            "can_rollback": (
+                bool(self.snapshot)
+                and self.state in TERMINAL_STATES
+                and self.pull_request is None
+            ),
             "reviewer_note": self.reviewer_note,
             "error": self.error,
             "rollback_note": self.rollback_note,
@@ -280,7 +340,15 @@ class Pipeline:
             )
 
         conf = self.store.all()
-        if conf.get("require_clean_worktree"):
+        pull_request_mode = bool(conf.get("pull_request_mode"))
+        if pull_request_mode:
+            # Stricter than the toggle below and checked whether or not it is
+            # on: every precondition for committing, pushing and opening the PR
+            # is verified here, before any agent spends quota.
+            blocker = gitutil.pull_request_blocker(root)
+            if blocker:
+                raise ValueError(blocker)
+        elif conf.get("require_clean_worktree"):
             st = gitutil.status(root)
             if not st.clean:
                 raise ValueError(
@@ -322,13 +390,22 @@ class Pipeline:
             if solo_stage not in providers:
                 solo_stage = "polisher"
 
+            run_id = uuid.uuid4().hex[:12]
             run = Run(
-                id=uuid.uuid4().hex[:12],
+                id=run_id,
                 task=task,
                 repo=root,
                 zero_touch=zero_touch,
                 solo=solo,
                 solo_stage=solo_stage,
+                pull_request_mode=pull_request_mode,
+                # Whatever is checked out is what the pull request targets, so
+                # this works for main, master or a release branch without
+                # another setting to keep in sync.
+                base_branch=gitutil.status(root).branch if pull_request_mode else "",
+                work_branch=(
+                    gitutil.branch_for(run_id, task) if pull_request_mode else ""
+                ),
                 parent_run_id=parent_run_id,
                 conversation=conversation,
                 config=conf,
@@ -584,6 +661,20 @@ class Pipeline:
                     return
                 execute_approved = True
 
+            # ---- Delivery branch ----------------------------------------
+            # Created here, after permission to write has been granted, so
+            # rejecting at the gate still leaves the repository untouched.
+            if run.pull_request_mode:
+                gitutil.create_branch(run.repo, run.work_branch)
+                self.bus.publish(
+                    "log",
+                    level="info",
+                    message=(
+                        f"Working on {run.work_branch}. {run.base_branch} will "
+                        f"not change until you merge the pull request."
+                    ),
+                )
+
             # ---- Safety snapshot ----------------------------------------
             # Taken immediately before the only stage that writes to disk.
             if conf.get("safety_snapshot", True):
@@ -667,17 +758,66 @@ class Pipeline:
                 self._finish_cancelled(run)
                 return
 
-            if result.ok:
-                self._set_state(run, COMPLETE)
-            else:
+            if not result.ok:
                 run.error = result.error or "The senior stage failed."
                 self._set_state(run, FAILED)
+            elif run.pull_request_mode:
+                self._publish(run)
+                self._set_state(run, FAILED if run.error else COMPLETE)
+            else:
+                self._set_state(run, COMPLETE)
 
         except Exception as exc:  # a crash here must not wedge the engine
             run.error = f"{type(exc).__name__}: {exc}"
             self._set_state(run, FAILED)
         finally:
             self._persist(run)
+
+    def _publish(self, run: Run) -> None:
+        """Commit, push and open the pull request. Records failure on the run.
+
+        Never raises: a publication that fails has still left the operator with
+        real work on a real branch, and the run has to say where it is rather
+        than crash the worker thread.
+        """
+        title, body = _pull_request_text(run)
+        try:
+            run.pull_request = gitutil.publish_pull_request(
+                run.repo, run.base_branch, run.work_branch, title, body
+            )
+        except (gitutil.GitError, OSError) as exc:
+            run.error = (
+                f"{exc} Everything this run wrote is on {run.work_branch}; "
+                f"{run.base_branch} is unchanged."
+            )
+            return
+
+        self.bus.publish(
+            "log",
+            level="info",
+            message=f"Pull request opened: {run.pull_request.url}",
+        )
+        try:
+            # The worktree diff collected a moment ago is empty now that the
+            # work is committed. What the reviewer will see is the branch
+            # against its base, which is also what an agent that committed its
+            # own work leaves behind.
+            run.diff = gitutil.branch_diff(run.repo, run.base_branch, run.work_branch)
+            run.diff_stat = gitutil.branch_diff_stat(
+                run.repo, run.base_branch, run.work_branch
+            )
+            # Put the operator back where they started. Left on the delivery
+            # branch, the next run would quietly take *it* as the base.
+            gitutil.checkout(run.repo, run.base_branch)
+        except (gitutil.GitError, OSError) as exc:
+            self.bus.publish(
+                "log",
+                level="warn",
+                message=(
+                    f"The pull request is open, but tidying up afterwards "
+                    f"failed ({exc}). You may still be on {run.work_branch}."
+                ),
+            )
 
     # -- helpers -----------------------------------------------------------
 
@@ -690,6 +830,18 @@ class Pipeline:
             if stage.state in ("pending", "running"):
                 stage.state = "skipped"
         run.error = message
+        # A cancellation after the gate leaves the operator on the delivery
+        # branch. Saying so is the difference between "nothing happened" and
+        # "your repository is on a branch you did not create".
+        if run.work_branch and gitutil.status(run.repo).branch == run.work_branch:
+            self.bus.publish(
+                "log",
+                level="warn",
+                message=(
+                    f"Cancelled on {run.work_branch}. Nothing was pushed and "
+                    f"{run.base_branch} is unchanged."
+                ),
+            )
         try:
             run.diff = gitutil.working_diff(run.repo)
             run.diff_stat = gitutil.diff_stat(run.repo)
