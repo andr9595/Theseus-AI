@@ -41,7 +41,7 @@ is zero.
 | Requirement | Notes |
 |---|---|
 | Python **3.9+** | Standard library only — no `pip install`, no virtualenv, no build step |
-| `git` | For the repo picker, diff viewer and rollback |
+| `git` | Optional — powers the diff viewer, safety snapshot and rollback when the working folder is a repository |
 | A browser | Chromium-family gets a frameless app window; Firefox gets a plain window |
 | `codex` CLI | Optional — Stage 1. See [Installing the agent CLIs](#installing-the-agent-clis) |
 | `claude` CLI | Optional — Stage 2 |
@@ -76,7 +76,7 @@ Theseus AI v1.0.0
   config      : /home/you/.config/ai-council/config.json
   runs        : /home/you/.config/ai-council/runs
   zero-touch  : off
-  target repo : (none selected)
+  workspace   : /home/you/.config/ai-council/workspace (scratch)
   pull request: off
 
 Providers:
@@ -153,8 +153,12 @@ drafter                       ← use "polisher" for Stage 2
 
 ## Using it
 
-1. **Pick a target repository.** Click the folder button in the sidebar. The
-   picker badges directories that are git repos; only those can be selected.
+1. **Optionally pick a working folder.** Click the folder button in the
+   sidebar. Any folder will do, and none is a fine answer too: with nothing
+   chosen, runs happen in a scratch folder of the app's own
+   (`~/.config/ai-council/workspace`), which is what makes "just ask it
+   something" work before you have configured anything. See
+   [The working folder](#the-working-folder).
 2. **Describe the task.** Be specific about files, behaviour and edge cases —
    the draft stage is only as good as its brief.
 3. **Run it** with the button or <kbd>Ctrl</kbd>+<kbd>Enter</kbd>.
@@ -177,6 +181,38 @@ drafter                       ← use "polisher" for Stage 2
 | **Draft** | Stage 1's proposal, rendered as Markdown with highlighted code |
 | **Senior review** | Stage 2's review, change summary and verification notes |
 | **Diff** | The real working-tree diff, syntax-marked and collapsible per file |
+
+---
+
+## The working folder
+
+Both modes run their agents in one folder. Choosing it is optional, and it does
+not have to be a git repository — the sidebar picker badges the ones that are,
+but any folder can be selected, and **Use no folder** goes back to having none.
+
+What the folder decides is which half of the safety model is available:
+
+| Working folder | You get | You do not get |
+|---|---|---|
+| A git repository | Everything below | — |
+| Any other folder | Draft, approval gate, live stream, conversations | Diff, safety snapshot, rollback, commit bar, pull-request mode |
+| None chosen | The same, in `~/.config/ai-council/workspace` | The same |
+
+None of that is enforced by refusing to start. The sidebar says which features
+the current folder is buying, the Diff tab names the reason it is empty rather
+than implying the run did nothing, and the approval gate tells you before you
+approve whether a rollback point will exist. The one thing that *is* refused up
+front is pull-request mode without a repository to branch from — checked before
+either agent spends any quota.
+
+The scratch workspace is a real directory you can open, not a temporary one:
+whatever a run writes with no folder chosen is still there afterwards. It is
+deliberately not a git repository, which is why a run there cannot be rolled
+back.
+
+> A folder inside a repository resolves to that repository's root, because the
+> diff, the snapshot and the delivery branch all operate on the root. Picking
+> `project/src` and picking `project` are the same choice.
 
 ---
 
@@ -206,12 +242,12 @@ Two deliberate limits:
 - **It replays the council's transcript, not the CLI's session.** A stage can
   be any command you configure, and a custom one has no session to resume.
   Replaying the transcript works for every agent identically.
-- **The repository is the authority, not the recollection.** A remembered run
+- **The working folder is the authority, not the recollection.** A remembered run
   may since have been rolled back or edited over by hand, so the prompt says so
   and the old diff is deliberately not replayed — the working tree already
   carries it, more accurately.
 
-Continuation only works within the repository the run started in.
+Continuation only works within the folder the run started in.
 
 ### The context meter, and compaction
 
@@ -291,9 +327,9 @@ Three properties hold in both modes, and they are covered by tests:
   reversible.
 
 > **Zero-Touch means what it says.** An agent will create, modify and delete
-> files in your repository with no further confirmation. Use it on a branch,
-> keep Safety Snapshot on, and don't point it at anything you can't afford to
-> lose.
+> files in your working folder with no further confirmation. Use it on a
+> branch, keep Safety Snapshot on, and don't point it at anything you can't
+> afford to lose.
 
 ### Other toggles
 
@@ -329,15 +365,15 @@ ChatGPT is. It has:
   Codex while the council runs Claude.
 - **No behaviour by default.** With the **Behaviour** box empty and no thread
   to replay, your message reaches the CLI *exactly as typed* — no persona, no
-  house rules, no repository preamble. Type something into that box and it is
+  house rules, no folder preamble. Type something into that box and it is
   put in front of the message; that is the whole of it.
 - **No council furniture.** No draft, no approval gate, no Zero-Touch, no
   pull request, no snapshot, no rollback, and none of the four output tabs —
   just the message and the reply.
 - **No write permission.** Solo is invoked with its agent's read-only
   arguments (`--sandbox read-only` for `codex`, `--permission-mode plan` for
-  `claude`) and never receives an auto-approve flag. It reads the selected
-  repository and talks about it; Council is the path for changing it.
+  `claude`) and never receives an auto-approve flag. It reads the working
+  folder and talks about it; Council is the path for changing it.
 
 Conversations from the two modes are kept apart: continuing one switches the
 selector to the mode it was held in, and the server refuses the mismatch
@@ -434,8 +470,9 @@ nor deleted. The one thing not reproduced is the staged/unstaged split:
 everything uncommitted before the run is uncommitted after it, but changes
 that were staged come back unstaged.
 
-Snapshotting **fails closed**. If any part of it fails — or the repository has
-no commits yet to anchor to — the run is told so in the live stream and
+Snapshotting **fails closed**. If any part of it fails — or there is nothing
+to anchor to, because the folder has no commits yet or no git at all — the run
+is told so in the live stream and
 **Roll back** is not offered at all. A snapshot that captured nothing cannot
 distinguish "your tree was clean" from "we recorded nothing", and resetting on
 that assumption would destroy the work the snapshot exists to protect.
@@ -717,7 +754,10 @@ Coverage focuses on the properties that matter if they're wrong:
   the PR against the branch that was checked out, and says where the work is
   when publishing fails.
 - A continued run carries the earlier exchange to **both** stages and refuses a
-  transcript from another repository.
+  transcript from another folder.
+- Both modes start with no working folder and in a folder with no git; what
+  those runs lose is the diff, the snapshot and pull-request delivery, and a
+  config written when the folder was a mandatory repository still migrates.
 - Cross-origin and bad-token requests are rejected; path traversal is blocked.
 
 ---

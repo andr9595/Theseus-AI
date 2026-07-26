@@ -28,7 +28,12 @@ State machine (Solo)
 Solo has no gate, no delivery branch, no safety snapshot and no diff, because
 it never writes: its provider is invoked with ``read_only_args`` instead of
 ever being granted the auto-approve flags. What it is for is a conversation
-with one agent about a repository, and what it produces is an answer.
+with one agent, and what it produces is an answer.
+
+Neither mode requires a repository. A run works in the folder it was given -
+or in the scratch workspace when it was given none - and the git-backed half
+of the safety model (snapshot, rollback, diff, pull-request delivery) is
+available exactly when that folder happens to be a git repository.
 
 Permission to write to disk is carried by ``execute_approved``. It is true
 only when Zero-Touch Mode granted it up front or a human granted it at the
@@ -92,6 +97,35 @@ MAX_PR_BODY_CHARS = 8_000
 # Git's own convention for a commit subject, and what GitHub shows before it
 # starts eliding a pull-request title.
 MAX_PR_TITLE_CHARS = 72
+
+
+def resolve_workspace(folder: str) -> str:
+    """The absolute directory a run should execute in.
+
+    Blank means the scratch workspace: neither mode requires a project, and
+    refusing to start without one made a plain question about Python cost a
+    trip through a directory picker first.
+
+    A folder inside a git repository resolves to that repository's root, which
+    is what the diff, the snapshot and the delivery branch all operate on.
+    Anything else is taken as it stands - a folder that is not a repository is
+    a legitimate place to work, it simply has none of that machinery.
+    """
+    folder = (folder or "").strip()
+    if not folder:
+        return str(cfg.workspace_dir())
+    path = Path(folder).expanduser()
+    if not path.is_dir():
+        raise ValueError(
+            f"{folder!r} is not a folder that exists. Pick another one, or "
+            f"clear it to work in the scratch workspace."
+        )
+    return gitutil.repo_root(path) or str(path.resolve())
+
+
+def _transcript_workspace(data: Dict[str, Any]) -> str:
+    """Where a persisted run worked. ``repo`` is what older ones called it."""
+    return str(data.get("workspace") or data.get("repo") or "")
 
 
 def _conversation_turn(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -232,7 +266,11 @@ class Run:
 
     id: str
     task: str
-    repo: str
+    # The folder the agents run in. Not necessarily a git repository, and not
+    # necessarily one the operator chose - blank in Settings means the scratch
+    # workspace, which is resolved before the run is built so the transcript
+    # records where the work actually happened.
+    workspace: str
     zero_touch: bool
     mode: str = "council"  # "council" | "solo"
     # Pull-request delivery. The branch is named at start but only created
@@ -241,6 +279,11 @@ class Run:
     base_branch: str = ""
     work_branch: str = ""
     pull_request: Optional[gitutil.PullRequest] = None
+    # Whether this run will have a rollback point. Decided once at start, from
+    # the frozen config and the folder - the toggle is worth nothing without a
+    # git repository to anchor to - because the approval gate quotes it, and
+    # that is the last moment it can change the operator's answer.
+    snapshot_planned: bool = False
     state: str = IDLE
     created_at: float = field(default_factory=time.time)
     ended_at: float = 0.0
@@ -288,7 +331,10 @@ class Run:
             "id": self.id,
             "file": self.transcript_name,
             "task": self.task,
-            "repo": self.repo,
+            "workspace": self.workspace,
+            # Kept alongside `workspace` for transcripts read by a version that
+            # only knew the folder as a repository.
+            "repo": self.workspace,
             "zero_touch": self.zero_touch,
             "mode": self.mode,
             # Kept alongside `mode` for transcripts written by, and read by,
@@ -298,6 +344,7 @@ class Run:
             "base_branch": self.base_branch,
             "work_branch": self.work_branch,
             "pull_request": self.pull_request.to_dict() if self.pull_request else None,
+            "snapshot_planned": self.snapshot_planned,
             "state": self.state,
             "created_at": self.created_at,
             "ended_at": self.ended_at,
@@ -401,11 +448,15 @@ class Pipeline:
     def start(
         self,
         task: str,
-        repo: str,
+        workspace: str = "",
         continue_from: str = "",
         compact_context: bool = False,
     ) -> Run:
         """Kick off a new run. Raises PipelineBusy if one is already active.
+
+        ``workspace`` is the folder the agents run in. Blank is allowed and
+        means the scratch workspace, and a folder that is not a git repository
+        is allowed too - what a run needs is somewhere to work, not a project.
 
         ``continue_from`` is the filename of a persisted transcript to continue.
         Its thread is carried into the new run's prompts, so the agents see
@@ -424,12 +475,11 @@ class Pipeline:
         if not task:
             raise ValueError("Task description is empty.")
 
-        root = gitutil.repo_root(repo)
-        if root is None:
-            raise ValueError(
-                f"{repo!r} is not a git repository. Pick a directory that "
-                f"contains a .git folder, or run `git init` there first."
-            )
+        # Remembered only when the operator chose it: resolving blank to the
+        # scratch workspace and then storing that would pin a folder nobody
+        # picked, and the next run would open with it selected.
+        chosen = (workspace or "").strip()
+        root = resolve_workspace(chosen)
 
         conf = self.store.all()
         mode = str(conf.get("mode") or "council")
@@ -464,11 +514,11 @@ class Pipeline:
                     "That run transcript no longer exists, so there is nothing "
                     "to continue."
                 )
-            # Both paths came out of `git rev-parse --show-toplevel`, so this
-            # compares canonical roots rather than whatever the operator typed.
-            if str(previous.get("repo") or "") != root:
+            # Both paths went through `resolve_workspace`, so this compares
+            # canonical folders rather than whatever the operator typed.
+            if _transcript_workspace(previous) != root:
                 raise ValueError(
-                    "A run can only be continued against the repository it "
+                    "A conversation can only be continued in the folder it "
                     "started in."
                 )
             # A council thread replayed into a plain conversation reads as an
@@ -506,7 +556,7 @@ class Pipeline:
             run = Run(
                 id=run_id,
                 task=task,
-                repo=root,
+                workspace=root,
                 zero_touch=zero_touch,
                 mode=mode,
                 pull_request_mode=pull_request_mode,
@@ -516,6 +566,11 @@ class Pipeline:
                 base_branch=gitutil.status(root).branch if pull_request_mode else "",
                 work_branch=(
                     gitutil.branch_for(run_id, task) if pull_request_mode else ""
+                ),
+                snapshot_planned=(
+                    mode == "council"
+                    and bool(conf.get("safety_snapshot", True))
+                    and gitutil.repo_root(root) is not None
                 ),
                 parent_run_id=parent_run_id,
                 conversation=conversation,
@@ -559,7 +614,8 @@ class Pipeline:
             self._gate.clear()
             self._gate_decision = ""
 
-        self.store.remember_repo(root)
+        if chosen:
+            self.store.remember_workspace(root)
         self.bus.clear()
         self.bus.publish("run_started", run=run.to_dict())
 
@@ -637,8 +693,8 @@ class Pipeline:
         note = gitutil.restore_snapshot(snap)
         with self._lock:
             run.rollback_note = note
-            run.diff = gitutil.working_diff(run.repo)
-            run.diff_stat = gitutil.diff_stat(run.repo)
+            run.diff = gitutil.working_diff(run.workspace)
+            run.diff_stat = gitutil.diff_stat(run.workspace)
         self.bus.publish("rolled_back", message=note, run=run.to_dict())
         return note
 
@@ -683,7 +739,7 @@ class Pipeline:
                 runner.cancel()
 
         result = runner.run(
-            prompt, cwd=run.repo, auto_approve=auto_approve, read_only=read_only
+            prompt, cwd=run.workspace, auto_approve=auto_approve, read_only=read_only
         )
 
         with self._lock:
@@ -752,7 +808,7 @@ class Pipeline:
         conf = run.config
         providers = conf.get("providers", {})
         house_rules = conf.get("house_rules", "")
-        repo_status = gitutil.status(run.repo).to_dict()
+        workspace_status = gitutil.status(run.workspace).to_dict()
 
         draft_text = ""
         # Whether Stage 2 may modify files. Zero-Touch grants this up front;
@@ -767,7 +823,7 @@ class Pipeline:
         # ---- Stage 1: Junior Draft --------------------------------------
         self._set_state(run, DRAFTING)
         draft_prompt = prompts.build_draft_prompt(
-            run.task, run.repo, repo_status, house_rules,
+            run.task, run.workspace, workspace_status, house_rules,
             run.conversation,
             system=prompts.resolve_system(
                 "drafter", providers.get("drafter", {}),
@@ -838,7 +894,7 @@ class Pipeline:
         # Created here, after permission to write has been granted, so
         # rejecting at the gate still leaves the repository untouched.
         if run.pull_request_mode:
-            gitutil.create_branch(run.repo, run.work_branch)
+            gitutil.create_branch(run.workspace, run.work_branch)
             self.bus.publish(
                 "log",
                 level="info",
@@ -852,7 +908,7 @@ class Pipeline:
         # Taken immediately before the only stage that writes to disk.
         if conf.get("safety_snapshot", True):
             try:
-                run.snapshot = gitutil.take_snapshot(run.repo)
+                run.snapshot = gitutil.take_snapshot(run.workspace)
                 if run.snapshot:
                     self.bus.publish(
                         "log",
@@ -860,13 +916,21 @@ class Pipeline:
                         message=f"Safety snapshot taken at {run.snapshot.head[:8]}.",
                     )
                 else:
+                    # Two ways to have nothing to anchor to, and the operator
+                    # can act on one of them. Saying "no commits yet" about a
+                    # folder that is not a repository at all sends them looking
+                    # for a git history that was never going to be there.
+                    why = (
+                        "this repository has no commits yet"
+                        if gitutil.repo_root(run.workspace)
+                        else "this folder is not a git repository"
+                    )
                     self.bus.publish(
                         "log",
                         level="warn",
                         message=(
-                            "No safety snapshot: this repository has no commits "
-                            "yet, so there is no state to restore. Rollback is "
-                            "unavailable for this run."
+                            f"No safety snapshot: {why}, so there is no state "
+                            f"to restore. Rollback is unavailable for this run."
                         ),
                     )
             except (gitutil.GitError, OSError) as exc:
@@ -891,8 +955,8 @@ class Pipeline:
         polish_prompt = prompts.build_polish_prompt(
             run.task,
             draft_text,
-            run.repo,
-            repo_status,
+            run.workspace,
+            workspace_status,
             house_rules,
             run.reviewer_note,
             run.conversation,
@@ -912,8 +976,8 @@ class Pipeline:
 
         # ---- Collect the diff -------------------------------------------
         try:
-            run.diff = gitutil.working_diff(run.repo)
-            run.diff_stat = gitutil.diff_stat(run.repo)
+            run.diff = gitutil.working_diff(run.workspace)
+            run.diff_stat = gitutil.diff_stat(run.workspace)
         except (gitutil.GitError, OSError) as exc:
             self.bus.publish(
                 "log", level="warn", message=f"Could not read the diff: {exc}"
@@ -942,7 +1006,7 @@ class Pipeline:
         title, body = _pull_request_text(run)
         try:
             run.pull_request = gitutil.publish_pull_request(
-                run.repo, run.base_branch, run.work_branch, title, body
+                run.workspace, run.base_branch, run.work_branch, title, body
             )
         except (gitutil.GitError, OSError) as exc:
             run.error = (
@@ -961,13 +1025,15 @@ class Pipeline:
             # work is committed. What the reviewer will see is the branch
             # against its base, which is also what an agent that committed its
             # own work leaves behind.
-            run.diff = gitutil.branch_diff(run.repo, run.base_branch, run.work_branch)
+            run.diff = gitutil.branch_diff(
+                run.workspace, run.base_branch, run.work_branch
+            )
             run.diff_stat = gitutil.branch_diff_stat(
-                run.repo, run.base_branch, run.work_branch
+                run.workspace, run.base_branch, run.work_branch
             )
             # Put the operator back where they started. Left on the delivery
             # branch, the next run would quietly take *it* as the base.
-            gitutil.checkout(run.repo, run.base_branch)
+            gitutil.checkout(run.workspace, run.base_branch)
         except (gitutil.GitError, OSError) as exc:
             self.bus.publish(
                 "log",
@@ -992,7 +1058,7 @@ class Pipeline:
         # A cancellation after the gate leaves the operator on the delivery
         # branch. Saying so is the difference between "nothing happened" and
         # "your repository is on a branch you did not create".
-        if run.work_branch and gitutil.status(run.repo).branch == run.work_branch:
+        if run.work_branch and gitutil.status(run.workspace).branch == run.work_branch:
             self.bus.publish(
                 "log",
                 level="warn",
@@ -1006,8 +1072,8 @@ class Pipeline:
         # uncommitted work to an agent that never had permission to write.
         if not run.solo:
             try:
-                run.diff = gitutil.working_diff(run.repo)
-                run.diff_stat = gitutil.diff_stat(run.repo)
+                run.diff = gitutil.working_diff(run.workspace)
+                run.diff_stat = gitutil.diff_stat(run.workspace)
             except (gitutil.GitError, OSError):
                 pass
         self._set_state(run, CANCELLED)
@@ -1076,7 +1142,7 @@ class Pipeline:
                     # the title is its first message and not its latest.
                     "title": str(first.get("task") or "")[:200],
                     "task": (data.get("task") or "")[:200],
-                    "repo": data.get("repo"),
+                    "workspace": _transcript_workspace(data),
                     "state": data.get("state"),
                     "created_at": data.get("created_at"),
                     # Served so the browser can switch to the right mode before

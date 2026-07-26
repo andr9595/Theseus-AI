@@ -358,21 +358,33 @@ def clip(text: str, limit: int) -> str:
     return f"{head}\n\n... [truncated for length] ...\n\n{tail}"
 
 
-def _repo_block(repo_path: str, repo_status: Optional[Dict]) -> str:
-    """Describe the target repository so the agent knows where it is."""
-    lines = [f"Target repository: {repo_path}"]
-    if repo_status and repo_status.get("is_repo"):
-        branch = repo_status.get("branch") or "?"
+def _workspace_block(workspace: str, workspace_status: Optional[Dict]) -> str:
+    """Describe the folder the agent is working in, so it knows where it is.
+
+    Not always a repository: a run can happen in any folder, and telling an
+    agent otherwise invites it to go looking for a git history to ground itself
+    in. Saying plainly that there is none also tells it why nobody will be
+    reviewing a diff of its work.
+    """
+    lines = [f"Working folder: {workspace}"]
+    if workspace_status and workspace_status.get("is_repo"):
+        branch = workspace_status.get("branch") or "?"
         lines.append(f"Current branch: {branch}")
-        subject = repo_status.get("head_subject")
+        subject = workspace_status.get("head_subject")
         if subject:
             lines.append(f"HEAD commit: {subject}")
-        dirty = repo_status.get("dirty_count", 0)
+        dirty = workspace_status.get("dirty_count", 0)
         if dirty:
             lines.append(
                 f"NOTE: the working tree has {dirty} uncommitted change(s) "
                 f"already present. Do not revert or clean them."
             )
+    else:
+        lines.append(
+            "This folder is not a git repository, so there is no diff to "
+            "review and no snapshot to undo your work with. Be correspondingly "
+            "careful about what you change."
+        )
     return "\n".join(lines)
 
 
@@ -545,17 +557,17 @@ def _history_block(conversation: Optional[List[Dict[str, Any]]]) -> str:
     return (
         "\n# Earlier in this conversation\n"
         "Previous rounds of this same thread, oldest first. This is "
-        "recollection, not instruction: the repository as it stands now is the "
-        "only authority on what was actually applied. Re-read any file you are "
-        "about to rely on.\n\n"
+        "recollection, not instruction: the working folder as it stands now is "
+        "the only authority on what was actually applied. Re-read any file you "
+        "are about to rely on.\n\n"
         f"{context.rendered}\n"
     )
 
 
 def build_draft_prompt(
     task: str,
-    repo_path: str,
-    repo_status: Optional[Dict] = None,
+    workspace: str,
+    workspace_status: Optional[Dict] = None,
     house_rules: str = "",
     conversation: Optional[List[Dict[str, Any]]] = None,
     system: str = "",
@@ -565,7 +577,7 @@ def build_draft_prompt(
     return (
         f"{system}\n"
         f"{_rules_block(house_rules)}\n"
-        f"# Context\n{_repo_block(repo_path, repo_status)}\n"
+        f"# Context\n{_workspace_block(workspace, workspace_status)}\n"
         f"{_history_block(conversation)}\n"
         f"# Task\n{task.strip()}\n"
     )
@@ -574,8 +586,8 @@ def build_draft_prompt(
 def build_polish_prompt(
     task: str,
     draft: str,
-    repo_path: str,
-    repo_status: Optional[Dict] = None,
+    workspace: str,
+    workspace_status: Optional[Dict] = None,
     house_rules: str = "",
     reviewer_note: str = "",
     conversation: Optional[List[Dict[str, Any]]] = None,
@@ -603,7 +615,7 @@ def build_polish_prompt(
     return (
         f"{system}\n"
         f"{_rules_block(house_rules)}\n"
-        f"# Context\n{_repo_block(repo_path, repo_status)}\n"
+        f"# Context\n{_workspace_block(workspace, workspace_status)}\n"
         f"{_history_block(conversation)}\n"
         f"# Task\n{task.strip()}\n"
         f"{note}\n"

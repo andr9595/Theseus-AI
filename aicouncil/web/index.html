@@ -50,19 +50,21 @@
 
     <div class="sidebar-panel active" data-sidebar-panel="council">
 
-    <!-- Target repository -->
+    <!-- Where the agents work. Optional: with nothing chosen a run happens in
+         a scratch folder of the app's own, which is what makes "ask it a
+         question" a thing you can do before configuring anything. -->
     <section class="panel">
-      <h2 class="panel-title">Target repository</h2>
-      <button id="repo-btn" class="repo-btn" type="button">
+      <h2 class="panel-title">Working folder <span class="panel-note">optional</span></h2>
+      <button id="workspace-btn" class="repo-btn" type="button">
         <span class="repo-icon" aria-hidden="true">
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
             <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
           </svg>
         </span>
-        <span class="repo-label" id="repo-label">Choose a repository&hellip;</span>
+        <span class="repo-label" id="workspace-label">Scratch workspace</span>
       </button>
-      <div id="repo-meta" class="repo-meta hidden"></div>
-      <div id="recent-repos" class="recent"></div>
+      <div id="workspace-meta" class="repo-meta hidden"></div>
+      <div id="recent-workspaces" class="recent"></div>
     </section>
 
     <!-- Live agent rail -->
@@ -97,9 +99,15 @@
 
     </section>
 
-    <!-- Where the work lands, and how to get it back -->
+    <!-- Where the work lands, and how to get it back. All three are git
+         features, so all three say so when the working folder has no git. -->
     <section class="panel">
       <h2 class="panel-title">Delivery &amp; recovery</h2>
+
+      <div id="no-git-warning" class="inline-note hidden">
+        This folder is not a git repository, so there is no diff, no snapshot
+        and nothing to roll back to. Pull request mode will refuse to start.
+      </div>
 
       <label class="toggle" for="pull-request-mode">
         <input type="checkbox" id="pull-request-mode">
@@ -203,7 +211,7 @@ Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP
         <div>
           <strong>Review required</strong>
           <p id="approval-copy">The draft is ready. <b>Nothing has been written to disk yet.</b>
-             Approving lets the senior stage apply changes to your repository.</p>
+             Approving lets the senior stage apply changes in your working folder.</p>
         </div>
       </div>
       <textarea id="approval-note" class="approval-note" rows="2" spellcheck="false"
@@ -250,6 +258,8 @@ Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP
             <button id="commit-btn" class="btn btn-primary btn-sm" type="button">Commit</button>
             <span id="commit-hint" class="commit-hint"></span>
           </div>
+          <!-- Replaced on first render: what belongs here depends on whether
+               the working folder has any git in it. -->
           <div id="diff-view" class="diff-view empty-state">
             Changes made to your working tree appear here as a git diff.
           </div>
@@ -260,8 +270,9 @@ Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP
     <!-- Solo's output: the message and the reply, and nothing else. -->
     <section id="solo-output" class="solo-output hidden" aria-live="polite">
       <div id="solo-empty" class="empty-state solo-empty">
-        Ask your assistant anything about this repository. One agent, no draft
-        stage and no approval gate &mdash; and it cannot change your files.
+        Ask your assistant anything. One agent, no draft stage and no approval
+        gate &mdash; and it cannot change your files. Point it at a working
+        folder when the question is about one.
       </div>
       <article id="solo-turn" class="solo-turn hidden">
         <div class="chat-message user-message">
@@ -295,10 +306,10 @@ Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP
 </div>
 
 <!-- ================= Directory picker ================= -->
-<div id="picker" class="modal hidden" role="dialog" aria-modal="true" aria-label="Choose a repository">
+<div id="picker" class="modal hidden" role="dialog" aria-modal="true" aria-label="Choose a working folder">
   <div class="modal-card modal-card-tall">
     <header class="modal-head">
-      <h3>Choose a repository</h3>
+      <h3>Choose a working folder</h3>
       <button class="icon-btn" data-close="picker" type="button" aria-label="Close">&times;</button>
     </header>
     <div class="picker-bar">
@@ -308,8 +319,9 @@ Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP
     </div>
     <div id="picker-list" class="picker-list"></div>
     <footer class="modal-foot">
+      <button id="picker-clear" class="btn btn-quiet" type="button">Use no folder</button>
       <span id="picker-status" class="picker-status"></span>
-      <button id="picker-select" class="btn btn-primary" type="button">Select this folder</button>
+      <button id="picker-select" class="btn btn-primary" type="button">Work here</button>
     </footer>
   </div>
 </div>
@@ -357,8 +369,9 @@ Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP
 
       <section class="settings-panel" data-settings-panel="project">
         <p class="settings-note">
-          Appended to every prompt the council is given, for every run against
-          this machine's repositories.
+          Appended to every prompt the council is given, whichever folder the
+          run happens in. Solo does not get them: it is a conversation, not a
+          run against a project.
         </p>
         <div class="field">
           <label for="house-rules">Standing project rules</label>

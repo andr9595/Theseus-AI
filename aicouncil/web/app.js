@@ -523,7 +523,13 @@ const state = {
   // Agents assignable to either job, served by /api/state. The browser never
   // holds its own copy of a command or a permission flag.
   agents: [],
-  repoStatus: null,
+  // Git status of the chosen working folder, or null when none is chosen.
+  // `is_repo: false` is a normal state here, not an error: the folder decides
+  // which git-backed features are on offer, not whether a run may start.
+  workspaceStatus: null,
+  // Where a run lands with no folder chosen. From the server, which is the
+  // only side that knows the XDG path.
+  scratchWorkspace: '',
   usage: {},
   roles: [],
   busy: false,
@@ -570,6 +576,23 @@ function visibleMode() {
   return selectedMode();
 }
 
+/** The folder the operator chose, or '' for the scratch workspace. */
+function workspacePath() {
+  return ((state.config || {}).workspace) || '';
+}
+
+/** Whether the chosen folder is a git repository. False with no folder chosen:
+ *  the scratch workspace deliberately is not one, so diff, snapshot, rollback
+ *  and pull-request delivery are all off there. */
+function workspaceIsRepo() {
+  return !!(workspacePath() && state.workspaceStatus && state.workspaceStatus.is_repo);
+}
+
+/** Where a run persisted its work. Older transcripts call it `repo`. */
+function runWorkspace(run) {
+  return (run && (run.workspace || run.repo)) || '';
+}
+
 function renderStatus() {
   const run = state.run;
   const pill = $('#status-pill');
@@ -606,10 +629,14 @@ function renderStatus() {
 
   const runBtn = $('#run-btn');
   const solo = visibleMode() === 'solo';
-  const hasRepo = !!(state.config && state.config.target_repo);
+  // A working folder is not a precondition. The only thing standing between a
+  // fresh install and a first answer is having typed something.
   const hasTask = $('#task-input').value.trim().length > 0;
-  runBtn.disabled = state.busy || !hasRepo || !hasTask;
+  runBtn.disabled = state.busy || !hasTask;
   runBtn.classList.toggle('busy', state.busy);
+  runBtn.title = state.busy
+    ? 'A run is already in progress.'
+    : hasTask ? '' : 'Describe what you want first.';
   $('.btn-label', runBtn).textContent = state.busy
     ? (solo ? 'Thinking' : 'Council in session')
     : (solo ? 'Send' : 'Convene the council');
@@ -622,7 +649,12 @@ function renderStatus() {
     $('#approval-copy').innerHTML =
       'The draft is ready — see the <b>Draft</b> tab. <b>Nothing has been ' +
       'written to disk yet.</b> Approving lets the senior stage apply changes ' +
-      'to your repository.';
+      `in <b>${esc(runWorkspace(run))}</b>.` +
+      // Whether a rollback point exists changes what approving costs, and the
+      // gate is the last moment that can change the answer.
+      (run.snapshot_planned ? '' :
+        ' <b>No safety snapshot will be taken</b>, so this run cannot be ' +
+        'rolled back.');
   }
 }
 
@@ -914,13 +946,14 @@ function worstUsageFor(providerIds) {
    Commit
    ========================================================================== */
 
-/** Show the commit bar whenever the target repo has uncommitted work, whether
- *  a council run produced it or you did. Hidden mid-run: committing under a
- *  running agent captures a tree it is still editing. */
+/** Show the commit bar whenever the working folder is a repository with
+ *  uncommitted work in it, whether a council run produced it or you did.
+ *  Hidden mid-run: committing under a running agent captures a tree it is
+ *  still editing. */
 function renderCommitBar() {
   const bar = $('#commit-bar');
   if (!bar) return;
-  const st = state.repoStatus;
+  const st = state.workspaceStatus;
   const dirty = st && st.is_repo ? st.dirty_count : 0;
   const show = dirty > 0 && !state.busy;
   bar.classList.toggle('hidden', !show);
@@ -944,7 +977,7 @@ async function doCommit() {
   try {
     const { commit } = await api('/api/commit', {
       method: 'POST',
-      body: { message, repo: (state.config || {}).target_repo },
+      body: { message, workspace: workspacePath() },
     });
     $('#commit-message').value = '';
     toast(
@@ -1075,36 +1108,42 @@ function openRoleEditor(roleId) {
   });
 }
 
-function renderRepo() {
+/** The working-folder panel: what was chosen, and what that folder can do.
+ *  Nothing chosen is a first-class state rather than an empty one — it names
+ *  the scratch folder a run would land in, so "no folder" never reads as
+ *  "nowhere". */
+function renderWorkspace() {
   const conf = state.config || {};
-  const repo = conf.target_repo || '';
-  const btn = $('#repo-btn');
-  btn.classList.toggle('unset', !repo);
-  $('#repo-label').textContent = repo || 'Choose a repository…';
-  btn.title = repo || '';
+  const folder = workspacePath();
+  const btn = $('#workspace-btn');
+  btn.classList.toggle('unset', !folder);
+  $('#workspace-label').textContent = folder || 'Scratch workspace';
+  btn.title = folder
+    ? folder
+    : `No folder chosen — runs happen in ${state.scratchWorkspace || 'a scratch folder'}`;
 
-  const meta = $('#repo-meta');
-  const st = state.repoStatus;
-  if (repo && st) {
-    const chips = [];
-    if (st.is_repo) {
-      chips.push(`<span class="chip">${esc(st.branch || '?')}</span>`);
-      if (st.head) chips.push(`<span class="chip">${esc(st.head.slice(0, 7))}</span>`);
-      chips.push(st.clean
-        ? '<span class="chip clean">clean</span>'
-        : `<span class="chip dirty">${st.dirty_count} uncommitted</span>`);
-    } else {
-      chips.push(`<span class="chip warn">${esc(st.error || 'not a git repo')}</span>`);
-    }
-    meta.innerHTML = chips.join('');
-    meta.classList.remove('hidden');
-  } else {
-    meta.classList.add('hidden');
+  const meta = $('#workspace-meta');
+  const st = state.workspaceStatus;
+  const chips = [];
+  if (!folder) {
+    // Not a warning: working nowhere in particular is a supported way to use
+    // this, and the chip says what it costs rather than that it is wrong.
+    chips.push('<span class="chip">no git — no diff or rollback</span>');
+  } else if (st && st.is_repo) {
+    chips.push(`<span class="chip">${esc(st.branch || '?')}</span>`);
+    if (st.head) chips.push(`<span class="chip">${esc(st.head.slice(0, 7))}</span>`);
+    chips.push(st.clean
+      ? '<span class="chip clean">clean</span>'
+      : `<span class="chip dirty">${st.dirty_count} uncommitted</span>`);
+  } else if (st) {
+    chips.push('<span class="chip">not a git repository</span>');
   }
+  meta.innerHTML = chips.join('');
+  meta.classList.toggle('hidden', !chips.length);
 
-  const recent = (conf.recent_repos || []).filter(r => r !== repo).slice(0, 4);
-  $('#recent-repos').innerHTML = recent.map(r =>
-    `<button class="recent-item" data-repo="${esc(r)}" type="button" title="${esc(r)}">${esc(r)}</button>`
+  const recent = (conf.recent_workspaces || []).filter(r => r !== folder).slice(0, 4);
+  $('#recent-workspaces').innerHTML = recent.map(r =>
+    `<button class="recent-item" data-workspace="${esc(r)}" type="button" title="${esc(r)}">${esc(r)}</button>`
   ).join('');
 }
 
@@ -1125,7 +1164,8 @@ function renderMode() {
     ? 'the assistant will be given that exchange as context.'
     : 'the council will be given that exchange as context.';
   $('#task-input').placeholder = mode === 'solo'
-    ? 'Ask anything about this repository…'
+    ? 'Ask anything. Point the working folder at a project when the question ' +
+      'is about one…'
     : 'Describe the change you want. Be specific about files, behaviour and ' +
       'edge cases…\nExample: Add rate limiting to the /api/login route, ' +
       '5 attempts per minute per IP, with tests.';
@@ -1141,6 +1181,18 @@ function renderToggles() {
   $('#clean-worktree').checked = !!c.require_clean_worktree;
   $('#pull-request-mode').checked = !!c.pull_request_mode;
   $('#zero-touch-warning').classList.toggle('hidden', !c.zero_touch);
+
+  // All three delivery toggles are git features. Left on and left silent in a
+  // folder with no git, they read as protection that is switched on — and the
+  // pull-request one turns into a run refused after the operator has already
+  // typed the task. They stay operable: this says what they are worth here,
+  // rather than deciding for the operator which of the two to change.
+  const note = $('#no-git-warning');
+  note.classList.toggle('hidden', workspaceIsRepo());
+  note.textContent =
+    (workspacePath() ? 'This folder' : 'The scratch workspace') +
+    ' is not a git repository, so there is no diff, no snapshot and nothing ' +
+    'to roll back to. Pull request mode will refuse to start.';
 
   // Pull-request mode changes what the other two delivery toggles are worth,
   // and neither one is switched off for you: it enforces a clean tree itself
@@ -1215,6 +1267,14 @@ function renderOutputs() {
     const files = (run.diff_stat && run.diff_stat.files) || 0;
     setBadge('#badge-diff', files ? `${files}` : '', true);
   } else {
+    // An empty tab that says "no changes" where git was never going to report
+    // any reads as a run that did nothing. Name the actual reason.
+    diffView.classList.add('empty-state');
+    diffView.textContent = workspaceIsRepo()
+      ? 'Changes made to your working tree appear here as a git diff.'
+      : `${workspacePath() || 'The scratch workspace'} is not a git ` +
+        'repository, so there is no diff to show. Anything the council wrote ' +
+        'is on disk all the same.';
     setBadge('#badge-diff', '');
   }
 }
@@ -1230,7 +1290,7 @@ function renderAll() {
   renderStatus();
   renderMode();
   renderAgents();
-  renderRepo();
+  renderWorkspace();
   renderToggles();
   renderOutputs();
   renderCommitBar();
@@ -1596,11 +1656,15 @@ async function loadPicker(path) {
   $('#picker-path').value = listing.path;
   $('#picker-up').disabled = !listing.parent;
 
+  // Any folder is selectable. Being a repository is not a requirement, it is
+  // the difference between a run you can undo and one you cannot — so the
+  // status line says which of the two this folder is buying.
   const status = listing.is_repo
-    ? 'This folder is a git repository.'
-    : 'This folder is not a git repository.';
+    ? 'A git repository — diff, safety snapshot and rollback all work here.'
+    : 'Not a git repository — the agents can work here, but there is no diff ' +
+      'and no rollback.';
   $('#picker-status').textContent = listing.error || status;
-  $('#picker-select').disabled = !listing.is_repo;
+  $('#picker-select').disabled = !!listing.error;
 
   const folderIcon =
     `<span class="folder"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" ` +
@@ -1622,22 +1686,46 @@ async function loadPicker(path) {
   ).join('');
 }
 
-async function selectRepo(path) {
+/** Point the app at a folder. Any folder: `status.path` is the repository root
+ *  when there is one, so a subdirectory of a project still resolves to the
+ *  place the diff and the snapshot operate on. */
+async function selectWorkspace(path) {
   try {
     const { status } = await api(`/api/repo?path=${encodeURIComponent(path)}`);
-    if (!status.is_repo) {
-      toast(`${path} is not a git repository.`, 'error');
-      return;
-    }
     const { config } = await api('/api/config', {
       method: 'POST',
-      body: { target_repo: status.path },
+      body: { workspace: status.path },
     });
     state.config = config;
-    state.repoStatus = status;
+    state.workspaceStatus = status;
     renderAll();
     closeModal('picker');
-    toast(`Target set to ${status.path}`, 'ok', 3200);
+    toast(
+      status.is_repo
+        ? `Working in ${status.path}`
+        : `Working in ${status.path} — not a git repository, so no diff or ` +
+          `rollback.`,
+      'ok', status.is_repo ? 3200 : 5200
+    );
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+/** Go back to having no folder. Runs then happen in the scratch workspace,
+ *  which is the state a fresh install starts in. */
+async function clearWorkspace() {
+  try {
+    const { config } = await api('/api/config', {
+      method: 'POST',
+      body: { workspace: '' },
+    });
+    state.config = config;
+    state.workspaceStatus = null;
+    renderAll();
+    closeModal('picker');
+    const where = state.scratchWorkspace || 'the scratch workspace';
+    toast(`No working folder. Runs now happen in ${where}.`, 'ok', 5200);
   } catch (err) {
     toast(err.message, 'error');
   }
@@ -1985,7 +2073,7 @@ function renderChats() {
   const open = state.openChat ? state.openChat.file : '';
   list.innerHTML = chats.map(c =>
     `<button class="chat-row ${esc(c.state)}${c.file === open ? ' open' : ''}" ` +
-      `type="button" data-chat-file="${esc(c.file)}" title="${esc(c.repo || '')}">` +
+      `type="button" data-chat-file="${esc(c.file)}" title="${esc(c.workspace || '')}">` +
       `<span class="chat-row-title">${esc(c.title || c.task || '(no task)')}</span>` +
       `<span class="chat-row-meta">${fmtWhen(c.created_at)} · ` +
         `${c.messages} message${c.messages === 1 ? '' : 's'}` +
@@ -2149,7 +2237,7 @@ function connect() {
       clearStream();
       pushDivider('Run started');
       pushLine('sys', 'system', `Task: ${d.run.task}`);
-      pushLine('sys', 'system', `Repo: ${d.run.repo}`);
+      pushLine('sys', 'system', `Folder: ${runWorkspace(d.run)}`);
       if (d.run.zero_touch) {
         pushLine('warn', 'system', 'Zero-Touch Mode: approvals will be skipped.');
       }
@@ -2282,7 +2370,8 @@ async function loadState() {
     state.agents = data.agents || [];
     state.providers = data.providers_status || [];
     state.roles = data.roles || [];
-    state.repoStatus = data.repo_status;
+    state.workspaceStatus = data.workspace_status;
+    state.scratchWorkspace = data.scratch_workspace || '';
     state.usage = data.usage || {};
     renderAll();
   } catch (err) {
@@ -2315,7 +2404,11 @@ async function startRun() {
     const ok = confirm(
       'Zero-Touch Mode is ON.\n\n' +
       'The pipeline will run to completion without pausing, and the senior ' +
-      'stage will modify files in:\n\n' + (conf.target_repo || '?') +
+      'stage will modify files in:\n\n' +
+      (workspacePath() || `${state.scratchWorkspace} (scratch workspace)`) +
+      (workspaceIsRepo() ? '' :
+        '\n\nThat folder is not a git repository, so this run cannot be ' +
+        'rolled back.') +
       '\n\nContinue?'
     );
     if (!ok) return;
@@ -2325,7 +2418,7 @@ async function startRun() {
       method: 'POST',
       body: {
         task,
-        repo: conf.target_repo,
+        workspace: workspacePath(),
         continue_from: state.continueFrom,
         compact_context: state.compactContext,
       },
@@ -2448,10 +2541,10 @@ function wire() {
   });
   window.addEventListener('resize', closeModelMenu);
 
-  // -- repo picker ------------------------------------------------------
-  $('#repo-btn').addEventListener('click', () => {
+  // -- working-folder picker --------------------------------------------
+  $('#workspace-btn').addEventListener('click', () => {
     openModal('picker');
-    loadPicker((state.config && state.config.target_repo) || '~');
+    loadPicker(workspacePath() || '~');
   });
   $('#picker-up').addEventListener('click', () => {
     const parent = pickerPath.replace(/\/[^/]+\/?$/, '') || '/';
@@ -2465,11 +2558,12 @@ function wire() {
     const row = e.target.closest('.picker-row');
     if (row) loadPicker(row.dataset.path);
   });
-  $('#picker-select').addEventListener('click', () => selectRepo(pickerPath));
+  $('#picker-select').addEventListener('click', () => selectWorkspace(pickerPath));
+  $('#picker-clear').addEventListener('click', clearWorkspace);
 
-  $('#recent-repos').addEventListener('click', (e) => {
+  $('#recent-workspaces').addEventListener('click', (e) => {
     const btn = e.target.closest('.recent-item');
-    if (btn) selectRepo(btn.dataset.repo);
+    if (btn) selectWorkspace(btn.dataset.workspace);
   });
 
   // -- settings ---------------------------------------------------------
@@ -2570,11 +2664,11 @@ function wire() {
     if (!open || !open.run) return;
     // The server enforces this too; checking here turns a rejected run into
     // an answerable message before anything is started.
-    const repo = (state.config || {}).target_repo || '';
-    if (open.run.repo !== repo) {
+    const was = runWorkspace(open.run);
+    if (was !== (workspacePath() || state.scratchWorkspace)) {
       toast(
-        `That conversation was in ${open.run.repo}. Select it as the target ` +
-        `repository to continue it.`, 'error', 9000
+        `That conversation was held in ${was}. Set that as the working folder ` +
+        `to continue it.`, 'error', 9000
       );
       return;
     }

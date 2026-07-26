@@ -262,7 +262,17 @@ html, body {
   color: var(--text-3);
 }
 
-/* ---- Repo picker button ---- */
+/* A qualifier on a section heading - "optional" and the like. Reads as an
+   aside rather than part of the label, so the label stays scannable. */
+.panel-note {
+  margin-left: 6px;
+  font-weight: 500;
+  letter-spacing: .02em;
+  text-transform: none;
+  opacity: .7;
+}
+
+/* ---- Working-folder button ---- */
 
 .repo-btn {
   display: flex; align-items: center; gap: 9px;
@@ -585,6 +595,17 @@ html, body {
   color: #ffc9c9;
   background: rgba(244, 99, 99, .1);
   border: 1px solid rgba(244, 99, 99, .3);
+  border-radius: var(--radius-sm);
+}
+
+/* The same shape in a neutral colour, for a state that is merely worth
+   knowing. Red is reserved for the ones that can cost you work. */
+.inline-note {
+  padding: 8px 10px;
+  font-size: 11px; line-height: 1.45;
+  color: var(--text-3);
+  background: var(--bg-2);
+  border: 1px solid var(--line);
   border-radius: var(--radius-sm);
 }
 

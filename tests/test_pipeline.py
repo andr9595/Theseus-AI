@@ -112,7 +112,7 @@ class PipelineTestBase(unittest.TestCase):
         self.config_path = self.tmp / "config.json"
         self.store = ConfigStore(self.config_path)
         self.store.update({
-            "target_repo": str(self.repo),
+            "workspace": str(self.repo),
             "safety_snapshot": True,
             "providers": {
                 "drafter": mock_provider("drafter", "Junior Draft"),
@@ -356,6 +356,96 @@ class TestSoloMode(PipelineTestBase):
             self.pipeline.start(
                 "and now?", str(self.repo), continue_from=first.transcript_name
             )
+
+
+class TestWorkingFolderIsOptional(PipelineTestBase):
+    """A repository is what makes a run reviewable, not what makes it possible.
+
+    Both modes have to start with no folder chosen and in a folder that has no
+    git in it. What those runs lose is the git-backed half of the safety model
+    - diff, snapshot, rollback, pull-request delivery - and the engine has to
+    say so rather than fail, half-apply, or offer a rollback that cannot work.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.plain = self.tmp / "just-a-folder"
+        self.plain.mkdir()
+        assistant = mock_provider("solo", "Assistant")
+        assistant["read_only_args"] = ["--read-only"]
+        self.store.update({"providers": {"solo": assistant}})
+
+    def test_a_council_run_works_in_a_folder_with_no_git(self):
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("add a demo artifact", str(self.plain))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(run.workspace, str(self.plain.resolve()))
+        self.assertTrue((self.plain / "AI_COUNCIL_DEMO.md").exists())
+        # Nothing to diff against and nothing to restore, and neither is
+        # reported as an error - they are simply absent.
+        self.assertEqual(run.diff, "")
+        self.assertIsNone(run.snapshot)
+        self.assertFalse(run.snapshot_planned)
+        self.assertFalse(run.to_dict()["can_rollback"])
+
+    def test_a_council_run_works_with_no_folder_chosen_at_all(self):
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("add a demo artifact")
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(run.workspace, str(cfg.workspace_dir()))
+        self.assertTrue((cfg.workspace_dir() / "AI_COUNCIL_DEMO.md").exists())
+
+    def test_a_conversation_needs_no_folder(self):
+        self.store.update({"mode": "solo"})
+        run = self.pipeline.start("what is a monad?")
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(run.workspace, str(cfg.workspace_dir()))
+        self.assertTrue(run.stages["solo"].output.strip())
+
+    def test_the_scratch_workspace_is_not_remembered_as_a_choice(self):
+        # Storing the folder a blank setting resolved to would pin a folder
+        # nobody picked, and the next run would open with it selected.
+        self.store.update({"mode": "solo", "workspace": ""})
+        self.pipeline.start("hello", "")
+        self.wait_terminal()
+
+        self.assertEqual(self.store.get("workspace"), "")
+        self.assertEqual(self.store.get("recent_workspaces"), [])
+
+    def test_a_chosen_folder_is_remembered(self):
+        self.store.update({"zero_touch": True})
+        self.pipeline.start("add a demo artifact", str(self.plain))
+        self.wait_terminal()
+
+        self.assertEqual(self.store.get("workspace"), str(self.plain.resolve()))
+        self.assertIn(str(self.plain.resolve()), self.store.get("recent_workspaces"))
+
+    def test_pull_request_mode_refuses_a_folder_with_no_git(self):
+        # Refused before either agent spends quota, and with a reason that
+        # names the toggle rather than reporting a bare git error.
+        self.store.update({"pull_request_mode": True})
+        with self.assertRaises(ValueError) as ctx:
+            self.pipeline.start("go", str(self.plain))
+        self.assertIn("not a git repository", str(ctx.exception))
+
+    def test_the_prompt_tells_the_agents_there_is_no_repository(self):
+        # An agent that assumes a git history will go looking for one, and
+        # will assume its work is about to be reviewed as a diff.
+        from aicouncil import prompts
+
+        prompt = prompts.build_draft_prompt(
+            "add a demo artifact",
+            str(self.plain),
+            gitutil.status(self.plain).to_dict(),
+        )
+        self.assertIn(f"Working folder: {self.plain}", prompt)
+        self.assertIn("not a git repository", prompt)
 
 
 class TestDiffStat(PipelineTestBase):
@@ -704,12 +794,10 @@ class TestFailureHandling(PipelineTestBase):
         self.assertTrue(run.stages["polisher"].ended_at)
         self.assertIn("misconfigured", run.stages["polisher"].error)
 
-    def test_non_repository_target_is_rejected(self):
-        plain = self.tmp / "not-a-repo"
-        plain.mkdir()
+    def test_a_folder_that_does_not_exist_is_rejected(self):
         with self.assertRaises(ValueError) as ctx:
-            self.pipeline.start("go", str(plain))
-        self.assertIn("not a git repository", str(ctx.exception))
+            self.pipeline.start("go", str(self.tmp / "nowhere"))
+        self.assertIn("not a folder that exists", str(ctx.exception))
 
     def test_empty_task_is_rejected(self):
         with self.assertRaises(ValueError):
@@ -940,13 +1028,13 @@ class TestContinuedConversation(PipelineTestBase):
                 "follow up", str(self.repo), continue_from="../../config.json"
             )
 
-    def test_a_run_cannot_be_continued_in_another_repository(self):
+    def test_a_run_cannot_be_continued_in_another_folder(self):
         first = self.first_run()
         other = self.tmp / "other"
         other.mkdir()
         git(["init", "-q"], other)
 
-        with self.assertRaisesRegex(ValueError, "repository it started in"):
+        with self.assertRaisesRegex(ValueError, "folder it started in"):
             self.pipeline.start(
                 "follow up", str(other), continue_from=first.transcript_name
             )
@@ -1274,14 +1362,14 @@ class TestConversationPrompt(unittest.TestCase):
         for prompt in (draft, polish, chat):
             self.assertIn("add a login route", prompt)
 
-    def test_the_repository_is_named_as_the_authority_over_the_transcript(self):
+    def test_the_working_folder_is_named_as_the_authority_over_the_transcript(self):
         # A remembered run may have been rolled back or edited over since.
         from aicouncil import prompts
 
         prompt = prompts.build_polish_prompt(
             "do it", "a draft", "/tmp/r", None, "", "", self.TURNS
         )
-        self.assertIn("repository as it stands now", prompt)
+        self.assertIn("working folder as it stands now", prompt)
 
     def test_an_over_long_thread_compacts_its_oldest_turns(self):
         from aicouncil import prompts
@@ -1467,6 +1555,49 @@ class TestCommitFromTheApp(PipelineTestBase):
         with self.assertRaises(gitutil.GitError) as ctx:
             gitutil.commit_all(self.repo, "try it")
         self.assertIn("identity", str(ctx.exception).lower())
+
+
+class TestWorkspaceMigration(unittest.TestCase):
+    """A config written when the folder was a mandatory repository still works.
+
+    The folder itself carries over - it is still where runs happen - under a
+    name that no longer claims it has to be a repository.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-migrate-"))
+        self.path = self.tmp / "config.json"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def write(self, data):
+        self.path.write_text(json.dumps(data), encoding="utf-8")
+        return ConfigStore(self.path)
+
+    def test_the_old_target_repository_becomes_the_working_folder(self):
+        store = self.write({
+            "target_repo": "/home/me/project",
+            "recent_repos": ["/home/me/project", "/home/me/other"],
+        })
+        self.assertEqual(store.get("workspace"), "/home/me/project")
+        self.assertEqual(
+            store.get("recent_workspaces"), ["/home/me/project", "/home/me/other"]
+        )
+
+    def test_the_old_keys_do_not_survive_the_migration(self):
+        # A stale key that no longer decides anything still reads as a setting.
+        store = self.write({"target_repo": "/home/me/project"})
+        self.assertNotIn("target_repo", store.all())
+        self.assertNotIn("recent_repos", store.all())
+
+    def test_a_config_that_already_uses_the_new_name_is_left_alone(self):
+        store = self.write({"workspace": "/home/me/new", "target_repo": "/old"})
+        self.assertEqual(store.get("workspace"), "/home/me/new")
+
+    def test_the_dead_cwd_mode_key_is_dropped_from_every_provider(self):
+        store = self.write({"providers": {"drafter": {"cwd_mode": "repo"}}})
+        self.assertNotIn("cwd_mode", store.get("providers")["drafter"])
 
 
 class TestEditableRoles(unittest.TestCase):

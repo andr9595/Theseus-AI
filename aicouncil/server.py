@@ -325,8 +325,16 @@ class Handler(BaseHTTPRequestHandler):
         state["ok"] = True
         state["version"] = __version__
         state["usage"] = self.app.usage.snapshot()
-        repo = state["config"].get("target_repo") or ""
-        state["repo_status"] = gitutil.status(repo).to_dict() if repo else None
+        workspace = state["config"].get("workspace") or ""
+        # Reported whether or not the folder is a repository: "not a git
+        # repository" is a state the UI shows rather than an error, since it
+        # only decides which of the git-backed features are on offer.
+        state["workspace_status"] = (
+            gitutil.status(workspace).to_dict() if workspace else None
+        )
+        # Where a run lands when no folder is chosen. Served rather than
+        # guessed in the browser, which knows nothing about XDG paths.
+        state["scratch_workspace"] = str(cfg.workspace_dir())
         return state
 
     def _api_set_config(self, params: Dict[str, list]) -> Dict[str, Any]:
@@ -423,18 +431,18 @@ class Handler(BaseHTTPRequestHandler):
     def _api_start(self, params: Dict[str, list]) -> Dict[str, Any]:
         body = self._read_body()
         task = body.get("task") or ""
-        repo = body.get("repo") or self.app.store.get("target_repo") or ""
+        # No folder is a legitimate answer, in either mode: the pipeline runs
+        # in the scratch workspace instead of refusing to start.
+        workspace = body.get("workspace") or self.app.store.get("workspace") or ""
         continue_from = body.get("continue_from") or ""
         compact_context = body.get("compact_context", False)
         if not isinstance(continue_from, str):
             raise ValueError("`continue_from` must be a transcript filename.")
         if not isinstance(compact_context, bool):
             raise ValueError("`compact_context` must be true or false.")
-        if not repo:
-            raise ValueError("No target repository selected.")
         run = self.app.pipeline.start(
             task,
-            repo,
+            workspace,
             continue_from=continue_from,
             compact_context=compact_context,
         )
@@ -453,18 +461,20 @@ class Handler(BaseHTTPRequestHandler):
         return {"ok": True}
 
     def _api_commit(self, params: Dict[str, list]) -> Dict[str, Any]:
-        """Commit the working tree of the selected repository."""
+        """Commit the working tree of the selected folder."""
         body = self._read_body()
-        repo = str(body.get("repo") or self.app.store.get("target_repo") or "")
-        if not repo:
-            raise ValueError("No target repository selected.")
+        workspace = str(body.get("workspace") or self.app.store.get("workspace") or "")
+        if not workspace:
+            raise ValueError(
+                "No working folder is selected, so there is nothing to commit."
+            )
         if self.app.pipeline.is_busy():
             # Committing underneath a running agent would capture a tree it is
             # still editing, and the resulting commit would match neither the
             # diff that was reviewed nor the one the run ends with.
             raise ValueError("A run is in progress. Wait for it to finish.")
-        result = gitutil.commit_all(repo, str(body.get("message") or ""))
-        self.app.bus.publish("committed", commit=result, repo=repo)
+        result = gitutil.commit_all(workspace, str(body.get("message") or ""))
+        self.app.bus.publish("committed", commit=result, workspace=workspace)
         return {"ok": True, "commit": result}
 
     def _api_save_role(self, params: Dict[str, list]) -> Dict[str, Any]:

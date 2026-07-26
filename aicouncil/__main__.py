@@ -88,13 +88,15 @@ def _print_doctor(store: cfg.ConfigStore) -> int:
     print(f"  runs        : {cfg.runs_dir()}")
     print(f"  mode        : {store.get('mode', 'council')}")
     print(f"  zero-touch  : {'ON' if store.get('zero_touch') else 'off'}")
-    repo = store.get("target_repo") or ""
-    print(f"  target repo : {repo or '(none selected)'}")
+    workspace = store.get("workspace") or ""
+    print(f"  workspace   : {workspace or f'{cfg.workspace_dir()} (scratch)'}")
     if store.get("pull_request_mode"):
         # PR mode's dependencies (a remote, `gh`, a git identity) are exactly
         # the kind of thing this command exists to find before a run does.
         blocker = (
-            gitutil.pull_request_blocker(repo) if repo else "no target repository"
+            gitutil.pull_request_blocker(workspace)
+            if workspace
+            else "the scratch workspace is not a git repository"
         )
         print(f"  pull request: ON - {blocker or 'ready'}")
     else:

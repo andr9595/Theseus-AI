@@ -145,8 +145,15 @@ def repo_root(path: str | Path) -> Optional[str]:
 
 
 def status(path: str | Path) -> RepoStatus:
-    """Describe the working tree at ``path``. Never raises."""
-    p = str(Path(path).expanduser())
+    """Describe the working tree at ``path``. Never raises.
+
+    ``path`` on the result is canonical either way: the repository root when
+    there is one, and the resolved directory when there is not. The app stores
+    what this reports and later resolves it again when a run starts, so the two
+    have to agree - otherwise a conversation held in a symlinked folder cannot
+    be continued from the same folder it was held in.
+    """
+    p = str(Path(path).expanduser().resolve())
     st = RepoStatus(path=p)
 
     root = repo_root(p)
@@ -568,7 +575,11 @@ def pull_request_blocker(path: str | Path) -> str:
     """
     st = status(path)
     if not st.is_repo:
-        return st.error or "Not a git repository."
+        return (
+            "Pull-request mode commits, pushes and opens a PR, and this "
+            "working folder is not a git repository. Pick one that is, or turn "
+            "the toggle off."
+        )
     if st.error:
         return st.error
     if not st.head:
@@ -723,8 +734,10 @@ def publish_pull_request(
 def list_directory(path: str | Path) -> Dict:
     """List subdirectories of ``path`` for the GUI's directory picker.
 
-    Returns only directories - the picker selects repositories, not files -
-    and flags which entries are themselves git repos so the UI can badge them.
+    Returns only directories - the picker selects a folder to work in, not a
+    file - and flags which entries are git repositories so the UI can badge
+    them. A badge, not a filter: any folder can be worked in, and being a
+    repository only decides whether diff, snapshot and rollback are on offer.
     """
     p = Path(path).expanduser()
     try:

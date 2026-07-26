@@ -63,6 +63,20 @@ def runs_dir() -> Path:
     return d
 
 
+def workspace_dir() -> Path:
+    """The folder a run executes in when no working folder has been chosen.
+
+    A directory of the app's own rather than ``$HOME``: an agent asked to write
+    something with nowhere in particular to put it has to put it *somewhere*,
+    and a named, contained folder is one the operator can find afterwards. It
+    is deliberately not a git repository - there is nothing here to snapshot,
+    and the UI says so rather than offering a rollback that cannot work.
+    """
+    d = config_dir() / "workspace"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 # --------------------------------------------------------------------------
 # Agents
 # --------------------------------------------------------------------------
@@ -184,7 +198,6 @@ DEFAULT_DRAFTER = {
     # argv. Useful for very long prompts that would blow the ARG_MAX limit.
     "prompt_on_stdin": False,
     "timeout_seconds": 900,
-    "cwd_mode": "repo",  # run inside the selected target repository
     # --- Model selection ---------------------------------------------------
     # Empty means "whatever the CLI is configured to use by default", which is
     # the safest choice: it keeps working when a vendor ships a new model.
@@ -220,7 +233,6 @@ DEFAULT_POLISHER = {
     "enabled": True,
     "prompt_on_stdin": False,
     "timeout_seconds": 1800,
-    "cwd_mode": "repo",
     # --- Model selection ---------------------------------------------------
     "model": "",
     # Empty for the same reason as the drafter: the picker asks the CLI. For
@@ -251,7 +263,6 @@ DEFAULT_SOLO = {
     "behavior": "",
     "prompt_on_stdin": False,
     "timeout_seconds": 1800,
-    "cwd_mode": "repo",
     # --- Model selection ----------------------------------------------------
     "model": "",
     "models": [],
@@ -267,8 +278,8 @@ DEFAULTS: Dict[str, Any] = {
     # Which of the two products the next message starts. Council is the
     # Junior Draft / Senior Polish pipeline; Solo is one assistant answering
     # directly. Not a modifier on the pipeline - Solo has no draft, no gate,
-    # no delivery and no diff, and the two share only the target repository
-    # and the conversation store.
+    # no delivery and no diff, and the two share only the working folder and
+    # the conversation store.
     "mode": "council",
     # --- Pipeline behaviour (Council only) ----------------------------------
     # Zero-Touch: run start-to-finish with no human gate, passing the CLIs'
@@ -285,9 +296,19 @@ DEFAULTS: Dict[str, Any] = {
     # base branch is then only ever changed by a human merging that PR. Implies
     # a clean starting tree regardless of the toggle above - see gitutil.
     "pull_request_mode": False,
-    # --- Target -------------------------------------------------------------
-    "target_repo": "",
-    "recent_repos": [],
+    # --- Where a run works --------------------------------------------------
+    # The folder both modes run their agents in. Optional, and blank by
+    # default: neither a conversation nor a council run needs a repository to
+    # be worth starting, and demanding one before the first message turns a
+    # coding assistant into a thing you have to configure first. Blank means
+    # the scratch workspace (see ``workspace_dir``).
+    #
+    # A folder that is not a git repository is equally legitimate. What it
+    # costs is the git-backed half of the safety model - snapshot, rollback,
+    # diff and pull-request delivery - and the UI says which of those are off
+    # rather than letting a run discover it.
+    "workspace": "",
+    "recent_workspaces": [],
     # --- Providers ----------------------------------------------------------
     "providers": {
         "drafter": DEFAULT_DRAFTER,
@@ -351,7 +372,7 @@ def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]
 
 
 def _migrate(merged: Dict[str, Any], raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Carry a config written before ``mode`` existed forward.
+    """Carry a config written before ``mode`` or ``workspace`` existed forward.
 
     Solo used to be a toggle that skipped Stage 1 and borrowed one council
     stage's configuration. What is worth keeping out of that is the operator's
@@ -359,10 +380,21 @@ def _migrate(merged: Dict[str, Any], raw: Dict[str, Any]) -> Dict[str, Any]:
     is copied onto the new ``solo`` provider - but deliberately not its council
     role, which is precisely the part Solo no longer has.
 
+    The working folder used to be a *target repository*: mandatory, and
+    refused unless it contained a .git directory. The folder itself carries
+    over unchanged - it is still where runs happen - but the name no longer
+    claims it is a repository, because it no longer has to be one.
+
     ``raw`` is the file as written rather than the merged result: after
     ``_deep_merge`` every new default is present, and a missing legacy key
     would be indistinguishable from one the operator set to the same value.
     """
+    if "workspace" not in raw:
+        merged["workspace"] = str(raw.get("target_repo") or "")
+        recent = raw.get("recent_repos")
+        if isinstance(recent, list):
+            merged["recent_workspaces"] = [str(r) for r in recent]
+
     if "mode" not in raw:
         merged["mode"] = "solo" if raw.get("solo_mode") else "council"
         source = (merged.get("providers") or {}).get(str(raw.get("solo_stage") or ""))
@@ -376,6 +408,14 @@ def _migrate(merged: Dict[str, Any], raw: Dict[str, Any]) -> Dict[str, Any]:
     # anything is worse than an absent one, because it still reads as a setting.
     merged.pop("solo_mode", None)
     merged.pop("solo_stage", None)
+    merged.pop("target_repo", None)
+    merged.pop("recent_repos", None)
+    # `cwd_mode` never decided anything - every stage has always run in the
+    # working folder - and now that the folder need not be a repository, the
+    # one value it ever held ("repo") does not even describe the default.
+    for provider in (merged.get("providers") or {}).values():
+        if isinstance(provider, dict):
+            provider.pop("cwd_mode", None)
     if merged.get("mode") not in ("council", "solo"):
         merged["mode"] = "council"
     return merged
@@ -511,13 +551,13 @@ class ConfigStore:
             self._write()
             return copy.deepcopy(self._data)
 
-    def remember_repo(self, repo: str, limit: int = 8) -> None:
-        """Push ``repo`` to the front of the most-recently-used list."""
-        if not repo:
+    def remember_workspace(self, folder: str, limit: int = 8) -> None:
+        """Push ``folder`` to the front of the most-recently-used list."""
+        if not folder:
             return
         with self._lock:
-            recent = [r for r in self._data.get("recent_repos", []) if r != repo]
-            recent.insert(0, repo)
-            self._data["recent_repos"] = recent[:limit]
-            self._data["target_repo"] = repo
+            recent = [r for r in self._data.get("recent_workspaces", []) if r != folder]
+            recent.insert(0, folder)
+            self._data["recent_workspaces"] = recent[:limit]
+            self._data["workspace"] = folder
             self._write()

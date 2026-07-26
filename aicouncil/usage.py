@@ -448,11 +448,11 @@ class UsagePoller:
 
     def poll_once(self) -> Dict[str, Any]:
         providers = self.store.get("providers", {}) or {}
-        repo = self.store.get("target_repo") or None
+        workspace = self.store.get("workspace") or None
         for pid, provider in providers.items():
             if self._stop.is_set():
                 break
-            reading = read_usage(provider, cwd=repo)
+            reading = read_usage(provider, cwd=workspace)
             with self._lock:
                 # Keep the previous numbers when a poll fails, so a transient
                 # error blanks the chip's freshness rather than its content.

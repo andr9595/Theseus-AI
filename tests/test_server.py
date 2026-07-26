@@ -429,10 +429,31 @@ class TestApi(ServerTestBase):
 
     def test_start_without_a_task_is_a_400(self):
         self.request("/api/config", method="POST",
-                     body={"target_repo": str(Path(__file__).parent.parent)})
+                     body={"workspace": str(Path(__file__).parent.parent)})
         status, data = self.request("/api/start", method="POST", body={"task": ""})
         self.assertEqual(status, 400)
         self.assertFalse(data["ok"])
+
+    def test_state_names_the_folder_a_run_lands_in_with_none_chosen(self):
+        # The browser has no way to work out an XDG path, and "no folder"
+        # must not read as "nowhere".
+        self.request("/api/config", method="POST", body={"workspace": ""})
+        _, data = self.request("/api/state")
+        self.assertTrue(data["scratch_workspace"])
+        self.assertIsNone(data["workspace_status"])
+
+    def test_start_needs_no_working_folder(self):
+        # The whole point: a fresh install can answer a question before it has
+        # been pointed at anything. Only the task is required.
+        self.request("/api/config", method="POST", body={"workspace": ""})
+        status, data = self.request(
+            "/api/start", method="POST",
+            body={"task": "hello", "continue_from": "1700000000-nope.json"},
+        )
+        # Refused for the transcript, not for the missing folder - which is
+        # what proves the folder check is gone rather than merely reordered.
+        self.assertEqual(status, 400)
+        self.assertIn("no longer exists", data["error"])
 
     def test_approve_without_a_gate_is_a_400(self):
         status, _ = self.request("/api/approve", method="POST", body={})
@@ -441,7 +462,7 @@ class TestApi(ServerTestBase):
     def test_start_rejects_a_continue_from_that_is_not_a_filename(self):
         status, data = self.request(
             "/api/start", method="POST",
-            body={"task": "follow up", "repo": str(Path(__file__).parent.parent),
+            body={"task": "follow up", "workspace": str(Path(__file__).parent.parent),
                   "continue_from": ["not", "a", "filename"]},
         )
         self.assertEqual(status, 400)
@@ -450,7 +471,7 @@ class TestApi(ServerTestBase):
     def test_start_rejects_an_unknown_transcript(self):
         status, data = self.request(
             "/api/start", method="POST",
-            body={"task": "follow up", "repo": str(Path(__file__).parent.parent),
+            body={"task": "follow up", "workspace": str(Path(__file__).parent.parent),
                   "continue_from": "1700000000-nosuchrun.json"},
         )
         self.assertEqual(status, 400)
@@ -459,7 +480,7 @@ class TestApi(ServerTestBase):
     def test_start_rejects_a_compaction_flag_that_is_not_a_boolean(self):
         status, data = self.request(
             "/api/start", method="POST",
-            body={"task": "follow up", "repo": str(Path(__file__).parent.parent),
+            body={"task": "follow up", "workspace": str(Path(__file__).parent.parent),
                   "compact_context": "yes"},
         )
         self.assertEqual(status, 400)
