@@ -42,9 +42,9 @@
       <div id="agent-rail" class="agent-rail"></div>
     </section>
 
-    <!-- Mode toggles -->
+    <!-- How the next run behaves -->
     <section class="panel">
-      <h2 class="panel-title">Mode</h2>
+      <h2 class="panel-title">Run</h2>
 
       <label class="toggle toggle-danger" for="zero-touch">
         <input type="checkbox" id="zero-touch">
@@ -55,14 +55,10 @@
         </span>
       </label>
 
-      <label class="toggle" for="safety-snapshot">
-        <input type="checkbox" id="safety-snapshot">
-        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
-        <span class="toggle-text">
-          <strong>Safety snapshot</strong>
-          <em>Enable one-click rollback</em>
-        </span>
-      </label>
+      <div id="zero-touch-warning" class="inline-warning hidden">
+        Auto-approve flags will be passed to the CLI. Files change without
+        confirmation.
+      </div>
 
       <label class="toggle" for="solo-mode">
         <input type="checkbox" id="solo-mode">
@@ -77,15 +73,11 @@
         <label for="solo-stage">Solo mode runs</label>
         <select id="solo-stage"></select>
       </div>
+    </section>
 
-      <label class="toggle" for="clean-worktree">
-        <input type="checkbox" id="clean-worktree">
-        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
-        <span class="toggle-text">
-          <strong>Require clean tree</strong>
-          <em>Refuse to run on uncommitted work</em>
-        </span>
-      </label>
+    <!-- Where the work lands, and how to get it back -->
+    <section class="panel">
+      <h2 class="panel-title">Delivery &amp; recovery</h2>
 
       <label class="toggle" for="pull-request-mode">
         <input type="checkbox" id="pull-request-mode">
@@ -96,10 +88,23 @@
         </span>
       </label>
 
-      <div id="zero-touch-warning" class="inline-warning hidden">
-        Auto-approve flags will be passed to the CLI. Files change without
-        confirmation.
-      </div>
+      <label class="toggle" for="clean-worktree">
+        <input type="checkbox" id="clean-worktree">
+        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+        <span class="toggle-text">
+          <strong>Require clean tree</strong>
+          <em id="clean-tree-note">Refuse to run on uncommitted work</em>
+        </span>
+      </label>
+
+      <label class="toggle" for="safety-snapshot">
+        <input type="checkbox" id="safety-snapshot">
+        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+        <span class="toggle-text">
+          <strong>Safety snapshot</strong>
+          <em id="snapshot-note">Enable one-click rollback</em>
+        </span>
+      </label>
     </section>
 
     <div class="sidebar-spacer"></div>
@@ -245,45 +250,66 @@ Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP
       <h3>Settings</h3>
       <button class="icon-btn" data-close="settings" type="button" aria-label="Close">&times;</button>
     </header>
+    <!-- One destination per kind of setting, so no panel is scrolled past to
+         reach another. Every panel stays in the DOM: Save reads them all. -->
+    <div class="settings-tabs" role="tablist">
+      <button class="settings-tab active" data-settings-tab="stages" role="tab">Stages</button>
+      <button class="settings-tab" data-settings-tab="roles" role="tab">Roles</button>
+      <button class="settings-tab" data-settings-tab="project" role="tab">Project</button>
+      <button class="settings-tab" data-settings-tab="app" role="tab">App</button>
+    </div>
     <div class="modal-body">
-      <p class="settings-note">
-        Each stage shells out to a locally installed CLI that carries your own
-        subscription auth. No API keys are stored or sent.
-        <code>{prompt}</code> is replaced with the generated prompt.
-      </p>
-      <div id="provider-forms"></div>
+      <section class="settings-panel active" data-settings-panel="stages">
+        <p class="settings-note">
+          Each stage shells out to a locally installed CLI that carries your own
+          subscription auth. No API keys are stored or sent.
+        </p>
+        <div id="provider-forms"></div>
+        <div id="doctor-out" class="doctor"></div>
+      </section>
 
-      <section class="roles-panel">
-        <h4 class="roles-head">
+      <section class="settings-panel" data-settings-panel="roles">
+        <h4 class="settings-head">
           Roles
           <button id="role-new" class="btn btn-quiet btn-sm" type="button">New role</button>
         </h4>
         <p class="settings-note">
-          Every role is editable, including the built-in ones. Editing a
-          built-in overrides its shipped text; <b>Restore</b> puts it back.
+          What a stage is told to do. Every role is editable, including the
+          built-in ones. Editing a built-in overrides its shipped text;
+          <b>Restore</b> puts it back.
         </p>
         <div id="role-list" class="role-list"></div>
       </section>
 
-      <div class="field">
-        <label for="house-rules">Standing project rules</label>
-        <textarea id="house-rules" rows="4" spellcheck="false"
-          placeholder="Appended to every prompt. e.g. Use tabs. Never add dependencies without asking. All new code needs tests."></textarea>
-      </div>
-
-      <div class="field-row">
+      <section class="settings-panel" data-settings-panel="project">
+        <p class="settings-note">
+          Appended to every prompt the council is given, for every run against
+          this machine's repositories.
+        </p>
         <div class="field">
-          <label for="port-input">Preferred port</label>
-          <input id="port-input" type="number" min="1024" max="65535">
+          <label for="house-rules">Standing project rules</label>
+          <textarea id="house-rules" rows="10" spellcheck="false"
+            placeholder="e.g. Use tabs. Never add dependencies without asking. All new code needs tests."></textarea>
         </div>
-        <div class="field field-check">
-          <label class="checkline" for="open-browser">
-            <input type="checkbox" id="open-browser"> Open a window on launch
-          </label>
-        </div>
-      </div>
+      </section>
 
-      <div id="doctor-out" class="doctor"></div>
+      <section class="settings-panel" data-settings-panel="app">
+        <p class="settings-note">
+          Where this dashboard serves itself. A changed port takes effect the
+          next time the app starts.
+        </p>
+        <div class="field-row">
+          <div class="field">
+            <label for="port-input">Preferred port</label>
+            <input id="port-input" type="number" min="1024" max="65535">
+          </div>
+          <div class="field field-check">
+            <label class="checkline" for="open-browser">
+              <input type="checkbox" id="open-browser"> Open a window on launch
+            </label>
+          </div>
+        </div>
+      </section>
     </div>
     <footer class="modal-foot">
       <button id="reset-config" class="btn btn-quiet" type="button">Reset to defaults</button>

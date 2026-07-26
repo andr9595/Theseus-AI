@@ -241,13 +241,16 @@ Three properties hold in both modes, and they are covered by tests:
 
 ### Other toggles
 
-| Toggle | Effect |
-|---|---|
-| **Safety snapshot** | Capture the worktree before Stage 2 so **Roll back** works. Leave on. |
-| **Solo mode** | Skip the draft and run a single agent. Costs more quota; use for tasks too small to be worth a draft. |
-| **Solo mode runs** | Which stage's configuration works alone — so Solo Mode can use a different agent than a full council run does. |
-| **Require clean tree** | Refuse to start if the repo has uncommitted changes. |
-| **Pull request** | Deliver the run on a branch of its own and open a GitHub PR instead of writing to the checked-out branch. See below. |
+The sidebar splits them by what they decide. **Run** is how the next run
+behaves; **Delivery & recovery** is where the work lands and how to get it back.
+
+| Toggle | Group | Effect |
+|---|---|---|
+| **Solo mode** | Run | Skip the draft and run a single agent. Costs more quota; use for tasks too small to be worth a draft. |
+| **Solo mode runs** | Run | Which stage's configuration works alone — so Solo Mode can use a different agent than a full council run does. |
+| **Pull request** | Delivery | Deliver the run on a branch of its own and open a GitHub PR instead of writing to the checked-out branch. See below. |
+| **Require clean tree** | Delivery | Refuse to start if the repo has uncommitted changes. Pull-request mode enforces this itself, on or off. |
+| **Safety snapshot** | Delivery | Capture the worktree before Stage 2 so **Roll back** works. Leave on. |
 
 Solo Mode still stops at the approval gate unless Zero-Touch is on: there is no
 draft to read, but the operator is still authorising an agent to write.
@@ -299,6 +302,16 @@ Two consequences worth knowing:
   PR and delete the branch instead. If publishing fails *before* the PR is
   created, rollback stays available and the run tells you which branch the work
   is sitting on.
+
+This mode narrows what a safety snapshot is *for*, without replacing it. It
+still runs, and it is still the only recovery on offer between the moment
+Stage 2 starts writing and the moment the PR exists — the window a failed push
+or an unauthenticated `gh` leaves you in. What it no longer protects is your
+own uncommitted work, because there wasn't any: the run refused to start
+otherwise. In pull-request mode a rollback discards the run's work and returns
+the delivery branch to the commit it forked from. Outside this mode the
+snapshot is doing the harder job of putting *your* in-flight edits back, which
+is why the toggle is not something pull-request mode can retire.
 
 An agent that commits its own work is fine: the run commits whatever is left
 outstanding and then judges success on whether the branch is actually ahead of

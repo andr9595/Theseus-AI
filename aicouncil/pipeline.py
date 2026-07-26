@@ -498,7 +498,7 @@ class Pipeline:
         if not snap:
             raise ValueError(
                 "No snapshot was taken for this run, so there is nothing to "
-                "restore. Enable 'Safety snapshot' in Settings."
+                "restore. Turn on 'Safety snapshot' under Delivery & recovery."
             )
 
         note = gitutil.restore_snapshot(snap)

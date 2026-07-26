@@ -951,6 +951,32 @@ kbd {
 
 /* ---- Settings ---- */
 
+.settings-tabs {
+  display: flex; align-items: center; gap: 3px;
+  padding: 0 18px;
+  border-bottom: 1px solid var(--line);
+}
+.settings-tab {
+  padding: 9px 12px;
+  font: inherit; font-size: 12.5px; font-weight: 550;
+  color: var(--text-3);
+  background: none; border: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  cursor: pointer;
+  transition: color .15s;
+}
+.settings-tab:hover { color: var(--text-2); }
+.settings-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+
+.settings-panel { display: none; }
+.settings-panel.active { display: block; }
+
+.settings-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin: 0 0 8px; font-size: 12.5px; font-weight: 620;
+}
+
 .settings-note {
   margin: 0 0 16px;
   font-size: 11.5px; line-height: 1.55;
@@ -1006,7 +1032,31 @@ kbd {
 .field input:focus, .field select:focus, .field textarea:focus {
   outline: none; border-color: var(--accent);
 }
-.field input.invalid { border-color: var(--red); }
+.field input.invalid, .field textarea.invalid { border-color: var(--red); }
+
+/* The CLI plumbing, folded away. The native marker is replaced rather than
+   styled: it is the one part of <details> browsers each draw differently. */
+.advanced { margin-top: 12px; border-top: 1px solid var(--line); }
+.advanced summary {
+  display: flex; align-items: center; gap: 6px;
+  padding: 10px 0 0;
+  font-size: 11px; font-weight: 550;
+  color: var(--text-3);
+  cursor: pointer;
+  list-style: none;
+}
+.advanced summary::-webkit-details-marker { display: none; }
+.advanced summary::before {
+  content: "";
+  width: 5px; height: 5px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform .15s;
+}
+.advanced[open] summary::before { transform: rotate(45deg) translate(-1px, -1px); }
+.advanced summary:hover { color: var(--text-2); }
+.advanced-body { padding-top: 11px; }
 
 .checkline {
   display: inline-flex; align-items: center; gap: 7px;
@@ -1258,13 +1308,6 @@ kbd {
 }
 
 /* ---- Role manager ---- */
-
-.roles-panel { margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--line); }
-
-.roles-head {
-  display: flex; align-items: center; justify-content: space-between;
-  margin: 0 0 8px; font-size: 12.5px; font-weight: 620;
-}
 
 .role-list { display: flex; flex-direction: column; gap: 6px; }
 

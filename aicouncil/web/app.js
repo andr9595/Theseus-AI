@@ -979,6 +979,18 @@ function renderToggles() {
   $('#pull-request-mode').checked = !!c.pull_request_mode;
   $('#zero-touch-warning').classList.toggle('hidden', !c.zero_touch);
 
+  // Pull-request mode changes what the other two delivery toggles are worth,
+  // and neither one is switched off for you: it enforces a clean tree itself
+  // whatever "Require clean tree" says, and it takes rollback away the moment
+  // the PR exists - but not before, which is exactly when publishing fails.
+  const pr = !!c.pull_request_mode;
+  $('#clean-tree-note').textContent = pr
+    ? 'Enforced by Pull request mode regardless'
+    : 'Refuse to run on uncommitted work';
+  $('#snapshot-note').textContent = pr
+    ? 'Rollback until the pull request is open'
+    : 'Enable one-click rollback';
+
   // Which stage's configuration runs alone. Only worth showing once Solo mode
   // is actually on.
   const providers = c.providers || {};
@@ -1279,6 +1291,15 @@ async function selectRepo(path) {
 
 /* ---- Settings ---- */
 
+/** Own selectors, not the output pane's `.tab`: that click handler is bound
+ *  document-wide at boot and would fire on these too. */
+function switchSettingsTab(name) {
+  $$('.settings-tab').forEach(t =>
+    t.classList.toggle('active', t.dataset.settingsTab === name));
+  $$('.settings-panel').forEach(p =>
+    p.classList.toggle('active', p.dataset.settingsPanel === name));
+}
+
 function renderSettings() {
   const conf = state.config || {};
   const providers = conf.providers || {};
@@ -1327,54 +1348,62 @@ function renderSettings() {
             `<button class="link-btn" type="button" data-reset-role="${id}">` +
               `reset to the template</button>` +
           `</label>` +
-          `<textarea rows="8" class="role-system" data-field="role_system" ` +
+          `<textarea rows="5" class="role-system" data-field="role_system" ` +
             `placeholder="Using the template above. Type here to override it.">` +
             `${esc(p.role_system || '')}</textarea>` +
           `<span class="field-hint" data-role-warn="${id}"></span>` +
         `</div>` +
-        `<div class="field">` +
-          `<label>Command (one argument per line, <code>{prompt}</code> is substituted)</label>` +
-          `<textarea rows="3" data-field="command">${esc((p.command || []).join('\n'))}</textarea>` +
-        `</div>` +
-        `<div class="field">` +
-          `<label>Auto-approve arguments (added only when execution is approved)</label>` +
-          `<textarea rows="2" data-field="auto_approve_args">${esc((p.auto_approve_args || []).join('\n'))}</textarea>` +
-        `</div>` +
-        `<div class="field">` +
-          `<label>Streaming arguments ` +
-            `<span class="field-hint">— always added; make the CLI report ` +
-            `progress as it works instead of only at the end</span></label>` +
-          `<textarea rows="2" data-field="stream_args">${esc((p.stream_args || []).join('\n'))}</textarea>` +
-        `</div>` +
-        `<div class="field-row">` +
-          `<div class="field">` +
-            `<label>Model (blank = the CLI's own default)</label>` +
-            `<input type="text" data-field="model" value="${esc(p.model || '')}">` +
+        // Everything below is the CLI plumbing the Agent dropdown fills in for
+        // you. Folded away because reading it is how you check a custom CLI,
+        // not how you configure a stage.
+        `<details class="advanced">` +
+          `<summary>Command line</summary>` +
+          `<div class="advanced-body">` +
+            `<div class="field">` +
+              `<label>Command (one argument per line, <code>{prompt}</code> is substituted)</label>` +
+              `<textarea rows="3" data-field="command">${esc((p.command || []).join('\n'))}</textarea>` +
+            `</div>` +
+            `<div class="field">` +
+              `<label>Auto-approve arguments (added only when execution is approved)</label>` +
+              `<textarea rows="2" data-field="auto_approve_args">${esc((p.auto_approve_args || []).join('\n'))}</textarea>` +
+            `</div>` +
+            `<div class="field">` +
+              `<label>Streaming arguments ` +
+                `<span class="field-hint">— always added; make the CLI report ` +
+                `progress as it works instead of only at the end</span></label>` +
+              `<textarea rows="2" data-field="stream_args">${esc((p.stream_args || []).join('\n'))}</textarea>` +
+            `</div>` +
+            `<div class="field-row">` +
+              `<div class="field">` +
+                `<label>Model (blank = the CLI's own default)</label>` +
+                `<input type="text" data-field="model" value="${esc(p.model || '')}">` +
+              `</div>` +
+              `<div class="field">` +
+                `<label>Model flag (<code>{model}</code> substituted)</label>` +
+                `<input type="text" data-field="model_args" ` +
+                  `value="${esc((p.model_args || []).join(' '))}">` +
+              `</div>` +
+            `</div>` +
+            `<div class="field">` +
+              `<label>Selectable models, one per line ` +
+                `<span class="field-hint">— shown in the picker on the agent card</span></label>` +
+              `<textarea rows="4" data-field="models">${esc((p.models || []).join('\n'))}</textarea>` +
+            `</div>` +
+            `<div class="field-row">` +
+              `<div class="field">` +
+                `<label>Timeout (seconds)</label>` +
+                `<input type="number" min="30" max="21600" data-field="timeout_seconds" ` +
+                  `value="${Number(p.timeout_seconds) || 900}">` +
+              `</div>` +
+              `<div class="field field-check">` +
+                `<label class="checkline">` +
+                  `<input type="checkbox" data-field="prompt_on_stdin" ` +
+                    `${p.prompt_on_stdin ? 'checked' : ''}> Pipe the prompt on stdin` +
+                `</label>` +
+              `</div>` +
+            `</div>` +
           `</div>` +
-          `<div class="field">` +
-            `<label>Model flag (<code>{model}</code> substituted)</label>` +
-            `<input type="text" data-field="model_args" ` +
-              `value="${esc((p.model_args || []).join(' '))}">` +
-          `</div>` +
-        `</div>` +
-        `<div class="field">` +
-          `<label>Selectable models, one per line ` +
-            `<span class="field-hint">— shown in the picker on the agent card</span></label>` +
-          `<textarea rows="4" data-field="models">${esc((p.models || []).join('\n'))}</textarea>` +
-        `</div>` +
-        `<div class="field-row">` +
-          `<div class="field">` +
-            `<label>Timeout (seconds)</label>` +
-            `<input type="number" min="30" max="21600" data-field="timeout_seconds" ` +
-              `value="${Number(p.timeout_seconds) || 900}">` +
-          `</div>` +
-          `<div class="field field-check">` +
-            `<label class="checkline">` +
-              `<input type="checkbox" data-field="prompt_on_stdin" ` +
-                `${p.prompt_on_stdin ? 'checked' : ''}> Pipe the prompt on stdin` +
-            `</label>` +
-          `</div>` +
-        `</div>` +
+        `</details>` +
       `</div>`
     );
   }).join('');
@@ -1427,6 +1456,10 @@ async function saveSettings() {
     const cmdInput = field('command');
     if (!command.length) {
       cmdInput.classList.add('invalid');
+      // The command lives behind a disclosure, and a field the operator cannot
+      // see is not a validation message - open it so the toast has a referent.
+      const advanced = cmdInput.closest('.advanced');
+      if (advanced) advanced.open = true;
       valid = false;
     } else {
       cmdInput.classList.remove('invalid');
@@ -1950,7 +1983,12 @@ function wire() {
     await refreshDoctor(true);
     renderSettings();
     renderRoleList();
+    switchSettingsTab('stages');
     openModal('settings');
+  });
+  $('.settings-tabs').addEventListener('click', (e) => {
+    const tab = e.target.closest('.settings-tab');
+    if (tab) switchSettingsTab(tab.dataset.settingsTab);
   });
   $('#provider-forms').addEventListener('click', (e) => {
     const reset = e.target.closest('[data-reset-role]');
@@ -2001,7 +2039,11 @@ function wire() {
     $('[data-field="models"]', form).value = '';
   });
 
-  $('#run-doctor').addEventListener('click', () => refreshDoctor(true));
+  // The probe results print into the Stages panel, so show it.
+  $('#run-doctor').addEventListener('click', () => {
+    switchSettingsTab('stages');
+    refreshDoctor(true);
+  });
   $('#reset-config').addEventListener('click', async () => {
     if (!confirm('Reset every setting to its default?')) return;
     try {
