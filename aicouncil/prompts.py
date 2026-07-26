@@ -243,30 +243,90 @@ ROLE_TEMPLATES: Dict[str, Dict] = {
 DEFAULT_TEMPLATE = {"drafter": "junior_draft", "polisher": "senior_polish"}
 
 
-def role_catalog() -> List[Dict]:
-    """The selectable roles, for the Settings dropdown."""
-    return [
-        {"id": key, **{k: v for k, v in tpl.items()}}
-        for key, tpl in ROLE_TEMPLATES.items()
-    ]
+def shipped_role(role_id: str) -> Optional[Dict]:
+    """The as-shipped definition of a built-in role, ignoring any edits."""
+    tpl = ROLE_TEMPLATES.get(role_id)
+    return dict(tpl, id=role_id, builtin=True) if tpl else None
 
 
-def resolve_system(stage_id: str, provider: Optional[Dict] = None) -> str:
+def role_catalog(stored: Optional[Dict[str, Dict]] = None) -> List[Dict]:
+    """Every selectable role: the built-ins, plus whatever has been added.
+
+    ``stored`` is the saved catalogue from config. A built-in that has been
+    edited appears with the edited text and ``edited: True``, so the UI can
+    offer to restore the shipped wording; one that has not appears as shipped.
+    Roles the operator created carry ``builtin: False`` and are otherwise
+    identical - same list, same editor, no second-class citizens.
+    """
+    stored = stored or {}
+    out: List[Dict] = []
+
+    for key, tpl in ROLE_TEMPLATES.items():
+        saved = stored.get(key) or {}
+        merged = dict(tpl)
+        merged.update({k: v for k, v in saved.items() if k != "id"})
+        out.append({
+            **merged,
+            "id": key,
+            "builtin": True,
+            # Compared against the shipped text rather than trusting a flag,
+            # so an edit that happens to restore the original stops being
+            # reported as an edit.
+            "edited": str(merged.get("system", "")).strip()
+                      != str(tpl["system"]).strip(),
+        })
+
+    for key, saved in stored.items():
+        if key in ROLE_TEMPLATES or not isinstance(saved, dict):
+            continue
+        out.append({
+            "id": key,
+            "name": saved.get("name") or key,
+            "summary": saved.get("summary") or "",
+            "system": saved.get("system") or "",
+            "writes": bool(saved.get("writes")),
+            "builtin": False,
+            "edited": False,
+        })
+    return out
+
+
+def role_by_id(role_id: str, stored: Optional[Dict[str, Dict]] = None) -> Optional[Dict]:
+    """One role from the merged catalogue."""
+    for role in role_catalog(stored):
+        if role["id"] == role_id:
+            return role
+    return None
+
+
+def resolve_system(
+    stage_id: str,
+    provider: Optional[Dict] = None,
+    stored_roles: Optional[Dict[str, Dict]] = None,
+) -> str:
     """The system prompt a stage should actually use.
 
-    An edited prompt wins over its template, which wins over the shipped
-    default for that stage. Blank means "use the template", so clearing the
-    box in Settings restores the default rather than sending an empty prompt.
+    Precedence: text typed against the stage itself, then the role it is
+    assigned (as edited, if it has been), then the shipped default for the
+    stage. Blank at any level means "fall through", so clearing a box restores
+    the layer beneath rather than sending an empty prompt.
     """
     provider = provider or {}
     custom = str(provider.get("role_system") or "").strip()
     if custom:
         return custom
+
     key = str(provider.get("role_template") or "").strip()
-    template = ROLE_TEMPLATES.get(key)
-    if template is None:
-        template = ROLE_TEMPLATES[DEFAULT_TEMPLATE.get(stage_id, "solo")]
-    return template["system"]
+    role = role_by_id(key, stored_roles) if key else None
+    if role and str(role.get("system") or "").strip():
+        return role["system"]
+
+    fallback = role_by_id(DEFAULT_TEMPLATE.get(stage_id, "solo"), stored_roles)
+    if fallback and str(fallback.get("system") or "").strip():
+        return fallback["system"]
+    # Every layer empty: a hand-edited config could do this, and an empty
+    # system prompt is worse than the shipped one.
+    return ROLE_TEMPLATES[DEFAULT_TEMPLATE.get(stage_id, "solo")]["system"]
 
 
 def clip(text: str, limit: int) -> str:

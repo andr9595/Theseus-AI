@@ -754,3 +754,66 @@ def list_directory(path: str | Path) -> Dict:
         "entries": entries,
         "error": "",
     }
+
+
+def commit_all(path: str | Path, message: str) -> Dict[str, Any]:
+    """Stage everything and commit it. Returns a summary of what landed.
+
+    Deliberately ``add -A``: the diff the operator just reviewed in the app is
+    the whole working tree, so committing a subset of it would not be the
+    thing they approved. Ignored files stay ignored - `add -A` honours
+    .gitignore, which is what keeps build output and virtualenvs out.
+
+    Nothing is pushed. Publishing is a separate, outward-facing act and it has
+    its own path through pull-request mode; a button labelled "commit" that
+    also pushed would be a surprise the first time it mattered.
+    """
+    message = (message or "").strip()
+    if not message:
+        raise GitError("A commit message is required.")
+
+    root = repo_root(path)
+    if root is None:
+        raise GitError(f"{path!r} is not a git repository.")
+
+    st = status(root)
+    if st.clean:
+        raise GitError("Nothing to commit - the working tree is clean.")
+
+    _run(["add", "-A"], root)
+
+    # `add -A` can still leave nothing staged: every change may have been to an
+    # ignored file. Committing then would create an empty commit.
+    staged = _run(["diff", "--cached", "--name-only"], root).stdout.split()
+    if not staged:
+        raise GitError(
+            "Nothing to commit after staging - the changes are all in ignored "
+            "files."
+        )
+
+    stat = _numstat_totals(_run(["diff", "--cached", "--numstat"], root).stdout)
+
+    proc = _run(["commit", "-m", message], root, check=False)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        # The overwhelmingly common cause, and git's own message for it is a
+        # wall of configuration advice.
+        if "user.email" in detail or "user.name" in detail:
+            raise GitError(
+                "git has no identity configured for this repository. Set one "
+                "with:  git config user.name '...'  and  git config "
+                "user.email '...'"
+            )
+        raise GitError(detail.splitlines()[-1] if detail else "git commit failed.")
+
+    head = _run(["rev-parse", "HEAD"], root, check=False).stdout.strip()
+    return {
+        "commit": head,
+        "short": head[:8],
+        "message": message,
+        "files": len(staged),
+        "insertions": stat.get("insertions", 0),
+        "deletions": stat.get("deletions", 0),
+        "branch": _run(["rev-parse", "--abbrev-ref", "HEAD"], root,
+                       check=False).stdout.strip(),
+    }

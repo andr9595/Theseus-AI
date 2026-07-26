@@ -22,6 +22,7 @@ import json
 import mimetypes
 import os
 import queue
+import re
 import secrets
 import socket
 import threading
@@ -37,6 +38,7 @@ from . import config as cfg
 from . import gitutil
 from .events import EventBus, drain, sse_comment, sse_format
 from .pipeline import Pipeline, PipelineBusy
+from . import prompts
 from .providers import discover_models, probe
 from .usage import UsagePoller
 
@@ -216,6 +218,13 @@ class Handler(BaseHTTPRequestHandler):
             ("POST", "/api/reject"): self._api_reject,
             ("POST", "/api/cancel"): self._api_cancel,
             ("POST", "/api/rollback"): self._api_rollback,
+            ("POST", "/api/commit"): self._api_commit,
+            ("GET", "/api/roles"): lambda p: {
+                "ok": True,
+                "roles": prompts.role_catalog(self.app.store.get("roles", {})),
+            },
+            ("POST", "/api/roles"): self._api_save_role,
+            ("POST", "/api/roles/delete"): self._api_delete_role,
         }
 
         handler = routes.get((method, path))
@@ -402,6 +411,66 @@ class Handler(BaseHTTPRequestHandler):
     def _api_cancel(self, params: Dict[str, list]) -> Dict[str, Any]:
         self.app.pipeline.cancel()
         return {"ok": True}
+
+    def _api_commit(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Commit the working tree of the selected repository."""
+        body = self._read_body()
+        repo = str(body.get("repo") or self.app.store.get("target_repo") or "")
+        if not repo:
+            raise ValueError("No target repository selected.")
+        if self.app.pipeline.is_busy():
+            # Committing underneath a running agent would capture a tree it is
+            # still editing, and the resulting commit would match neither the
+            # diff that was reviewed nor the one the run ends with.
+            raise ValueError("A run is in progress. Wait for it to finish.")
+        result = gitutil.commit_all(repo, str(body.get("message") or ""))
+        self.app.bus.publish("committed", commit=result, repo=repo)
+        return {"ok": True, "commit": result}
+
+    def _api_save_role(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Create a role, or edit one - including a built-in."""
+        body = self._read_body()
+        role_id = str(body.get("id") or "").strip().lower()
+        role_id = re.sub(r"[^a-z0-9_]+", "_", role_id).strip("_")
+        if not role_id:
+            raise ValueError("A role needs an id.")
+        if not str(body.get("name") or "").strip():
+            raise ValueError("A role needs a name.")
+        if not str(body.get("system") or "").strip():
+            raise ValueError("A role needs prompt text.")
+
+        roles = self.app.store.get("roles", {}) or {}
+        roles[role_id] = {
+            "name": str(body["name"]).strip(),
+            "summary": str(body.get("summary") or "").strip(),
+            "system": str(body["system"]),
+            "writes": bool(body.get("writes")),
+        }
+        conf = self.app.store.update({"roles": roles})
+        self.app.bus.publish("config", config=conf)
+        return {
+            "ok": True,
+            "roles": prompts.role_catalog(conf.get("roles", {})),
+            "saved": role_id,
+        }
+
+    def _api_delete_role(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Delete a custom role, or restore a built-in to its shipped text.
+
+        The same call for both: a built-in has no stored entry once its edit is
+        removed, which *is* the shipped definition. Nothing special-cases it.
+        """
+        role_id = str(self._read_body().get("id") or "").strip()
+        roles = self.app.store.get("roles", {}) or {}
+        roles.pop(role_id, None)
+        # `update` deep-merges, so a popped key would survive it.
+        conf = self.app.store.replace_roles(roles)
+        self.app.bus.publish("config", config=conf)
+        return {
+            "ok": True,
+            "roles": prompts.role_catalog(conf.get("roles", {})),
+            "builtin": role_id in prompts.ROLE_TEMPLATES,
+        }
 
     def _api_rollback(self, params: Dict[str, list]) -> Dict[str, Any]:
         return {"ok": True, "message": self.app.pipeline.rollback()}

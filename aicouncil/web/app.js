@@ -771,6 +771,172 @@ function worstUsageFor(providerIds) {
   return worst;
 }
 
+
+/* ==========================================================================
+   Commit
+   ========================================================================== */
+
+/** Show the commit bar whenever the target repo has uncommitted work, whether
+ *  a council run produced it or you did. Hidden mid-run: committing under a
+ *  running agent captures a tree it is still editing. */
+function renderCommitBar() {
+  const bar = $('#commit-bar');
+  if (!bar) return;
+  const st = state.repoStatus;
+  const dirty = st && st.is_repo ? st.dirty_count : 0;
+  const show = dirty > 0 && !state.busy;
+  bar.classList.toggle('hidden', !show);
+  if (!show) return;
+
+  $('#commit-hint').textContent =
+    `${dirty} uncommitted change${dirty === 1 ? '' : 's'} on ${st.branch || '?'}`;
+  const box = $('#commit-message');
+  if (!box.value && state.run && state.run.task) {
+    // The task is a reasonable first draft of the subject; the operator can
+    // rewrite it, and an empty message is refused server-side either way.
+    box.value = state.run.task.split('\n')[0].slice(0, 72);
+  }
+}
+
+async function doCommit() {
+  const message = $('#commit-message').value.trim();
+  if (!message) { toast('A commit message is required.', 'warn'); return; }
+  const btn = $('#commit-btn');
+  btn.disabled = true;
+  try {
+    const { commit } = await api('/api/commit', {
+      method: 'POST',
+      body: { message, repo: (state.config || {}).target_repo },
+    });
+    $('#commit-message').value = '';
+    toast(
+      `Committed ${commit.short} on ${commit.branch} — ${commit.files} file(s), ` +
+      `+${commit.insertions}/-${commit.deletions}`, 'ok', 6000);
+    await loadState();
+  } catch (err) {
+    toast(err.message, 'error', 9000);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ==========================================================================
+   Role manager
+   ========================================================================== */
+
+function renderRoleList() {
+  const host = $('#role-list');
+  if (!host) return;
+  host.innerHTML = (state.roles || []).map(r => `
+    <div class="role-row" data-role="${esc(r.id)}">
+      <div class="role-row-head">
+        <span class="role-name">${esc(r.name)}</span>
+        <span class="role-badges">
+          ${r.builtin ? '<span class="role-badge">built-in</span>' : '<span class="role-badge custom">custom</span>'}
+          ${r.edited ? '<span class="role-badge edited">edited</span>' : ''}
+          ${r.writes ? '<span class="role-badge writes">writes</span>' : '<span class="role-badge">read-only</span>'}
+        </span>
+        <button class="link-btn role-edit" type="button">Edit</button>
+      </div>
+      <div class="role-summary">${esc(r.summary || '')}</div>
+    </div>`).join('');
+}
+
+/** One editor for every role — built-in or not, the same form. */
+function openRoleEditor(roleId) {
+  const existing = (state.roles || []).find(r => r.id === roleId);
+  const isNew = !existing;
+  const r = existing || { id: '', name: '', summary: '', system: '', writes: false,
+                          builtin: false, edited: false };
+
+  const dlg = document.createElement('div');
+  dlg.className = 'modal';
+  dlg.id = 'role-editor';
+  dlg.innerHTML = `
+    <div class="modal-card modal-card-tall">
+      <header class="modal-head">
+        <h3>${isNew ? 'New role' : `Edit ${esc(r.name)}`}</h3>
+        <button class="icon-btn" data-close-role type="button" aria-label="Close">&times;</button>
+      </header>
+      <div class="modal-body">
+        <div class="field-row">
+          <div class="field">
+            <label>Name</label>
+            <input type="text" id="role-f-name" value="${esc(r.name)}">
+          </div>
+          <div class="field">
+            <label>Id ${r.builtin || !isNew ? '<span class="field-hint">— fixed</span>' : ''}</label>
+            <input type="text" id="role-f-id" value="${esc(r.id)}"
+              ${isNew ? '' : 'disabled'} placeholder="e.g. perf_reviewer">
+          </div>
+        </div>
+        <div class="field">
+          <label>Summary <span class="field-hint">— one line, shown in the dropdown</span></label>
+          <input type="text" id="role-f-summary" value="${esc(r.summary || '')}">
+        </div>
+        <div class="field field-check">
+          <label class="checkline">
+            <input type="checkbox" id="role-f-writes" ${r.writes ? 'checked' : ''}>
+            This behaviour expects to modify files
+          </label>
+          <span class="field-hint">
+            Advisory: permission is granted per stage, and Settings flags a mismatch.
+          </span>
+        </div>
+        <div class="field">
+          <label>Prompt</label>
+          <textarea id="role-f-system" rows="18" class="role-system">${esc(r.system || '')}</textarea>
+        </div>
+      </div>
+      <footer class="modal-foot">
+        ${r.builtin && r.edited
+          ? '<button class="btn btn-quiet" id="role-restore" type="button">Restore shipped text</button>'
+          : (!r.builtin && !isNew
+             ? '<button class="btn btn-quiet" id="role-delete" type="button">Delete role</button>'
+             : '')}
+        <span class="modal-foot-spacer"></span>
+        <button class="btn btn-quiet" data-close-role type="button">Cancel</button>
+        <button class="btn btn-primary" id="role-save" type="button">Save</button>
+      </footer>
+    </div>`;
+  document.body.appendChild(dlg);
+
+  const close = () => dlg.remove();
+  $$('[data-close-role]', dlg).forEach(b => b.addEventListener('click', close));
+  dlg.addEventListener('click', e => { if (e.target === dlg) close(); });
+
+  $('#role-save', dlg).addEventListener('click', async () => {
+    try {
+      const { roles } = await api('/api/roles', { method: 'POST', body: {
+        id: isNew ? $('#role-f-id', dlg).value : r.id,
+        name: $('#role-f-name', dlg).value,
+        summary: $('#role-f-summary', dlg).value,
+        system: $('#role-f-system', dlg).value,
+        writes: $('#role-f-writes', dlg).checked,
+      }});
+      state.roles = roles;
+      renderRoleList(); renderSettings();
+      close();
+      toast('Role saved.', 'ok', 3000);
+    } catch (err) { toast(err.message, 'error', 8000); }
+  });
+
+  const remove = $('#role-restore', dlg) || $('#role-delete', dlg);
+  if (remove) remove.addEventListener('click', async () => {
+    const builtin = !!r.builtin;
+    if (!confirm(builtin
+      ? `Restore "${r.name}" to its shipped text? Your edits are discarded.`
+      : `Delete "${r.name}"? Stages using it fall back to the stage default.`)) return;
+    try {
+      const { roles } = await api('/api/roles/delete', { method: 'POST', body: { id: r.id } });
+      state.roles = roles;
+      renderRoleList(); renderSettings();
+      close();
+      toast(builtin ? 'Shipped text restored.' : 'Role deleted.', 'ok', 3000);
+    } catch (err) { toast(err.message, 'error', 8000); }
+  });
+}
+
 function renderRepo() {
   const conf = state.config || {};
   const repo = conf.target_repo || '';
@@ -871,6 +1037,7 @@ function renderAll() {
   renderRepo();
   renderToggles();
   renderOutputs();
+  renderCommitBar();
 }
 
 /* ==========================================================================
@@ -1542,6 +1709,11 @@ function connect() {
              'system', d.message);
   });
 
+  on('committed', (d) => {
+    pushLine('sys', 'git', `committed ${d.commit.short} — ${d.commit.message}`);
+    loadState();
+  });
+
   on('rolled_back', (d) => {
     state.run = d.run;
     pushLine('warn', 'system', d.message);
@@ -1556,6 +1728,10 @@ function connect() {
 
   on('config', (d) => {
     state.config = d.config;
+    // Roles live in config now, so a change from another tab must refresh the
+    // catalogue too - otherwise the dropdown and the list disagree.
+    api('/api/roles').then(r => { state.roles = r.roles; renderRoleList(); })
+      .catch(() => {});
     renderAll();
   });
 }
@@ -1773,6 +1949,7 @@ function wire() {
   $('#settings-btn').addEventListener('click', async () => {
     await refreshDoctor(true);
     renderSettings();
+    renderRoleList();
     openModal('settings');
   });
   $('#provider-forms').addEventListener('click', (e) => {
@@ -1788,6 +1965,17 @@ function wire() {
     if (e.target.matches('[data-field="role_template"]')) {
       updateRoleWarning(e.target.closest('.provider-form'));
     }
+  });
+
+  $('#commit-btn').addEventListener('click', doCommit);
+  $('#commit-message').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') doCommit();
+  });
+
+  $('#role-new').addEventListener('click', () => openRoleEditor(null));
+  $('#role-list').addEventListener('click', (e) => {
+    const row = e.target.closest('.role-row');
+    if (row && e.target.closest('.role-edit')) openRoleEditor(row.dataset.role);
   });
 
   $('#save-settings').addEventListener('click', saveSettings);

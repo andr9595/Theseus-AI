@@ -593,3 +593,5 @@ Coverage focuses on the properties that matter if they're wrong:
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+<!-- commit bar verification -->

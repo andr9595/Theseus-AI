@@ -1047,3 +1047,149 @@ class TestRoleReachesTheRun(PipelineTestBase):
         # received is what the pipeline built.
         self.assertTrue(run.stages["drafter"].output)
         self.assertEqual(run.state, "complete", run.error)
+
+
+class TestCommitFromTheApp(PipelineTestBase):
+    """Committing is the operator's act; the app only has to do it faithfully."""
+
+    def test_commits_the_whole_reviewed_tree(self):
+        (self.repo / "new.txt").write_text("added\n")
+        (self.repo / "README.md").write_text("# fixture\nedited\n")
+
+        result = gitutil.commit_all(self.repo, "do the thing")
+        self.assertEqual(result["message"], "do the thing")
+        self.assertEqual(result["files"], 2)
+        self.assertTrue(gitutil.status(self.repo).clean)
+
+        log = subprocess.run(["git", "log", "-1", "--pretty=%s"], cwd=self.repo,
+                             capture_output=True, text=True, check=True)
+        self.assertEqual(log.stdout.strip(), "do the thing")
+
+    def test_untracked_files_are_included(self):
+        # The diff the operator reviewed shows new files as additions, so a
+        # commit that skipped them would not be what they approved.
+        (self.repo / "brand_new.py").write_text("x = 1\n")
+        gitutil.commit_all(self.repo, "add it")
+        tracked = subprocess.run(["git", "ls-files"], cwd=self.repo,
+                                 capture_output=True, text=True, check=True)
+        self.assertIn("brand_new.py", tracked.stdout)
+
+    def test_an_empty_message_is_refused(self):
+        (self.repo / "x.txt").write_text("y\n")
+        for blank in ("", "   ", "\n"):
+            with self.assertRaises(gitutil.GitError):
+                gitutil.commit_all(self.repo, blank)
+
+    def test_a_clean_tree_is_refused_rather_than_committed_empty(self):
+        with self.assertRaises(gitutil.GitError) as ctx:
+            gitutil.commit_all(self.repo, "nothing to say")
+        self.assertIn("clean", str(ctx.exception).lower())
+
+    def test_ignored_files_alone_do_not_make_a_commit(self):
+        (self.repo / ".gitignore").write_text("build/\n")
+        gitutil.commit_all(self.repo, "add ignore rules")
+        (self.repo / "build").mkdir()
+        (self.repo / "build" / "out.o").write_text("binary\n")
+        with self.assertRaises(gitutil.GitError):
+            gitutil.commit_all(self.repo, "should not commit build output")
+
+    def test_a_missing_identity_is_explained_not_dumped(self):
+        subprocess.run(["git", "config", "--unset", "user.email"], cwd=self.repo,
+                       capture_output=True)
+        subprocess.run(["git", "config", "--unset", "user.name"], cwd=self.repo,
+                       capture_output=True)
+        # A repo with no identity and no global fallback; skip where a global
+        # identity exists, since git would then succeed.
+        probe = subprocess.run(["git", "var", "GIT_AUTHOR_IDENT"], cwd=self.repo,
+                               capture_output=True, text=True)
+        if probe.returncode == 0:
+            self.skipTest("a global git identity is configured on this machine")
+        (self.repo / "x.txt").write_text("y\n")
+        with self.assertRaises(gitutil.GitError) as ctx:
+            gitutil.commit_all(self.repo, "try it")
+        self.assertIn("identity", str(ctx.exception).lower())
+
+
+class TestEditableRoles(unittest.TestCase):
+    """Built-ins are defaults, not laws — and a role you add is not a lesser one."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-roles-"))
+        self.store = ConfigStore(self.tmp / "config.json")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_an_untouched_builtin_reports_the_shipped_text(self):
+        from aicouncil import prompts
+
+        role = prompts.role_by_id("junior_draft", {})
+        self.assertTrue(role["builtin"])
+        self.assertFalse(role["edited"])
+        self.assertIn("JUNIOR ENGINEER", role["system"])
+
+    def test_editing_a_builtin_overrides_it_and_is_flagged(self):
+        from aicouncil import prompts
+
+        stored = {"junior_draft": {"name": "Junior Draft", "system": "Be brief."}}
+        role = prompts.role_by_id("junior_draft", stored)
+        self.assertEqual(role["system"], "Be brief.")
+        self.assertTrue(role["builtin"])
+        self.assertTrue(role["edited"])
+
+    def test_an_edit_that_matches_the_shipped_text_is_not_an_edit(self):
+        from aicouncil import prompts
+
+        shipped = prompts.ROLE_TEMPLATES["junior_draft"]["system"]
+        role = prompts.role_by_id("junior_draft", {"junior_draft": {"system": shipped}})
+        self.assertFalse(role["edited"])
+
+    def test_a_custom_role_joins_the_same_list(self):
+        from aicouncil import prompts
+
+        stored = {"perf": {"name": "Perf Reviewer", "summary": "Finds slow paths",
+                           "system": "Profile first.", "writes": False}}
+        catalog = prompts.role_catalog(stored)
+        ids = [r["id"] for r in catalog]
+        self.assertIn("perf", ids)
+        self.assertIn("junior_draft", ids)
+        perf = next(r for r in catalog if r["id"] == "perf")
+        self.assertFalse(perf["builtin"])
+        # Same shape as a built-in: the UI renders one list, not two.
+        self.assertEqual(set(perf), set(catalog[0]))
+
+    def test_a_custom_role_reaches_the_prompt(self):
+        from aicouncil import prompts
+
+        stored = {"perf": {"name": "Perf", "system": "PROFILE-FIRST-SENTINEL"}}
+        text = prompts.resolve_system("drafter", {"role_template": "perf"}, stored)
+        self.assertEqual(text, "PROFILE-FIRST-SENTINEL")
+
+    def test_deleting_a_builtin_edit_restores_the_shipped_text(self):
+        from aicouncil import prompts
+
+        self.store.update({"roles": {"junior_draft": {"system": "Overridden."}}})
+        self.assertEqual(
+            prompts.role_by_id("junior_draft", self.store.get("roles"))["system"],
+            "Overridden.",
+        )
+        # Deletion must *replace* the map: update() deep-merges and would
+        # resurrect the key.
+        self.store.replace_roles({})
+        role = prompts.role_by_id("junior_draft", self.store.get("roles"))
+        self.assertIn("JUNIOR ENGINEER", role["system"])
+        self.assertFalse(role["edited"])
+
+    def test_a_stage_pointing_at_a_deleted_role_falls_back(self):
+        from aicouncil import prompts
+
+        text = prompts.resolve_system("polisher", {"role_template": "gone"}, {})
+        self.assertIn("SENIOR STAFF ARCHITECT", text)
+
+    def test_an_empty_role_never_produces_an_empty_prompt(self):
+        from aicouncil import prompts
+
+        stored = {"hollow": {"name": "Hollow", "system": "   "}}
+        text = prompts.resolve_system("drafter", {"role_template": "hollow"}, stored)
+        self.assertTrue(text.strip())
+        self.assertIn("JUNIOR ENGINEER", text)

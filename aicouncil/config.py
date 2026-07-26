@@ -237,6 +237,13 @@ DEFAULTS: Dict[str, Any] = {
     # --- Prompting ----------------------------------------------------------
     # Extra standing instructions appended to both stages.
     "house_rules": "",
+    # --- Roles ------------------------------------------------------------
+    # Edits to the built-in roles and any roles the operator added, keyed by
+    # id. Built-ins are merged over their shipped definition rather than
+    # copied into here wholesale, so an untouched role keeps tracking the
+    # shipped text when this app updates, and "reset" is a delete.
+    "roles": {},
+
     # --- Quota ---------------------------------------------------------------
     # Poll the CLI's own /usage on launch and on this interval. Claude answers
     # locally, so this costs no tokens; agents that cannot report say so.
@@ -384,6 +391,15 @@ class ConfigStore:
         """Discard the in-memory copy and re-read from disk."""
         with self._lock:
             self._data = self._load()
+            return copy.deepcopy(self._data)
+
+    def replace_roles(self, roles: Dict[str, Any]) -> Dict[str, Any]:
+        """Set the roles map wholesale. ``update`` deep-merges, so a deleted
+        role would come straight back; deletion needs replacement."""
+        with self._lock:
+            self._data = _deep_merge(self._load(), {})
+            self._data["roles"] = copy.deepcopy(roles)
+            self._write()
             return copy.deepcopy(self._data)
 
     def reset(self) -> Dict[str, Any]:

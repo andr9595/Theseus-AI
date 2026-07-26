@@ -1233,3 +1233,59 @@ kbd {
 /* Shown when the chip's colour is driven by a limit other than the one whose
    number is displayed — e.g. a nearly-exhausted weekly behind a fresh session. */
 .usage-other { margin-left: 1px; font-weight: 700; }
+
+/* ---- Commit bar under the diff ---- */
+
+.commit-bar {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 12px; padding: 9px 11px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.commit-message {
+  flex: 1; min-width: 0; padding: 7px 10px;
+  font-family: var(--sans); font-size: 12.5px;
+  color: var(--text);
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.commit-message:focus { outline: none; border-color: var(--accent); }
+.commit-hint {
+  font-family: var(--mono); font-size: 10.5px;
+  color: var(--text-3); flex: 0 0 auto;
+}
+
+/* ---- Role manager ---- */
+
+.roles-panel { margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--line); }
+
+.roles-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin: 0 0 8px; font-size: 12.5px; font-weight: 620;
+}
+
+.role-list { display: flex; flex-direction: column; gap: 6px; }
+
+.role-row {
+  padding: 9px 11px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.role-row-head { display: flex; align-items: center; gap: 8px; }
+.role-name { font-size: 12.5px; font-weight: 600; flex: 0 0 auto; }
+.role-badges { display: flex; gap: 4px; flex: 1; flex-wrap: wrap; }
+.role-summary { margin-top: 3px; font-size: 11px; color: var(--text-3); }
+
+.role-badge {
+  padding: 1px 6px;
+  font-family: var(--mono); font-size: 9px;
+  color: var(--text-3);
+  background: var(--bg-3);
+  border-radius: 20px;
+}
+.role-badge.custom { color: var(--accent-2); background: rgba(124, 92, 255, .13); }
+.role-badge.edited { color: var(--yellow); background: rgba(234, 179, 8, .12); }
+.role-badge.writes { color: var(--amber); background: rgba(245, 165, 36, .12); }

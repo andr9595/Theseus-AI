@@ -306,7 +306,7 @@ class Pipeline:
             "agents": cfg.agent_catalog(),
             # The role behaviours a stage can be assigned. Served rather than
             # duplicated in the browser, so the shipped text has one home.
-            "roles": prompts.role_catalog(),
+            "roles": prompts.role_catalog(self.store.get("roles", {})),
             "providers_status": [
                 probe(providers[k]) for k in ("drafter", "polisher") if k in providers
             ],
@@ -595,7 +595,8 @@ class Pipeline:
                     run.task, run.repo, repo_status, house_rules,
                     run.conversation,
                     system=prompts.resolve_system(
-                        "drafter", providers.get("drafter", {})
+                        "drafter", providers.get("drafter", {}),
+                        conf.get("roles", {}),
                     ),
                 )
                 # Stage 1 is read-only by instruction, so it never receives the
@@ -720,7 +721,8 @@ class Pipeline:
                     run.task, run.repo, repo_status, house_rules,
                     run.conversation,
                     system=prompts.resolve_system(
-                        run.solo_stage, providers.get(run.solo_stage, {})
+                        run.solo_stage, providers.get(run.solo_stage, {}),
+                        conf.get("roles", {}),
                     ),
                 )
             else:
@@ -733,7 +735,8 @@ class Pipeline:
                     run.reviewer_note,
                     run.conversation,
                     system=prompts.resolve_system(
-                        "polisher", providers.get("polisher", {})
+                        "polisher", providers.get("polisher", {}),
+                        conf.get("roles", {}),
                     ),
                 )
 

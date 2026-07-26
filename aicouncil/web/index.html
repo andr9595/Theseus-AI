@@ -203,6 +203,12 @@ Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP
           </div>
         </div>
         <div class="tab-panel" data-panel="diff">
+          <div id="commit-bar" class="commit-bar hidden">
+            <input id="commit-message" class="commit-message" spellcheck="false"
+              placeholder="Commit message&hellip;">
+            <button id="commit-btn" class="btn btn-primary btn-sm" type="button">Commit</button>
+            <span id="commit-hint" class="commit-hint"></span>
+          </div>
           <div id="diff-view" class="diff-view empty-state">
             Changes made to your working tree appear here as a git diff.
           </div>
@@ -246,6 +252,18 @@ Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP
         <code>{prompt}</code> is replaced with the generated prompt.
       </p>
       <div id="provider-forms"></div>
+
+      <section class="roles-panel">
+        <h4 class="roles-head">
+          Roles
+          <button id="role-new" class="btn btn-quiet btn-sm" type="button">New role</button>
+        </h4>
+        <p class="settings-note">
+          Every role is editable, including the built-in ones. Editing a
+          built-in overrides its shipped text; <b>Restore</b> puts it back.
+        </p>
+        <div id="role-list" class="role-list"></div>
+      </section>
 
       <div class="field">
         <label for="house-rules">Standing project rules</label>
