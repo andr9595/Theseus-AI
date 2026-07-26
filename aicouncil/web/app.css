@@ -282,9 +282,20 @@ html, body {
 
 .agent-rail { display: flex; flex-direction: column; gap: 8px; }
 
+/* Two rows: identity on top, the pickers beneath. It was one flex row until
+   the effort chip arrived and the right-hand column - which does not shrink -
+   squeezed the name and role to nothing. The pickers are the widest thing on
+   the card and the least urgent to read, so they get their own line instead of
+   competing with the name for it. */
 .agent-card {
   position: relative;
-  display: flex; align-items: center; gap: 10px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas:
+    "avatar body  right"
+    "chips  chips chips";
+  align-items: center;
+  column-gap: 10px; row-gap: 7px;
   padding: 10px 11px;
   background: var(--bg-2);
   border: 1px solid var(--line);
@@ -296,6 +307,7 @@ html, body {
 .agent-card[data-agent="polisher"] { --agent-color: var(--amber); }
 
 .agent-avatar {
+  grid-area: avatar;
   display: grid; place-items: center;
   width: 30px; height: 30px; flex: 0 0 auto;
   border-radius: 8px;
@@ -305,13 +317,19 @@ html, body {
   border: 1px solid color-mix(in srgb, var(--agent-color) 28%, transparent);
 }
 
-.agent-body { flex: 1; min-width: 0; }
-.agent-name { font-size: 12.5px; font-weight: 600; }
-.agent-role { font-size: 10.5px; color: var(--text-3); }
+.agent-body { grid-area: body; min-width: 0; }
+.agent-name {
+  font-size: 12.5px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.agent-role {
+  font-size: 10.5px; color: var(--text-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 
 .agent-right {
+  grid-area: right;
   display: flex; flex-direction: column; align-items: flex-end; gap: 4px;
-  flex: 0 0 auto;
 }
 
 .agent-state {
@@ -324,7 +342,7 @@ html, body {
 
 .model-chip {
   display: inline-flex; align-items: center; gap: 3px;
-  max-width: 108px; padding: 1px 5px 1px 7px;
+  min-width: 0; padding: 1px 5px 1px 7px;
   font: inherit; font-family: var(--mono); font-size: 9.5px;
   color: var(--text-3);
   background: var(--bg-3);
@@ -338,10 +356,19 @@ html, body {
 .model-chip.set { color: var(--agent-color, var(--accent-2)); }
 .model-chip svg { flex: 0 0 auto; opacity: .7; }
 
-/* Model and effort sit on one line: they are two halves of one decision, and
-   stacking them pushed the card taller than the avatar beside it. */
-.chip-row { display: flex; align-items: center; gap: 4px; }
-.effort-chip { max-width: 84px; }
+/* Model and effort sit together on the card's own row: they are two halves of
+   one decision, and reading them as a pair is the point. The model takes the
+   room it needs and truncates last, since a slug carries more meaning than a
+   one-word effort level. */
+.chip-row {
+  grid-area: chips;
+  display: flex; align-items: center; gap: 4px; min-width: 0;
+}
+.chip-row .model-chip { flex: 0 1 auto; }
+.chip-row .effort-chip { flex: 0 0 auto; }
+/* The label the chip carries, clipped rather than the whole button, so the
+   caret stays visible on a chip that had to give up room. */
+.chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ---- Model picker menu ---- */
 

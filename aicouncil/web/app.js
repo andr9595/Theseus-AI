@@ -750,9 +750,17 @@ function renderAgents() {
     const initial = (provider.label || id).slice(0, 2).toUpperCase();
     // An empty model means the CLI picks; say so rather than showing a blank.
     const modelLabel = provider.model || 'default model';
-    // Same for effort. Shown only when the command has the knob at all, so a
-    // hand-written template does not sprout a chip that cannot do anything.
+    // The effort chip says only "default", not "default effort" — it sits
+    // beside the model chip, which names itself, and the tooltip covers the
+    // rest. On a 251px card the words it saves are the name's.
+    const effortLabel = provider.effort || 'default';
+    // Shown only when the command has the knob at all, so a hand-written
+    // template does not sprout a chip that cannot do anything.
     const hasEffort = (provider.effort_args || []).length > 0;
+    const caret =
+      `<svg viewBox="0 0 24 24" width="9" height="9" fill="none" stroke="currentColor" ` +
+      `stroke-width="3" stroke-linecap="round" stroke-linejoin="round">` +
+      `<path d="M6 9l6 6 6-6"/></svg>`;
 
     return (
       `<div class="agent-card ${stageState} ${available ? '' : 'unavailable'}" data-agent="${id}">` +
@@ -772,25 +780,23 @@ function renderAgents() {
         `<div class="agent-right">` +
           `<div class="agent-state">${esc(label)}${esc(duration)}</div>` +
           usageChipHtml(id) +
-          `<div class="chip-row">` +
-            `<button class="model-chip${provider.model ? ' set' : ''}" type="button" ` +
-              `data-model-for="${id}" title="Change the model for this stage">` +
-              `${esc(modelLabel)}` +
-              `<svg viewBox="0 0 24 24" width="9" height="9" fill="none" stroke="currentColor" ` +
-              `stroke-width="3" stroke-linecap="round" stroke-linejoin="round">` +
-              `<path d="M6 9l6 6 6-6"/></svg>` +
-            `</button>` +
-            (hasEffort
-              ? `<button class="model-chip effort-chip${provider.effort ? ' set' : ''}" ` +
-                `type="button" data-effort-for="${id}" ` +
-                `title="How hard this stage is asked to think">` +
-                `${esc(provider.effort || 'default effort')}` +
-                `<svg viewBox="0 0 24 24" width="9" height="9" fill="none" stroke="currentColor" ` +
-                `stroke-width="3" stroke-linecap="round" stroke-linejoin="round">` +
-                `<path d="M6 9l6 6 6-6"/></svg>` +
-              `</button>`
-              : '') +
-          `</div>` +
+        `</div>` +
+        // Its own row, spanning the card. Stacked in the column above it, the
+        // pickers left the name and role no width at all.
+        `<div class="chip-row">` +
+          `<button class="model-chip${provider.model ? ' set' : ''}" type="button" ` +
+            `data-model-for="${id}" ` +
+            `title="Model for this stage — ${esc(modelLabel)}">` +
+            `<span class="chip-label">${esc(modelLabel)}</span>${caret}` +
+          `</button>` +
+          (hasEffort
+            ? `<button class="model-chip effort-chip${provider.effort ? ' set' : ''}" ` +
+              `type="button" data-effort-for="${id}" ` +
+              `title="How hard this stage is asked to think — ` +
+              `${esc(provider.effort || "the CLI's own default")}">` +
+              `<span class="chip-label">${esc(effortLabel)}</span>${caret}` +
+            `</button>`
+            : '') +
         `</div>` +
       `</div>`
     );
