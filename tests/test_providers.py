@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from aicouncil.providers import (  # noqa: E402
     ARGV_PROMPT_LIMIT,
     ClaudeStreamReader,
+    discover_efforts,
     discover_models,
     ProviderRunner,
     ProviderUnavailable,
@@ -201,6 +202,79 @@ class TestModelSelection(unittest.TestCase):
         provider = dict(CLAUDE, model="a; rm -rf /")
         argv, _ = build_argv(provider, "hi", auto_approve=False)
         self.assertIn("a; rm -rf /", argv)  # one literal argv entry
+
+
+class TestEffortSelection(unittest.TestCase):
+    """Reasoning depth, the knob `/effort` sets in Claude Code.
+
+    Its flag has no common spelling - Claude takes `--effort high` and Codex
+    takes `-c model_reasoning_effort=high` - so unlike the model there is no
+    fallback to guess at. A provider with no `effort_args` has no knob.
+    """
+
+    def test_no_effort_means_no_effort_flag(self):
+        provider = dict(CLAUDE, effort_args=["--effort", "{effort}"])
+        argv, _ = build_argv(provider, "hi", auto_approve=False)
+        self.assertNotIn("--effort", argv)
+
+    def test_effort_is_passed_before_the_prompt(self):
+        provider = dict(CLAUDE, effort="xhigh", effort_args=["--effort", "{effort}"])
+        argv, _ = build_argv(provider, "hi", auto_approve=False)
+        self.assertEqual(argv, ["claude", "-p", "--effort", "xhigh", "hi"])
+
+    def test_codex_takes_its_effort_as_a_config_override(self):
+        provider = dict(
+            CODEX, effort="high",
+            effort_args=["-c", "model_reasoning_effort={effort}"],
+        )
+        argv, _ = build_argv(provider, "task", auto_approve=False)
+        self.assertEqual(
+            argv, ["codex", "exec", "-c", "model_reasoning_effort=high", "task"]
+        )
+
+    def test_an_effort_with_no_flag_configured_is_dropped(self):
+        # Never guessed at: `--effort` handed to codex, or a bare `high`, would
+        # be read as the prompt or rejected outright.
+        provider = dict(CODEX, effort="high")
+        argv, _ = build_argv(provider, "task", auto_approve=False)
+        self.assertEqual(argv, ["codex", "exec", "task"])
+
+    def test_whitespace_only_effort_is_ignored(self):
+        provider = dict(CLAUDE, effort="  ", effort_args=["--effort", "{effort}"])
+        argv, _ = build_argv(provider, "hi", auto_approve=False)
+        self.assertNotIn("--effort", argv)
+
+    def test_model_and_effort_and_grant_all_precede_the_prompt(self):
+        provider = dict(
+            CLAUDE, model="opus", effort="max",
+            model_args=["--model", "{model}"],
+            effort_args=["--effort", "{effort}"],
+        )
+        argv, _ = build_argv(provider, "hi", auto_approve=True)
+        self.assertEqual(argv, [
+            "claude", "-p",
+            "--model", "opus",
+            "--effort", "max",
+            "--dangerously-skip-permissions",
+            "hi",
+        ])
+
+    def test_effort_goes_last_when_prompt_is_on_stdin(self):
+        provider = dict(
+            CLAUDE, effort="low", prompt_on_stdin=True,
+            effort_args=["--effort", "{effort}"],
+        )
+        argv, stdin = build_argv(provider, "hi", auto_approve=False)
+        self.assertEqual(argv, ["claude", "-p", "--effort", "low"])
+        self.assertEqual(stdin, "hi")
+
+    def test_effort_value_is_never_shell_interpreted(self):
+        provider = dict(
+            CODEX, effort="a; rm -rf /",
+            effort_args=["-c", "model_reasoning_effort={effort}"],
+        )
+        argv, _ = build_argv(provider, "hi", auto_approve=False)
+        self.assertIn("model_reasoning_effort=a; rm -rf /", argv)
 
 
 class TestStreamingArgs(unittest.TestCase):
@@ -575,4 +649,118 @@ class TestModelDiscovery(unittest.TestCase):
     def test_unknown_cli_reports_no_discovery(self):
         r = discover_models({"command": ["some-other-agent", "{prompt}"]})
         self.assertEqual(r["models"], [])
+        self.assertTrue(r["error"])
+
+
+class TestEffortDiscovery(unittest.TestCase):
+    """Which levels are legal is per-model, and Codex says so in its cache.
+
+    Getting this wrong is not cosmetic: Codex fails a run outright on a level
+    the model does not accept, minutes after launch, for a reason nothing on
+    screen would explain.
+    """
+
+    CODEX_PROVIDER = {
+        "command": ["codex", "exec", "{prompt}"],
+        "effort_args": ["-c", "model_reasoning_effort={effort}"],
+    }
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-efforts-"))
+        self._old = os.environ.get("CODEX_HOME")
+        os.environ["CODEX_HOME"] = str(self.tmp)
+        self._write_cache({"fetched_at": "2026-07-26T03:15:04Z", "models": [
+            {
+                "slug": "deep-model", "visibility": "list",
+                "default_reasoning_level": "medium",
+                "supported_reasoning_levels": [
+                    {"effort": "low", "description": "quick"},
+                    {"effort": "medium", "description": "balanced"},
+                    {"effort": "ultra", "description": "delegates"},
+                ],
+            },
+            {
+                "slug": "shallow-model", "visibility": "list",
+                "default_reasoning_level": "low",
+                "supported_reasoning_levels": [
+                    {"effort": "low", "description": "quick"},
+                    {"effort": "medium", "description": "balanced"},
+                ],
+            },
+            {
+                "slug": "internal-model", "visibility": "hide",
+                "supported_reasoning_levels": [{"effort": "low"}],
+            },
+        ]})
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = self._old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_cache(self, payload):
+        (self.tmp / "models_cache.json").write_text(json.dumps(payload))
+
+    def _levels(self, result):
+        return [level["effort"] for level in result["levels"]]
+
+    def test_a_command_with_no_effort_flag_has_no_effort_knob(self):
+        r = discover_efforts({"command": ["codex", "exec", "{prompt}"]})
+        self.assertEqual(r["levels"], [])
+        self.assertIn("effort_args", r["error"])
+
+    def test_levels_come_from_the_selected_model(self):
+        r = discover_efforts(dict(self.CODEX_PROVIDER, model="deep-model"))
+        self.assertEqual(self._levels(r), ["low", "medium", "ultra"])
+        self.assertEqual(r["default"], "medium")
+        # The vendor's own wording, not this app's paraphrase of it.
+        self.assertEqual(r["levels"][2]["description"], "delegates")
+
+    def test_a_shallower_model_does_not_inherit_a_deeper_one_s_levels(self):
+        r = discover_efforts(dict(self.CODEX_PROVIDER, model="shallow-model"))
+        self.assertNotIn("ultra", self._levels(r))
+
+    def test_with_no_model_pinned_only_universally_safe_levels_are_offered(self):
+        # The CLI picks the model, so only levels every model accepts are safe.
+        r = discover_efforts(self.CODEX_PROVIDER)
+        self.assertEqual(self._levels(r), ["low", "medium"])
+
+    def test_hidden_models_do_not_narrow_the_shared_set(self):
+        # internal-model offers only `low`; it is not selectable, so counting
+        # it would strip `medium` from a menu that can legitimately offer it.
+        r = discover_efforts(self.CODEX_PROVIDER)
+        self.assertIn("medium", self._levels(r))
+
+    def test_an_uncatalogued_model_reports_unknown_rather_than_guessing(self):
+        r = discover_efforts(dict(self.CODEX_PROVIDER, model="not-in-catalogue"))
+        self.assertEqual(r["levels"], [])
+        self.assertIn("not-in-catalogue", r["error"])
+
+    def test_a_missing_cache_explains_itself(self):
+        (self.tmp / "models_cache.json").unlink()
+        r = discover_efforts(dict(self.CODEX_PROVIDER, model="deep-model"))
+        self.assertEqual(r["levels"], [])
+        self.assertIn("models_cache.json", r["error"])
+
+    def test_claude_falls_back_to_known_levels_when_it_cannot_be_asked(self):
+        # The binary is absent here, so the probe cannot run. A menu with no
+        # options at all would be worse than the levels the CLI documents.
+        r = discover_efforts({
+            "command": ["claude-does-not-exist", "-p", "{prompt}"],
+            "effort_args": ["--effort", "{effort}"],
+        })
+        self.assertEqual(self._levels(r), ["low", "medium", "high", "xhigh", "max"])
+        self.assertFalse(r["error"])
+        # And it says the list is second-hand, rather than passing a shipped
+        # list off as something the CLI just confirmed.
+        self.assertIn("could not be asked", r["source"])
+
+    def test_unknown_cli_reports_no_discovery(self):
+        r = discover_efforts({
+            "command": ["some-other-agent", "{prompt}"],
+            "effort_args": ["--effort", "{effort}"],
+        })
+        self.assertEqual(r["levels"], [])
         self.assertTrue(r["error"])

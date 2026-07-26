@@ -84,6 +84,12 @@ AGENTS: Dict[str, Dict[str, Any]] = {
         "auto_approve_args": ["--dangerously-bypass-approvals-and-sandbox"],
         # argv fragment used to pass the model. `{model}` is substituted.
         "model_args": ["--model", "{model}"],
+        # How hard the model is asked to think. Codex has no `--effort` flag:
+        # reasoning depth is the `model_reasoning_effort` key in config.toml,
+        # and `-c` overrides it for one run without editing that file. Which
+        # levels are legal depends on the model, so the picker reads them from
+        # the same cache the model list comes from.
+        "effort_args": ["-c", "model_reasoning_effort={effort}"],
         # Empty on purpose: `codex exec` already narrates its work on stdout as
         # it goes. Present all the same, so assigning this agent to a job
         # clears the other's streaming flags instead of leaving them behind on
@@ -95,6 +101,10 @@ AGENTS: Dict[str, Dict[str, Any]] = {
         "command": ["claude", "-p", "{prompt}"],
         "auto_approve_args": ["--dangerously-skip-permissions"],
         "model_args": ["--model", "{model}"],
+        # Claude Code takes the level as a first-class flag. Unlike Codex it
+        # warns and falls back to its default on a value it does not know, so a
+        # level that a future release drops degrades rather than failing a run.
+        "effort_args": ["--effort", "{effort}"],
         # `claude -p` in its default text mode prints nothing at all until the
         # run is over, so the live stream sat empty for minutes and then filled
         # with the conclusion in one go. This asks for one JSON event per step
@@ -138,6 +148,7 @@ def agent_catalog() -> List[Dict[str, Any]]:
         "command": [],
         "auto_approve_args": [],
         "model_args": [],
+        "effort_args": [],
         "stream_args": [],
     })
     return catalog
@@ -172,6 +183,13 @@ DEFAULT_DRAFTER = {
     # would be both stale and wrong for accounts with different entitlements
     # (a ChatGPT-account login cannot run every model an API key can).
     "models": [],
+    # --- Reasoning effort ---------------------------------------------------
+    # How hard the model is asked to think, the same knob `/effort` sets in
+    # Claude Code and the reasoning selector sets in Codex. Empty means the
+    # CLI's own default, which is what the vendor tuned for that model. Not
+    # enumerated here for the same reason `models` is not: the legal levels
+    # are per-model and the picker reads them at open time.
+    "effort": "",
     # --- Agent -------------------------------------------------------------
     # Codex drafts by default because its quota is the generous one. Reassign
     # it in Settings; nothing else about this stage has to change.
@@ -200,6 +218,10 @@ DEFAULT_POLISHER = {
     # this app cannot know which ones an account may use, and a stale pinned
     # ID is exactly the failure being avoided. Type one to use it anyway.
     "models": [],
+    # --- Reasoning effort ---------------------------------------------------
+    # Empty for the same reason as the drafter: the CLI's default is the tuned
+    # one, and the legal levels depend on the model in use.
+    "effort": "",
     # --- Agent -------------------------------------------------------------
     **copy.deepcopy(AGENTS["claude"]),
 }
@@ -320,6 +342,11 @@ def _resolve_agent_choices(
         # handed to `claude --model` fails at launch - so the swap clears them.
         changes["model"] = ""
         changes["models"] = []
+        # Nor are reasoning levels: `ultra` exists only on some Codex models,
+        # and Claude's set is its own. Carrying one over would either be
+        # rejected outright or silently ignored, and silently ignored is worse
+        # - the chip would keep claiming a depth the run never used.
+        changes["effort"] = ""
     return out
 
 

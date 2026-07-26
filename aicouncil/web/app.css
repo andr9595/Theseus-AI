@@ -338,6 +338,11 @@ html, body {
 .model-chip.set { color: var(--agent-color, var(--accent-2)); }
 .model-chip svg { flex: 0 0 auto; opacity: .7; }
 
+/* Model and effort sit on one line: they are two halves of one decision, and
+   stacking them pushed the card taller than the avatar beside it. */
+.chip-row { display: flex; align-items: center; gap: 4px; }
+.effort-chip { max-width: 84px; }
+
 /* ---- Model picker menu ---- */
 
 .model-menu {
@@ -1368,6 +1373,13 @@ kbd {
   cursor: pointer;
 }
 .link-btn:hover { border-bottom-color: var(--accent-2); }
+/* Present but inert — the operator can see the control and read its tooltip
+   for why it cannot act yet, rather than wondering where it went. */
+.link-btn:disabled {
+  color: var(--text-3); border-bottom-style: dotted;
+  border-bottom-color: var(--line); cursor: default;
+}
+.link-btn.active { color: var(--green); border-bottom-color: var(--green); }
 
 .field-hint.warn { color: var(--yellow); }
 

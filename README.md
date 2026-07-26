@@ -231,6 +231,14 @@ measures the replayed conversation only: your task, the junior's draft and
 whatever the agent reads for itself all land in the same window, so treat it as
 a floor rather than a total.
 
+How far below the total is worth knowing. A `claude -p` run with a 22-character
+prompt — one this meter would price at ~6 tokens — reports **36,560 input
+tokens**, because Claude Code loads its own system prompt, tool schemas and
+`CLAUDE.md` before your text arrives. That is roughly 18% of a 200k window spent
+before the council has said anything. So the meter is a reliable guide to
+whether *the thread* is getting expensive, and not a reading of how full the
+window actually is.
+
 A thread is bounded at both ends. Each stage's answer is trimmed when it is
 recorded, and once the rendered thread would exceed its budget the oldest turns
 are **compacted**: your message, the outcome, your steer at the gate and the
@@ -242,8 +250,14 @@ labelled as a summary both in the prompt and in the conversation view, so no
 agent mistakes an outline for the whole reply.
 
 **Compact** next to the banner does it early, before the thread gets that far.
-It applies to the run you are about to start; the transcripts already on disk
-are never rewritten.
+It is a toggle on the run you are about to start, not an action taken there and
+then: click it and the meter immediately re-reads for the compacted thread, so
+you can see what it buys before spending anything, and click it again to send
+the turns in full after all. The transcripts already on disk are never
+rewritten. The button is present whenever a conversation is attached and says
+in its tooltip when there is nothing yet to compact — with only one earlier
+message there is nothing to summarise, because the newest turn is always sent
+whole.
 
 Compaction happens here, on the council's own transcript, rather than through a
 CLI's own `/compact`. Every stage is a fresh process replaying that transcript,
@@ -553,6 +567,41 @@ whatever it is configured for. That is the setting most likely to still be
 correct in six months. A practical split: put the cheap, generous-quota model
 on Stage 1 and spend the rationed one on Stage 2, which is where judgement
 actually matters.
+
+### Choosing a reasoning effort per stage
+
+Beside the model chip is a second one for **reasoning effort** — the same knob
+`/effort` sets in Claude Code and the reasoning selector sets in Codex. Depth
+costs quota, and the two stages want different amounts of it: a junior sketching
+an approach rarely needs what a senior verifying it against the real code does.
+
+The levels are asked for, not shipped, for the same reason the model list is —
+and here it matters more, because the legal set is **per model**. Codex
+publishes `supported_reasoning_levels` for each model in the same
+`models_cache.json` the model picker reads, along with its default and the
+vendor's own one-line description of each level, so a model offering `ultra` and
+one stopping at `xhigh` are told apart rather than averaged. Claude Code will
+name its own levels if you hand it one it does not recognise, and does so
+without reaching the model, so the picker simply asks — at no cost in tokens or
+quota.
+
+With no model pinned the CLI chooses one, so Codex's menu offers only the levels
+*every* selectable model accepts. Pin a model to unlock the rest.
+
+Changing the model re-checks the level you had set, and clears it if the new
+model does not offer it. That check exists because the two CLIs fail
+differently: Claude warns and falls back to its default, which is survivable,
+while Codex rejects the run outright — minutes after launch, for a reason
+nothing on screen would explain.
+
+Blank — the default — passes no effort flag at all and lets each CLI use the
+depth its vendor tuned for that model.
+
+The flag itself lives in `effort_args` under **Command line** in Settings, next
+to `model_args`, because there is no common spelling: Claude takes
+`--effort high` and Codex takes `-c model_reasoning_effort=high`. A configured
+command with no `effort_args` has no effort knob, and gets no chip — nothing is
+guessed at, since a wrong guess would be read as the prompt or rejected.
 
 ---
 

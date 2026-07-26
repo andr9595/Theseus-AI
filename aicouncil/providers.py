@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -40,6 +41,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 PROMPT_TOKEN = "{prompt}"
 MODEL_TOKEN = "{model}"
+EFFORT_TOKEN = "{effort}"
 
 # A prompt longer than this is piped on stdin regardless of the configured
 # mode. Linux caps a single argv entry at MAX_ARG_STRLEN (128 KB), and the CLI
@@ -188,6 +190,18 @@ def build_argv(
             if not token:
                 continue
             extra.append(token.replace(MODEL_TOKEN, model))
+
+    effort = str(provider.get("effort") or "").strip()
+    if effort:
+        # No fallback here, unlike the model above. There is no spelling this
+        # is safe to guess at: Claude takes `--effort high` and Codex takes
+        # `-c model_reasoning_effort=high`, and either one handed to the other
+        # binary is an error. A provider with no `effort_args` simply has no
+        # effort knob, and the picker does not offer one.
+        for token in provider.get("effort_args") or []:
+            if not token:
+                continue
+            extra.append(token.replace(EFFORT_TOKEN, effort))
 
     if auto_approve:
         extra.extend(a for a in (provider.get("auto_approve_args") or []) if a)
@@ -710,6 +724,176 @@ def _discover_codex_models() -> Dict:
         "models": models,
         "source": f"{cache} (fetched {data.get('fetched_at', '?')})",
         "error": "" if models else "Cache contained no selectable models.",
+    }
+
+
+# Fallback for `claude --effort`, used only when the probe below cannot run.
+# Transcribed from the CLI's own validation message (claude 2.1.219) rather
+# than invented, and ordered shallowest-first as the CLI lists them.
+CLAUDE_EFFORT_FALLBACK = ["low", "medium", "high", "xhigh", "max"]
+
+# What each level means. Codex publishes its own wording per model and that is
+# preferred where it exists; this covers Claude, which publishes none.
+EFFORT_NOTES = {
+    "low": "fastest, least thinking",
+    "medium": "balanced",
+    "high": "deeper thinking, slower",
+    "xhigh": "very deep, noticeably slower",
+    "max": "maximum depth",
+    "ultra": "maximum depth, delegates subtasks",
+}
+
+
+def discover_efforts(provider: Dict) -> Dict:
+    """What reasoning levels the configured CLI will accept.
+
+    The legal set is not universal and not static: Codex varies it per model
+    (only some models offer ``ultra``) and Claude keeps its own. Both are asked
+    rather than assumed, for the same reason the model list is.
+
+    Returns ``{"levels": [{"effort", "description"}], "default": str,
+    "source": str, "error": str}``. An empty ``levels`` means this command has
+    no effort knob, which is the honest answer for a hand-written template.
+    """
+    if not (provider.get("effort_args") or []):
+        return {
+            "levels": [], "default": "", "source": "",
+            "error": (
+                "This command has no reasoning-effort setting. Add one as "
+                "`effort_args` in Settings if the CLI accepts a level."
+            ),
+        }
+
+    exe = (provider.get("command") or [""])[0]
+    base = os.path.basename(str(exe))
+    if "codex" in base:
+        return _discover_codex_efforts(str(provider.get("model") or "").strip())
+    if "claude" in base:
+        return _discover_claude_efforts(provider)
+    return {
+        "levels": [], "default": "", "source": "",
+        "error": "No effort discovery available for this CLI.",
+    }
+
+
+def _discover_claude_efforts(provider: Dict) -> Dict:
+    """Ask `claude` itself which levels it accepts.
+
+    Handing it a value it cannot know makes it print the whole legal set and
+    exit. With `-p ""` it never reaches the model, so this costs no quota and
+    no tokens - it is a pure argument-validation path.
+    """
+    path = resolve_binary(list(provider.get("command") or []))
+    levels: List[str] = []
+    source = ""
+    if path:
+        try:
+            proc = subprocess.run(
+                # A value no real level will ever be. Not a NUL sentinel:
+                # argv cannot carry one and subprocess rejects it outright.
+                [path, "--effort", "?ask", "-p", ""],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            text = (proc.stdout or "") + (proc.stderr or "")
+            match = re.search(r"Valid values:\s*([a-zA-Z0-9_, -]+)", text)
+            if match:
+                levels = [v.strip() for v in match.group(1).split(",") if v.strip()]
+                source = "claude --effort validation (asked just now)"
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            pass
+
+    if not levels:
+        levels = list(CLAUDE_EFFORT_FALLBACK)
+        source = "known values for claude --effort (the CLI could not be asked)"
+
+    return {
+        "levels": [
+            {"effort": name, "description": EFFORT_NOTES.get(name, "")}
+            for name in levels
+        ],
+        # Claude does not report which level it defaults to, and it varies by
+        # model. Saying nothing beats naming one and being wrong.
+        "default": "",
+        "source": source,
+        "error": "",
+    }
+
+
+def _discover_codex_efforts(model: str) -> Dict:
+    """Read the levels Codex publishes for the selected model.
+
+    Each entry in the model cache carries its own ``supported_reasoning_levels``
+    and ``default_reasoning_level``, so a model that offers ``ultra`` and one
+    that stops at ``xhigh`` are told apart rather than averaged.
+
+    With no model pinned the CLI picks, and this cannot know which - so it
+    offers only the levels *every* listed model accepts. That set is safe
+    whatever the CLI chooses; picking a model first unlocks the rest.
+    """
+    home = os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
+    cache = Path(home) / "models_cache.json"
+    try:
+        data = json.loads(cache.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        return {
+            "levels": [], "default": "", "source": str(cache),
+            "error": (
+                f"Could not read {cache}: {exc}. Run `codex` once so it "
+                f"fetches the catalogue for your account."
+            ),
+        }
+
+    entries = [e for e in (data.get("models") or []) if isinstance(e, dict)]
+    fetched = data.get("fetched_at", "?")
+
+    def levels_of(entry: Dict) -> List[Dict[str, str]]:
+        out = []
+        for level in entry.get("supported_reasoning_levels") or []:
+            if isinstance(level, dict) and level.get("effort"):
+                out.append(
+                    {
+                        "effort": str(level["effort"]),
+                        "description": str(level.get("description") or ""),
+                    }
+                )
+        return out
+
+    if model:
+        for entry in entries:
+            if str(entry.get("slug") or "") == model:
+                return {
+                    "levels": levels_of(entry),
+                    "default": str(entry.get("default_reasoning_level") or ""),
+                    "source": f"{cache} · {model} (fetched {fetched})",
+                    "error": "",
+                }
+        return {
+            "levels": [], "default": "", "source": str(cache),
+            "error": (
+                f"{model!r} is not in the model catalogue, so its reasoning "
+                f"levels are unknown."
+            ),
+        }
+
+    listed = [e for e in entries if e.get("visibility") == "list"]
+    if not listed:
+        return {
+            "levels": [], "default": "", "source": str(cache),
+            "error": "The model catalogue lists no selectable models.",
+        }
+
+    shared = set.intersection(*({l["effort"] for l in levels_of(e)} for e in listed))
+    # Ordered by the first model that lists them, which is the vendor's own
+    # shallow-to-deep ordering rather than anything alphabetical.
+    ordered = [l for l in levels_of(listed[0]) if l["effort"] in shared]
+    return {
+        "levels": ordered,
+        "default": "",
+        "source": f"{cache} · levels common to every model (fetched {fetched})",
+        "error": (
+            "" if ordered else
+            "No reasoning level is accepted by every model in the catalogue."
+        ),
     }
 
 

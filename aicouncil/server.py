@@ -39,7 +39,7 @@ from . import gitutil
 from .events import EventBus, drain, sse_comment, sse_format
 from .pipeline import Pipeline, PipelineBusy
 from . import prompts
-from .providers import discover_models, probe
+from .providers import discover_efforts, discover_models, probe
 from .usage import UsagePoller
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
@@ -206,6 +206,7 @@ class Handler(BaseHTTPRequestHandler):
             ("GET", "/api/context"): self._api_context,
             ("GET", "/api/doctor"): self._api_doctor,
             ("GET", "/api/models"): self._api_models,
+            ("GET", "/api/efforts"): self._api_efforts,
             ("GET", "/api/usage"): lambda p: {
                 "ok": True, "usage": self.app.usage.snapshot()
             },
@@ -390,6 +391,22 @@ class Handler(BaseHTTPRequestHandler):
         result["ok"] = True
         result["provider"] = pid
         result["current"] = provider.get("model", "")
+        return result
+
+    def _api_efforts(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """What reasoning levels the configured CLI accepts for its model."""
+        pid = (params.get("provider") or [""])[0]
+        provider = self.app.store.get("providers", {}).get(pid)
+        if not provider:
+            raise ValueError(f"No such provider: {pid!r}")
+        result = discover_efforts(provider)
+        result["ok"] = True
+        result["provider"] = pid
+        result["current"] = provider.get("effort", "")
+        # Named so the menu can say which model the levels belong to - they
+        # differ between them, and a list with no model attached invites the
+        # assumption that it is universal.
+        result["model"] = provider.get("model", "")
         return result
 
     def _api_usage_refresh(self, params: Dict[str, list]) -> Dict[str, Any]:

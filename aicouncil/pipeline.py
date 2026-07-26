@@ -187,6 +187,7 @@ class StageRecord:
     command: List[str] = field(default_factory=list)
     exit_code: Optional[int] = None
     model: str = ""  # "" means the CLI's own default was used
+    effort: str = ""  # reasoning depth; "" means the CLI's own default
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -204,6 +205,7 @@ class StageRecord:
             "command": self.command,
             "exit_code": self.exit_code,
             "model": self.model,
+            "effort": self.effort,
         }
 
 
@@ -473,6 +475,7 @@ class Pipeline:
                     label=p.get("label", solo_stage),
                     role="Solo",
                     model=str(p.get("model") or ""),
+                    effort=str(p.get("effort") or ""),
                 )
             else:
                 d = providers.get("drafter", {})
@@ -481,6 +484,7 @@ class Pipeline:
                     label=d.get("label", "Codex"),
                     role=d.get("role", "Junior Draft"),
                     model=str(d.get("model") or ""),
+                    effort=str(d.get("effort") or ""),
                 )
                 p = providers.get("polisher", {})
                 run.stages["polisher"] = StageRecord(
@@ -488,6 +492,7 @@ class Pipeline:
                     label=p.get("label", "Claude"),
                     role=p.get("role", "Senior Polish"),
                     model=str(p.get("model") or ""),
+                    effort=str(p.get("effort") or ""),
                 )
 
             self._run = run
@@ -590,6 +595,7 @@ class Pipeline:
         """Run one stage. ``provider`` comes from the run's frozen config."""
         stage = run.stages[stage_id]
         stage.model = str(provider.get("model") or "")
+        stage.effort = str(provider.get("effort") or "")
         stage.state = "running"
         stage.started_at = time.time()
         self.bus.publish("stage_started", stage=stage_id, run=run.to_dict())

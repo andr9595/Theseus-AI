@@ -215,6 +215,27 @@ class TestAgentAssignment(unittest.TestCase):
         conf = self.store.update({"providers": {"polisher": {"agent": "codex"}}})
         self.assertEqual(conf["providers"]["polisher"]["model"], "")
 
+    def test_switching_agents_clears_the_reasoning_effort(self):
+        # `ultra` exists only on some Codex models and not on Claude at all.
+        # Carried over it would be silently ignored, and the chip would go on
+        # claiming a depth the run never used.
+        self.store.update({"providers": {"drafter": {"effort": "ultra"}}})
+        conf = self.store.update({"providers": {"drafter": {"agent": "claude"}}})
+        self.assertEqual(conf["providers"]["drafter"]["effort"], "")
+
+    def test_switching_agents_swaps_the_effort_flag(self):
+        # Claude takes `--effort high`; Codex takes a config override. Neither
+        # spelling means anything to the other binary.
+        conf = self.store.update({"providers": {"polisher": {"agent": "codex"}}})
+        self.assertEqual(
+            conf["providers"]["polisher"]["effort_args"],
+            ["-c", "model_reasoning_effort={effort}"],
+        )
+        conf = self.store.update({"providers": {"drafter": {"agent": "claude"}}})
+        self.assertEqual(
+            conf["providers"]["drafter"]["effort_args"], ["--effort", "{effort}"]
+        )
+
     def test_a_changed_agent_beats_a_stale_command_in_the_same_patch(self):
         # The Settings form submits both. Letting the textarea win would pair
         # Claude's binary with Codex's permission flag.

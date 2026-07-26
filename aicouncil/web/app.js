@@ -652,11 +652,26 @@ function renderContinuation() {
     : '';
   meter.classList.toggle('warn', contextIsTight(context) && !state.compactContext);
 
-  // Nothing to compact once every earlier turn already is, and nothing to
-  // offer before the measurement has arrived.
-  const room = context && context.compacted &&
-    context.compacted.compacted_turns > context.compacted_turns;
-  $('#compact-btn').classList.toggle('hidden', !(room && !state.compactContext));
+  // The button stays put whenever a conversation is attached, and says why it
+  // cannot do anything when it cannot. Hiding it instead made a working
+  // feature read as a missing one - the same mistake as dropping a stage card
+  // in Solo Mode - and it is the control the operator goes looking for by
+  // name, so it has to be findable before it is useful.
+  const btn = $('#compact-btn');
+  const room = !!(context && context.compacted &&
+    context.compacted.compacted_turns > context.compacted_turns);
+  btn.classList.toggle('hidden', !state.continueFrom);
+  btn.classList.toggle('active', state.compactContext);
+  btn.disabled = !room && !state.compactContext;
+  btn.textContent = state.compactContext ? 'Compacted ✓' : 'Compact';
+  btn.title = state.compactContext
+    ? 'Earlier turns will be summarised. Click to send them in full instead.'
+    : room
+      ? 'Summarise every earlier turn, keeping the newest in full.'
+      : !context
+        ? 'Measuring what this conversation replays…'
+        : 'Nothing to compact yet — the newest message is always sent in ' +
+          'full, and it is the only one here.';
 }
 
 /** Attach a transcript to the next run, and measure what that will replay. */
@@ -735,6 +750,9 @@ function renderAgents() {
     const initial = (provider.label || id).slice(0, 2).toUpperCase();
     // An empty model means the CLI picks; say so rather than showing a blank.
     const modelLabel = provider.model || 'default model';
+    // Same for effort. Shown only when the command has the knob at all, so a
+    // hand-written template does not sprout a chip that cannot do anything.
+    const hasEffort = (provider.effort_args || []).length > 0;
 
     return (
       `<div class="agent-card ${stageState} ${available ? '' : 'unavailable'}" data-agent="${id}">` +
@@ -754,13 +772,25 @@ function renderAgents() {
         `<div class="agent-right">` +
           `<div class="agent-state">${esc(label)}${esc(duration)}</div>` +
           usageChipHtml(id) +
-          `<button class="model-chip${provider.model ? ' set' : ''}" type="button" ` +
-            `data-model-for="${id}" title="Change the model for this stage">` +
-            `${esc(modelLabel)}` +
-            `<svg viewBox="0 0 24 24" width="9" height="9" fill="none" stroke="currentColor" ` +
-            `stroke-width="3" stroke-linecap="round" stroke-linejoin="round">` +
-            `<path d="M6 9l6 6 6-6"/></svg>` +
-          `</button>` +
+          `<div class="chip-row">` +
+            `<button class="model-chip${provider.model ? ' set' : ''}" type="button" ` +
+              `data-model-for="${id}" title="Change the model for this stage">` +
+              `${esc(modelLabel)}` +
+              `<svg viewBox="0 0 24 24" width="9" height="9" fill="none" stroke="currentColor" ` +
+              `stroke-width="3" stroke-linecap="round" stroke-linejoin="round">` +
+              `<path d="M6 9l6 6 6-6"/></svg>` +
+            `</button>` +
+            (hasEffort
+              ? `<button class="model-chip effort-chip${provider.effort ? ' set' : ''}" ` +
+                `type="button" data-effort-for="${id}" ` +
+                `title="How hard this stage is asked to think">` +
+                `${esc(provider.effort || 'default effort')}` +
+                `<svg viewBox="0 0 24 24" width="9" height="9" fill="none" stroke="currentColor" ` +
+                `stroke-width="3" stroke-linecap="round" stroke-linejoin="round">` +
+                `<path d="M6 9l6 6 6-6"/></svg>` +
+              `</button>`
+              : '') +
+          `</div>` +
         `</div>` +
       `</div>`
     );
@@ -1161,10 +1191,11 @@ function clearStream() {
 }
 
 /* ==========================================================================
-   8. Model picker
-   Neither CLI can enumerate its own models, so the list is whatever the user
-   has configured plus a free-text entry. That keeps a newly released model
-   one keystroke away instead of requiring an app update.
+   8. Model and effort pickers
+   Both lists are asked for at open time rather than shipped: Codex publishes
+   an account-scoped catalogue and Claude will name its own effort levels when
+   asked. The model menu keeps a free-text entry on top of that, so a model
+   released after the catalogue was fetched is still one keystroke away.
    ========================================================================== */
 
 function closeModelMenu() {
@@ -1268,6 +1299,88 @@ function onDocClickCloseModel(e) {
   closeModelMenu();
 }
 
+/** Reasoning-effort menu. Shares the model menu's chrome deliberately: it is
+ *  the same gesture on the same card, and a second set of styles would drift.
+ *  No free-text entry here — an effort the CLI does not know is either ignored
+ *  with a warning (Claude) or fatal (Codex), and neither is worth offering. */
+async function openEffortMenu(anchor, providerId) {
+  closeModelMenu();
+  const provider = ((state.config || {}).providers || {})[providerId] || {};
+  const current = provider.effort || '';
+  const who = provider.label || providerId;
+
+  const menu = document.createElement('div');
+  menu.className = 'model-menu';
+  menu.innerHTML =
+    `<div class="model-menu-head">${esc(who)} reasoning effort</div>` +
+    `<div class="model-loading">Asking ${esc(who)}…</div>`;
+  document.body.appendChild(menu);
+  positionModelMenu(menu, anchor);
+
+  let levels = [], fallback = '', source = '', error = '', model = '';
+  try {
+    const data = await api(`/api/efforts?provider=${encodeURIComponent(providerId)}`);
+    levels = data.levels || [];
+    fallback = data.default || '';
+    source = data.source || '';
+    error = data.error || '';
+    model = data.model || '';
+  } catch (err) {
+    error = err.message;
+  }
+
+  menu.innerHTML =
+    `<div class="model-menu-head">${esc(who)} reasoning effort` +
+      // Codex's levels differ per model, so name the one they belong to.
+      (model ? ` · ${esc(model)}` : '') +
+    `</div>` +
+    `<button class="model-opt${current ? '' : ' active'}" data-value="">` +
+      `<span class="model-opt-name">CLI default</span>` +
+      `<span class="model-opt-note">` +
+        `${fallback ? esc(fallback) : 'whatever the CLI is set to'}</span>` +
+    `</button>` +
+    levels.map(l =>
+      `<button class="model-opt${l.effort === current ? ' active' : ''}" ` +
+        `data-value="${esc(l.effort)}" title="${esc(l.description || '')}">` +
+        `<span class="model-opt-name">${esc(l.effort)}</span>` +
+        `<span class="model-opt-note">${esc(l.description || '')}</span>` +
+      `</button>`
+    ).join('') +
+    // A level set before the model changed, or typed into Settings by hand.
+    // Codex fails the run on one it does not recognise, so say so here rather
+    // than letting it surface as a launch error minutes into a task.
+    (current && levels.length && !levels.some(l => l.effort === current)
+      ? `<div class="model-menu-error">` +
+        `${esc(current)} is set but not offered here. It will be rejected at ` +
+        `launch — pick one above.</div>`
+      : '') +
+    (error ? `<div class="model-menu-error">${esc(error)}</div>` : '') +
+    (source ? `<div class="model-menu-source">${esc(source)}</div>` : '');
+
+  positionModelMenu(menu, anchor);
+
+  menu.addEventListener('click', (e) => {
+    const opt = e.target.closest('.model-opt');
+    if (!opt) return;
+    closeModelMenu();
+    setEffort(providerId, opt.dataset.value);
+  });
+
+  setTimeout(() => {
+    document.addEventListener('click', onDocClickCloseModel, { once: true });
+  }, 0);
+}
+
+async function setEffort(providerId, value) {
+  const provider = ((state.config || {}).providers || {})[providerId] || {};
+  await patchConfig({ providers: { [providerId]: { effort: value } } });
+  toast(
+    value ? `${provider.label || providerId} → ${value} effort`
+          : `${provider.label || providerId} → CLI default effort`,
+    'ok', 2600
+  );
+}
+
 async function setModel(providerId, value) {
   const providers = (state.config || {}).providers || {};
   const provider = providers[providerId] || {};
@@ -1283,6 +1396,32 @@ async function setModel(providerId, value) {
           : `${provider.label || providerId} → CLI default`,
     'ok', 2600
   );
+  await dropUnsupportedEffort(providerId, provider);
+}
+
+/** Clear a reasoning level the newly chosen model does not offer.
+ *
+ *  Codex varies its levels per model — only some accept `ultra` — and it fails
+ *  the run outright on one it does not know. Leaving a stale level set would
+ *  turn a model change into a run that dies at launch, minutes later, for a
+ *  reason nothing on screen explains. */
+async function dropUnsupportedEffort(providerId, provider) {
+  const effort = provider.effort || '';
+  if (!effort) return;
+  try {
+    const data = await api(`/api/efforts?provider=${encodeURIComponent(providerId)}`);
+    const levels = (data.levels || []).map(l => l.effort);
+    // An empty list means discovery failed, not that nothing is supported —
+    // clearing on that would silently undo a deliberate choice.
+    if (!levels.length || levels.includes(effort)) return;
+    await patchConfig({ providers: { [providerId]: { effort: '' } } });
+    toast(
+      `${provider.label || providerId} does not offer ${effort} effort on ` +
+      `that model — reset to the CLI default.`, 'warn', 5000
+    );
+  } catch (err) {
+    /* Discovery is best-effort; a failed check must not block a model change. */
+  }
 }
 
 /* ==========================================================================
@@ -1454,6 +1593,17 @@ function renderSettings() {
             `</div>` +
             `<div class="field-row">` +
               `<div class="field">` +
+                `<label>Reasoning effort (blank = the CLI's own default)</label>` +
+                `<input type="text" data-field="effort" value="${esc(p.effort || '')}">` +
+              `</div>` +
+              `<div class="field">` +
+                `<label>Effort flag (<code>{effort}</code> substituted)</label>` +
+                `<input type="text" data-field="effort_args" ` +
+                  `value="${esc((p.effort_args || []).join(' '))}">` +
+              `</div>` +
+            `</div>` +
+            `<div class="field-row">` +
+              `<div class="field">` +
                 `<label>Timeout (seconds)</label>` +
                 `<input type="number" min="30" max="21600" data-field="timeout_seconds" ` +
                   `value="${Number(p.timeout_seconds) || 900}">` +
@@ -1544,6 +1694,8 @@ async function saveSettings() {
       // Space-separated on this form, since a model flag is always short.
       model_args: field('model_args').value.trim().split(/\s+/).filter(Boolean),
       models: lines('models'),
+      effort: field('effort').value.trim(),
+      effort_args: field('effort_args').value.trim().split(/\s+/).filter(Boolean),
       timeout_seconds: Math.max(30, parseInt(field('timeout_seconds').value, 10) || 900),
       prompt_on_stdin: field('prompt_on_stdin').checked,
     };
@@ -2053,7 +2205,8 @@ function wire() {
     if (!chip) return;
     e.stopPropagation();
     if ($('.model-menu')) { closeModelMenu(); return; }  // toggle
-    openModelMenu(chip, chip.dataset.modelFor);
+    if (chip.dataset.effortFor) openEffortMenu(chip, chip.dataset.effortFor);
+    else openModelMenu(chip, chip.dataset.modelFor);
   });
   window.addEventListener('resize', closeModelMenu);
 
@@ -2137,9 +2290,11 @@ function wire() {
     $('[data-field="stream_args"]', form).value =
       (preset.stream_args || []).join('\n');
     $('[data-field="model_args"]', form).value = (preset.model_args || []).join(' ');
-    // Model names are not interchangeable between CLIs.
+    $('[data-field="effort_args"]', form).value = (preset.effort_args || []).join(' ');
+    // Neither model names nor effort levels are interchangeable between CLIs.
     $('[data-field="model"]', form).value = '';
     $('[data-field="models"]', form).value = '';
+    $('[data-field="effort"]', form).value = '';
   });
 
   // The probe results print into the Stages panel, so show it.
@@ -2200,13 +2355,19 @@ function wire() {
   // Compaction applies to the run about to start; the transcript on disk is
   // never rewritten, so the full text of every turn stays readable in its own
   // conversation.
+  // A toggle, not a one-way switch: compaction here is a choice about the run
+  // about to start, and one the operator can still take back - unlike Claude
+  // Code's `/compact`, which rewrites a live session there and then.
   $('#compact-btn').addEventListener('click', () => {
     if (!state.continueContext) return;
-    state.compactContext = true;
+    state.compactContext = !state.compactContext;
     renderContinuation();
     toast(
-      'Earlier turns will be summarised for the next run, keeping the window ' +
-      'clear for the work itself.', 'ok', 5200
+      state.compactContext
+        ? 'Earlier turns will be summarised for the next run, keeping the ' +
+          'window clear for the work itself.'
+        : 'Earlier turns will be sent in full again.',
+      'ok', 5200
     );
   });
 
