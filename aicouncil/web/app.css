@@ -82,8 +82,20 @@ html, body {
   padding: 18px 16px;
   background: var(--bg-1);
   border-right: 1px solid var(--line);
-  overflow-y: auto;
+  /* The sidebar itself must not scroll. It is a flex column, so if it did,
+     its children would still be free to shrink below their content height and
+     paint over whatever follows - which is how the Mode toggles ended up
+     printed across the Settings and History buttons. The scrolling belongs to
+     the active panel, below, so the brand, tabs and footer stay put. */
+  overflow: hidden;
 }
+
+/* Fixed furniture: these keep their natural height no matter how tall the
+   panel's content gets. Without this they are the first things flexbox
+   compresses. */
+.brand,
+.sidebar-tabs,
+.sidebar-foot { flex-shrink: 0; }
 
 .sidebar-spacer { flex: 1; min-height: 8px; }
 
@@ -124,9 +136,18 @@ html, body {
   flex: 1;
   flex-direction: column;
   gap: 18px;
+  /* min-height:0 lets this shrink; the overflow-y below is what turns that
+     into a scrollbar rather than content spilling out of the box. The two
+     belong together - min-height:0 on its own is the bug. */
   min-height: 0;
+  overflow-y: auto;
+  /* Room for the scrollbar so it never sits on top of a toggle. */
+  padding-right: 2px;
 }
 .sidebar-panel.active { display: flex; }
+
+/* A panel's own sections must not be squeezed either: the panel scrolls. */
+.sidebar-panel > * { flex-shrink: 0; }
 
 /* ---- Conversation list ---- */
 
