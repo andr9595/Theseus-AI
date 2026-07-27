@@ -72,8 +72,18 @@
     </div>
 
     <!-- Council members. Sticky above the thread rather than inside it: it is
-         the control surface for the run, so it must not scroll away mid-run. -->
+         the control surface for the run, so it must not scroll away mid-run.
+         Who sits here is routed from the prompt, so it changes as you type. -->
     <div id="council-strip" class="council-strip hidden"></div>
+
+    <!-- The three stages, as a stepper. Rendered with the same cells the
+         project tracker uses, so a stage in flight reads identically in both
+         places rather than inventing a second visual language for progress. -->
+    <div id="council-steps" class="council-steps hidden">
+      <div class="column">
+        <div class="project-strip"></div>
+      </div>
+    </div>
 
     <div id="scroll" class="scroll">
       <div class="column">
@@ -362,6 +372,7 @@
          reach another. Every panel stays in the DOM: Save reads them all. -->
     <div class="settings-tabs" role="tablist">
       <button class="settings-tab active" data-settings-tab="stages" role="tab">Agents</button>
+      <button class="settings-tab" data-settings-tab="council" role="tab">Council</button>
       <button class="settings-tab" data-settings-tab="roles" role="tab">Roles</button>
       <button class="settings-tab" data-settings-tab="run" role="tab">Run</button>
       <button class="settings-tab" data-settings-tab="project" role="tab">Project</button>
@@ -378,6 +389,78 @@
         </p>
         <div id="provider-forms"></div>
         <div id="doctor-out" class="doctor"></div>
+      </section>
+
+      <section class="settings-panel" data-settings-panel="council">
+        <p class="settings-note">
+          Who deliberates, and how hard they push each other. The bench is
+          chosen per run from what you asked for &mdash; a security question
+          seats a different council than a rename &mdash; so most of this
+          decides the <em>bounds</em> of that choice rather than the choice.
+        </p>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="council-seats">Members</label>
+            <input id="council-seats" type="number" min="2" max="6">
+            <span class="field-hint">
+              How many answer the task independently. Two is the floor: one
+              member has no peer to review.
+            </span>
+          </div>
+          <div class="field">
+            <label for="council-chair-timeout">Chair timeout (s)</label>
+            <input id="council-chair-timeout" type="number" min="60" max="7200">
+            <span class="field-hint">
+              The chair applies the patch, so it gets longer than the
+              read-only members.
+            </span>
+          </div>
+        </div>
+
+        <label class="toggle" for="council-routing">
+          <input type="checkbox" id="council-routing">
+          <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+          <span class="toggle-text">
+            <strong>Route the bench from the prompt</strong>
+            <em>Off pins the council to your seating below and ignores what you asked</em>
+          </span>
+        </label>
+
+        <label class="toggle" for="council-chair-deliberates">
+          <input type="checkbox" id="council-chair-deliberates">
+          <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+          <span class="toggle-text">
+            <strong>Chair also holds a seat</strong>
+            <em id="council-chair-note">Three positions instead of two, at the cost of a chair weighing its own</em>
+          </span>
+        </label>
+
+        <div class="field">
+          <label for="council-strictness">Strictness</label>
+          <div class="project-slider">
+            <input id="council-strictness" type="range" min="0" max="5" step="1" value="2">
+            <output id="council-strictness-out" for="council-strictness"></output>
+          </div>
+          <span class="field-hint" id="council-strictness-hint"></span>
+        </div>
+
+        <h4 class="settings-head">Seating</h4>
+        <p class="settings-note">
+          Pin a chair to a CLI and the router works around it. Leave a seat on
+          <b>Auto</b> and it is chosen per run.
+        </p>
+        <div id="council-pins" class="council-pins"></div>
+
+        <h4 class="settings-head">What each CLI is good at</h4>
+        <p class="settings-note">
+          Half of what the router scores against &mdash; the other half is what
+          your prompt is about. These are <b>starting positions, not
+          measurements</b>: nothing here was benchmarked, and a figure you
+          disagree with is meant to be edited. Runs feed back into the choice
+          on their own, within bounds.
+        </p>
+        <div id="council-capabilities" class="council-caps"></div>
       </section>
 
       <section class="settings-panel" data-settings-panel="roles">

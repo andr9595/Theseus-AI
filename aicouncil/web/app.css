@@ -302,8 +302,38 @@ html, body {
 }
 .member:hover { background: var(--bg-3); border-color: var(--line); }
 .member:focus-visible { outline: 2px solid var(--agent-color); outline-offset: 1px; }
-.member[data-agent="drafter"]  { --agent-color: var(--cyan); }
-.member[data-agent="polisher"] { --agent-color: var(--amber); }
+/* Coloured by which CLI is in the seat rather than by which chair it is. The
+   chair moves between runs now that the bench is routed, and a colour that
+   followed the chair would repaint the strip every time the prompt changed. */
+.member[data-agent="codex"]  { --agent-color: var(--cyan); }
+.member[data-agent="claude"] { --agent-color: var(--amber); }
+.member[data-agent="agy"]    { --agent-color: var(--accent-2); }
+.member[data-agent="custom"] { --agent-color: var(--text-2); }
+/* The chairman is the only seat that writes, so it is the only one set apart
+   from the row - the rest are peers and look it. */
+.member.is-chair {
+  border-color: color-mix(in srgb, var(--agent-color) 34%, transparent);
+  background: color-mix(in srgb, var(--agent-color) 7%, transparent);
+}
+.member-pin { color: var(--text-3); margin-left: 4px; }
+
+.strip-empty {
+  padding: 10px 12px;
+  font-size: 12px; color: var(--text-3);
+}
+/* Anything the router had to settle for: one CLI installed, a pin it could
+   not honour, a chair that is also a member. Never silent - a bench that is
+   not the one asked for has to say so. */
+.strip-note-line {
+  max-width: 640px; margin: 5px auto 0;
+  font-size: 10.5px; line-height: 1.45; color: var(--text-3);
+  text-align: center;
+}
+
+/* The three-stage stepper. Reuses the project tracker's cells verbatim so a
+   stage in flight reads identically in both places. */
+.council-steps { flex: 0 0 auto; padding: 0 20px 8px; }
+.council-steps .strip-cell.muted { opacity: .55; }
 
 .member-mark {
   display: grid; place-items: center;
@@ -394,6 +424,59 @@ html, body {
 
 .assistant-message[data-agent="drafter"]  { --agent-color: var(--cyan); }
 .assistant-message[data-agent="polisher"] { --agent-color: var(--amber); }
+.assistant-message[data-agent="codex"]    { --agent-color: var(--cyan); }
+.assistant-message[data-agent="claude"]   { --agent-color: var(--amber); }
+.assistant-message[data-agent="agy"]      { --agent-color: var(--accent-2); }
+
+/* Which anonymous name this seat's peers knew it by. Quiet, because it is a
+   footnote for reading the critiques rather than a property of the answer. */
+.msg-alias {
+  font-family: var(--mono); font-size: 9.5px;
+  color: var(--text-3);
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+}
+
+/* A figure an agent stated about itself. Never one this app worked out: there
+   is no ground truth here to score an answer against, so a computed number
+   would be indistinguishable on screen from a reported one. A stage that gave
+   no figure draws no chip. */
+.conf-chip {
+  display: inline-flex; align-items: baseline; gap: 4px;
+  padding: 1px 6px;
+  font-family: var(--mono); font-size: 9.5px;
+  border-radius: 5px;
+  border: 1px solid color-mix(in srgb, var(--conf-color) 30%, transparent);
+  background: color-mix(in srgb, var(--conf-color) 10%, transparent);
+  color: var(--conf-color);
+}
+.conf-chip.high { --conf-color: var(--green); }
+.conf-chip.mid  { --conf-color: var(--yellow); }
+.conf-chip.low  { --conf-color: var(--red); }
+.conf-label {
+  font-size: 8.5px; letter-spacing: .07em; text-transform: uppercase;
+  opacity: .8;
+}
+.conf-value { font-weight: 700; }
+
+/* The chairman's card. The one message in a council run that is a decision
+   rather than an opinion, and the only one written by a seat that could
+   change a file - so it is the one the eye should land on. */
+.verdict {
+  padding: 14px 16px;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--agent-color, var(--accent));
+  border-radius: var(--radius);
+}
+
+/* Divides positions from critiques from the verdict. Seven messages in a row
+   with no divisions gives no clue which are which. */
+.council-divider {
+  margin: 4px 0 -6px;
+  text-align: center;
+}
 
 /* An earlier turn of the same thread, replayed as context rather than run now.
    Dimmed so the current exchange is the one the eye lands on. */
@@ -1822,4 +1905,62 @@ pre.project-file {
     animation-iteration-count: 1 !important;
     transition-duration: .01ms !important;
   }
+}
+
+/* ---- Council settings ---------------------------------------------------
+   The seating list and the capability profiles. Both are matrices of small
+   controls, and both borrow the project matrix's spacing so the three agent
+   grids in this app do not each have their own rhythm.
+   ---------------------------------------------------------------------- */
+
+.council-pins { display: flex; flex-direction: column; gap: 6px; }
+.council-pin-row {
+  display: grid; grid-template-columns: 90px minmax(0, 1fr);
+  align-items: center; gap: 10px;
+}
+.council-pin-label { font-size: 12px; color: var(--text-2); }
+.council-pin-row select {
+  width: 100%;
+  padding: 6px 8px;
+  font: inherit; font-size: 12px;
+  color: var(--text);
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+
+.council-caps {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px;
+}
+.council-cap {
+  padding: 11px 12px;
+  background: var(--bg-1);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+}
+.council-cap-name {
+  margin: 0 0 9px;
+  font-size: 11px; font-weight: 600;
+  letter-spacing: .8px; text-transform: uppercase;
+  color: var(--text-3);
+}
+.council-cap-row {
+  display: grid; grid-template-columns: 78px minmax(0, 1fr) 46px;
+  align-items: center; gap: 8px;
+  margin-bottom: 5px;
+}
+.council-cap-axis { font-size: 11px; color: var(--text-2); }
+.council-cap-row input[type="range"] {
+  width: 100%; min-width: 0;
+  accent-color: var(--accent);
+}
+/* An axis the operator has never touched. It is not zero and not a default
+   they chose - the server is still using its shipped profile - so it reads as
+   "default" rather than as a number. */
+.council-cap-row input[data-unset] { opacity: .45; }
+.council-cap-row output {
+  font-family: var(--mono); font-size: 10px; color: var(--text-3);
+  text-align: right;
 }

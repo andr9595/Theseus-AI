@@ -65,6 +65,40 @@ def mock_provider(pid: str, role: str, extra=None):
     }
 
 
+def mock_council(agent: str, extra=None):
+    """One CLI's council seat, pointed at the mock agent.
+
+    No `--role`: a council turn is identified by what the prompt asks for, not
+    by the chair it was sent to - the same CLI holds a member seat, critiques
+    its peers and may chair, and which of those it is doing is decided per run
+    by the router.
+    """
+    return {
+        "id": cfg.council_provider_id(agent),
+        "label": f"Mock {agent}",
+        "command": [sys.executable, MOCK, *(extra or []), "{prompt}"],
+        "auto_approve_args": ["--dangerously-skip-permissions"],
+        "read_only_args": ["--read-only"],
+        # Cleared for the same reason every real agent declares its own: these
+        # merge onto the CLI preset, and Claude's `--output-format stream-json`
+        # left on a command that is not Claude puts `stream-json` where the
+        # prompt should be. The seat then runs on an 11-character task and
+        # still exits zero, which is the worst kind of green.
+        "stream_args": [],
+        "prompt_on_stdin": False,
+        "timeout_seconds": 60,
+    }
+
+
+def council_providers(extra_for=None):
+    """The whole bench on the mock, optionally breaking one agent."""
+    extra_for = extra_for or {}
+    return {
+        cfg.council_provider_id(a): mock_council(a, extra_for.get(a))
+        for a in cfg.AGENTS
+    }
+
+
 def git(args, cwd):
     subprocess.run(
         ["git", *args], cwd=cwd, check=True,
@@ -89,6 +123,20 @@ class PipelineTestBase(unittest.TestCase):
         # still cannot reach the developer's real history.
         previous_xdg = os.environ.get("XDG_CONFIG_HOME")
         os.environ["XDG_CONFIG_HOME"] = str(self.tmp / "xdg")
+        # The mock paces its output so the UI's streaming is visible when it is
+        # driven by hand. A council run is seven stages rather than two, so that
+        # pacing now dominates the suite's runtime. Nothing here is testing the
+        # delay itself.
+        previous_delay = os.environ.get("MOCK_AGENT_DELAY")
+        os.environ["MOCK_AGENT_DELAY"] = "0"
+
+        def restore_delay():
+            if previous_delay is None:
+                os.environ.pop("MOCK_AGENT_DELAY", None)
+            else:
+                os.environ["MOCK_AGENT_DELAY"] = previous_delay
+
+        self.addCleanup(restore_delay)
 
         def restore_xdg():
             if previous_xdg is None:
@@ -114,14 +162,41 @@ class PipelineTestBase(unittest.TestCase):
         self.store.update({
             "workspace": str(self.repo),
             "safety_snapshot": True,
-            "providers": {
-                "drafter": mock_provider("drafter", "Junior Draft"),
-                "polisher": mock_provider("polisher", "Senior Polish"),
-            },
+            "providers": council_providers(),
         })
         self.bus = EventBus()
         self.runs_dir = self.tmp / "xdg" / "ai-council" / "runs"
         self.pipeline = Pipeline(self.store, self.bus, runs_dir=self.runs_dir)
+
+    # -- council helpers ---------------------------------------------------
+    #
+    # The bench is routed per run, so a test cannot name "seat2" and know which
+    # CLI is in it. These ask the run what it seated instead, which is also the
+    # only way an assertion stays true when the routing changes.
+
+    def member_ids(self, run):
+        """The Stage 1 stage ids of this run, in seating order."""
+        return [s.id for s in run.seating.members]
+
+    def member_stages(self, run):
+        return [run.stages[s.id] for s in run.seating.members]
+
+    def critique_stages(self, run):
+        return [run.stages[f"{s.id}_critique"] for s in run.seating.members]
+
+    def pin_chair(self, agent, provider=None):
+        """Fix the chair to one CLI, and optionally break that CLI.
+
+        The bench is routed, so "break the stage that writes" is no longer a
+        thing a test can say by naming a provider - any of the three could be
+        chairing. Pinning makes the intent precise, and sitting the chair out
+        of the deliberation keeps the breakage on the chair alone rather than
+        also taking out a member seat.
+        """
+        patch = {"council": {"pins": {"chair": agent}, "chair_deliberates": False}}
+        if provider is not None:
+            patch["providers"] = {cfg.council_provider_id(agent): provider}
+        self.store.update(patch)
 
     def tearDown(self):
         self.pipeline.cancel()
@@ -161,25 +236,78 @@ class TestZeroTouch(PipelineTestBase):
         self.wait_terminal()
 
         self.assertEqual(run.state, "complete", run.error)
-        self.assertEqual(run.stages["drafter"].state, "done")
-        self.assertEqual(run.stages["polisher"].state, "done")
+        for stage in self.member_stages(run):
+            self.assertEqual(stage.state, "done", stage.error)
+        for stage in self.critique_stages(run):
+            self.assertEqual(stage.state, "done", stage.error)
+        self.assertEqual(run.stages["chair"].state, "done")
         # Zero-Touch means the file really was written.
         self.assertTrue((self.repo / "AI_COUNCIL_DEMO.md").exists())
         self.assertIn("AI_COUNCIL_DEMO.md", run.diff)
         self.assertGreaterEqual(run.diff_stat["files"], 1)
 
-    def test_stage_one_never_receives_auto_approve_flags(self):
-        # The junior is read-only by contract; the flag must not reach it even
-        # when Zero-Touch is on.
+    def test_only_the_chairman_is_granted_permission_to_write(self):
+        # The permission model is positional: every deliberating seat is
+        # read-only by contract *and* by flag, and the chairman is the only
+        # thing that can change a file - even under Zero-Touch.
         self.store.update({"zero_touch": True})
         run = self.pipeline.start("anything", str(self.repo))
         self.wait_terminal()
-        self.assertNotIn(
-            "--dangerously-skip-permissions", run.stages["drafter"].command
-        )
+
+        for stage in self.member_stages(run) + self.critique_stages(run):
+            self.assertNotIn(
+                "--dangerously-skip-permissions", stage.command,
+                f"{stage.id} was handed write permission",
+            )
+            self.assertIn(
+                "--read-only", stage.command,
+                f"{stage.id} was not invoked read-only",
+            )
         self.assertIn(
-            "--dangerously-skip-permissions", run.stages["polisher"].command
+            "--dangerously-skip-permissions", run.stages["chair"].command
         )
+        self.assertNotIn("--read-only", run.stages["chair"].command)
+
+    def test_a_critic_reviews_its_peers_and_never_itself(self):
+        # Asserted on what each critic actually reported rather than on the
+        # prompt it was given - the prompt is redacted out of `command`, and
+        # the mock names every peer it was shown under its own heading. A
+        # member reviewing itself under an alias, believing it a colleague, is
+        # worse than not running the stage at all.
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+
+        for seat in run.seating.members:
+            reported = run.stages[f"{seat.id}_critique"].output
+            self.assertNotIn(
+                f"### {seat.alias}", reported,
+                f"{seat.id} was handed its own answer to review",
+            )
+            for other in run.seating.members:
+                if other.id != seat.id:
+                    self.assertIn(f"### {other.alias}", reported)
+
+    def test_the_chairman_reports_its_own_confidence(self):
+        # Parsed off the reply, never computed here. A run whose chairman said
+        # nothing reports None rather than a number this app invented.
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.confidence, 75)
+        self.assertEqual(run.consensus, 80)
+        # Both figures also ride on the chair's own stage record, which is what
+        # the verdict card renders from - the run-level properties are a
+        # convenience, not the source the UI reads.
+        chair = run.stages["chair"]
+        self.assertEqual(chair.confidence, 75)
+        self.assertEqual(chair.consensus, 80)
+        self.assertTrue(chair.because)
+        # And a member states a confidence but never a consensus: it has not
+        # seen the other members, so it has no view on how far they agreed.
+        for stage in self.member_stages(run):
+            self.assertIsNotNone(stage.confidence)
+            self.assertIsNone(stage.consensus)
 
     def test_rollback_restores_the_tree(self):
         self.store.update({"zero_touch": True})
@@ -513,15 +641,17 @@ class TestApprovalGate(PipelineTestBase):
         # The critical guarantee: the gate is reached with a pristine tree.
         self.assertFalse((self.repo / "AI_COUNCIL_DEMO.md").exists())
         self.assertTrue(gitutil.status(self.repo).clean)
-        self.assertTrue(run.stages["drafter"].output.strip())
-        self.assertEqual(run.stages["polisher"].state, "pending")
+        # The whole council has spoken and none of it touched a file.
+        for stage in self.member_stages(run):
+            self.assertTrue(stage.output.strip(), f"{stage.id} said nothing")
+        self.assertEqual(run.stages["chair"].state, "pending")
 
         self.pipeline.approve("also mention the reviewer note")
         self.wait_terminal()
         self.assertEqual(run.state, "complete", run.error)
         self.assertTrue((self.repo / "AI_COUNCIL_DEMO.md").exists())
 
-    def test_approval_grants_execute_permission_to_stage_two(self):
+    def test_approval_grants_execute_permission_to_the_chairman(self):
         # With Zero-Touch off, the flag must still be passed *after* the human
         # approves - otherwise the CLI would block on an interactive prompt.
         self.store.update({"zero_touch": False})
@@ -530,7 +660,7 @@ class TestApprovalGate(PipelineTestBase):
         self.pipeline.approve()
         self.wait_terminal()
         self.assertIn(
-            "--dangerously-skip-permissions", run.stages["polisher"].command
+            "--dangerously-skip-permissions", run.stages["chair"].command
         )
 
     def test_reject_abandons_the_run_without_touching_files(self):
@@ -543,7 +673,7 @@ class TestApprovalGate(PipelineTestBase):
         self.assertEqual(run.state, "cancelled")
         self.assertFalse((self.repo / "AI_COUNCIL_DEMO.md").exists())
         self.assertTrue(gitutil.status(self.repo).clean)
-        self.assertEqual(run.stages["polisher"].state, "skipped")
+        self.assertEqual(run.stages["chair"].state, "skipped")
 
     def test_reviewer_note_reaches_the_senior_prompt(self):
         self.store.update({"zero_touch": False})
@@ -562,9 +692,12 @@ class TestApprovalGate(PipelineTestBase):
         run = self.pipeline.start("do the thing", str(self.repo))
         self.wait_for(lambda: run.state == "awaiting_approval")
 
+        # Swap the command under every seat the chair could be sitting in.
         self.store.update({
             "providers": {
-                "polisher": {"command": ["definitely-not-the-approved-command"]},
+                cfg.council_provider_id(a):
+                    {"command": ["definitely-not-the-approved-command"]}
+                for a in cfg.AGENTS
             },
         })
         self.pipeline.approve()
@@ -572,7 +705,7 @@ class TestApprovalGate(PipelineTestBase):
 
         self.assertEqual(run.state, "complete", run.error)
         self.assertNotIn(
-            "definitely-not-the-approved-command", run.stages["polisher"].command
+            "definitely-not-the-approved-command", run.stages["chair"].command
         )
 
 
@@ -734,10 +867,8 @@ class TestPullRequestMode(PipelineTestBase):
         self.assertTrue((self.repo / "AI_COUNCIL_DEMO.md").exists())
         self.assertTrue(run.to_dict()["can_rollback"])
 
-    def test_a_senior_stage_that_changes_nothing_opens_no_pull_request(self):
-        self.store.update({
-            "providers": {"polisher": mock_provider("polisher", "Senior", ["--fail"])},
-        })
+    def test_a_chairman_that_changes_nothing_opens_no_pull_request(self):
+        self.pin_chair("claude", mock_council("claude", ["--fail"]))
         run = self.pipeline.start("do nothing at all", str(self.repo))
         self.wait_terminal()
 
@@ -757,75 +888,115 @@ class TestPullRequestMode(PipelineTestBase):
 
 
 class TestFailureHandling(PipelineTestBase):
-    def test_failing_senior_stage_marks_the_run_failed(self):
-        self.store.update({
-            "zero_touch": True,
-            "providers": {"polisher": mock_provider("polisher", "Senior", ["--fail"])},
-        })
+    def test_failing_chairman_marks_the_run_failed(self):
+        self.store.update({"zero_touch": True})
+        self.pin_chair("claude", mock_council("claude", ["--fail"]))
         run = self.pipeline.start("this will fail", str(self.repo))
         self.wait_terminal()
         self.assertEqual(run.state, "failed")
-        self.assertEqual(run.stages["polisher"].state, "failed")
+        self.assertEqual(run.stages["chair"].state, "failed")
         self.assertTrue(run.error)
 
-    def test_failing_junior_stage_does_not_abort_the_run(self):
-        # A dead junior is recoverable — the senior can work from the task
-        # alone — but recovery is the operator's call, not the pipeline's.
-        # Under Zero-Touch the run degrades to the approval gate rather than
-        # proceeding unattended; see TestDraftFailureDoesNotEscalate.
-        self.store.update({
-            "zero_touch": False,
-            "providers": {"drafter": mock_provider("drafter", "Junior", ["--fail"])},
-        })
-        run = self.pipeline.start("carry on regardless", str(self.repo))
-        self.wait_for(lambda: run.state == "awaiting_approval")
-        self.assertEqual(run.stages["drafter"].state, "failed")
-
-        self.pipeline.approve()
-        self.wait_terminal()
-        self.assertEqual(run.state, "complete", run.error)
-
-    def test_missing_executable_is_reported_not_raised(self):
+    def test_one_failing_member_does_not_abort_the_council(self):
+        # A seat that dies is simply not at the table for the rest of the run.
+        # It is not replaced: a substitute would not have deliberated
+        # independently with the others, which is the only thing Stage 1 buys.
         self.store.update({
             "zero_touch": True,
             "providers": {
-                "polisher": {
-                    "id": "polisher",
-                    "label": "Ghost",
-                    "role": "Senior",
-                    "command": ["definitely-not-a-real-binary-xyz", "{prompt}"],
-                    "auto_approve_args": [],
-                    "timeout_seconds": 30,
-                }
+                cfg.council_provider_id("codex"): mock_council("codex", ["--fail"]),
             },
         })
-        run = self.pipeline.start("go", str(self.repo))
+        run = self.pipeline.start("carry on regardless", str(self.repo))
         self.wait_terminal()
-        self.assertEqual(run.state, "failed")
-        self.assertIn("not installed", run.stages["polisher"].error)
+
+        self.assertEqual(run.state, "complete", run.error)
+        states = {s.agent: s.state for s in self.member_stages(run)}
+        self.assertEqual(states.get("codex"), "failed")
+        self.assertIn("done", states.values())
+        self.assertTrue((self.repo / "AI_COUNCIL_DEMO.md").exists())
+
+    def test_a_council_with_no_surviving_member_degrades_to_the_gate(self):
+        # Zero-Touch assumes a deliberation to synthesise. With none, the run
+        # pauses for a human rather than letting one agent write to the repo
+        # with nobody watching - a combination nobody selected.
+        self.store.update({
+            "zero_touch": True,
+            "providers": {
+                cfg.council_provider_id(a): mock_council(a, ["--fail"])
+                for a in cfg.AGENTS
+            },
+        })
+        self.pin_chair("claude")
+        run = self.pipeline.start("everyone fails", str(self.repo))
+        self.wait_for(
+            lambda: run.state == "awaiting_approval", what="the degraded gate"
+        )
+        self.assertFalse((self.repo / "AI_COUNCIL_DEMO.md").exists())
+        self.pipeline.reject()
+        self.wait_terminal()
+
+    def test_a_lone_position_skips_the_critique_stage(self):
+        # One member handed its own answer back under an alias would be
+        # reviewing itself while believing it a colleague. Skipping is right.
+        # Chair sits out, so the bench is codex and agy - and only agy answers.
+        self.store.update({
+            "zero_touch": True,
+            "providers": {
+                cfg.council_provider_id("codex"): mock_council("codex", ["--fail"]),
+            },
+        })
+        self.pin_chair("claude")
+        run = self.pipeline.start("only one survives", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        for stage in self.critique_stages(run):
+            self.assertIn(stage.state, ("skipped", "failed"))
+
+    def test_no_installed_cli_refuses_to_start(self):
+        # The router seats only CLIs that actually resolve, so a machine with
+        # none of them says so before a run begins rather than failing at the
+        # first seat. This is stricter than the two-stage council was: it used
+        # to start, run, and report the failure per stage.
+        self.store.update({
+            "zero_touch": True,
+            "providers": {
+                cfg.council_provider_id(a): {
+                    "command": ["definitely-not-a-real-binary-xyz", "{prompt}"],
+                }
+                for a in cfg.AGENTS
+            },
+        })
+        with self.assertRaises(ValueError) as ctx:
+            self.pipeline.start("go", str(self.repo))
+        self.assertIn("nobody to seat", str(ctx.exception))
 
     def test_unusable_provider_config_finishes_the_stage(self):
         # A stage that cannot be launched must still end. It used to be left
         # marked "running" forever, with no end time and no error on it.
+        #
+        # Asserted on a member rather than the chair: the binary has to resolve
+        # or the router would not seat it at all, and the chair's timeout is
+        # replaced by `council.chair_timeout_seconds` on the way in - so the
+        # chair cannot carry a broken one.
         self.store.update({
             "zero_touch": True,
             "providers": {
-                "polisher": {
-                    "id": "polisher",
-                    "label": "Broken",
-                    "role": "Senior",
-                    "command": [],
-                    "timeout_seconds": "not a number",
-                }
+                cfg.council_provider_id("codex"): dict(
+                    mock_council("codex"), timeout_seconds="not a number"
+                ),
             },
         })
         run = self.pipeline.start("go", str(self.repo))
         self.wait_terminal()
 
-        self.assertEqual(run.state, "failed")
-        self.assertEqual(run.stages["polisher"].state, "failed")
-        self.assertTrue(run.stages["polisher"].ended_at)
-        self.assertIn("misconfigured", run.stages["polisher"].error)
+        broken = [s for s in self.member_stages(run) if s.agent == "codex"]
+        self.assertTrue(broken, "codex was not seated")
+        for stage in broken:
+            self.assertEqual(stage.state, "failed")
+            self.assertTrue(stage.ended_at, "a stage that failed to launch never ended")
+            self.assertIn("misconfigured", stage.error)
 
     def test_a_folder_that_does_not_exist_is_rejected(self):
         with self.assertRaises(ValueError) as ctx:
@@ -952,9 +1123,15 @@ class TestContinuedConversation(PipelineTestBase):
         self.assertIn("MAGIC-THREAD-TOKEN", second.conversation[0]["task"])
         self.assertTrue(second.conversation[0]["replies"])
 
-        # And it reached the CLIs, not just the Run object: both stages were
-        # launched with a materially longer prompt than the same task alone.
-        for stage in ("drafter", "polisher"):
+        # And it reached the CLIs, not just the Run object. Compared per seat
+        # id rather than per CLI: the bench is routed, so seat 1 of the
+        # follow-up need not be the same agent as seat 1 of the first run -
+        # what has to hold is that the seat was told what came before.
+        #
+        # Only the stages that carry the thread are checked. A critique is
+        # given the peers' answers rather than the history, so its prompt does
+        # not grow with the conversation and asserting it would be wrong.
+        for stage in [*self.member_ids(second), "chair"]:
             self.assertGreater(
                 self.prompt_size(second, stage), self.prompt_size(first, stage) + 200,
                 f"the {stage} stage was not told what came before",
@@ -1225,20 +1402,30 @@ if __name__ == "__main__":
 
 
 class TestDraftFailureDoesNotEscalate(PipelineTestBase):
-    """A failed Stage 1 must not turn Zero-Touch into an unattended solo run.
+    """A dead Stage 1 must not turn Zero-Touch into an unattended solo run.
 
-    Zero-Touch means "you may skip my approval because a junior drafted it and
-    a senior is verifying that draft". With no draft, that premise is gone —
-    proceeding anyway silently grants an agent unattended write access under a
-    setting the operator chose for a different situation.
+    Zero-Touch means "you may skip my approval because a council deliberated
+    and a chairman is synthesising what it decided". With no positions at all
+    that premise is gone — proceeding anyway silently grants one agent
+    unattended write access under a setting the operator chose for a different
+    situation.
+
+    One member dying is a different case and does not degrade: the council
+    continues with whoever is left. It takes losing all of them.
     """
 
     def setUp(self):
         super().setUp()
         self.store.update({
             "zero_touch": True,
-            "providers": {"drafter": mock_provider("drafter", "Junior", ["--fail"])},
+            "providers": {
+                cfg.council_provider_id(a): mock_council(a, ["--fail"])
+                for a in cfg.AGENTS
+            },
         })
+        # The chair has to survive to be approvable, so it is pinned to a CLI
+        # that is put back in working order.
+        self.pin_chair("claude", mock_council("claude"))
 
     def test_zero_touch_falls_back_to_the_gate(self):
         run = self.pipeline.start("do the thing", str(self.repo))
@@ -1265,11 +1452,9 @@ class TestDraftFailureDoesNotEscalate(PipelineTestBase):
         self.assertEqual(run.state, "cancelled")
         self.assertTrue(gitutil.status(self.repo).clean)
 
-    def test_a_healthy_draft_still_skips_the_gate_under_zero_touch(self):
+    def test_a_healthy_council_still_skips_the_gate_under_zero_touch(self):
         # The fallback must not become a gate on every Zero-Touch run.
-        self.store.update({
-            "providers": {"drafter": mock_provider("drafter", "Junior Draft")},
-        })
+        self.store.update({"providers": council_providers()})
         run = self.pipeline.start("do the thing", str(self.repo))
         self.wait_terminal()
         self.assertEqual(run.state, "complete", run.error)
@@ -1602,18 +1787,25 @@ class TestSoloPrompt(unittest.TestCase):
 
 
 class TestRoleReachesTheRun(PipelineTestBase):
-    def test_a_configured_role_is_used_by_a_real_run(self):
-        # End to end: set a role, run, and confirm the agent saw that text.
+    def test_a_configured_persona_is_used_by_a_real_run(self):
+        # End to end: pin a seat's lens, run, and confirm the agent answered
+        # as that persona rather than as the neutral member. The mock varies
+        # its position by the lens it was given, so its own output is the
+        # evidence that the persona text actually reached the CLI.
         self.store.update({
             "zero_touch": True,
-            "providers": {"drafter": {"role_system": "SENTINEL-ROLE-TEXT"}},
+            "council": {
+                "personas": {"seat1": "pragmatist"},
+                "chair_deliberates": False,
+            },
         })
         run = self.pipeline.start("do a thing", str(self.repo))
         self.wait_terminal()
-        # The mock agent echoes the prompt length and its role; the prompt it
-        # received is what the pipeline built.
-        self.assertTrue(run.stages["drafter"].output)
+
         self.assertEqual(run.state, "complete", run.error)
+        seat1 = run.stages["seat1"]
+        self.assertEqual(seat1.persona, "pragmatist")
+        self.assertIn("not paid for by this task", seat1.output)
 
 
 class TestCommitFromTheApp(PipelineTestBase):

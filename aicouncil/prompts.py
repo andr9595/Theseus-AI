@@ -28,6 +28,7 @@ council is that the shipped wording lives here and nowhere else.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -209,6 +210,201 @@ best-practice advice as a finding; if the code is sound, say so.\
 """
 
 
+# --------------------------------------------------------------------------
+# The deliberating council
+# --------------------------------------------------------------------------
+
+# Every council stage ends with the same trailer, and it is the only place a
+# confidence figure ever comes from.
+#
+# This app does not compute confidence. It cannot: it has no ground truth to
+# score an answer against, and a number it invented would be indistinguishable
+# on screen from one a model actually reported. So the figure is asked for
+# explicitly, parsed out of the reply, and shown as the agent's own claim -
+# and when an agent does not give one, the UI says it did not rather than
+# filling the gap. `parse_confidence` returning None is a supported outcome,
+# not an error.
+CONFIDENCE_CONTRACT = """\
+Finish your reply with exactly these two lines, on their own, as the very last \
+thing you write:
+
+CONFIDENCE: <integer 0-100>
+BECAUSE: <one line - what would have to be true for you to be wrong>
+
+CONFIDENCE is your own honest reading of how likely your answer is to be \
+correct and complete. It is not a score for effort and it is not a formality. \
+Low is a legitimate answer and is more useful than false certainty: 40 with an \
+honest BECAUSE line is worth more to the chairman than 95 with a vague one.\
+"""
+
+
+COUNCIL_MEMBER_SYSTEM = """\
+You are one member of an AI council deliberating on the task below.
+
+Several other agents are answering this same task at the same time, \
+independently. You cannot see their work and they cannot see yours. That is \
+deliberate: the council wants genuinely independent judgement first, so that \
+agreement later means something. Answer as though yours were the only reply.
+
+RULES - these are strict:
+1. DO NOT modify, create or delete any file. Do not run commands that write to \
+disk, stage changes, or commit. This stage is read-only. A later stage applies \
+whatever the council settles on.
+2. DO read the working folder as much as you need. Ground every claim in code \
+that actually exists, and cite real file paths and real symbol names.
+3. Where you are uncertain, say so in the place where it matters rather than \
+in a disclaimer at the end.
+
+Structure your reply as Markdown:
+
+## Position
+Your answer to the task, stated plainly in a few sentences. Lead with it.
+
+## Grounding
+The specific files, functions and call sites that support your position. Quote \
+the few lines that matter. If you could not find something you expected, say \
+so explicitly instead of assuming it exists.
+
+## Proposal
+What you would actually do. For code changes, a fenced block per file, \
+labelled with the path. For a question, the recommendation and its \
+consequences.
+
+## Where I could be wrong
+The weakest part of your own position, and what would settle it. Be specific \
+enough that another agent could go and check.\
+"""
+
+
+COUNCIL_CRITIQUE_SYSTEM = """\
+You are one member of an AI council. The independent answers of your fellow \
+members are below, anonymised.
+
+Your job now is to find what is WRONG with them. Not to summarise them, not to \
+rank them, and not to be collegial about them.
+
+RULES - these are strict:
+1. DO NOT modify, create or delete any file. This stage is read-only.
+2. VERIFY claims against the actual code rather than judging them by how \
+plausible they sound. A confident paragraph about a function that does not \
+exist is the single most valuable thing you can catch here, and it is only \
+catchable by looking.
+3. You do not know which agent is which, and you are not told which reply is \
+your own. Judge the argument, not its author.
+4. Do not invent disagreement. If a peer is right, saying so - once, briefly - \
+is a real contribution, because it tells the chairman the point is settled.
+
+For each peer, under a heading with their name:
+
+### Agent <letter>
+**Hallucinations:** anything asserted about the code that is not true. Name \
+the file you checked. This section is the reason the stage exists - do it \
+first and do it properly.
+**Errors:** where the reasoning breaks, with the specific mechanism.
+**Missing:** what the task needed that they did not address.
+**Sound:** what they got right that the chairman should keep.\
+"""
+
+
+CHAIRMAN_SYSTEM = """\
+You are the CHAIRMAN of an AI council, and the only member permitted to write \
+to disk.
+
+Below you have the original task, every member's independent answer, and every \
+member's critique of the others. The members could not see each other while \
+answering, so where they agree they agreed independently - and where they \
+disagree, at least one of them is wrong.
+
+YOUR JOB:
+1. WEIGH the positions against the critiques and against the repository \
+itself. A critique is not automatically right either - verify the ones you act \
+on. Where the council is split, decide, and say what decided it.
+2. DISCARD what does not survive. A position that a peer showed to be \
+hallucinated does not get softened into a caveat; it gets dropped.
+3. IMPLEMENT the outcome. Apply the edits to the working tree yourself. You \
+have final say on architecture, naming, error handling and test strategy.
+4. MATCH the surrounding code's conventions - its comment density, naming, \
+import ordering, test layout and error-handling idiom.
+5. Where the council was genuinely divided and you are not confident, say so \
+and implement the more conservative option. An honest split reported is worth \
+more than a false consensus.
+
+Structure your reply as Markdown, in this order:
+
+## Verdict
+The council's answer, as one paragraph a reader could act on without reading \
+anything below it.
+
+## Consensus
+What the members independently agreed on. Only real agreement belongs here.
+
+## Disagreement
+Where they split, what each side held, and what settled it. If they did not \
+split, write "None - the council was aligned." and nothing else.
+
+## Summary of changes
+- `path/to/file.py` - what changed and why, one line each.
+
+## Verification
+How you confirmed this works, or precisely what you could not verify.
+
+Then, before the confidence trailer, one more line on its own:
+
+CONSENSUS: <integer 0-100>
+
+CONSENSUS is how strongly the members actually agreed, judged by you from \
+their answers - 100 means they said the same thing independently, 0 means they \
+contradicted each other outright. It describes the council, not your certainty; \
+your certainty is the CONFIDENCE line that follows.\
+"""
+
+
+# The personas a seat can be given. These are *behaviours*, orthogonal to the
+# stage machinery: the pipeline supplies the stage contract (independent
+# answer, peer critique, synthesis) and the persona changes the lens the seat
+# brings to it. That split is what lets the same three CLIs form a different
+# council per task without a second copy of the stage prompts.
+NEUTRAL_MEMBER_SYSTEM = """\
+You are seated without a special remit.
+
+The other members have been given lenses of their own and will argue from \
+them. Yours is to answer the task on its merits and to be the member who has \
+not decided in advance what kind of answer this is. Where a specialist's \
+framing does not fit this task, you are the one who can say so.
+
+Answer as though the council's decision rested on your reply alone, because \
+where the specialists disagree it may.\
+"""
+
+
+PRAGMATIST_SYSTEM = """\
+Your lens on this council is PRAGMATISM.
+
+Argue for the smallest change that fully solves the stated task, and against \
+anything speculative. Ask what breaks in production, what the maintenance cost \
+is in six months, and whether the problem is worth solving at all. Be the \
+member who notices that the elegant answer requires a migration nobody \
+budgeted for.
+
+You are not the member who says no to everything - you are the one who prices \
+the yes.\
+"""
+
+
+VISIONARY_SYSTEM = """\
+Your lens on this council is the LONGER VIEW.
+
+Argue from where this code should end up, not only from where it is. Name the \
+structural problem the immediate task is a symptom of, and say what shape would \
+make this class of task stop recurring. Consider what the next three requests \
+against this code will be.
+
+Say plainly when the ambitious answer is not worth it here. A visionary who \
+recommends a rewrite for every bug report is noise, and the council will \
+discount you accordingly.\
+"""
+
+
 # The role catalogue. Each entry is a starting point the operator can edit -
 # the shipped text is a default, not a law.
 #
@@ -258,10 +454,43 @@ ROLE_TEMPLATES: Dict[str, Dict] = {
         "system": SECURITY_SYSTEM,
         "writes": False,
     },
+    # -- the deliberating council -----------------------------------------
+    # `council_member` is the neutral seat: no lens beyond answering well. It
+    # is what an unrouted seat gets, and what the persona picker falls back to.
+    "council_member": {
+        "name": "Council Member",
+        "summary": "Answers independently, then critiques its peers. Never writes.",
+        "system": NEUTRAL_MEMBER_SYSTEM,
+        "writes": False,
+    },
+    "pragmatist": {
+        "name": "Pragmatist",
+        "summary": "Prices the change. Smallest thing that actually solves it.",
+        "system": PRAGMATIST_SYSTEM,
+        "writes": False,
+    },
+    "visionary": {
+        "name": "Visionary",
+        "summary": "Argues from where the code should end up, not where it is.",
+        "system": VISIONARY_SYSTEM,
+        "writes": False,
+    },
+    "chairman": {
+        "name": "Chairman",
+        "summary": "Weighs the council, decides, and applies the outcome.",
+        "system": CHAIRMAN_SYSTEM,
+        "writes": True,
+    },
 }
 
 # Which template a stage falls back to when its setting is missing or unknown.
-DEFAULT_TEMPLATE = {"drafter": "junior_draft", "polisher": "senior_polish"}
+# The council's numbered seats are not listed: they are routed per run and
+# their persona is resolved from the seating, not from a fixed stage id.
+DEFAULT_TEMPLATE = {
+    "drafter": "junior_draft",
+    "polisher": "senior_polish",
+    "chair": "chairman",
+}
 
 
 def shipped_role(role_id: str) -> Optional[Dict]:
@@ -629,6 +858,356 @@ def build_polish_prompt(
         f"any part of it.\n\n"
         f"---\n\n{draft}\n"
     )
+
+
+# How much of the deliberation each later stage is shown. These are *totals*
+# split across the bench, not per-member allowances, because the chairman's
+# prompt carries every position and every critique at once and a per-member
+# figure would grow it linearly with the seat count.
+#
+# The ceiling that matters is argv: `agy` takes its prompt as `--prompt=<text>`,
+# and `build_argv` refuses to move a decorated placeholder to stdin rather than
+# quietly running it on an empty prompt. So the whole chairman prompt has to fit
+# under ARGV_PROMPT_LIMIT (96,000) with the workspace block and thread history
+# alongside it. These two totals plus that overhead leave real headroom.
+MAX_POSITIONS_TOTAL = 45_000
+MAX_CRITIQUES_TOTAL = 24_000
+# The ceiling the whole chairman prompt is held under, with headroom below
+# providers.ARGV_PROMPT_LIMIT (96,000) for the argv the prompt travels in.
+MAX_CHAIRMAN_PROMPT = 88_000
+# No member is clipped below this regardless of how many are seated - past a
+# certain point a "position" is too short to be one, and it is better to seat
+# fewer members than to show the chairman six stubs.
+MIN_MEMBER_CHARS = 4_000
+
+
+def _share(total: int, count: int) -> int:
+    """One member's slice of a shared character budget."""
+    return max(MIN_MEMBER_CHARS, total // max(1, count))
+
+# Strictness, as the slider sets it. This is a *prompt* knob, not a sampling
+# one: none of the CLIs expose temperature, and shipping a temperature slider
+# that quietly did nothing would be worse than not having one. What it changes
+# is how hard the critique stage is told to push and how much agreement the
+# chairman is told to require - both of which are real, and both of which show
+# up in the transcript.
+STRICTNESS_LEVELS: Dict[int, Dict[str, str]] = {
+    0: {
+        "name": "Collegial",
+        "critique": (
+            "Raise only what would actually change the outcome. A stylistic "
+            "preference is not a finding."
+        ),
+        "chair": (
+            "Prefer the position the members converged on. Reserve overruling "
+            "them for something demonstrably wrong."
+        ),
+    },
+    1: {
+        "name": "Measured",
+        "critique": (
+            "Raise what would change the outcome, plus anything that would "
+            "mislead a reader of the final answer."
+        ),
+        "chair": "Prefer the converged position unless a critique defeats it.",
+    },
+    2: {
+        "name": "Balanced",
+        "critique": (
+            "Check every factual claim about the code. Raise errors, gaps and "
+            "anything asserted without grounding."
+        ),
+        "chair": (
+            "Weigh positions and critiques on their merits. Say plainly when "
+            "the council was split."
+        ),
+    },
+    3: {
+        "name": "Exacting",
+        "critique": (
+            "Assume each peer is wrong until you have checked it against the "
+            "code. Unverified claims are findings in their own right."
+        ),
+        "chair": (
+            "Accept a position only where it survived critique or you verified "
+            "it yourself. Implement the conservative option where it did not."
+        ),
+    },
+    4: {
+        "name": "Adversarial",
+        "critique": (
+            "Attack every position, including the strongest. Try actively to "
+            "construct the input or sequence on which it fails, and report the "
+            "attempt either way."
+        ),
+        "chair": (
+            "Treat an unrefuted position as unproven rather than correct. "
+            "Where you cannot verify, implement the smallest safe change and "
+            "say what you left undone."
+        ),
+    },
+    5: {
+        "name": "Hostile",
+        "critique": (
+            "Your default verdict is that the peer is wrong. Only a claim you "
+            "personally traced through the real code escapes. State explicitly "
+            "which claims you checked and which you merely did not disprove."
+        ),
+        "chair": (
+            "Nothing enters the verdict that was not verified against the "
+            "repository by you or survived a hostile critique intact. Prefer "
+            "reporting an unresolved split over manufacturing a consensus."
+        ),
+    },
+}
+
+DEFAULT_STRICTNESS = 2
+
+
+def strictness(level: Any) -> Dict[str, str]:
+    """The strictness band for a slider position, clamped into range."""
+    try:
+        value = int(level)
+    except (TypeError, ValueError):
+        value = DEFAULT_STRICTNESS
+    value = max(0, min(max(STRICTNESS_LEVELS), value))
+    return {**STRICTNESS_LEVELS[value], "level": value}
+
+
+# The trailer lines the council contract asks for. Anchored to the start of a
+# line and matched case-insensitively, because a model that writes "Confidence:
+# 80" has met the contract in every way that matters. The *last* match wins: an
+# agent that restates the format while explaining itself would otherwise be
+# read as having answered its own example.
+_CONFIDENCE_RE = re.compile(r"^\s*CONFIDENCE:\s*(\d{1,3})\s*$", re.I | re.M)
+_CONSENSUS_RE = re.compile(r"^\s*CONSENSUS:\s*(\d{1,3})\s*$", re.I | re.M)
+_BECAUSE_RE = re.compile(r"^\s*BECAUSE:\s*(.+?)\s*$", re.I | re.M)
+
+
+def _last_percent(pattern: "re.Pattern[str]", text: str) -> Optional[int]:
+    """The last 0-100 integer this pattern captures, or None.
+
+    None is a real answer and the callers treat it as one. An agent that did
+    not give a figure has not given one, and the UI says exactly that instead
+    of substituting a default - a fabricated 50 would be indistinguishable on
+    screen from a reported 50.
+    """
+    matches = pattern.findall(text or "")
+    for raw in reversed(matches):
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= value <= 100:
+            return value
+    return None
+
+
+def parse_confidence(text: str) -> Optional[int]:
+    """The agent's own stated confidence, or None if it did not state one."""
+    return _last_percent(_CONFIDENCE_RE, text)
+
+
+def parse_consensus(text: str) -> Optional[int]:
+    """The chairman's own reading of how far the council agreed, or None."""
+    return _last_percent(_CONSENSUS_RE, text)
+
+
+def parse_trailer(text: str) -> Dict[str, Any]:
+    """Everything the contract asks for, plus the body with it removed.
+
+    The trailer is stripped from the body because the UI renders it as a badge;
+    leaving it in would show the same figure twice, once as a chip and once as
+    a stray line of prose at the bottom of the card.
+    """
+    text = text or ""
+    because = _BECAUSE_RE.findall(text)
+    body = _CONSENSUS_RE.sub("", _BECAUSE_RE.sub("", _CONFIDENCE_RE.sub("", text)))
+    return {
+        "confidence": parse_confidence(text),
+        "consensus": parse_consensus(text),
+        "because": (because[-1].strip() if because else ""),
+        "body": body.rstrip(),
+    }
+
+
+def _persona_block(persona_system: str) -> str:
+    """A seat's lens, appended to the stage contract it is working under."""
+    persona_system = (persona_system or "").strip()
+    if not persona_system:
+        return ""
+    return f"\n# Your lens\n{persona_system}\n"
+
+
+def build_member_prompt(
+    task: str,
+    workspace: str,
+    workspace_status: Optional[Dict] = None,
+    house_rules: str = "",
+    conversation: Optional[List[Dict[str, Any]]] = None,
+    persona_system: str = "",
+    system: str = "",
+) -> str:
+    """Stage 1: one member answering the task with no sight of its peers.
+
+    ``persona_system`` is the seat's lens and is composed *onto* the stage
+    contract rather than replacing it - a Pragmatist is still a council member
+    bound by the read-only rule and the confidence trailer.
+    """
+    system = system or COUNCIL_MEMBER_SYSTEM
+    return (
+        f"{system}\n"
+        f"{_persona_block(persona_system)}"
+        f"{_rules_block(house_rules)}\n"
+        f"# Context\n{_workspace_block(workspace, workspace_status)}\n"
+        f"{_history_block(conversation)}\n"
+        f"# Task\n{task.strip()}\n"
+        f"\n{CONFIDENCE_CONTRACT}\n"
+    )
+
+
+def build_critique_prompt(
+    task: str,
+    peers: List[Dict[str, str]],
+    workspace: str,
+    workspace_status: Optional[Dict] = None,
+    house_rules: str = "",
+    persona_system: str = "",
+    strictness_level: Any = DEFAULT_STRICTNESS,
+    system: str = "",
+) -> str:
+    """Stage 2: one member critiquing its peers, who are anonymous to it.
+
+    ``peers`` is ``[{"alias": "Agent B", "output": "..."}]`` and must already
+    exclude this seat's own answer. Excluding it is the caller's job because
+    only the caller knows which seat this is; a member handed its own text back
+    under an alias would be reviewing itself while believing it was reviewing a
+    colleague, which is worse than not running the stage.
+    """
+    system = system or COUNCIL_CRITIQUE_SYSTEM
+    band = strictness(strictness_level)
+
+    budget = _share(MAX_POSITIONS_TOTAL, len(peers))
+    blocks = []
+    for peer in peers:
+        alias = str(peer.get("alias") or "A peer")
+        body = clip(str(peer.get("output") or "").strip(), budget)
+        if not body:
+            body = "(This member produced no usable answer. Nothing to review.)"
+        blocks.append(f"## {alias}\n\n{body}")
+    peer_text = "\n\n---\n\n".join(blocks) if blocks else (
+        "(No peer answers survived to this stage.)"
+    )
+
+    return (
+        f"{system}\n"
+        f"{_persona_block(persona_system)}"
+        f"\n# How hard to push ({band['name']})\n{band['critique']}\n"
+        f"{_rules_block(house_rules)}\n"
+        f"# Context\n{_workspace_block(workspace, workspace_status)}\n"
+        f"# The task every member was given\n{task.strip()}\n"
+        f"\n# Your fellow members' answers\n"
+        f"These were written independently and at the same time as yours. One "
+        f"of them may be better than yours; none of them is authoritative.\n\n"
+        f"---\n\n{peer_text}\n"
+        f"\n{CONFIDENCE_CONTRACT}\n"
+    )
+
+
+def build_chairman_prompt(
+    task: str,
+    positions: List[Dict[str, str]],
+    critiques: List[Dict[str, str]],
+    workspace: str,
+    workspace_status: Optional[Dict] = None,
+    house_rules: str = "",
+    reviewer_note: str = "",
+    conversation: Optional[List[Dict[str, Any]]] = None,
+    strictness_level: Any = DEFAULT_STRICTNESS,
+    system: str = "",
+) -> str:
+    """Stage 3: the chairman synthesises the council and applies the outcome.
+
+    The chairman sees the aliases, not the CLI names. Members are anonymous to
+    it for the same reason they were anonymous to each other: "Claude said so"
+    is not evidence, and a chairman that knows which seat is the expensive
+    model will defer to it rather than to the argument.
+
+    ``reviewer_note`` is whatever the human typed at the approval gate and
+    outranks the whole council, which is the point of the gate.
+    """
+    system = system or CHAIRMAN_SYSTEM
+    band = strictness(strictness_level)
+
+    note = ""
+    if reviewer_note.strip():
+        note = (
+            "\n# Human reviewer's instructions\n"
+            "The human operator read the council's deliberation and added "
+            "this. It takes precedence over every member and over your own "
+            "reading where they conflict.\n\n"
+            f"{reviewer_note.strip()}\n"
+        )
+
+    # Everything that is not the deliberation itself, rendered first so the
+    # deliberation can be given exactly the argv room that is left.
+    #
+    # Budgeting the parts independently is not enough: the fixed sections have
+    # their own caps (the thread alone may be 40,000 characters) and three
+    # separately-reasonable budgets still add up past the limit. `agy` takes
+    # its prompt as `--prompt=<text>` and `build_argv` refuses to move a
+    # decorated placeholder to stdin, so an over-long prompt is a failed run
+    # rather than a slow one - it has to fit.
+    head = (
+        f"{system}\n"
+        f"\n# How much agreement to require ({band['name']})\n{band['chair']}\n"
+        f"{_rules_block(house_rules)}\n"
+        f"# Context\n{_workspace_block(workspace, workspace_status)}\n"
+        f"{_history_block(conversation)}\n"
+        f"# Task\n{task.strip()}\n"
+        f"{note}\n"
+    )
+    tail = f"\n{CONFIDENCE_CONTRACT}\n"
+    # What the headings, rules and separators around the quoted text cost.
+    scaffolding = 600
+
+    room = max(
+        MIN_MEMBER_CHARS * 2,
+        MAX_CHAIRMAN_PROMPT - len(head) - len(tail) - scaffolding,
+    )
+    # Positions get two thirds: they are what is being decided between, and a
+    # critique is a comment on one.
+    position_budget = _share(min(MAX_POSITIONS_TOTAL, room * 2 // 3), len(positions))
+    critique_budget = _share(min(MAX_CRITIQUES_TOTAL, room // 3), len(critiques))
+
+    position_text = "\n\n---\n\n".join(
+        f"## {p.get('alias') or 'A member'}\n\n"
+        + (clip(str(p.get("output") or "").strip(), position_budget)
+           or "(No usable answer. This seat failed or timed out.)")
+        for p in positions
+    ) or "(No member produced an answer.)"
+
+    critique_text = "\n\n---\n\n".join(
+        f"## {c.get('alias') or 'A member'} reviewing the others\n\n"
+        + (clip(str(c.get("output") or "").strip(), critique_budget)
+           or "(No usable critique. This seat failed or timed out.)")
+        for c in critiques
+    ) or "(No critiques were produced. Weigh the positions on your own.)"
+
+    deliberation = (
+        f"# Stage 1 - independent positions\n"
+        f"Written without sight of each other.\n\n"
+        f"---\n\n{position_text}\n"
+        f"\n# Stage 2 - peer critique\n"
+        f"Each member reviewing the others, still anonymous.\n\n"
+        f"---\n\n{critique_text}\n"
+    )
+    # A last hard bound. The per-member shares above are the mechanism; this is
+    # the guarantee, and it holds however many members were seated and however
+    # the shares round. Clipped here rather than at the end of the whole prompt
+    # so the contract trailer - the only thing that makes the reply parseable -
+    # can never be the part that gets cut.
+    return head + clip(deliberation, room) + tail
 
 
 def _chat_history_block(conversation: Optional[List[Dict[str, Any]]]) -> str:

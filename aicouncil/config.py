@@ -178,10 +178,36 @@ AGENTS: Dict[str, Dict[str, Any]] = {
 # template, or the bundled mock agent.
 CUSTOM_AGENT = "custom"
 
-# The order every list of chairs is presented in: the two council stages, the
-# chat assistant, then Projects Mode's three roles. Here rather than repeated
-# at each call site, so adding a seventh cannot leave one screen showing six.
-PROVIDER_ORDER = ("drafter", "polisher", "solo", "architect", "coder", "qa")
+# The council seats are configured per *CLI* rather than per chair, because
+# which chair a CLI takes is decided per run by the router - there is no
+# standing "seat 2" to configure. What an operator sets here is how Codex
+# behaves whenever Codex is seated, which is the thing that stays true across
+# runs.
+def council_provider_id(agent: str) -> str:
+    """The provider id holding one CLI's council configuration."""
+    return f"council_{agent}"
+
+
+COUNCIL_PROVIDERS = tuple(council_provider_id(a) for a in AGENTS)
+
+# The order every list of chairs is presented in: the council's per-CLI seats,
+# the legacy two-stage pair, the chat assistant, then Projects Mode's three
+# roles. Here rather than repeated at each call site, so adding another cannot
+# leave one screen showing the rest.
+#
+# `drafter` and `polisher` are kept after the rewrite of Council into a
+# deliberating bench. They are no longer dispatched on, but transcripts written
+# before it name them, and dropping them from the order would render an
+# archived run with two unlabelled stages.
+PROVIDER_ORDER = (
+    *COUNCIL_PROVIDERS,
+    "drafter",
+    "polisher",
+    "solo",
+    "architect",
+    "coder",
+    "qa",
+)
 
 
 def agent_for(provider: Dict[str, Any]) -> str:
@@ -352,6 +378,36 @@ DEFAULT_CODER = _project_role("coder", "codex", 2700)
 DEFAULT_QA = _project_role("qa", "agy", 1800)
 
 
+def _council_seat(agent: str) -> Dict[str, Any]:
+    """One CLI's standing council configuration.
+
+    No `role_template`: a seat's persona is decided by the router per run, from
+    what the prompt is about, so pinning one here would defeat the routing. Pin
+    the persona in the Council panel instead, where it sits next to the agent
+    pin that has the same effect on the same seat.
+
+    The timeout is a ceiling rather than an expectation. A member is read-only
+    and usually quick; the chairman writes, and takes its own longer ceiling
+    from `council.chair_timeout_seconds` because the same CLI does both jobs
+    and only one of them applies a patch.
+    """
+    return {
+        "id": council_provider_id(agent),
+        "enabled": True,
+        "prompt_on_stdin": False,
+        "timeout_seconds": 1200,
+        "model": "",
+        "models": [],
+        "effort": "",
+        **copy.deepcopy(AGENTS[agent]),
+    }
+
+
+DEFAULT_COUNCIL_PROVIDERS = {
+    council_provider_id(agent): _council_seat(agent) for agent in AGENTS
+}
+
+
 DEFAULTS: Dict[str, Any] = {
     "version": 1,
     # --- Mode ---------------------------------------------------------------
@@ -395,6 +451,12 @@ DEFAULTS: Dict[str, Any] = {
     "recent_workspaces": [],
     # --- Providers ----------------------------------------------------------
     "providers": {
+        # One entry per CLI that can be seated on the council. Ordinary
+        # providers, so the agent swap, model picker, effort picker,
+        # availability probe and quota chip all work on them unchanged.
+        **DEFAULT_COUNCIL_PROVIDERS,
+        # The pre-deliberation council's two fixed chairs. No longer dispatched
+        # on; kept so archived transcripts still render with named stages.
         "drafter": DEFAULT_DRAFTER,
         "polisher": DEFAULT_POLISHER,
         "solo": DEFAULT_SOLO,
@@ -405,6 +467,46 @@ DEFAULTS: Dict[str, Any] = {
         "architect": DEFAULT_ARCHITECT,
         "coder": DEFAULT_CODER,
         "qa": DEFAULT_QA,
+    },
+    # --- Council ------------------------------------------------------------
+    # The deliberating bench: who sits, how hard they push, and how much of
+    # that the operator fixes by hand.
+    "council": {
+        # How many members answer the task independently in Stage 1. Two is the
+        # floor the router enforces - one member has no peer to review and the
+        # critique stage would have nothing to do.
+        "seat_count": 3,
+        # Whether the chairman may also hold a member seat. On, because with
+        # three CLIs installed the alternative benches the strongest one for
+        # the whole of Stage 1. The cost - a chairman weighing a position it
+        # wrote - is real, and the seating discloses it rather than hiding it.
+        "chair_deliberates": True,
+        # How hard the critique stage pushes and how much agreement the chair
+        # requires, 0-5. A prompt knob, not a sampling one: none of these CLIs
+        # expose temperature, so a temperature slider here would move nothing.
+        "strictness": 2,
+        # "auto" routes the bench from the prompt. "manual" freezes it to the
+        # pins below, which is what to use when the routing keeps choosing
+        # differently to you and you would rather it stopped.
+        "routing": "auto",
+        # seat id -> agent, e.g. {"chair": "claude", "seat1": "codex"}. A
+        # pinned seat is still profiled and still explains itself; it simply
+        # cannot be moved. Unpinned seats route around whatever is pinned.
+        "pins": {},
+        # seat id -> role template id, fixing a seat's lens the same way.
+        "personas": {},
+        # The chair applies the patch, so it gets a longer ceiling than the
+        # read-only members even though it is usually the same CLI.
+        "chair_timeout_seconds": 1800,
+        # agent -> axis -> 0.0-1.0. What each CLI is taken to be good at, which
+        # is half of what the router scores against. Empty means "use the
+        # shipped profiles"; see router.DEFAULT_CAPABILITIES for those and for
+        # why they are starting positions rather than measurements.
+        "capabilities": {},
+        # The router's feedback loop, written by the pipeline rather than by
+        # the operator: per agent, per axis, how its seats have actually gone.
+        # A run the operator rolled back counts against the seat that wrote it.
+        "stats": {},
     },
     # --- Projects -----------------------------------------------------------
     # The bounds on an autonomous build. All three exist because the loop has

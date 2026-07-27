@@ -73,6 +73,27 @@ class AppState:
         self.usage = UsagePoller(
             store, on_update=lambda snap: self.bus.publish("usage", usage=snap)
         )
+        # Let the seating router see how much quota each CLI has left, so it can
+        # route around one that is nearly out rather than seating it and having
+        # the run die at the first stage. The poller is owned here, not by the
+        # pipeline, so it is handed over as a callable - and the router works
+        # without it, which is why this is wiring rather than a constructor
+        # argument. Readings are the vendor's own; nothing here computes one.
+        self.pipeline.quota_source = self._agent_quota
+
+    def _agent_quota(self) -> Dict[str, Optional[float]]:
+        """Percent of its window each council CLI has consumed, where known.
+
+        Keyed by agent rather than by provider id, because that is what the
+        router seats. A CLI the poller has no reading for is absent from the
+        map, and the router treats absent as "no signal" rather than as zero.
+        """
+        out: Dict[str, Optional[float]] = {}
+        for agent in cfg.AGENTS:
+            percent = self.usage.worst_percent(cfg.council_provider_id(agent))
+            if percent is not None:
+                out[agent] = percent
+        return out
 
     def _refuse_if_busy(self) -> None:
         """Raise if a council or chat run is working the tree right now."""
@@ -255,6 +276,7 @@ class Handler(BaseHTTPRequestHandler):
             ("POST", "/api/project/stop"): self._api_project_stop,
             ("POST", "/api/project/handoff"): self._api_project_handoff,
             ("GET", "/api/project/file"): self._api_project_file,
+            ("POST", "/api/council/route"): self._api_council_route,
             ("GET", "/api/roles"): lambda p: {
                 "ok": True,
                 "roles": prompts.role_catalog(self.app.store.get("roles", {})),
@@ -638,6 +660,24 @@ class Handler(BaseHTTPRequestHandler):
             "path": str(readable[name]),
             "text": ws.read_text(readable[name], projects.MAX_UI_TEXT),
         }
+
+    def _api_council_route(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Who would be seated for this prompt, without spending a token on it.
+
+        The composer calls this as the operator types so the strip shows the
+        bench that would actually run. It is the same call `start()` makes, on
+        the same config, so what is previewed is what is seated - a preview
+        computed a second way would eventually disagree with the run.
+
+        The run id is deliberately not passed: it is what shuffles the
+        anonymous aliases, and a preview that reshuffled the letters on every
+        keystroke would be unreadable. The letters are assigned for real when
+        the run starts.
+        """
+        body = self._read_body()
+        task = str(body.get("task") or "")
+        seating = self.app.pipeline.seat_council(task, self.app.store.all())
+        return {"ok": True, "seating": seating.to_dict()}
 
     def _api_save_role(self, params: Dict[str, list]) -> Dict[str, Any]:
         """Create a role, or edit one - including a built-in."""

@@ -572,6 +572,11 @@ const state = {
   // pointer, and the version it points at is the thing worth knowing. Filled
   // in from /api/models; empty until the CLI has been asked once.
   resolvedModels: {},
+  // Who the router would seat for what is currently in the composer, from
+  // /api/council/route. Refreshed as you type, because the bench is chosen
+  // from the prompt and a strip showing last run's council would be worse
+  // than one showing none. Null until the first answer arrives.
+  seating: null,
 };
 
 const STATE_LABELS = {
@@ -801,49 +806,170 @@ function roleTag(role) {
  *  thread. Clicking a member opens everything about it — CLI, model, effort
  *  and role — rather than spreading those across chips that widen the strip
  *  until it no longer fits on one line. */
+/** The seating the strip should draw: the live run's if there is one, the
+ *  router's preview of the composer otherwise.
+ *
+ *  A run's own seating always wins. The bench is frozen when a run starts —
+ *  the human approves a council at the gate and must get that one — so
+ *  redrawing the strip from a preview mid-run would show a council that is not
+ *  the one working. */
+function activeSeating() {
+  const run = (state.openChat && state.openChat.run) || state.run;
+  if (run && !run.solo && run.seating) return run.seating;
+  return state.seating;
+}
+
 function renderStrip() {
   const strip = $('#council-strip');
   const council = uiMode() === 'council';
   strip.classList.toggle('hidden', !council);
   if (!council) { strip.innerHTML = ''; return; }
 
-  const run = state.run;
+  const seating = activeSeating();
+  if (!seating) {
+    // Before the first routing answer there is genuinely nothing to say about
+    // who will sit. Saying so beats drawing a placeholder bench that is about
+    // to be replaced by a different one.
+    strip.innerHTML =
+      '<div class="strip-inner"><span class="strip-empty">' +
+      'Describe the task and the council seats itself.</span></div>';
+    return;
+  }
+
+  const run = (state.openChat && state.openChat.run) || state.run;
   const providers = (state.config || {}).providers || {};
-  const probeFor = (id) => state.providers.find(p => p.id === id);
+  const seats = [...(seating.members || []), seating.chair].filter(Boolean);
 
-  strip.innerHTML = '<div class="strip-inner">' + ['drafter', 'polisher'].map(id => {
-    const p = providers[id] || {};
-    const stage = run && run.stages ? run.stages[id] : null;
-    const info = probeFor(id);
-    const available = !info || info.available;
+  strip.innerHTML =
+    '<div class="strip-inner">' +
+    seats.map(seat => seatHtml(seat, run, providers)).join('') +
+    '</div>' +
+    (seating.notes || []).map(n =>
+      `<div class="strip-note-line">${esc(n)}</div>`
+    ).join('');
+}
 
-    let st = stage ? stage.state : 'pending';
-    if (run && run.state === 'awaiting_approval' && id === 'polisher') st = 'waiting';
+/** One seat on the strip. Coloured by which CLI is in it rather than by which
+ *  chair it is: the chair moves between runs, and a colour that followed the
+ *  chair would recolour the whole strip every time the routing changed. */
+function seatHtml(seat, run, providers) {
+  const p = providers[seat.provider_id] || {};
+  const stageId = seat.chairman ? 'chair' : seat.id;
+  const stage = run && run.stages ? run.stages[stageId] : null;
+  const info = state.providers.find(x => x.id === seat.provider_id);
+  const available = !info || info.available;
 
-    const initial = (p.label || id).slice(0, 2).toUpperCase();
-    const model = p.model || 'default model';
-    const title =
-      `${p.label || id} — ${p.role || 'no role'} · ${modelDetail(model)}` +
-      (p.effort ? ` · ${p.effort}` : '') +
-      (available ? '' : ` · ${(p.command || [])[0] || 'CLI'} not found`) +
-      '\nClick to change CLI, model, effort or role.';
+  let st = stage ? stage.state : 'pending';
+  if (run && run.state === 'awaiting_approval' && seat.chairman) st = 'waiting';
+
+  const who = p.label || seat.agent;
+  const model = p.model || 'default model';
+  const role = seat.chairman ? 'Chair' : (seat.persona_name || 'Member');
+  const reasons = (seat.reasons || []).join(' · ');
+
+  const title =
+    `${who} — ${role}` +
+    (seat.alias ? ` · appears to its peers as ${seat.alias}` : '') +
+    ` · ${modelDetail(model)}` +
+    (p.effort ? ` · ${p.effort}` : '') +
+    (available ? '' : ` · ${(p.command || [])[0] || 'CLI'} not found`) +
+    (reasons ? `\n\nSeated because: ${reasons}` : '') +
+    (seat.pinned ? '\nPinned in Settings → Council.' : '') +
+    '\n\nClick to change CLI, model or effort.';
+
+  return (
+    `<button class="member ${st}${available ? '' : ' unavailable'}` +
+      `${seat.chairman ? ' is-chair' : ''}" type="button" ` +
+      `data-member="${esc(seat.provider_id)}" data-agent="${esc(seat.agent)}" ` +
+      `title="${esc(title)}">` +
+      `<span class="member-mark">${esc(String(who).slice(0, 2).toUpperCase())}</span>` +
+      `<span class="member-body">` +
+        `<span class="member-name">${esc(who)}` +
+          (seat.pinned ? '<span class="member-pin" aria-label="pinned">·</span>' : '') +
+        `</span>` +
+        `<span class="member-model">${esc(seat.alias || model)}</span>` +
+      `</span>` +
+      `<span class="member-tail">` +
+        `<span class="member-role">${esc(roleTag(role))}</span>` +
+        memberQuotaHtml(seat.provider_id) +
+        `<span class="member-dot"></span>` +
+      `</span>` +
+    `</button>`
+  );
+}
+
+/** The three stages, as a stepper. Built from the run's own stage records so
+ *  "6 of 6 answered" is a count of what happened rather than of what was
+ *  planned — a council that lost a member to a timeout says so here. */
+const COUNCIL_STEPS = [
+  { key: 'position', label: 'Independent perspectives', states: ['deliberating'] },
+  { key: 'critique', label: 'Cross-evaluating', states: ['critiquing'] },
+  { key: 'chair', label: 'Synthesising the verdict',
+    states: ['synthesizing', 'awaiting_approval'] },
+];
+
+function renderCouncilSteps() {
+  const host = $('#council-steps');
+  const run = (state.openChat && state.openChat.run) || state.run;
+  const show = uiMode() === 'council' && run && !run.solo && run.seating;
+  host.classList.toggle('hidden', !show);
+  if (!show) { $('.project-strip', host).innerHTML = ''; return; }
+
+  const stages = Object.values(run.stages || {});
+  $('.project-strip', host).innerHTML = COUNCIL_STEPS.map(step => {
+    const mine = stages.filter(s => s.kind === step.key);
+    const done = mine.filter(s => s.state === 'done').length;
+    const failed = mine.filter(s => s.state === 'failed').length;
+    const skipped = mine.length > 0 && mine.every(s => s.state === 'skipped');
+    const live = step.states.includes(run.state);
+
+    let note;
+    if (skipped) note = 'skipped — nothing to compare';
+    else if (live && step.key === 'chair' && run.state === 'awaiting_approval')
+      note = 'waiting for you';
+    else if (live) note = `${done} of ${mine.length} answered`;
+    else if (mine.length) note = `${done} of ${mine.length}` +
+      (failed ? `, ${failed} failed` : '');
+    else note = 'not reached';
 
     return (
-      `<button class="member ${st}${available ? '' : ' unavailable'}" type="button" ` +
-        `data-member="${id}" data-agent="${id}" title="${esc(title)}">` +
-        `<span class="member-mark">${esc(initial)}</span>` +
-        `<span class="member-body">` +
-          `<span class="member-name">${esc(p.label || id)}</span>` +
-          `<span class="member-model">${esc(model)}</span>` +
-        `</span>` +
-        `<span class="member-tail">` +
-          `<span class="member-role">${esc(roleTag(p.role))}</span>` +
-          memberQuotaHtml(id) +
-          `<span class="member-dot"></span>` +
-        `</span>` +
-      `</button>`
+      `<span class="strip-cell${live ? ' live' : ''}${skipped ? ' muted' : ''}">` +
+        `<span class="strip-label">${esc(step.label)}</span>` +
+        `<span class="strip-value">${live ? 'Working' : (done ? 'Done' : 'Waiting')}</span>` +
+        `<span class="strip-note">${esc(note)}</span>` +
+      `</span>`
     );
-  }).join('') + '</div>';
+  }).join('');
+}
+
+/** Ask the server who would sit for what is in the composer.
+ *
+ *  Debounced, and the answer is dropped if the box has changed since — the
+ *  routing is cheap but not free, and a stale bench arriving late would
+ *  overwrite the right one. */
+let seatingTimer = null;
+let seatingSeq = 0;
+function scheduleSeating() {
+  if (uiMode() !== 'council') return;
+  clearTimeout(seatingTimer);
+  seatingTimer = setTimeout(refreshSeating, 250);
+}
+
+async function refreshSeating() {
+  if (uiMode() !== 'council') return;
+  const task = $('#task-input').value || '';
+  const seq = ++seatingSeq;
+  try {
+    const res = await api('/api/council/route', {
+      method: 'POST', body: { task },
+    });
+    if (seq !== seatingSeq) return;
+    state.seating = res.seating;
+    renderStrip();
+  } catch (e) {
+    // A routing preview that fails is not worth a toast: the run itself seats
+    // the council again anyway, and the strip simply keeps what it had.
+  }
 }
 
 /** Quota on the strip, shown only once it is worth interrupting for. A chip on
@@ -1297,27 +1423,112 @@ function userHtml(task) {
     renderMarkdown(task || '(no message)') + '</div></div>';
 }
 
+/** A figure an agent reported about itself, as a chip.
+ *
+ *  Only ever drawn from a number the agent actually stated. A stage that gave
+ *  none renders nothing here, and the verdict card says "not stated" in words
+ *  — this app has no way to measure confidence and must not appear to. */
+function confidenceChip(value, label, why) {
+  if (value === null || value === undefined) return '';
+  const band = value >= 75 ? 'high' : value >= 45 ? 'mid' : 'low';
+  const title = `${label}: ${value}% — the agent's own figure, not measured` +
+    (why ? `\n\nIt said it could be wrong if: ${why}` : '');
+  return (
+    `<span class="conf-chip ${band}" title="${esc(title)}">` +
+      `<span class="conf-label">${esc(label)}</span>` +
+      `<span class="conf-value">${value}%</span>` +
+    `</span>`
+  );
+}
+
 function messageHtml(reply, id) {
   const who = reply.label || reply.stage || id || 'Agent';
   const st = reply.state || '';
   const dur = reply.duration ? ` · ${fmtDuration(reply.duration)}` : '';
   const word = STAGE_WORDS[st] || '';
-  const body = renderMarkdown(reply.output || '') ||
+  const chair = reply.kind === 'chair';
+  // The trailer lines are stripped from the body because they are rendered as
+  // chips above it. Left in, the same figure would appear twice — once as a
+  // badge and once as a stray line of prose at the bottom of the card.
+  const body = renderMarkdown(stripTrailer(reply.output || '')) ||
     `<p class="history-none">${esc(reply.error || `(${st || 'no output'})`)}</p>`;
+
   return (
-    `<div class="chat-message assistant-message" data-agent="${esc(id || '')}">` +
+    `<div class="chat-message assistant-message${chair ? ' verdict' : ''}" ` +
+      `data-agent="${esc(reply.agent || id || '')}">` +
       `<div class="msg-head">` +
         `<span class="msg-mark">${esc(String(who).slice(0, 2).toUpperCase())}</span>` +
         `<span class="msg-who">${esc(who)}</span>` +
         (reply.role ? `<span class="msg-role">${esc(roleTag(reply.role))}</span>` : '') +
+        // The alias is what its peers knew it as. Shown on the member's own
+        // card so a critique that says "Agent B was wrong" can be followed
+        // back to a CLI without reading the transcript.
+        (reply.alias && !chair
+          ? `<span class="msg-alias" title="How this seat appeared to its peers">` +
+            `${esc(reply.alias)}</span>`
+          : '') +
+        (chair && reply.consensus !== null && reply.consensus !== undefined
+          ? confidenceChip(reply.consensus, 'consensus', '')
+          : '') +
+        confidenceChip(reply.confidence, 'confidence', reply.because) +
         `<span class="msg-state${st === 'failed' ? ' failed' : ''}">` +
           `${esc(word)}${esc(dur)}</span>` +
       `</div>` +
       // `data-live` marks the one body `stage_output` may append to. Only a
       // running stage has it, so a finished message can never be scribbled on.
       `<div class="markdown"${st === 'running' ? ' data-live="1"' : ''}>${body}</div>` +
+      (chair && st === 'done' && (reply.confidence === null ||
+                                  reply.confidence === undefined)
+        ? '<div class="turn-note">The chairman did not state a confidence. ' +
+          'Nothing here fills that in.</div>'
+        : '') +
     `</div>`
   );
+}
+
+/** Remove the contract trailer so it is not shown twice. Matches the parser in
+ *  prompts.py; a line the parser would not have read is left alone. */
+function stripTrailer(text) {
+  return String(text || '')
+    .replace(/^[ \t]*(?:CONFIDENCE|CONSENSUS):[ \t]*\d{1,3}[ \t]*$/gim, '')
+    .replace(/^[ \t]*BECAUSE:[ \t]*.*$/gim, '')
+    .trimEnd();
+}
+
+/** The stages of a turn, grouped under the stage they belong to.
+ *
+ *  Still messages in the conversation rather than a tabbed grid beside it —
+ *  that is how every other agent in this app speaks, and a council that needed
+ *  its own layout would read as a different product bolted on. The headings
+ *  are the only addition, and they exist because seven messages in a row with
+ *  no divisions gives no clue which are positions and which are reviews. */
+const STAGE_HEADINGS = {
+  position: 'Independent positions',
+  critique: 'Peer critique',
+  chair: 'The verdict',
+};
+
+function councilBodyHtml(run, gated) {
+  const stages = stagesOf(run);
+  let last = null;
+  return stages.map(s => {
+    const heading = (s.kind && s.kind !== last && STAGE_HEADINGS[s.kind])
+      ? `<h4 class="project-head-sm council-divider">${esc(STAGE_HEADINGS[s.kind])}</h4>`
+      : '';
+    last = s.kind || last;
+    // The gate sits immediately before the stage it is gating, which is the
+    // chairman - the only stage that can write. Anchored on the last critique
+    // so it reads as "here is everything the council said; now decide".
+    const gateHere = gated && s.kind === 'chair';
+    return (gateHere ? '<div data-slot="approval-gate"></div>' : '') +
+      heading + messageHtml(s, s.id);
+  }).join('') +
+    // A gated run has not reached the chairman yet, so there is no chair
+    // message to anchor the gate to. It goes at the end of what has been said.
+    (gated && !stages.some(s => s.kind === 'chair')
+      ? '<h4 class="project-head-sm council-divider">The verdict</h4>' +
+        '<div data-slot="approval-gate"></div>'
+      : '');
 }
 
 function renderThread() {
@@ -1369,12 +1580,7 @@ function renderThread() {
   const current =
     '<div class="turn">' +
       userHtml(run.task) +
-      stagesOf(run).map(s =>
-        messageHtml(s, s.id) +
-        // The gate belongs against the draft it is judging, not at the top of
-        // the screen where it used to sit with nothing to read beside it.
-        (gated && s.id === 'drafter' ? '<div data-slot="approval-gate"></div>' : '')
-      ).join('') +
+      councilBodyHtml(run, gated) +
       (run.reviewer_note
         ? `<div class="turn-note">Your note at the gate: ${esc(run.reviewer_note)}</div>`
         : '') +
@@ -1900,6 +2106,7 @@ function renderAll() {
   renderMode();
   renderProfile();
   renderStrip();
+  renderCouncilSteps();
   renderComposerChips();
   renderWorkspace();
   renderToggles();
@@ -2762,6 +2969,139 @@ function renderSettings() {
   $('#project-max-steps').value = proj.max_steps ?? 40;
   $('#project-max-fixes').value = proj.max_fix_attempts ?? 3;
   $('#project-innovation-default').value = proj.innovation_rounds ?? 2;
+
+  renderCouncilSettings();
+}
+
+/* ---- Council settings --------------------------------------------------- */
+
+/** What each strictness step actually changes, in words. The number alone
+ *  says nothing about the thing worth knowing: how hard will they be on each
+ *  other, and will the chairman tell me when they disagreed? */
+const STRICTNESS_NOTES = [
+  ['Collegial', 'Members raise only what would change the outcome, and the ' +
+    'chair prefers whatever they converged on.'],
+  ['Measured', 'Adds anything that would mislead a reader of the final answer.'],
+  ['Balanced', 'Every factual claim about the code gets checked. The chair ' +
+    'says plainly when the council was split.'],
+  ['Exacting', 'Peers are assumed wrong until verified against the code, and ' +
+    'the chair implements the conservative option where they were not.'],
+  ['Adversarial', 'Members actively try to construct the input each position ' +
+    'fails on. Unrefuted is treated as unproven, not correct.'],
+  ['Hostile', 'The default verdict is that the peer is wrong. Nothing enters ' +
+    'the verdict that the chair did not verify itself.'],
+];
+
+/** The axes a capability profile is scored on. Mirrors router.DIMENSIONS —
+ *  the server is the authority, this is only what to label the sliders. */
+const CAPABILITY_AXES = [
+  ['implementation', 'Building'],
+  ['debugging', 'Debugging'],
+  ['review', 'Reviewing'],
+  ['security', 'Security'],
+  ['architecture', 'Architecture'],
+  ['analysis', 'Analysis'],
+];
+
+function renderCouncilSettings() {
+  const conf = state.config || {};
+  const council = conf.council || {};
+
+  $('#council-seats').value = council.seat_count ?? 3;
+  $('#council-chair-timeout').value = council.chair_timeout_seconds ?? 1800;
+  $('#council-routing').checked = (council.routing || 'auto') !== 'manual';
+  $('#council-chair-deliberates').checked = council.chair_deliberates !== false;
+  $('#council-strictness').value = council.strictness ?? 2;
+  updateStrictnessNote();
+
+  // Seating. One row per chair, each choosing a CLI or leaving it to the
+  // router - the same shape as the project agent matrix, so a chair is
+  // reassigned the same way wherever it lives.
+  const seats = ['chair'];
+  for (let i = 1; i <= (Number(council.seat_count) || 3); i++) seats.push(`seat${i}`);
+  const pins = council.pins || {};
+  const agents = (state.agents || []).filter(a => (a.command || []).length);
+
+  $('#council-pins').innerHTML = seats.map(id => {
+    const label = id === 'chair' ? 'Chair' : `Seat ${id.replace('seat', '')}`;
+    return (
+      `<label class="council-pin-row">` +
+        `<span class="council-pin-label">${esc(label)}</span>` +
+        `<select data-pin="${esc(id)}">` +
+          `<option value=""${pins[id] ? '' : ' selected'}>Auto — routed per run</option>` +
+          agents.map(a =>
+            `<option value="${esc(a.id)}"${pins[id] === a.id ? ' selected' : ''}>` +
+            `${esc(a.label)}</option>`
+          ).join('') +
+        `</select>` +
+      `</label>`
+    );
+  }).join('');
+
+  // Capability profiles.
+  const caps = council.capabilities || {};
+  $('#council-capabilities').innerHTML = agents.map(a => {
+    const mine = caps[a.id] || {};
+    return (
+      `<div class="council-cap" data-cap-agent="${esc(a.id)}">` +
+        `<h5 class="council-cap-name">${esc(a.label)}</h5>` +
+        CAPABILITY_AXES.map(([axis, name]) => {
+          // Blank means "use the shipped profile", and the server decides what
+          // that is. An empty box here is therefore a real value, not a gap.
+          const value = mine[axis];
+          return (
+            `<label class="council-cap-row">` +
+              `<span class="council-cap-axis">${esc(name)}</span>` +
+              `<input type="range" min="0" max="100" step="5" ` +
+                `data-cap-axis="${esc(axis)}" ` +
+                `value="${value === undefined ? '' : Math.round(value * 100)}"` +
+                `${value === undefined ? ' data-unset="1"' : ''}>` +
+              `<output>${value === undefined ? 'default' : Math.round(value * 100)}</output>` +
+            `</label>`
+          );
+        }).join('') +
+      `</div>`
+    );
+  }).join('');
+}
+
+function updateStrictnessNote() {
+  const level = Number($('#council-strictness').value);
+  const [name, note] = STRICTNESS_NOTES[level] || STRICTNESS_NOTES[2];
+  $('#council-strictness-out').textContent = name;
+  $('#council-strictness-hint').textContent = note;
+}
+
+/** The council block, read back off the panel. */
+function readCouncilSettings() {
+  const pins = {};
+  $$('#council-pins select').forEach(sel => {
+    if (sel.value) pins[sel.dataset.pin] = sel.value;
+  });
+
+  const capabilities = {};
+  $$('#council-capabilities .council-cap').forEach(card => {
+    const agent = card.dataset.capAgent;
+    const axes = {};
+    $$('input[data-cap-axis]', card).forEach(input => {
+      // Untouched sliders stay absent so the server keeps using its shipped
+      // profile. Writing 0.6 for every axis the operator never looked at
+      // would freeze today's defaults into their config for good.
+      if (input.dataset.unset) return;
+      axes[input.dataset.capAxis] = Number(input.value) / 100;
+    });
+    if (Object.keys(axes).length) capabilities[agent] = axes;
+  });
+
+  return {
+    seat_count: Number($('#council-seats').value) || 3,
+    chair_timeout_seconds: Number($('#council-chair-timeout').value) || 1800,
+    routing: $('#council-routing').checked ? 'auto' : 'manual',
+    chair_deliberates: $('#council-chair-deliberates').checked,
+    strictness: Number($('#council-strictness').value),
+    pins,
+    capabilities,
+  };
 }
 
 /** Flag a behaviour whose write expectation disagrees with the stage's actual
@@ -2866,6 +3206,7 @@ async function saveSettings() {
       method: 'POST',
       body: {
         providers,
+        council: readCouncilSettings(),
         house_rules: $('#house-rules').value,
         display_name: $('#display-name').value.trim(),
         port: parseInt($('#port-input').value, 10) || 8760,
@@ -2885,6 +3226,9 @@ async function saveSettings() {
     await refreshDoctor();
     renderAll();
     closeModal('settings');
+    // The bench depends on every one of those settings, so the strip on screen
+    // is now describing a council that would no longer be seated.
+    refreshSeating();
     toast('Settings saved.', 'ok', 3000);
   } catch (err) {
     toast(err.message, 'error');
@@ -3484,7 +3828,25 @@ function wire() {
     input.style.height = 'auto';
     input.style.height = `${input.scrollHeight}px`;
   };
-  input.addEventListener('input', () => { autosize(); renderStatus(); });
+  // The council is seated from what is in this box, so the strip follows it.
+  input.addEventListener('input', () => {
+    autosize(); renderStatus(); scheduleSeating();
+  });
+
+  // -- council settings --------------------------------------------------
+  $('#council-strictness').addEventListener('input', updateStrictnessNote);
+  // Changing the member count adds or removes a row in the seating list, so
+  // the list is rebuilt rather than left showing chairs that no longer exist.
+  $('#council-seats').addEventListener('change', renderCouncilSettings);
+  $('#council-capabilities').addEventListener('input', (e) => {
+    const slider = e.target.closest('input[data-cap-axis]');
+    if (!slider) return;
+    // Touching a slider is what turns "use the shipped profile" into a value
+    // of the operator's own. Until then it is left unset on purpose.
+    delete slider.dataset.unset;
+    const out = slider.parentElement.querySelector('output');
+    if (out) out.textContent = slider.value;
+  });
   input.addEventListener('keydown', (e) => {
     // Enter sends, as in every chat box; Shift+Enter is the newline. Ctrl+Enter
     // still works, because that is what the old composer taught.
