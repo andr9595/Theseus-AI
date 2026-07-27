@@ -22,287 +22,188 @@
           <path d="M2.5 13.3h19l-1.8 4a3.6 3.6 0 0 1-3.3 2.1H7.6a3.6 3.6 0 0 1-3.3-2.1z"/>
         </svg>
       </div>
-      <div class="brand-text">
-        <h1>Theseus AI</h1>
-        <span class="brand-sub" id="brand-sub">Draft &rarr; Polish pipeline</span>
-      </div>
+      <h1>Theseus AI</h1>
     </div>
 
-    <!-- The first decision, above everything it changes: a two-stage council
-         run, or one assistant answering directly. -->
-    <div id="mode-switch" class="mode-switch" role="radiogroup" aria-label="Mode">
-      <button type="button" role="radio" data-mode="council" aria-checked="true">
-        Council</button>
-      <button type="button" role="radio" data-mode="solo" aria-checked="false">
-        Solo</button>
-    </div>
+    <button id="new-chat" class="new-chat" type="button">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+        <path d="M12 5v14M5 12h14"/>
+      </svg>
+      New chat
+    </button>
 
-    <!-- Two halves of the sidebar: how the next run behaves, and which
-         conversation it belongs to. Both stay in the DOM so switching back
-         does not reload the panels. -->
-    <div class="sidebar-tabs" role="tablist" aria-label="Sidebar">
-      <button class="sidebar-tab active" type="button" role="tab"
-        aria-selected="true" data-sidebar-tab="council">Setup</button>
-      <button class="sidebar-tab" type="button" role="tab"
-        aria-selected="false" data-sidebar-tab="chats">Chats
-        <span class="sidebar-tab-count hidden" id="chat-count"></span></button>
-    </div>
-
-    <div class="sidebar-panel active" data-sidebar-panel="council">
-
-    <!-- Where the agents work. Optional: with nothing chosen a run happens in
-         a scratch folder of the app's own, which is what makes "ask it a
-         question" a thing you can do before configuring anything. -->
-    <section class="panel">
-      <h2 class="panel-title">Working folder <span class="panel-note">optional</span></h2>
-      <button id="workspace-btn" class="repo-btn" type="button">
-        <span class="repo-icon" aria-hidden="true">
-          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
-          </svg>
-        </span>
-        <span class="repo-label" id="workspace-label">Scratch workspace</span>
-      </button>
-      <div id="workspace-meta" class="repo-meta hidden"></div>
-      <div id="recent-workspaces" class="recent"></div>
-    </section>
-
-    <!-- Live agent rail -->
-    <section class="panel">
-      <h2 class="panel-title" id="agent-panel-title">Council</h2>
-      <div id="agent-rail" class="agent-rail"></div>
-    </section>
-
-    <!-- Everything below decides how a council run behaves. None of it applies
-         to Solo, which has no gate, no branch and nothing to roll back, so it
-         is hidden there rather than shown doing nothing. Hidden, not cleared:
-         switching back restores the operator's choices untouched. -->
-    <div id="council-controls">
-
-    <!-- How the next run behaves -->
-    <section class="panel">
-      <h2 class="panel-title">Run</h2>
-
-      <label class="toggle toggle-danger" for="zero-touch">
-        <input type="checkbox" id="zero-touch">
-        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
-        <span class="toggle-text">
-          <strong>Zero-Touch Mode</strong>
-          <em>Run autonomously, skip all approvals</em>
-        </span>
-      </label>
-
-      <div id="zero-touch-warning" class="inline-warning hidden">
-        Auto-approve flags will be passed to the CLI. Files change without
-        confirmation.
-      </div>
-
-    </section>
-
-    <!-- Where the work lands, and how to get it back. All three are git
-         features, so all three say so when the working folder has no git. -->
-    <section class="panel">
-      <h2 class="panel-title">Delivery &amp; recovery</h2>
-
-      <div id="no-git-warning" class="inline-note hidden">
-        This folder is not a git repository, so there is no diff, no snapshot
-        and nothing to roll back to. Pull request mode will refuse to start.
-      </div>
-
-      <label class="toggle" for="pull-request-mode">
-        <input type="checkbox" id="pull-request-mode">
-        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
-        <span class="toggle-text">
-          <strong>Pull request</strong>
-          <em>Commit to a new branch and open a PR to merge yourself</em>
-        </span>
-      </label>
-
-      <label class="toggle" for="clean-worktree">
-        <input type="checkbox" id="clean-worktree">
-        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
-        <span class="toggle-text">
-          <strong>Require clean tree</strong>
-          <em id="clean-tree-note">Refuse to run on uncommitted work</em>
-        </span>
-      </label>
-
-      <label class="toggle" for="safety-snapshot">
-        <input type="checkbox" id="safety-snapshot">
-        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
-        <span class="toggle-text">
-          <strong>Safety snapshot</strong>
-          <em id="snapshot-note">Enable one-click rollback</em>
-        </span>
-      </label>
-    </section>
-
-    </div><!-- /council-controls -->
-
-    <div class="sidebar-spacer"></div>
-
-    </div><!-- /council -->
-
-    <div class="sidebar-panel" data-sidebar-panel="chats">
-      <button id="new-chat" class="btn btn-quiet new-chat" type="button">
-        + New conversation
-      </button>
-      <div id="chat-list" class="chat-list"></div>
-    </div>
+    <!-- The whole sidebar below the button is history. Grouped by day in
+         `renderChats`, so the headings are data, not markup. -->
+    <div id="chat-list" class="chat-list"></div>
 
     <nav class="sidebar-foot">
-      <button id="settings-btn" class="ghost-btn" type="button">Settings</button>
+      <button id="settings-btn" class="foot-btn" type="button">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2v.2a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0-1.2-2.9H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 8a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V2a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V8a1.7 1.7 0 0 0 1.5 1H22a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>
+        </svg>
+        Settings
+      </button>
+      <div class="profile">
+        <span class="profile-mark" id="profile-mark" aria-hidden="true">?</span>
+        <span class="profile-name" id="profile-name">&hellip;</span>
+      </div>
     </nav>
   </aside>
 
   <!-- ================= Main ================= -->
   <main class="main">
 
-    <header class="topbar">
-      <div class="status-pill" id="status-pill">
-        <span class="dot" id="status-dot"></span>
-        <span id="status-text">Idle</span>
+    <!-- Centred mode selector. Council and Chat are real modes the server
+         stores; Project is a placeholder and deliberately never persisted. -->
+    <div class="mode-bar">
+      <div id="mode-switch" class="mode-switch" role="radiogroup" aria-label="Mode">
+        <button type="button" role="radio" data-mode="council" aria-checked="true">Council</button>
+        <button type="button" role="radio" data-mode="solo" aria-checked="false">Chat</button>
+        <button type="button" role="radio" data-mode="project" aria-checked="false">Project</button>
       </div>
-      <div class="topbar-meta" id="topbar-meta"></div>
-      <div class="topbar-actions">
-        <span class="conn" id="conn-state" title="Event stream">
-          <span class="conn-dot"></span><span class="conn-text">connecting</span>
-        </span>
-        <button id="cancel-btn" class="btn btn-quiet hidden" type="button">Cancel run</button>
-        <button id="pr-btn" class="btn btn-quiet hidden" type="button">Open pull request</button>
-        <button id="continue-btn" class="btn btn-quiet hidden" type="button">Continue this run</button>
-        <button id="rollback-btn" class="btn btn-quiet hidden" type="button">Roll back</button>
+      <div class="mode-bar-right">
+        <button id="cancel-btn" class="btn btn-quiet btn-sm hidden" type="button">Cancel</button>
+        <button id="rollback-btn" class="btn btn-quiet btn-sm hidden" type="button">Roll back</button>
+        <button id="pr-btn" class="btn btn-quiet btn-sm hidden" type="button">View pull request</button>
       </div>
-    </header>
+    </div>
 
-    <!-- Task composer -->
-    <section class="composer" id="composer">
-      <div id="continue-banner" class="continue-banner hidden">
-        <span class="continue-icon" aria-hidden="true">&#8618;</span>
-        <span class="continue-text">
-          Continuing <b id="continue-task"></b> &mdash;
-          <span id="continue-copy">the council will be given that exchange as
-          context.</span>
-          <span id="continue-context" class="context-meter"></span>
-        </span>
-        <button id="compact-btn" class="link-btn hidden" type="button">Compact</button>
-        <button id="continue-clear" class="link-btn" type="button">Start fresh instead</button>
-      </div>
-      <textarea id="task-input" class="task-input" rows="3" spellcheck="false"
-        placeholder="Describe the change you want. Be specific about files, behaviour and edge cases&hellip;
-Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP, with tests."></textarea>
-      <div class="composer-foot">
-        <span class="hint"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> to run</span>
-        <button id="run-btn" class="btn btn-primary" type="button" disabled>
-          <span class="btn-spinner" aria-hidden="true"></span>
-          <span class="btn-label">Convene the council</span>
-        </button>
-      </div>
-    </section>
+    <!-- Council members. Sticky above the thread rather than inside it: it is
+         the control surface for the run, so it must not scroll away mid-run. -->
+    <div id="council-strip" class="council-strip hidden"></div>
 
-    <!-- Approval gate -->
-    <section id="approval-gate" class="approval hidden" aria-live="polite">
-      <div class="approval-head">
-        <span class="approval-icon" aria-hidden="true">
-          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>
-          </svg>
-        </span>
-        <div>
-          <strong>Review required</strong>
-          <p id="approval-copy">The draft is ready. <b>Nothing has been written to disk yet.</b>
-             Approving lets the senior stage apply changes in your working folder.</p>
+    <div id="scroll" class="scroll">
+      <div class="column">
+
+        <!-- Empty state. Replaced by the thread as soon as there is one. -->
+        <div id="hero" class="hero">
+          <h2 id="hero-title">Hey. What shall we build today?</h2>
+          <p id="hero-sub" class="hero-sub"></p>
         </div>
-      </div>
-      <textarea id="approval-note" class="approval-note" rows="2" spellcheck="false"
-        placeholder="Optional: steer the senior stage. Takes precedence over the draft."></textarea>
-      <div class="approval-actions">
-        <button id="reject-btn" class="btn btn-quiet" type="button">Reject</button>
-        <button id="approve-btn" class="btn btn-primary" type="button">Approve &amp; execute</button>
-      </div>
-    </section>
 
-    <!-- Output. Council only: Live stream, Draft, Senior review and Diff are
-         all artefacts of the pipeline, and a conversation has none of them. -->
-    <section class="output" id="council-output">
-      <div class="tabs" role="tablist">
-        <button class="tab active" data-tab="stream" role="tab">Live stream</button>
-        <button class="tab" data-tab="draft" role="tab">Draft <span class="tab-badge hidden" id="badge-draft"></span></button>
-        <button class="tab" data-tab="final" role="tab">Senior review <span class="tab-badge hidden" id="badge-final"></span></button>
-        <button class="tab" data-tab="diff" role="tab">Diff <span class="tab-badge hidden" id="badge-diff"></span></button>
-        <div class="tabs-spacer"></div>
-        <label class="autoscroll" for="autoscroll" title="Follow output as it arrives">
-          <input type="checkbox" id="autoscroll" checked> Follow
-        </label>
-      </div>
-
-      <div class="tab-panels">
-        <div class="tab-panel active" data-panel="stream">
-          <div id="stream" class="stream" role="log" aria-live="polite"></div>
+        <!-- Project is a placeholder: no config, no controls, nothing that
+             pretends to work. -->
+        <div id="project-empty" class="hero hidden">
+          <h2>Projects are coming soon</h2>
+          <p class="hero-sub">No configuration in this tab yet.</p>
         </div>
-        <div class="tab-panel" data-panel="draft">
-          <div id="draft-view" class="markdown empty-state">
-            The junior stage&rsquo;s proposal appears here. It is read-only &mdash;
-            no files are touched during this stage.
+
+        <div id="thread" class="thread"></div>
+      </div>
+    </div>
+
+    <!-- Composer, docked. In Council mode the CLI/model/effort chips live on
+         the strip above instead, so this row only carries what applies. -->
+    <div class="composer-dock">
+      <div class="column">
+        <div id="continue-banner" class="continue-banner hidden">
+          <span class="continue-text">
+            Continuing <b id="continue-task"></b> &mdash;
+            <span id="continue-copy">the council will be given that exchange as context.</span>
+            <span id="continue-context" class="context-meter"></span>
+          </span>
+          <button id="compact-btn" class="link-btn hidden" type="button">Compact</button>
+          <button id="continue-clear" class="link-btn" type="button">Start fresh instead</button>
+        </div>
+
+        <div class="composer" id="composer">
+          <textarea id="task-input" class="task-input" rows="1" spellcheck="false"
+            placeholder="Ask the council&hellip;"></textarea>
+          <div class="composer-foot">
+            <div id="composer-chips" class="composer-chips"></div>
+            <div class="composer-spacer"></div>
+            <button id="gear-btn" class="icon-round" type="button" aria-label="Run options" aria-haspopup="true">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+                <circle cx="12" cy="12" r="3"/>
+                <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2v.2a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0-1.2-2.9H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 8a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V2a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V8a1.7 1.7 0 0 0 1.5 1H22a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>
+              </svg>
+            </button>
+            <button id="run-btn" class="send-btn" type="button" disabled aria-label="Send">
+              <span class="btn-spinner" aria-hidden="true"></span>
+              <svg class="send-icon" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 19V5M5 12l7-7 7 7"/>
+              </svg>
+            </button>
           </div>
         </div>
-        <div class="tab-panel" data-panel="final">
-          <div id="final-view" class="markdown empty-state">
-            The senior stage&rsquo;s review and summary of applied changes appears here.
-          </div>
-        </div>
-        <div class="tab-panel" data-panel="diff">
-          <div id="commit-bar" class="commit-bar hidden">
-            <input id="commit-message" class="commit-message" spellcheck="false"
-              placeholder="Commit message&hellip;">
-            <button id="commit-btn" class="btn btn-primary btn-sm" type="button">Commit</button>
-            <span id="commit-hint" class="commit-hint"></span>
-          </div>
-          <!-- Replaced on first render: what belongs here depends on whether
-               the working folder has any git in it. -->
-          <div id="diff-view" class="diff-view empty-state">
-            Changes made to your working tree appear here as a git diff.
-          </div>
+
+      </div>
+    </div>
+
+    <!-- Empty, and load-bearing. With no conversation on screen the scroller
+         shrinks to its hero and this eats the slack, which floats the composer
+         near the middle as in the mock; once a thread exists the scroller
+         takes the space back and the composer docks to the bottom. -->
+    <div id="dock-spacer" class="dock-spacer"></div>
+
+    <!-- Status bar. Clicking the folder opens the picker; working nowhere in
+         particular is a supported state, so it reads as a choice. -->
+    <div class="statusbar-wrap">
+      <div class="column">
+        <div class="statusbar">
+          <button id="workspace-btn" class="status-item" type="button">
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+            </svg>
+            <span id="workspace-label">Scratch workspace</span>
+          </button>
+          <span id="workspace-git" class="status-git"></span>
+          <span class="status-spacer"></span>
+          <span id="topbar-meta" class="status-meta"></span>
+          <span class="conn" id="conn-state" title="Event stream">
+            <span class="conn-dot"></span><span class="conn-text">connecting</span>
+          </span>
         </div>
       </div>
-    </section>
-
-    <!-- Solo's output: the message and the reply, and nothing else. -->
-    <section id="solo-output" class="solo-output hidden" aria-live="polite">
-      <div id="solo-empty" class="empty-state solo-empty">
-        Ask your assistant anything. One agent, no draft stage and no approval
-        gate &mdash; and it cannot change your files. Point it at a working
-        folder when the question is about one.
-      </div>
-      <article id="solo-turn" class="solo-turn hidden">
-        <div class="chat-message user-message">
-          <div id="solo-question" class="markdown"></div>
-        </div>
-        <div class="chat-message assistant-message">
-          <div id="solo-speaker" class="chat-speaker">Assistant</div>
-          <div id="solo-answer" class="markdown"></div>
-        </div>
-      </article>
-    </section>
-
-    <!-- A saved conversation, read in place of the live run's output rather
-         than in a modal over it. The live run keeps its rendered state. -->
-    <section id="chat-view" class="chat-view hidden">
-      <header class="chat-head">
-        <button id="chat-close" class="btn btn-quiet btn-sm" type="button">
-          &larr; Current run
-        </button>
-        <div class="chat-head-text">
-          <h2 id="chat-title">Conversation</h2>
-          <div id="chat-context" class="context-meter"></div>
-        </div>
-        <button id="chat-continue" class="btn btn-primary btn-sm" type="button">
-          Continue
-        </button>
-      </header>
-      <div id="chat-transcript" class="history-transcript"></div>
-    </section>
+    </div>
   </main>
+</div>
+
+<!-- ==========================================================================
+     Relocatable widgets. These hold state a re-render must not destroy - a
+     half-typed approval note, a scrolled console, a commit message - so they
+     live here permanently and are *moved* into the thread by `renderThread`
+     rather than rebuilt from a string each time.
+     ========================================================================== -->
+<div id="parking" class="hidden" aria-hidden="true">
+
+  <section id="approval-gate" class="approval" aria-live="polite">
+    <div class="approval-head">
+      <span class="approval-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>
+        </svg>
+      </span>
+      <div>
+        <strong>Review required</strong>
+        <p id="approval-copy"></p>
+      </div>
+    </div>
+    <textarea id="approval-note" class="approval-note" rows="2" spellcheck="false"
+      placeholder="Optional: steer the senior stage. Takes precedence over the draft."></textarea>
+    <div class="approval-actions">
+      <button id="reject-btn" class="btn btn-quiet btn-sm" type="button">Reject</button>
+      <button id="approve-btn" class="btn btn-primary btn-sm" type="button">Approve &amp; execute</button>
+    </div>
+  </section>
+
+  <details id="console-block" class="console-block">
+    <summary>Console output</summary>
+    <div id="stream" class="stream" role="log" aria-live="polite"></div>
+  </details>
+
+  <details id="diff-block" class="diff-block">
+    <summary id="diff-summary">Changes</summary>
+    <div id="commit-bar" class="commit-bar hidden">
+      <input id="commit-message" class="commit-message" spellcheck="false"
+        placeholder="Commit message&hellip;">
+      <button id="commit-btn" class="btn btn-primary btn-sm" type="button">Commit</button>
+      <span id="commit-hint" class="commit-hint"></span>
+    </div>
+    <div id="diff-view" class="diff-view"></div>
+  </details>
+
 </div>
 
 <!-- ================= Directory picker ================= -->
@@ -318,6 +219,7 @@ Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP
       <input id="picker-path" class="picker-path" spellcheck="false" aria-label="Current path">
     </div>
     <div id="picker-list" class="picker-list"></div>
+    <div id="recent-workspaces" class="recent"></div>
     <footer class="modal-foot">
       <button id="picker-clear" class="btn btn-quiet" type="button">Use no folder</button>
       <span id="picker-status" class="picker-status"></span>
@@ -338,6 +240,7 @@ Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP
     <div class="settings-tabs" role="tablist">
       <button class="settings-tab active" data-settings-tab="stages" role="tab">Agents</button>
       <button class="settings-tab" data-settings-tab="roles" role="tab">Roles</button>
+      <button class="settings-tab" data-settings-tab="run" role="tab">Run</button>
       <button class="settings-tab" data-settings-tab="project" role="tab">Project</button>
       <button class="settings-tab" data-settings-tab="app" role="tab">App</button>
     </div>
@@ -346,9 +249,9 @@ Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP
         <p class="settings-note">
           Each one shells out to a locally installed CLI that carries your own
           subscription auth. No API keys are stored or sent. The two council
-          stages and the Solo assistant are configured independently &mdash;
-          Solo's behaviour is optional and blank by default, and which CLI it
-          runs is picked from its own card, not here.
+          stages and the Chat assistant are configured independently &mdash;
+          Chat's behaviour is optional and blank by default, and which CLI it
+          runs is picked from the composer, not here.
         </p>
         <div id="provider-forms"></div>
         <div id="doctor-out" class="doctor"></div>
@@ -367,10 +270,63 @@ Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP
         <div id="role-list" class="role-list"></div>
       </section>
 
+      <!-- The full set. The gear beside the composer carries the two that get
+           changed per run; these are the rest, in one place rather than
+           stacked down a sidebar that is now history. -->
+      <section class="settings-panel" data-settings-panel="run">
+        <p class="settings-note">
+          How a council run behaves. Chat has no gate, no branch and nothing to
+          roll back, so none of this applies there.
+        </p>
+
+        <label class="toggle toggle-danger" for="zero-touch">
+          <input type="checkbox" id="zero-touch">
+          <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+          <span class="toggle-text">
+            <strong>Zero-Touch Mode</strong>
+            <em>Run autonomously, skip all approvals</em>
+          </span>
+        </label>
+        <div id="zero-touch-warning" class="inline-warning hidden">
+          Auto-approve flags will be passed to the CLI. Files change without
+          confirmation.
+        </div>
+
+        <h4 class="settings-head">Delivery &amp; recovery</h4>
+        <div id="no-git-warning" class="inline-note hidden"></div>
+
+        <label class="toggle" for="pull-request-mode">
+          <input type="checkbox" id="pull-request-mode">
+          <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+          <span class="toggle-text">
+            <strong>Pull request</strong>
+            <em>Commit to a new branch and open a PR to merge yourself</em>
+          </span>
+        </label>
+
+        <label class="toggle" for="clean-worktree">
+          <input type="checkbox" id="clean-worktree">
+          <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+          <span class="toggle-text">
+            <strong>Require clean tree</strong>
+            <em id="clean-tree-note">Refuse to run on uncommitted work</em>
+          </span>
+        </label>
+
+        <label class="toggle" for="safety-snapshot">
+          <input type="checkbox" id="safety-snapshot">
+          <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+          <span class="toggle-text">
+            <strong>Safety snapshot</strong>
+            <em id="snapshot-note">Enable one-click rollback</em>
+          </span>
+        </label>
+      </section>
+
       <section class="settings-panel" data-settings-panel="project">
         <p class="settings-note">
           Appended to every prompt the council is given, whichever folder the
-          run happens in. Solo does not get them: it is a conversation, not a
+          run happens in. Chat does not get them: it is a conversation, not a
           run against a project.
         </p>
         <div class="field">
@@ -382,9 +338,18 @@ Example: Add rate limiting to the /api/login route, 5 attempts per minute per IP
 
       <section class="settings-panel" data-settings-panel="app">
         <p class="settings-note">
-          Where this dashboard serves itself. A changed port takes effect the
-          next time the app starts.
+          Where this dashboard serves itself, and what it calls you. A changed
+          port takes effect the next time the app starts.
         </p>
+        <div class="field">
+          <label for="display-name">Your name</label>
+          <input id="display-name" spellcheck="false" autocomplete="off">
+          <span class="field-hint">
+            Used in the greeting. Left blank it falls back to the account this
+            app is running as &mdash; there is no login here, so that is the
+            only name it can work out for itself.
+          </span>
+        </div>
         <div class="field-row">
           <div class="field">
             <label for="port-input">Preferred port</label>

@@ -153,42 +153,48 @@ drafter                       ← use "polisher" for Stage 2
 
 ## Using it
 
-1. **Optionally pick a working folder.** Click the folder button in the
-   sidebar. Any folder will do, and none is a fine answer too: with nothing
-   chosen, runs happen in a scratch folder of the app's own
+1. **Optionally pick a working folder.** Click it in the status bar along the
+   bottom, which also shows the branch and whether the tree is clean. Any
+   folder will do, and none is a fine answer too: with nothing chosen, runs
+   happen in a scratch folder of the app's own
    (`~/.config/ai-council/workspace`), which is what makes "just ask it
    something" work before you have configured anything. See
    [The working folder](#the-working-folder).
 2. **Describe the task.** Be specific about files, behaviour and edge cases —
    the draft stage is only as good as its brief.
-3. **Run it** with the button or <kbd>Ctrl</kbd>+<kbd>Enter</kbd>.
-4. **Watch the council work.** The sidebar rail shows which agent is active;
-   the Live stream tab carries their output line by line as it arrives.
-5. **Review and approve.** The run pauses with the draft in the **Draft** tab
-   and nothing yet written to disk. Optionally type a steer — it takes
-   precedence over the draft — then click **Approve & execute**.
-6. **Inspect the result.** The **Diff** tab renders the actual `git diff` of
-   your working tree, per file, with line numbers.
+3. **Send it** with <kbd>Enter</kbd>, or the arrow button.
+   <kbd>Shift</kbd>+<kbd>Enter</kbd> is a newline.
+4. **Watch the council work.** The strip above the conversation shows which
+   member is active. Each stage's answer arrives as a message in the thread;
+   the raw stdout/stderr is in the **Console output** block beneath it.
+5. **Review and approve.** The run pauses with a gate card sitting directly
+   under the draft, and nothing yet written to disk. Optionally type a steer —
+   it takes precedence over the draft — then click **Approve & execute**.
+6. **Inspect the result.** A **Changes** block closes the turn, holding the
+   real `git diff` per file with line numbers, and the commit bar.
 7. **Roll back** if you don't like it. One click restores the tree exactly.
-8. **Or keep going.** **Continue this run** turns the finished run into the
-   first message of a conversation — see [Continuing a run](#continuing-a-run).
+8. **Or keep going.** Just type again — the composer stays attached to the
+   conversation. See [Continuing a run](#continuing-a-run).
 
-### The tabs
+### The three tabs
 
-| Tab | Contents |
+| Tab | What it is |
 |---|---|
-| **Live stream** | Interleaved stdout/stderr from both CLIs, tagged by agent |
-| **Draft** | Stage 1's proposal, rendered as Markdown with highlighted code |
-| **Senior review** | Stage 2's review, change summary and verification notes |
-| **Diff** | The real working-tree diff, syntax-marked and collapsible per file |
+| **Council** | The two-stage pipeline: draft, approve, apply. Each member's CLI, model, effort and role are set by clicking it on the strip. |
+| **Chat** | One agent, one conversation, no gate and no writes. Its CLI, model and effort are the pickers under the composer. |
+| **Project** | A placeholder. Nothing is configurable there yet. |
+
+Everything a run does lands in the conversation itself — the gate, the console
+and the diff are blocks in the thread rather than tabs beside it, so each one
+sits next to the exchange that produced it.
 
 ---
 
 ## The working folder
 
 Both modes run their agents in one folder. Choosing it is optional, and it does
-not have to be a git repository — the sidebar picker badges the ones that are,
-but any folder can be selected, and **Use no folder** goes back to having none.
+not have to be a git repository — the picker badges the ones that are, but any
+folder can be selected, and **Use no folder** goes back to having none.
 
 What the folder decides is which half of the safety model is available:
 
@@ -198,10 +204,10 @@ What the folder decides is which half of the safety model is available:
 | Any other folder | Draft, approval gate, live stream, conversations | Diff, safety snapshot, rollback, commit bar, pull-request mode |
 | None chosen | The same, in `~/.config/ai-council/workspace` | The same |
 
-None of that is enforced by refusing to start. The sidebar says which features
-the current folder is buying, the Diff tab names the reason it is empty rather
-than implying the run did nothing, and the approval gate tells you before you
-approve whether a rollback point will exist. The one thing that *is* refused up
+None of that is enforced by refusing to start. The status bar says which
+features the current folder is buying, a run with no diff to show names the
+reason rather than implying it did nothing, and the approval gate tells you
+before you approve whether a rollback point will exist. The one thing that *is* refused up
 front is pull-request mode without a repository to branch from — checked before
 either agent spends any quota.
 
@@ -218,11 +224,13 @@ back.
 
 ## Continuing a run
 
-A single task is rarely the whole conversation. The **Chats** tab in the
-sidebar lists your conversations, newest first, the way a chat client does.
-Select one to read it in the main pane — every message, what each agent
-answered, the note you left at the approval gate, and the diff that resulted.
-**+ New conversation** clears the attachment and puts you back at the composer.
+A single task is rarely the whole conversation. The sidebar lists your
+conversations grouped under Today, Yesterday and Previous 7 days, the way a
+chat client does. Click one to open it in the thread — every message, what each
+agent answered, the note you left at the approval gate, and the diff that
+resulted. Opening it also attaches it to the composer, so typing again
+continues that conversation rather than starting a new one. **New chat**
+detaches and gives you an empty thread.
 
 A follow-up is not a separate entry in that list. It carries the earlier turns
 inside its own transcript, so the newest run of a thread *is* the conversation,
@@ -333,10 +341,11 @@ Three properties hold in both modes, and they are covered by tests:
 
 ### Other toggles
 
-The sidebar splits them by what they decide. **Run** is how the next run
-behaves; **Delivery & recovery** is where the work lands and how to get it back.
-Both groups are Council-only and are hidden in Solo Mode, which has nothing for
-them to decide.
+The gear beside the composer carries the two that change per run — Zero-Touch
+and Pull request. The rest live in **Settings → Run**, split by what they
+decide: how the next run behaves, and where the work lands. All of them are
+Council-only, and the gear says so rather than going quiet in Chat, which has
+no gate and no branch for them to decide anything about.
 
 | Toggle | Group | Effect |
 |---|---|---|
@@ -346,31 +355,33 @@ them to decide.
 
 ---
 
-## Council or Solo
+## Council or Chat
 
-The switch at the top of the sidebar decides which of two things your next
-message starts. It is the first choice, above everything it changes, because
-the two share almost nothing.
+The selector centred at the top decides which of two things your next message
+starts. It is the first choice, above everything it changes, because the two
+share almost nothing. (The third tab, Project, is a placeholder and starts
+nothing at all — it is deliberately not written to config, so the app never
+comes back up sitting in a mode it cannot run.)
 
 **Council** is the pipeline this README is mostly about: Junior Draft →
-approval gate → Senior Polish, with Live stream, Draft, Senior review and Diff
-views, delivery controls, snapshots and rollback.
+approval gate → Senior Polish, with the console, the diff, delivery controls,
+snapshots and rollback.
 
-**Solo** is one assistant answering one message, the way opening `claude` or
+**Chat** is one assistant answering one message, the way opening `claude` or
 ChatGPT is. It has:
 
-- **Its own agent**, picked from the first chip on the Assistant card, beside
-  its model and reasoning level — switching CLI mid-conversation is one click,
-  not a visit to Settings. It borrows neither council stage, so Solo can run
-  Codex while the council runs Claude.
+- **Its own agent**, picked from the first chip under the composer, beside its
+  model and reasoning level — switching CLI mid-conversation is one click, not
+  a visit to Settings. It borrows neither council stage, so Chat can run Codex
+  while the council runs Claude.
 - **No behaviour by default.** With the **Behaviour** box empty and no thread
   to replay, your message reaches the CLI *exactly as typed* — no persona, no
   house rules, no folder preamble. Type something into that box and it is
   put in front of the message; that is the whole of it.
 - **No council furniture.** No draft, no approval gate, no Zero-Touch, no
-  pull request, no snapshot, no rollback, and none of the four output tabs —
-  just the message and the reply.
-- **No write permission.** Solo is invoked with its agent's read-only
+  pull request, no snapshot, no rollback and no member strip — just the
+  message and the reply.
+- **No write permission.** Chat is invoked with its agent's read-only
   arguments (`--sandbox read-only` for `codex`, `--permission-mode plan` for
   `claude`) and never receives an auto-approve flag. It reads the working
   folder and talks about it; Council is the path for changing it.
@@ -381,8 +392,9 @@ outright rather than replay a council transcript into a plain chat.
 
 Configurations written before this existed are migrated on load. The old
 **Solo mode** toggle becomes the mode; the stage the old **Solo mode runs**
-selector pointed at becomes the initial Solo assistant, keeping its CLI, model
-and reasoning level but not its council role.
+selector pointed at becomes the initial Chat assistant, keeping its CLI, model
+and reasoning level but not its council role. The mode is still stored as
+`solo` on disk — only what the tab is called has changed.
 
 ---
 
@@ -535,10 +547,10 @@ behaviour — is untouched. Editing the command by hand still works and simply
 reads back as **Custom command**; the command is the source of truth, and the
 dropdown is derived from it, so the two can never disagree.
 
-The Solo assistant has its own entry in the same list, with its own display
+The Chat assistant has its own entry in the same list, with its own display
 name, command and optional **Behaviour**. It has no Role, because it is not a
-stage in anything, and no Agent dropdown: the CLI Solo runs is the first chip
-on its card, where the same swap happens on one click. Everything the dropdown
+stage in anything, and no Agent dropdown: the CLI Chat runs is the first chip
+under the composer, where the same swap happens on one click. Everything the dropdown
 would have written — command, permission flags, a cleared model and reasoning
 level — is written by the server either way.
 

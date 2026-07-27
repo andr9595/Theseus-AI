@@ -281,6 +281,10 @@ DEFAULTS: Dict[str, Any] = {
     # no delivery and no diff, and the two share only the working folder and
     # the conversation store.
     "mode": "council",
+    # What the dashboard calls you. Blank falls back to the OS user the app was
+    # launched as, which is the only name it can know without being told - and
+    # a login name is rarely the one a person answers to.
+    "display_name": "",
     # --- Pipeline behaviour (Council only) ----------------------------------
     # Zero-Touch: run start-to-finish with no human gate, passing the CLIs'
     # auto-approve flags. OFF by default - opting in to autonomous file

@@ -534,7 +534,13 @@ const state = {
   roles: [],
   busy: false,
   streamLines: [],
-  activeTab: 'stream',
+  // The OS user, for the sidebar footer and the greeting. There are no
+  // accounts in this app; this is only who it is running as.
+  user: '',
+  // Project is a placeholder tab, held here and never written to config: the
+  // server knows 'council' and 'solo' only, and a mode it cannot run is not one
+  // the app should still be sitting in after a restart.
+  tab: '',
   // The transcript the next run continues, if any. Held as a filename because
   // that is what the server accepts; the task text is kept alongside it purely
   // so the composer can name what is being continued.
@@ -562,9 +568,17 @@ const STATE_LABELS = {
 
 const WORKING_STATES = ['drafting', 'polishing', 'running'];
 
-/** The mode the *next* message starts, from config. */
+/** The mode the *next* message starts, from config. Never 'project': that tab
+ *  runs nothing, so the mode a run would start in is whichever real one the
+ *  operator was last in. */
 function selectedMode() {
   return ((state.config || {}).mode === 'solo') ? 'solo' : 'council';
+}
+
+/** The tab on screen, which is `selectedMode` plus the Project placeholder. */
+function uiMode() {
+  if (state.tab === 'project') return 'project';
+  return visibleMode();
 }
 
 /** The mode the main pane should be showing. A run in flight owns the screen —
@@ -595,22 +609,17 @@ function runWorkspace(run) {
 
 function renderStatus() {
   const run = state.run;
-  const pill = $('#status-pill');
   const s = run ? run.state : 'idle';
 
-  pill.className = 'status-pill';
-  if (WORKING_STATES.includes(s)) pill.classList.add('active');
-  else if (s === 'awaiting_approval') pill.classList.add('waiting');
-  else if (s === 'complete') pill.classList.add('ok');
-  else if (s === 'failed' || s === 'cancelled') pill.classList.add('bad');
-
-  $('#status-text').textContent = STATE_LABELS[s] || s;
-
+  // No status pill any more: what a stage is doing reads off the member that
+  // is doing it, and what the *run* is doing lands in the status bar. Only
+  // states that are not already obvious from the thread are worth the words.
   const meta = [];
   if (run) {
-    meta.push(`run ${run.id}`);
+    if (WORKING_STATES.includes(s) || s === 'awaiting_approval') {
+      meta.push(STATE_LABELS[s] || s);
+    }
     if (run.zero_touch) meta.push('ZERO-TOUCH');
-    if (run.solo) meta.push('solo');
     if (run.work_branch) meta.push(run.work_branch);
     if (run.diff_stat && run.diff_stat.files) {
       meta.push(`${run.diff_stat.files} file(s) +${run.diff_stat.insertions}/-${run.diff_stat.deletions}`);
@@ -622,34 +631,27 @@ function renderStatus() {
   $('#cancel-btn').classList.toggle('hidden', !state.busy);
   $('#rollback-btn').classList.toggle('hidden', !(run && run.can_rollback));
   $('#pr-btn').classList.toggle('hidden', !(run && run.pull_request && run.pull_request.url));
-  // A finished run is the one an operator most often wants to follow up on,
-  // so it is offered here rather than only from History.
-  $('#continue-btn').classList.toggle('hidden', !(run && !state.busy && run.file));
   renderContinuation();
 
   const runBtn = $('#run-btn');
-  const solo = visibleMode() === 'solo';
   // A working folder is not a precondition. The only thing standing between a
   // fresh install and a first answer is having typed something.
   const hasTask = $('#task-input').value.trim().length > 0;
-  runBtn.disabled = state.busy || !hasTask;
+  const project = uiMode() === 'project';
+  runBtn.disabled = state.busy || !hasTask || project;
   runBtn.classList.toggle('busy', state.busy);
-  runBtn.title = state.busy
-    ? 'A run is already in progress.'
-    : hasTask ? '' : 'Describe what you want first.';
-  $('.btn-label', runBtn).textContent = state.busy
-    ? (solo ? 'Thinking' : 'Council in session')
-    : (solo ? 'Send' : 'Convene the council');
+  runBtn.title = project ? 'Project mode does not run anything yet.'
+    : state.busy ? 'A run is already in progress.'
+    : hasTask ? 'Send' : 'Describe what you want first.';
 
-  // Solo never reaches the gate: it is never granted permission to write, so
-  // there is nothing for the operator to authorise.
+  // The gate itself is placed in the thread by `renderThread`, next to the
+  // draft it is judging. What it says still depends only on the run.
   const gated = !!(run && !run.solo && run.state === 'awaiting_approval');
-  $('#approval-gate').classList.toggle('hidden', !gated);
   if (gated) {
     $('#approval-copy').innerHTML =
-      'The draft is ready — see the <b>Draft</b> tab. <b>Nothing has been ' +
-      'written to disk yet.</b> Approving lets the senior stage apply changes ' +
-      `in <b>${esc(runWorkspace(run))}</b>.` +
+      'The draft above is ready. <b>Nothing has been written to disk yet.</b> ' +
+      'Approving lets the senior stage apply changes in ' +
+      `<b>${esc(runWorkspace(run))}</b>.` +
       // Whether a rollback point exists changes what approving costs, and the
       // gate is the last moment that can change the answer.
       (run.snapshot_planned ? '' :
@@ -726,7 +728,7 @@ function renderContinuation() {
 /** Attach a transcript to the next run, and measure what that will replay.
  *  ``mode`` is the mode that conversation was held in; the server refuses to
  *  continue it in the other one, so switch first rather than fail later. */
-async function continueRun(file, task, mode = '') {
+async function continueRun(file, task, mode = '', quiet = false) {
   if (mode && mode !== selectedMode()) {
     await patchConfig({ mode });
   }
@@ -736,7 +738,10 @@ async function continueRun(file, task, mode = '') {
   state.compactContext = false;
   renderStatus();
   $('#task-input').focus();
-  toast('That conversation is attached. Type your follow-up.', 'ok', 4200);
+  // Silent when opening a conversation from the sidebar: the thread appearing
+  // on screen already says what happened, and a toast on every click through
+  // history is noise.
+  if (!quiet) toast('That conversation is attached. Type your follow-up.', 'ok', 4200);
 
   try {
     const { context } = await api(`/api/context?file=${encodeURIComponent(file)}`);
@@ -766,117 +771,103 @@ function agentOf(provider) {
   return hit ? hit.id : 'custom';
 }
 
-function renderAgents() {
-  const rail = $('#agent-rail');
-  const run = state.run;
-  const conf = state.config || {};
-  const providers = conf.providers || {};
-  // Solo is one agent with a configuration of its own, so the council's two
-  // cards are not shown greyed out beside it - they belong to the other mode
-  // entirely, and the rail is titled for whichever one is on screen.
-  const solo = visibleMode() === 'solo';
-  const order = solo ? ['solo'] : ['drafter', 'polisher'];
-  $('#agent-panel-title').textContent = solo ? 'Assistant' : 'Council';
+/** A short label for a stage's role. The catalogue is editable, so this is the
+ *  operator's own wording uppercased — not a fixed PLAN/REVIEW pair, which
+ *  would go on saying PLAN after the role behind it had been changed. */
+function roleTag(role) {
+  return String(role || '').trim().toUpperCase();
+}
 
+/** The council strip: one compact button per stage, in a single row above the
+ *  thread. Clicking a member opens everything about it — CLI, model, effort
+ *  and role — rather than spreading those across chips that widen the strip
+ *  until it no longer fits on one line. */
+function renderStrip() {
+  const strip = $('#council-strip');
+  const council = uiMode() === 'council';
+  strip.classList.toggle('hidden', !council);
+  if (!council) { strip.innerHTML = ''; return; }
+
+  const run = state.run;
+  const providers = (state.config || {}).providers || {};
   const probeFor = (id) => state.providers.find(p => p.id === id);
 
-  rail.innerHTML = order.map((id, idx) => {
-    const provider = providers[id] || {};
+  strip.innerHTML = '<div class="strip-inner">' + ['drafter', 'polisher'].map(id => {
+    const p = providers[id] || {};
     const stage = run && run.stages ? run.stages[id] : null;
     const info = probeFor(id);
     const available = !info || info.available;
 
-    let stageState = stage ? stage.state : 'pending';
-    if (run && run.state === 'awaiting_approval' && id === 'polisher') stageState = 'waiting';
+    let st = stage ? stage.state : 'pending';
+    if (run && run.state === 'awaiting_approval' && id === 'polisher') st = 'waiting';
 
-    const label = { pending: 'idle', running: 'working', done: 'done',
-                    failed: 'failed', skipped: 'skipped',
-                    waiting: 'gated' }[stageState] || stageState;
-
-    const duration = stage && stage.duration ? ` · ${fmtDuration(stage.duration)}` : '';
-    const initial = (provider.label || id).slice(0, 2).toUpperCase();
-    // An empty model means the CLI picks; say so rather than showing a blank.
-    const modelLabel = provider.model || 'default model';
-    // The effort chip says only "default", not "default effort" — it sits
-    // beside the model chip, which names itself, and the tooltip covers the
-    // rest. On a 251px card the words it saves are the name's.
-    const effortLabel = provider.effort || 'default';
-    // Shown only when the command has the knob at all, so a hand-written
-    // template does not sprout a chip that cannot do anything.
-    const hasEffort = (provider.effort_args || []).length > 0;
-    // Which CLI answers is Solo's most-changed setting - it is the difference
-    // between two assistants, not a tuning knob - so it sits on the card with
-    // the model and effort. A council stage keeps its agent in Settings:
-    // swapping one there is a change to the pipeline, not to a message.
-    const agent = state.agents.find(a => a.id === agentOf(provider));
-    // "Custom command" is the catalogue's full name for it; on a chip this
-    // narrow the one word that matters is the one that fits.
-    const agentLabel = agent && (agent.command || []).length ? agent.label : 'custom';
-    const caret =
-      `<svg viewBox="0 0 24 24" width="9" height="9" fill="none" stroke="currentColor" ` +
-      `stroke-width="3" stroke-linecap="round" stroke-linejoin="round">` +
-      `<path d="M6 9l6 6 6-6"/></svg>`;
+    const initial = (p.label || id).slice(0, 2).toUpperCase();
+    const model = p.model || 'default model';
+    const title =
+      `${p.label || id} — ${p.role || 'no role'} · ${model}` +
+      (p.effort ? ` · ${p.effort}` : '') +
+      (available ? '' : ` · ${(p.command || [])[0] || 'CLI'} not found`) +
+      '\nClick to change CLI, model, effort or role.';
 
     return (
-      `<div class="agent-card ${stageState} ${available ? '' : 'unavailable'}" data-agent="${id}">` +
-        // The monogram is the CLI's own initials, so in Solo it is the most
-        // direct thing on the card to point at when swapping CLI. It opens the
-        // same menu as the chip below rather than a second way to choose:
-        // one code path, one list, one confirmation toast. Council cards keep
-        // it inert - their agent is a pipeline decision, made in Settings.
-        (solo
-          ? `<button class="agent-avatar pickable" type="button" ` +
-            `data-agent-for="${id}" ` +
-            `title="Which CLI answers — ${esc(agentLabel)}">${esc(initial)}</button>`
-          : `<div class="agent-avatar">${esc(initial)}</div>`) +
-        `<div class="agent-body">` +
-          `<div class="agent-name">${esc(provider.label || id)}</div>` +
-          `<div class="agent-role">${
-            solo
-              // Solo has no council role, so the card says what it does carry:
-              // whether the operator has given it a behaviour at all.
-              ? (provider.behavior ? 'Custom behaviour' : 'No behaviour')
-              : `${idx + 1}. ${esc(provider.role || '')}`
-          }</div>` +
-          (available ? '' :
-            `<div class="agent-missing">${esc(provider.command ? provider.command[0] : '?')} not found</div>`) +
-        `</div>` +
-        `<div class="agent-right">` +
-          `<div class="agent-state">${esc(label)}${esc(duration)}</div>` +
-          usageChipHtml(id) +
-        `</div>` +
-        // Its own row, spanning the card. Stacked in the column above it, the
-        // pickers left the name and role no width at all.
-        `<div class="chip-row">` +
-          (solo
-            ? `<button class="model-chip agent-chip set" type="button" ` +
-              `data-agent-for="${id}" ` +
-              `title="Which CLI answers — ${esc(agentLabel)}">` +
-              `<span class="chip-label">${esc(agentLabel)}</span>${caret}` +
-            `</button>`
-            : '') +
-          `<button class="model-chip${provider.model ? ' set' : ''}" type="button" ` +
-            `data-model-for="${id}" ` +
-            `title="Model for this stage — ${esc(modelLabel)}">` +
-            `<span class="chip-label">${esc(modelLabel)}</span>${caret}` +
-          `</button>` +
-          (hasEffort
-            ? `<button class="model-chip effort-chip${provider.effort ? ' set' : ''}" ` +
-              `type="button" data-effort-for="${id}" ` +
-              `title="How hard this stage is asked to think — ` +
-              `${esc(provider.effort || "the CLI's own default")}">` +
-              `<span class="chip-label">${esc(effortLabel)}</span>${caret}` +
-            `</button>`
-            : '') +
-        `</div>` +
-      `</div>`
+      `<button class="member ${st}${available ? '' : ' unavailable'}" type="button" ` +
+        `data-member="${id}" data-agent="${id}" title="${esc(title)}">` +
+        `<span class="member-mark">${esc(initial)}</span>` +
+        `<span class="member-body">` +
+          `<span class="member-name">${esc(p.label || id)}</span>` +
+          `<span class="member-model">${esc(model)}</span>` +
+        `</span>` +
+        `<span class="member-tail">` +
+          `<span class="member-role">${esc(roleTag(p.role))}</span>` +
+          memberQuotaHtml(id) +
+          `<span class="member-dot"></span>` +
+        `</span>` +
+      `</button>`
     );
-  }).join('');
+  }).join('') + '</div>';
+}
 
-  // The CSP forbids inline style attributes, so bar widths are set through the
-  // CSSOM after the markup lands. Writing `style="width:24%"` into the string
-  // above looks correct in the DOM inspector and renders as a 0px bar.
-  $$('[data-fill]', rail).forEach(el => { el.style.width = `${el.dataset.fill}%`; });
+/** Quota on the strip, shown only once it is worth interrupting for. A chip on
+ *  every member at all times would double the strip's width to say "fine"; the
+ *  full reading is a click away on the member itself. */
+function memberQuotaHtml(id) {
+  const u = (state.usage || {})[id];
+  if (!u || !u.supported || !u.worst) return '';
+  const threshold = Number((state.config || {}).usage_warn_percent ?? 85);
+  return u.worst.percent >= threshold ? usageChipHtml(id) : '';
+}
+
+/** Chat's pickers. In Council these live on the strip instead: there are two
+ *  agents there, and a chip in the composer could not say which it belonged
+ *  to without repeating the agent's name in front of every one of them. */
+function renderComposerChips() {
+  const host = $('#composer-chips');
+  if (uiMode() !== 'solo') { host.innerHTML = ''; return; }
+
+  const p = ((state.config || {}).providers || {}).solo || {};
+  const agent = state.agents.find(a => a.id === agentOf(p));
+  const agentLabel = agent && (agent.command || []).length ? agent.label : 'custom';
+  const modelLabel = p.model || 'default model';
+  const effortLabel = p.effort || 'default';
+  const hasEffort = (p.effort_args || []).length > 0;
+  const caret =
+    `<svg viewBox="0 0 24 24" width="9" height="9" fill="none" stroke="currentColor" ` +
+    `stroke-width="3" stroke-linecap="round" stroke-linejoin="round">` +
+    `<path d="M6 9l6 6 6-6"/></svg>`;
+
+  host.innerHTML =
+    `<button class="model-chip agent-chip set" type="button" data-agent-for="solo" ` +
+      `title="Which CLI answers — ${esc(agentLabel)}">` +
+      `<span class="chip-label">${esc(agentLabel)}</span>${caret}</button>` +
+    `<button class="model-chip${p.model ? ' set' : ''}" type="button" data-model-for="solo" ` +
+      `title="Model — ${esc(modelLabel)}">` +
+      `<span class="chip-label">${esc(modelLabel)}</span>${caret}</button>` +
+    (hasEffort
+      ? `<button class="model-chip effort-chip${p.effort ? ' set' : ''}" type="button" ` +
+        `data-effort-for="solo" title="How hard it is asked to think — ` +
+        `${esc(p.effort || "the CLI's own default")}">` +
+        `<span class="chip-label">${esc(effortLabel)}</span>${caret}</button>`
+      : '');
 }
 
 
@@ -1112,66 +1103,80 @@ function openRoleEditor(roleId) {
  *  Nothing chosen is a first-class state rather than an empty one — it names
  *  the scratch folder a run would land in, so "no folder" never reads as
  *  "nowhere". */
-function renderWorkspace() {
-  const conf = state.config || {};
-  const folder = workspacePath();
-  const btn = $('#workspace-btn');
-  btn.classList.toggle('unset', !folder);
-  $('#workspace-label').textContent = folder || 'Scratch workspace';
-  btn.title = folder
-    ? folder
-    : `No folder chosen — runs happen in ${state.scratchWorkspace || 'a scratch folder'}`;
+/** A path short enough for an 11px status bar. Ellipsising in CSS would clip
+ *  the tail, which is the half that says which folder this is, so the head is
+ *  dropped instead and the full path stays in the tooltip. */
+function shortPath(path) {
+  const parts = String(path || '').split('/').filter(Boolean);
+  return parts.length > 2 ? `…/${parts.slice(-2).join('/')}` : path;
+}
 
-  const meta = $('#workspace-meta');
+/** The status bar's folder control. Working nowhere in particular is a
+ *  supported way to use this, so the scratch workspace is named as a choice
+ *  rather than left looking like something the operator forgot to set. */
+function renderWorkspace() {
+  const folder = workspacePath();
+  $('#workspace-label').textContent = folder ? shortPath(folder) : 'Scratch workspace';
+  $('#workspace-btn').title =
+    (folder || `No folder chosen — runs happen in ${state.scratchWorkspace || 'a scratch folder'}`) +
+    '\nClick to work somewhere else.';
+
   const st = state.workspaceStatus;
   const chips = [];
   if (!folder) {
-    // Not a warning: working nowhere in particular is a supported way to use
-    // this, and the chip says what it costs rather than that it is wrong.
-    chips.push('<span class="chip">no git — no diff or rollback</span>');
+    // Not a warning: this says what working nowhere costs, not that it is wrong.
+    chips.push('<span class="chip">no git</span>');
   } else if (st && st.is_repo) {
     chips.push(`<span class="chip">${esc(st.branch || '?')}</span>`);
-    if (st.head) chips.push(`<span class="chip">${esc(st.head.slice(0, 7))}</span>`);
     chips.push(st.clean
       ? '<span class="chip clean">clean</span>'
       : `<span class="chip dirty">${st.dirty_count} uncommitted</span>`);
   } else if (st) {
     chips.push('<span class="chip">not a git repository</span>');
   }
-  meta.innerHTML = chips.join('');
-  meta.classList.toggle('hidden', !chips.length);
+  $('#workspace-git').innerHTML = chips.join('');
 
-  const recent = (conf.recent_workspaces || []).filter(r => r !== folder).slice(0, 4);
+  // Recents moved into the picker with the folder control. They were beside a
+  // sidebar button that no longer exists, and the picker is now the only place
+  // the operator goes to change folder.
+  const recent = ((state.config || {}).recent_workspaces || [])
+    .filter(r => r !== folder).slice(0, 5);
   $('#recent-workspaces').innerHTML = recent.map(r =>
     `<button class="recent-item" data-workspace="${esc(r)}" type="button" title="${esc(r)}">${esc(r)}</button>`
   ).join('');
 }
 
 function renderMode() {
-  const mode = selectedMode();
+  const mode = uiMode();
+  // Which mode a *run* is in, so that a run in flight can still be returned to
+  // after a look at Project.
+  const runMode = visibleMode();
   $$('#mode-switch [data-mode]').forEach(btn => {
     const active = btn.dataset.mode === mode;
     btn.classList.toggle('active', active);
     btn.setAttribute('aria-checked', String(active));
-    // Changing mode mid-run would leave the selector and the output pane
-    // describing different things.
-    btn.disabled = state.busy;
+    // Swapping Council for Chat mid-run would leave the selector and the
+    // thread describing different things. Project runs nothing, so looking at
+    // it while a run finishes elsewhere costs nothing and stays allowed.
+    btn.disabled = state.busy &&
+      btn.dataset.mode !== 'project' && btn.dataset.mode !== runMode;
   });
-  $('#brand-sub').textContent = mode === 'solo'
-    ? 'One agent, one conversation' : 'Draft → Polish pipeline';
-  $('#council-controls').classList.toggle('hidden', mode !== 'council');
+
+  const name = ((state.config || {}).display_name || '').trim() || state.user;
+  const who = name ? `, ${name}` : '';
+  $('#hero-title').textContent = mode === 'solo'
+    ? `Hey${who}. Ready to dive in?`
+    : `Hey${who}. What shall we build today?`;
+  $('#hero-sub').textContent = mode === 'solo'
+    ? 'One agent, one conversation. It cannot change your files.'
+    : 'One agent drafts, you approve, the other applies.';
+
   $('#continue-copy').textContent = mode === 'solo'
     ? 'the assistant will be given that exchange as context.'
     : 'the council will be given that exchange as context.';
   $('#task-input').placeholder = mode === 'solo'
-    ? 'Ask anything. Point the working folder at a project when the question ' +
-      'is about one…'
-    : 'Describe the change you want. Be specific about files, behaviour and ' +
-      'edge cases…\nExample: Add rate limiting to the /api/login route, ' +
-      '5 attempts per minute per IP, with tests.';
-  $('.hint').innerHTML = mode === 'solo'
-    ? '<kbd>Ctrl</kbd>+<kbd>Enter</kbd> to send'
-    : '<kbd>Ctrl</kbd>+<kbd>Enter</kbd> to run';
+    ? 'Ask Theseus AI…'
+    : 'Ask the council…';
 }
 
 function renderToggles() {
@@ -1207,93 +1212,183 @@ function renderToggles() {
     : 'Enable one-click rollback';
 }
 
-/** Solo's whole output: the message, then the reply. Rendered from the run
- *  rather than accumulated, so a reload mid-answer picks up where it was. */
-function renderSoloOutput() {
-  const run = state.run;
-  const stage = run && run.stages ? run.stages.solo : null;
-  $('#solo-empty').classList.toggle('hidden', !!run);
-  $('#solo-turn').classList.toggle('hidden', !run);
-  if (!run) return;
+/* ---- The thread --------------------------------------------------------
+   Council's stages are messages in the conversation rather than tabs beside
+   it, so the gate, the console and the diff all sit next to the exchange that
+   produced them. Both modes render through this one path: a Chat turn is a
+   council turn with one stage and no gate.
+   ----------------------------------------------------------------------- */
 
-  $('#solo-question').innerHTML = renderMarkdown(run.task || '');
-  $('#solo-speaker').textContent = (stage && stage.label) || 'Assistant';
-  const answer = (stage && stage.output) || '';
-  // While the CLI is still talking the pane holds partial text put there by
-  // `stage_output`; replacing it with an empty stage record would blank the
-  // answer being read. The finished output always wins once it exists.
-  if (answer.trim()) {
-    $('#solo-answer').innerHTML = renderMarkdown(answer);
-  } else if (run.error || (stage && stage.error)) {
-    $('#solo-answer').textContent = run.error || stage.error;
-  }
+/** Widgets holding state a re-render must not destroy — a half-typed approval
+ *  note, a scrolled console, an unsent commit message. They live in #parking
+ *  and are *moved* into the thread rather than rebuilt from a string. Anything
+ *  still sitting in the thread has to go home before its innerHTML is
+ *  replaced, or the next render deletes it along with what was typed into it. */
+const PARKED = ['approval-gate', 'console-block', 'diff-block'];
+
+function park() {
+  const home = $('#parking');
+  PARKED.forEach(id => {
+    const node = document.getElementById(id);
+    if (node && node.parentNode !== home) home.appendChild(node);
+  });
 }
 
-function renderOutputs() {
-  const run = state.run;
-  const solo = visibleMode() === 'solo';
-  $('#council-output').classList.toggle('hidden', solo || !!state.openChat);
-  $('#solo-output').classList.toggle('hidden', !solo || !!state.openChat);
-  if (solo) {
-    renderSoloOutput();
+function fillSlots(root) {
+  PARKED.forEach(id => {
+    const slot = $(`[data-slot="${id}"]`, root);
+    if (slot) slot.replaceWith(document.getElementById(id));
+  });
+}
+
+/** The run's stages in the order it runs them, each tagged with its own id so
+ *  a message can be coloured for the job rather than for the CLI. */
+function stagesOf(run) {
+  const stages = run.stages || {};
+  return (run.stage_order || Object.keys(stages))
+    .map(id => (stages[id] ? Object.assign({}, stages[id], { id }) : null))
+    .filter(Boolean)
+    // A stage that has not started yet has nothing to say, and an empty bubble
+    // reading "(no output)" looks like a stage that failed quietly. What is
+    // coming next is already legible on the strip above.
+    .filter(s => s.state !== 'pending' || (s.output || '').trim());
+}
+
+// "done" on every finished message is noise — the output is the evidence. Only
+// states that explain an absence of output earn a word.
+const STAGE_WORDS = {
+  running: 'working', failed: 'failed', skipped: 'skipped',
+  pending: 'queued', waiting: 'gated',
+};
+
+function userHtml(task) {
+  return '<div class="chat-message user-message"><div class="markdown">' +
+    renderMarkdown(task || '(no message)') + '</div></div>';
+}
+
+function messageHtml(reply, id) {
+  const who = reply.label || reply.stage || id || 'Agent';
+  const st = reply.state || '';
+  const dur = reply.duration ? ` · ${fmtDuration(reply.duration)}` : '';
+  const word = STAGE_WORDS[st] || '';
+  const body = renderMarkdown(reply.output || '') ||
+    `<p class="history-none">${esc(reply.error || `(${st || 'no output'})`)}</p>`;
+  return (
+    `<div class="chat-message assistant-message" data-agent="${esc(id || '')}">` +
+      `<div class="msg-head">` +
+        `<span class="msg-mark">${esc(String(who).slice(0, 2).toUpperCase())}</span>` +
+        `<span class="msg-who">${esc(who)}</span>` +
+        (reply.role ? `<span class="msg-role">${esc(roleTag(reply.role))}</span>` : '') +
+        `<span class="msg-state${st === 'failed' ? ' failed' : ''}">` +
+          `${esc(word)}${esc(dur)}</span>` +
+      `</div>` +
+      // `data-live` marks the one body `stage_output` may append to. Only a
+      // running stage has it, so a finished message can never be scribbled on.
+      `<div class="markdown"${st === 'running' ? ' data-live="1"' : ''}>${body}</div>` +
+    `</div>`
+  );
+}
+
+function renderThread() {
+  const mode = uiMode();
+  const main = $('.main');
+  const thread = $('#thread');
+  const stream = $('#stream');
+  const scrolled = stream.scrollTop;
+
+  // Rescue the movable widgets before the innerHTML below would delete them.
+  park();
+
+  $('#project-empty').classList.toggle('hidden', mode !== 'project');
+  if (mode === 'project') {
+    $('#hero').classList.add('hidden');
+    thread.innerHTML = '';
+    main.classList.add('empty');
     return;
   }
 
-  const draft = run && run.stages && run.stages.drafter ? run.stages.drafter.output : '';
-  const final = run && run.stages && run.stages.polisher ? run.stages.polisher.output : '';
+  // Whichever conversation is on screen: the one opened from history, or the
+  // live run. They are the same shape, so one path renders both.
+  const run = (state.openChat && state.openChat.run) || state.run;
+  const live = !state.openChat;
 
-  const draftView = $('#draft-view');
-  if (draft && draft.trim()) {
-    draftView.innerHTML = renderMarkdown(draft);
-    draftView.classList.remove('empty-state');
-    setBadge('#badge-draft', 'ready');
-  } else {
-    setBadge('#badge-draft', '');
+  $('#hero').classList.toggle('hidden', !!run);
+  main.classList.toggle('empty', !run);
+  if (!run) { thread.innerHTML = ''; return; }
+
+  const council = !run.solo;
+  const gated = live && council && run.state === 'awaiting_approval';
+  const hasDiff = !!(run.diff && run.diff.trim());
+
+  // Earlier turns of the same thread, replayed as context rather than run now.
+  const earlier = (run.conversation || []).map(t =>
+    '<div class="turn earlier">' +
+      userHtml(t.task) +
+      (t.replies || []).map(r => messageHtml(r, r.stage)).join('') +
+      (t.compacted
+        ? '<div class="turn-note">Replayed compacted to fit the context window</div>'
+        : '') +
+    '</div>'
+  ).join('');
+
+  const current =
+    '<div class="turn">' +
+      userHtml(run.task) +
+      stagesOf(run).map(s =>
+        messageHtml(s, s.id) +
+        // The gate belongs against the draft it is judging, not at the top of
+        // the screen where it used to sit with nothing to read beside it.
+        (gated && s.id === 'drafter' ? '<div data-slot="approval-gate"></div>' : '')
+      ).join('') +
+      (run.reviewer_note
+        ? `<div class="turn-note">Your note at the gate: ${esc(run.reviewer_note)}</div>`
+        : '') +
+      (council && live ? '<div data-slot="console-block"></div>' : '') +
+      (hasDiff ? '<div data-slot="diff-block"></div>' : '') +
+      (run.rollback_note ? `<div class="turn-note">${esc(run.rollback_note)}</div>` : '') +
+      (run.error ? `<div class="turn-note">${esc(run.error)}</div>` : '') +
+    '</div>';
+
+  thread.innerHTML = earlier + current;
+
+  if (hasDiff) {
+    $('#diff-view').innerHTML = renderDiff(run.diff, run.diff_stat);
+    const st = run.diff_stat || {};
+    $('#diff-summary').textContent = st.files
+      ? `Changes — ${st.files} file${st.files === 1 ? '' : 's'} ` +
+        `+${st.insertions}/-${st.deletions}`
+      : 'Changes';
   }
 
-  const finalView = $('#final-view');
-  if (final && final.trim()) {
-    finalView.innerHTML = renderMarkdown(final);
-    finalView.classList.remove('empty-state');
-    setBadge('#badge-final', 'ready');
-  } else {
-    setBadge('#badge-final', '');
-  }
-
-  const diffView = $('#diff-view');
-  if (run && run.diff && run.diff.trim()) {
-    diffView.innerHTML = renderDiff(run.diff, run.diff_stat);
-    diffView.classList.remove('empty-state');
-    const files = (run.diff_stat && run.diff_stat.files) || 0;
-    setBadge('#badge-diff', files ? `${files}` : '', true);
-  } else {
-    // An empty tab that says "no changes" where git was never going to report
-    // any reads as a run that did nothing. Name the actual reason.
-    diffView.classList.add('empty-state');
-    diffView.textContent = workspaceIsRepo()
-      ? 'Changes made to your working tree appear here as a git diff.'
-      : `${workspacePath() || 'The scratch workspace'} is not a git ` +
-        'repository, so there is no diff to show. Anything the council wrote ' +
-        'is on disk all the same.';
-    setBadge('#badge-diff', '');
-  }
+  fillSlots(thread);
+  stream.scrollTop = scrolled;
+  renderCommitBar();
 }
 
-function setBadge(sel, text, positive = false) {
-  const node = $(sel);
-  node.textContent = text;
-  node.classList.toggle('hidden', !text);
-  node.classList.toggle('add', positive);
+/** The sidebar footer. There are no accounts here — the app is a local tool on
+ *  loopback — so this is whatever name Settings was given, or failing that the
+ *  OS user it was launched as. It signs you in to nothing. */
+function renderProfile() {
+  const chosen = ((state.config || {}).display_name || '').trim();
+  const name = chosen || state.user || '';
+  $('#profile-name').textContent = name || 'local';
+  $('#profile-mark').textContent = (name || '?').slice(0, 2).toUpperCase();
+  $('.profile').title = chosen
+    ? `${chosen} — set in Settings. Theseus AI has no account of its own.`
+    : state.user
+      ? `Running as ${state.user}. Set a name in Settings → App.`
+      : 'Theseus AI has no account of its own.';
 }
 
 function renderAll() {
   renderStatus();
   renderMode();
-  renderAgents();
+  renderProfile();
+  renderStrip();
+  renderComposerChips();
   renderWorkspace();
   renderToggles();
-  renderOutputs();
-  renderCommitBar();
+  renderThread();
 }
 
 /* ==========================================================================
@@ -1304,9 +1399,11 @@ const MAX_STREAM_LINES = 4000;
 
 function pushLine(kind, tag, text) {
   const stream = $('#stream');
-  const follow = $('#autoscroll').checked;
+  // The console scrolls itself now, and there is no Follow checkbox: being
+  // near the bottom already means "still watching", and scrolling up to read
+  // something is the only signal the operator has stopped.
   const nearBottom =
-    stream.scrollHeight - stream.parentElement.scrollTop - stream.parentElement.clientHeight < 120;
+    stream.scrollHeight - stream.scrollTop - stream.clientHeight < 120;
 
   const row = document.createElement('div');
   row.className = `line ${kind}`;
@@ -1324,9 +1421,7 @@ function pushLine(kind, tag, text) {
     stream.removeChild(stream.firstElementChild);
   }
 
-  if (follow && nearBottom) {
-    stream.parentElement.scrollTop = stream.parentElement.scrollHeight;
-  }
+  if (nearBottom) stream.scrollTop = stream.scrollHeight;
 }
 
 function pushDivider(text) {
@@ -1532,8 +1627,156 @@ async function setEffort(providerId, value) {
   );
 }
 
-/** Agent menu for the Solo card. Same chrome and the same gesture as the two
- *  chips beside it. The list is the server's catalogue, so the browser still
+/** Everything about one council member, from one click on it. Each row opens
+ *  the menu that already owns that setting rather than reimplementing it here:
+ *  four settings, four existing menus, no fifth copy of the model list to drift
+ *  out of step with the other one. */
+function openMemberMenu(anchor, providerId) {
+  closeModelMenu();
+  const provider = ((state.config || {}).providers || {})[providerId] || {};
+  const agent = state.agents.find(a => a.id === agentOf(provider));
+  const agentLabel = agent && (agent.command || []).length ? agent.label : 'custom command';
+  const hasEffort = (provider.effort_args || []).length > 0;
+
+  const rows = [
+    ['agent', 'CLI', agentLabel],
+    ['model', 'Model', provider.model || 'the CLI’s default'],
+    ...(hasEffort ? [['effort', 'Effort', provider.effort || 'the CLI’s default']] : []),
+    ['role', 'Role', provider.role || 'none'],
+  ];
+
+  const menu = document.createElement('div');
+  menu.className = 'model-menu';
+  menu.innerHTML =
+    `<div class="model-menu-head">${esc(provider.label || providerId)}</div>` +
+    rows.map(([key, label, value]) =>
+      `<button class="model-opt" data-open="${key}">` +
+        `<span class="model-opt-name">${esc(label)}</span>` +
+        `<span class="model-opt-note">${esc(value)}</span>` +
+      `</button>`
+    ).join('') +
+    `<div class="model-menu-source">Applies to this stage only.</div>`;
+  document.body.appendChild(menu);
+  positionModelMenu(menu, anchor);
+
+  menu.addEventListener('click', (e) => {
+    const opt = e.target.closest('[data-open]');
+    if (!opt) return;
+    closeModelMenu();
+    const open = {
+      agent: openAgentMenu, model: openModelMenu,
+      effort: openEffortMenu, role: openRoleMenu,
+    }[opt.dataset.open];
+    if (open) open(anchor, providerId);
+  });
+
+  setTimeout(() => {
+    document.addEventListener('click', onDocClickCloseModel, { once: true });
+  }, 0);
+}
+
+/** Role menu. The catalogue is the server's, the same one Settings edits, so
+ *  a role written there is selectable here the moment it is saved. */
+function openRoleMenu(anchor, providerId) {
+  closeModelMenu();
+  const provider = ((state.config || {}).providers || {})[providerId] || {};
+  const current = provider.role_template || '';
+
+  const menu = document.createElement('div');
+  menu.className = 'model-menu';
+  menu.innerHTML =
+    `<div class="model-menu-head">${esc(provider.label || providerId)} role</div>` +
+    (state.roles || []).map(r =>
+      `<button class="model-opt${r.id === current ? ' active' : ''}" ` +
+        `data-value="${esc(r.id)}" title="${esc(r.summary || '')}">` +
+        `<span class="model-opt-name">${esc(r.name || r.id)}</span>` +
+        `<span class="model-opt-note">${r.writes ? 'writes files' : 'read-only'}</span>` +
+      `</button>`
+    ).join('') +
+    `<div class="model-menu-source">` +
+      (provider.role_system
+        ? 'This stage has edited role text; picking one here replaces it.'
+        : 'Wording is editable in Settings → Roles.') +
+    `</div>`;
+  document.body.appendChild(menu);
+  positionModelMenu(menu, anchor);
+
+  menu.addEventListener('click', async (e) => {
+    const opt = e.target.closest('.model-opt');
+    if (!opt) return;
+    closeModelMenu();
+    const role = (state.roles || []).find(r => r.id === opt.dataset.value);
+    if (!role || role.id === current) return;
+    const roleName = role.name || role.id;
+    // `role_system` blank means "use the template", so it is cleared with the
+    // swap — otherwise the old role's edited text would be sent under the new
+    // role's name, which is the one combination that reads as neither.
+    await patchConfig({ providers: { [providerId]: {
+      role_template: role.id, role: roleName, role_system: '',
+    } } });
+    toast(`${provider.label || providerId} → ${roleName}`, 'ok', 2600);
+  });
+
+  setTimeout(() => {
+    document.addEventListener('click', onDocClickCloseModel, { once: true });
+  }, 0);
+}
+
+/** The gear beside the composer: the two options that get changed per run.
+ *  The rest are a click further on, in Settings, because they are decisions
+ *  about the project rather than about the message being sent. */
+function openGearMenu(anchor) {
+  closeModelMenu();
+  const c = state.config || {};
+  // Neither toggle means anything to Chat — it has no gate to skip and no
+  // branch to deliver — so they say so rather than sitting there inert.
+  const council = uiMode() === 'council';
+
+  const row = (key, label, on, danger) =>
+    `<button class="menu-toggle${on ? ' on' : ''}${danger ? ' danger' : ''}" ` +
+      `data-toggle="${key}"${council ? '' : ' disabled'}>` +
+      `<span class="menu-box">✓</span>${esc(label)}</button>`;
+
+  const menu = document.createElement('div');
+  menu.className = 'model-menu gear-menu';
+  menu.innerHTML =
+    row('zero_touch', 'Zero-Touch mode', !!c.zero_touch, true) +
+    row('pull_request_mode', 'Pull request mode', !!c.pull_request_mode, false) +
+    `<hr>` +
+    `<button class="model-opt" data-open="settings">` +
+      `<span class="model-opt-name">More…</span>` +
+      `<span class="model-opt-note">Settings</span>` +
+    `</button>` +
+    `<div class="model-menu-source">` +
+      (council
+        ? 'Applies to every council run until changed.'
+        : 'Both are council settings. Chat has no gate and no branch.') +
+    `</div>`;
+  document.body.appendChild(menu);
+  positionModelMenu(menu, anchor);
+
+  menu.addEventListener('click', (e) => {
+    if (e.target.closest('[data-open="settings"]')) {
+      closeModelMenu();
+      $('#settings-btn').click();
+      return;
+    }
+    const btn = e.target.closest('[data-toggle]');
+    if (!btn || btn.disabled) return;
+    closeModelMenu();
+    // Routed through the real checkbox so the confirmations live in one place:
+    // the gear must not be a second, quieter way to switch Zero-Touch on.
+    const box = $(btn.dataset.toggle === 'zero_touch' ? '#zero-touch' : '#pull-request-mode');
+    box.checked = !box.checked;
+    box.dispatchEvent(new Event('change'));
+  });
+
+  setTimeout(() => {
+    document.addEventListener('click', onDocClickCloseModel, { once: true });
+  }, 0);
+}
+
+/** Agent menu. The list is the server's catalogue, so the browser still
  *  carries no command and no permission flag of its own — it sends an id and
  *  the server expands it. */
 function openAgentMenu(anchor, providerId) {
@@ -1589,7 +1832,7 @@ async function setAgent(providerId, agentId) {
   const now = ((state.config || {}).providers || {})[providerId] || {};
   toast(`${provider.label || providerId} → ${now.label || agentId}`, 'ok', 2600);
   api('/api/usage/refresh', { method: 'POST' })
-    .then(d => { state.usage = d.usage || {}; renderAgents(); })
+    .then(d => { state.usage = d.usage || {}; renderStrip(); })
     .catch(() => {});
 }
 
@@ -1755,7 +1998,7 @@ function renderSettings() {
   const FORMS = [
     { id: 'drafter', num: 'Stage 1', council: true },
     { id: 'polisher', num: 'Stage 2', council: true },
-    { id: 'solo', num: 'Solo', council: false },
+    { id: 'solo', num: 'Chat', council: false },
   ];
 
   host.innerHTML = FORMS.map(({ id, num, council }) => {
@@ -1844,7 +2087,7 @@ function renderSettings() {
             (council ? '' :
               `<div class="field">` +
                 `<label>Read-only arguments ` +
-                  `<span class="field-hint">— always added; Solo has no ` +
+                  `<span class="field-hint">— always added; Chat has no ` +
                   `approval gate, diff or rollback, so it never writes</span></label>` +
                 `<textarea rows="2" data-field="read_only_args">` +
                   `${esc((p.read_only_args || []).join('\n'))}</textarea>` +
@@ -1903,6 +2146,7 @@ function renderSettings() {
 
   $$('.provider-form').forEach(updateRoleWarning);
   $('#house-rules').value = conf.house_rules || '';
+  $('#display-name').value = conf.display_name || '';
   $('#port-input').value = conf.port || 8760;
   $('#open-browser').checked = conf.open_browser !== false;
 }
@@ -2006,6 +2250,7 @@ async function saveSettings() {
       body: {
         providers,
         house_rules: $('#house-rules').value,
+        display_name: $('#display-name').value.trim(),
         port: parseInt($('#port-input').value, 10) || 8760,
         open_browser: $('#open-browser').checked,
       },
@@ -2032,7 +2277,7 @@ async function refreshDoctor(show = false) {
       lines.push('', `config: ${data.config_path}`, `runs:   ${data.runs_path}`);
       $('#doctor-out').textContent = lines.join('\n');
     }
-    renderAgents();
+    renderStrip();
     if (show) renderSettings();
   } catch (err) {
     toast(err.message, 'error');
@@ -2058,128 +2303,102 @@ async function loadChats() {
   }
 }
 
+// Buckets matching how the operator thinks about "the one from yesterday".
+// Everything past a week falls into one group rather than a heading per day,
+// which would make the labels longer than the list they label.
+const GROUP_ORDER = ['Today', 'Yesterday', 'Previous 7 days', 'Older'];
+
+function chatGroup(ts) {
+  if (!ts) return 'Older';
+  const midnight = new Date();
+  midnight.setHours(0, 0, 0, 0);
+  // Whole days between the start of today and the conversation. Negative means
+  // it is later than midnight this morning, i.e. today.
+  const days = Math.floor((midnight.getTime() - ts * 1000) / 86400000);
+  if (days < 0) return 'Today';
+  if (days === 0) return 'Yesterday';
+  return days < 7 ? 'Previous 7 days' : 'Older';
+}
+
+/** A time for today's rows and a date for older ones: a bare "10:42" under
+ *  "Previous 7 days" does not say which of those days it was. */
+function chatWhen(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  return chatGroup(ts) === 'Today'
+    ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
 function renderChats() {
   const list = $('#chat-list');
   const chats = state.chats || [];
-  const count = $('#chat-count');
-  count.textContent = chats.length ? String(chats.length) : '';
-  count.classList.toggle('hidden', !chats.length);
 
   if (!chats.length) {
     list.innerHTML =
-      '<div class="picker-empty">No conversations yet. Run a task to start one.</div>';
+      '<div class="picker-empty">No conversations yet. Ask something to start one.</div>';
     return;
   }
+
   const open = state.openChat ? state.openChat.file : '';
-  list.innerHTML = chats.map(c =>
-    `<button class="chat-row ${esc(c.state)}${c.file === open ? ' open' : ''}" ` +
-      `type="button" data-chat-file="${esc(c.file)}" title="${esc(c.workspace || '')}">` +
-      `<span class="chat-row-title">${esc(c.title || c.task || '(no task)')}</span>` +
-      `<span class="chat-row-meta">${fmtWhen(c.created_at)} · ` +
-        `${c.messages} message${c.messages === 1 ? '' : 's'}` +
-        `${c.mode === 'solo' ? ' · solo' : ''}` +
-        `${c.zero_touch ? ' · zero-touch' : ''}</span>` +
-    `</button>`
+  const buckets = new Map(GROUP_ORDER.map(g => [g, []]));
+  chats.forEach(c => buckets.get(chatGroup(c.created_at)).push(c));
+
+  list.innerHTML = GROUP_ORDER.filter(g => buckets.get(g).length).map(g =>
+    `<div class="chat-group">${esc(g)}</div>` +
+    buckets.get(g).map(c =>
+      `<button class="chat-row ${esc(c.state)}${c.file === open ? ' open' : ''}" ` +
+        `type="button" data-chat-file="${esc(c.file)}" ` +
+        `title="${esc(c.workspace || 'Scratch workspace')}">` +
+        `<span class="chat-row-title">${esc(c.title || c.task || '(no task)')}</span>` +
+        `<span class="chat-row-meta">${esc(chatWhen(c.created_at))}` +
+          `${c.mode === 'solo' ? ' · chat' : ''}` +
+          `${c.zero_touch ? ' · zero-touch' : ''}</span>` +
+      `</button>`
+    ).join('')
   ).join('');
 }
 
-function historySection(title, bodyHtml, cls = 'markdown') {
-  if (!bodyHtml) return '';
-  return (
-    `<section class="history-block"><h3>${esc(title)}</h3>` +
-    `<div class="${cls}">${bodyHtml}</div></section>`
-  );
-}
-
-/** One exchange: what the human asked, then what each agent answered.
- *  `compacted` marks a turn whose answers were summarised to fit the context
- *  budget, so a clipped outline is not shown as if it were the whole reply. */
-function historyTurn(task, replies, prefix = '', compacted = false) {
-  const note = compacted ? ' · compacted' : '';
-  return (
-    historySection(`${prefix}You asked`, renderMarkdown(task || '(no message)')) +
-    replies.map(r => historySection(
-      `${prefix}${r.label || r.stage || 'Agent'}${note}`,
-      renderMarkdown(r.output || '') ||
-        `<p class="history-none">${esc(r.error || `(${r.state || 'no output'})`)}</p>`
-    )).join('')
-  );
-}
-
-/** Open one conversation in the main pane: every turn of the thread, then the
- *  result of its latest run. The live run's own output is hidden rather than
- *  cleared, so closing this puts it back untouched. */
+/** Open a conversation in the thread *and* attach it to the composer, so the
+ *  next message continues it where it is. Reading a thread and continuing it
+ *  used to be two steps with a button between them; they are one gesture now,
+ *  which is the whole difference between a chat list and a log. */
 async function openChat(file) {
-  const transcript = $('#chat-transcript');
-  // Marked open before the fetch, not after: `renderOutputs` decides which
-  // pane is visible from this, and an event arriving mid-load would otherwise
-  // put the run's output back on top of the transcript being read.
+  // Marked open before the fetch, not after: `renderThread` decides what is on
+  // screen from this, and an event arriving mid-load would otherwise drop the
+  // live run on top of the conversation being opened.
   state.openChat = { file, run: null };
-  $('#council-output').classList.add('hidden');
-  $('#solo-output').classList.add('hidden');
-  $('#chat-view').classList.remove('hidden');
-  $('#chat-continue').disabled = true;
-  $('#chat-context').textContent = '';
-  transcript.innerHTML = '<div class="picker-empty">Loading…</div>';
+  state.tab = '';
+  renderChats();
 
   try {
     const { run } = await api(`/api/run?file=${encodeURIComponent(file)}`);
+    if (!state.openChat || state.openChat.file !== file) return;
     state.openChat = { file, run };
-    renderChats();
-    // Earlier turns of the same thread travel inside the transcript, so a
-    // follow-up reads as the conversation it was rather than a lone message.
+
+    // A thread continues in the mode it already was. Sending a council run
+    // into a chat is refused by the server anyway, so the selector follows the
+    // conversation rather than letting the operator walk into that.
     const earlier = run.conversation || [];
-    $('#chat-title').textContent =
-      (earlier.length ? earlier[0].task : run.task) || 'Conversation';
-    $('#chat-continue').disabled = false;
-
-    const stages = (run.stage_order || Object.keys(run.stages || {}))
-      .map(id => (run.stages || {})[id])
-      .filter(Boolean);
-
-    transcript.innerHTML =
-      earlier.map(t =>
-        historyTurn(t.task, t.replies || [], 'Earlier · ', t.compacted)).join('') +
-      historyTurn(run.task, stages) +
-      historySection('Your note at the approval gate',
-        renderMarkdown(run.reviewer_note || '')) +
-      historySection('Repository changes',
-        run.diff ? renderDiff(run.diff, run.diff_stat) : '', 'diff-view') +
-      historySection('Rolled back', renderMarkdown(run.rollback_note || '')) +
-      historySection('Error', renderMarkdown(run.error || ''));
-
-    // What a follow-up to *this* conversation would replay — measured now
-    // rather than after the operator has committed to it.
-    const { context } = await api(`/api/context?file=${encodeURIComponent(file)}`);
-    if (state.openChat && state.openChat.file === file) {
-      const cost = contextLine(context);
-      const meter = $('#chat-context');
-      meter.textContent = `${fmtWhen(run.created_at)} · ${run.state}` +
-        (cost ? ` · continuing replays ${cost}` : '');
-      meter.classList.toggle('warn', contextIsTight(context));
-    }
+    const title = (earlier.length ? earlier[0].task : run.task) || '';
+    await continueRun(file, title, run.mode || (run.solo ? 'solo' : 'council'), true);
+    renderAll();
   } catch (err) {
-    transcript.innerHTML = `<div class="picker-empty">${esc(err.message)}</div>`;
+    toast(err.message, 'error');
+    state.openChat = null;
+    renderAll();
   }
 }
 
+/** Back to the live run, and detached: leaving a conversation on screen while
+ *  the composer still pointed at it is what made the old Continue button
+ *  necessary in the first place. */
 function closeChat() {
+  if (!state.openChat) return;
   state.openChat = null;
-  $('#chat-view').classList.add('hidden');
-  // Which pane comes back depends on the mode, so let the renderer decide.
-  renderOutputs();
+  clearContinuation();
+  renderAll();
   renderChats();
-}
-
-function switchSidebarTab(name) {
-  $$('.sidebar-tab').forEach(t => {
-    const active = t.dataset.sidebarTab === name;
-    t.classList.toggle('active', active);
-    t.setAttribute('aria-selected', String(active));
-  });
-  $$('.sidebar-panel').forEach(p =>
-    p.classList.toggle('active', p.dataset.sidebarPanel === name));
-  if (name === 'chats') loadChats();
 }
 
 /* ==========================================================================
@@ -2226,14 +2445,14 @@ function connect() {
   on('run_started', (d) => {
     state.run = d.run;
     state.busy = true;
-    // A saved conversation is hiding the pane the answer renders into, and a
-    // run starting is where the operator's attention belongs.
-    closeChat();
-    if (d.run.solo) {
-      // The stream is a council view. Solo's progress goes into the answer
-      // bubble, which starts empty and fills as the CLI talks.
-      $('#solo-answer').textContent = '';
-    } else {
+    // A conversation opened from history is on screen where the answer is
+    // about to render, and a run starting is where attention belongs.
+    state.openChat = null;
+    state.tab = '';
+    // The unsent commit message belonged to the run that just ended; carried
+    // into this one it would describe the wrong change.
+    $('#commit-message').value = '';
+    if (!d.run.solo) {
       clearStream();
       pushDivider('Run started');
       pushLine('sys', 'system', `Task: ${d.run.task}`);
@@ -2241,9 +2460,12 @@ function connect() {
       if (d.run.zero_touch) {
         pushLine('warn', 'system', 'Zero-Touch Mode: approvals will be skipped.');
       }
-      switchTab('stream');
+      // Open while the run is going, and left alone afterwards — closing it on
+      // completion would fight an operator who had opened it to read something.
+      $('#console-block').open = true;
     }
     renderAll();
+    renderChats();
   });
 
   on('state', (d) => {
@@ -2251,19 +2473,27 @@ function connect() {
     state.busy = !['complete', 'failed', 'cancelled'].includes(d.state);
     const solo = !!d.run && d.run.solo;
     if (d.state === 'awaiting_approval') {
-      switchTab('draft');
       toast('Approval needed. Nothing has been written yet.', 'warn', 8000);
     }
     if (d.state === 'complete') {
-      if (!solo) switchTab(d.run && d.run.diff ? 'diff' : 'final');
       toast(solo ? 'Reply complete.' : 'Run complete.', 'ok');
+      // What the run changed is the thing to read next, so it is open on
+      // arrival. Only here, never on a plain re-render, so an operator who
+      // collapses it is not overruled by the next event.
+      if (d.run && d.run.diff) $('#diff-block').open = true;
     }
     if (d.state === 'failed') toast(d.run.error || 'Run failed.', 'error', 9000);
     if (d.state === 'cancelled') toast('Run cancelled.', 'warn');
     // The transcript is written when the run reaches a terminal state, which is
     // when the conversation list can show it — and when a follow-up has folded
     // its parent into itself and must replace it there.
-    if (!state.busy) loadChats();
+    if (!state.busy) {
+      loadChats();
+      // The run has just written to the working tree, so the git status the
+      // status bar and the commit bar are drawn from is now a run out of date.
+      // Nothing else re-reads it, and the commit bar stays hidden until it does.
+      loadState();
+    }
     renderAll();
   });
 
@@ -2283,8 +2513,10 @@ function connect() {
     if (state.run && state.run.solo) {
       // Progressive, and provisional: `stage_finished` replaces this with the
       // CLI's own final answer, which is prose rather than a transcript of it.
-      const answer = $('#solo-answer');
-      answer.textContent += `${d.line}\n`;
+      // Written straight into the live message, which no render between here
+      // and `stage_finished` rebuilds.
+      const live = $('#thread .assistant-message .markdown[data-live]');
+      if (live) live.textContent += `${d.line}\n`;
       return;
     }
     // Tag with the stage's own label: either agent can hold either job, so a
@@ -2327,7 +2559,7 @@ function connect() {
 
   on('usage', (d) => {
     state.usage = d.usage || {};
-    renderAgents();
+    renderStrip();
   });
 
   on('config', (d) => {
@@ -2343,12 +2575,6 @@ function connect() {
 /* ==========================================================================
    10. Wiring + boot
    ========================================================================== */
-
-function switchTab(name) {
-  state.activeTab = name;
-  $$('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
-  $$('.tab-panel').forEach(p => p.classList.toggle('active', p.dataset.panel === name));
-}
 
 async function patchConfig(patch) {
   try {
@@ -2373,6 +2599,7 @@ async function loadState() {
     state.workspaceStatus = data.workspace_status;
     state.scratchWorkspace = data.scratch_workspace || '';
     state.usage = data.usage || {};
+    state.user = data.user || '';
     renderAll();
   } catch (err) {
     toast(err.message, 'error', 12000);
@@ -2435,19 +2662,52 @@ function wire() {
   // -- mode -------------------------------------------------------------
   $('#mode-switch').addEventListener('click', (e) => {
     const btn = e.target.closest('[data-mode]');
-    if (!btn || state.busy || btn.dataset.mode === selectedMode()) return;
+    if (!btn || btn.disabled) return;
+    const want = btn.dataset.mode;
+    if (want === uiMode()) return;
+
+    // Project is a placeholder, so it is remembered in the page and nowhere
+    // else. Leaving it puts the operator back in the real mode config still
+    // holds, which is why nothing is patched on the way out either.
+    if (want === 'project') { state.tab = 'project'; renderAll(); return; }
+    state.tab = '';
+
     // A conversation belongs to the mode it was started in, so switching
     // detaches whatever is attached rather than continuing it in the other.
-    if (state.continueFrom) clearContinuation();
-    patchConfig({ mode: btn.dataset.mode });
+    if (want !== selectedMode()) {
+      if (state.continueFrom) clearContinuation();
+      closeChat();
+      patchConfig({ mode: want });
+    } else {
+      renderAll();
+    }
   });
 
   // -- composer ---------------------------------------------------------
-  $('#task-input').addEventListener('input', renderStatus);
-  $('#task-input').addEventListener('keydown', (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); startRun(); }
+  const input = $('#task-input');
+  const autosize = () => {
+    // Reset first: without it the box can only ever grow, because scrollHeight
+    // is measured against the height already set.
+    input.style.height = 'auto';
+    input.style.height = `${input.scrollHeight}px`;
+  };
+  input.addEventListener('input', () => { autosize(); renderStatus(); });
+  input.addEventListener('keydown', (e) => {
+    // Enter sends, as in every chat box; Shift+Enter is the newline. Ctrl+Enter
+    // still works, because that is what the old composer taught.
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      startRun();
+    }
   });
   $('#run-btn').addEventListener('click', startRun);
+
+  // -- run options (the gear) -------------------------------------------
+  $('#gear-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    if ($('.model-menu')) { closeModelMenu(); return; }
+    openGearMenu($('#gear-btn'));
+  });
 
   // -- run controls -----------------------------------------------------
   $('#cancel-btn').addEventListener('click', () =>
@@ -2472,7 +2732,6 @@ function wire() {
     try {
       await api('/api/approve', { method: 'POST', body: { note: $('#approval-note').value } });
       $('#approval-note').value = '';
-      switchTab('stream');
     } catch (err) { toast(err.message, 'error'); }
   });
 
@@ -2515,23 +2774,29 @@ function wire() {
     patchConfig({ pull_request_mode: e.target.checked });
   });
 
-  // -- tabs -------------------------------------------------------------
-  $$('.tab').forEach(tab => tab.addEventListener('click', () => switchTab(tab.dataset.tab)));
-
-  // -- agent, model and effort pickers ----------------------------------
-  // Delegated: the agent rail is re-rendered on every state change.
-  $('#agent-rail').addEventListener('click', (e) => {
-    const usageChip = e.target.closest('[data-usage-for]');
-    if (usageChip) {
-      usageChip.classList.add('checking');
+  // -- agent, model, effort and role pickers ----------------------------
+  // Delegated: both hosts are re-rendered on every state change. A member on
+  // the strip opens one menu covering all four settings; Chat's chips in the
+  // composer open the single menu each of them names.
+  $('#council-strip').addEventListener('click', (e) => {
+    const chip = e.target.closest('[data-usage-for]');
+    if (chip) {
+      e.stopPropagation();
+      chip.classList.add('checking');
       api('/api/usage/refresh', { method: 'POST' })
-        .then(d => { state.usage = d.usage || {}; renderAgents(); })
+        .then(d => { state.usage = d.usage || {}; renderStrip(); })
         .catch(err => toast(err.message, 'error'));
       return;
     }
-    // The Solo monogram is a fourth opener, not a fourth menu: it carries
-    // `data-agent-for` like the chip does and lands in the same branch below.
-    const chip = e.target.closest('.model-chip, .agent-avatar.pickable');
+    const member = e.target.closest('.member');
+    if (!member) return;
+    e.stopPropagation();
+    if ($('.model-menu')) { closeModelMenu(); return; }  // toggle
+    openMemberMenu(member, member.dataset.member);
+  });
+
+  $('#composer-chips').addEventListener('click', (e) => {
+    const chip = e.target.closest('.model-chip');
     if (!chip) return;
     e.stopPropagation();
     if ($('.model-menu')) { closeModelMenu(); return; }  // toggle
@@ -2649,45 +2914,26 @@ function wire() {
   });
 
   // -- conversations ----------------------------------------------------
-  $('.sidebar-tabs').addEventListener('click', (e) => {
-    const tab = e.target.closest('.sidebar-tab');
-    if (tab) switchSidebarTab(tab.dataset.sidebarTab);
-  });
   // Delegated: the list is rebuilt whenever it is reloaded.
   $('#chat-list').addEventListener('click', (e) => {
     const row = e.target.closest('[data-chat-file]');
     if (row) openChat(row.dataset.chatFile);
   });
-  $('#chat-close').addEventListener('click', closeChat);
-  $('#chat-continue').addEventListener('click', () => {
-    const open = state.openChat;
-    if (!open || !open.run) return;
-    // The server enforces this too; checking here turns a rejected run into
-    // an answerable message before anything is started.
-    const was = runWorkspace(open.run);
-    if (was !== (workspacePath() || state.scratchWorkspace)) {
-      toast(
-        `That conversation was held in ${was}. Set that as the working folder ` +
-        `to continue it.`, 'error', 9000
-      );
-      return;
-    }
-    continueRun(open.file, open.run.task,
-      open.run.mode || (open.run.solo ? 'solo' : 'council'));
-    closeChat();
-  });
   $('#new-chat').addEventListener('click', () => {
+    state.tab = '';
+    state.run = null;
     clearContinuation();
     closeChat();
-    switchSidebarTab('council');
+    renderAll();
+    renderChats();
     $('#task-input').focus();
   });
 
   // -- continuation -----------------------------------------------------
-  $('#continue-btn').addEventListener('click', () => {
-    if (state.run) continueRun(state.run.file, state.run.task, state.run.mode);
+  $('#continue-clear').addEventListener('click', () => {
+    clearContinuation();
+    closeChat();
   });
-  $('#continue-clear').addEventListener('click', clearContinuation);
   // Compaction applies to the run about to start; the transcript on disk is
   // never rewritten, so the full text of every turn stays readable in its own
   // conversation.

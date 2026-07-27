@@ -18,6 +18,7 @@ three defences are layered on:
 
 from __future__ import annotations
 
+import getpass
 import json
 import mimetypes
 import os
@@ -325,6 +326,13 @@ class Handler(BaseHTTPRequestHandler):
         state["ok"] = True
         state["version"] = __version__
         state["usage"] = self.app.usage.snapshot()
+        # Whose desktop this is, for the sidebar footer. There are no accounts
+        # here - the app is a local tool bound to loopback - so the only true
+        # answer is the OS user it was launched as.
+        try:
+            state["user"] = getpass.getuser()
+        except (KeyError, OSError):
+            state["user"] = ""
         workspace = state["config"].get("workspace") or ""
         # Reported whether or not the folder is a repository: "not a git
         # repository" is a state the UI shows rather than an error, since it
