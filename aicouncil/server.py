@@ -203,6 +203,7 @@ class Handler(BaseHTTPRequestHandler):
             ("GET", "/api/fs"): self._api_fs,
             ("GET", "/api/repo"): self._api_repo,
             ("GET", "/api/history"): self._api_history,
+            ("POST", "/api/history/delete"): self._api_history_delete,
             ("GET", "/api/run"): self._api_run,
             ("GET", "/api/context"): self._api_context,
             ("GET", "/api/doctor"): self._api_doctor,
@@ -373,7 +374,36 @@ class Handler(BaseHTTPRequestHandler):
         return {"ok": True, "status": gitutil.status(path).to_dict()}
 
     def _api_history(self, params: Dict[str, list]) -> Dict[str, Any]:
-        return {"ok": True, "runs": self.app.pipeline.history()}
+        # Council and Chat conversations are not interchangeable - continuing
+        # one in the other mode is refused - so the sidebar asks for the mode
+        # it is showing rather than filtering a mixed list in the browser.
+        mode = (params.get("mode") or [""])[0]
+        if mode not in ("council", "solo", ""):
+            raise ValueError("Mode must be either 'council' or 'solo'.")
+        return {"ok": True, "runs": self.app.pipeline.history(mode=mode)}
+
+    def _api_history_delete(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Delete one conversation, or every conversation of a mode.
+
+        Deliberately two explicit shapes rather than one with an optional
+        filter: a bug that dropped the filter from a request would otherwise
+        turn "delete this one" into "delete everything".
+        """
+        body = self._read_body()
+        name = str(body.get("file") or "")
+        if name:
+            if not self.app.pipeline.delete_run(name):
+                raise ValueError("No such run transcript.")
+            return {"ok": True, "deleted": 1}
+
+        if not body.get("all"):
+            raise ValueError(
+                "Send a transcript filename, or `all: true` to clear the list."
+            )
+        mode = str(body.get("mode") or "")
+        if mode not in ("council", "solo", ""):
+            raise ValueError("Mode must be either 'council' or 'solo'.")
+        return {"ok": True, "deleted": self.app.pipeline.clear_history(mode)}
 
     def _api_run(self, params: Dict[str, list]) -> Dict[str, Any]:
         name = (params.get("file") or [""])[0]

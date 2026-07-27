@@ -201,7 +201,7 @@ What the folder decides is which half of the safety model is available:
 | Working folder | You get | You do not get |
 |---|---|---|
 | A git repository | Everything below | — |
-| Any other folder | Draft, approval gate, live stream, conversations | Diff, safety snapshot, rollback, commit bar, pull-request mode |
+| Any other folder | Draft, approval gate, console, conversations, and agents that can still write to it | Diff, safety snapshot, rollback, commit bar, pull-request mode |
 | None chosen | The same, in `~/.config/ai-council/workspace` | The same |
 
 None of that is enforced by refusing to start. The status bar says which
@@ -231,6 +231,16 @@ agent answered, the note you left at the approval gate, and the diff that
 resulted. Opening it also attaches it to the composer, so typing again
 continues that conversation rather than starting a new one. **New chat**
 detaches and gives you an empty thread.
+
+**Council and Chat keep separate histories.** Neither can be continued in the
+other — the server refuses it — so each mode lists only its own conversations
+rather than offering rows that clicking cannot act on.
+
+Deleting is in two places. Hovering a row reveals a **×** that removes just
+that conversation; **Settings → App → Conversations** has a button per mode
+that clears the lot, each showing how many it would delete. Both confirm first,
+both are immediate and permanent — the transcript is the only copy, there is no
+bin, and neither touches your files or your git history.
 
 A follow-up is not a separate entry in that list. It carries the earlier turns
 inside its own transcript, so the newest run of a thread *is* the conversation,
@@ -315,24 +325,37 @@ council members working from the same conversation.
 
 The toggle the whole design orbits around.
 
-**Off (default).** The run pauses at the approval gate. The draft is read-only
-by instruction, so at that moment *nothing has been written to disk*. Clicking
-**Approve & execute** is what grants Stage 2 permission to modify files.
+It is the one thing that hands a CLI its auto-approve flag
+(`--dangerously-skip-permissions` for `claude`,
+`--dangerously-bypass-approvals-and-sandbox` for `codex`), and it applies in
+both modes — but it means something slightly different in each, because only
+one of them has a gate.
 
-**On.** No gate. The pipeline runs start to finish unattended, and Stage 2
-receives its CLI's auto-approve flag (`--dangerously-skip-permissions` for
-`claude`, `--dangerously-bypass-approvals-and-sandbox` for `codex`).
+| | Zero-Touch **off** (default) | Zero-Touch **on** |
+|---|---|---|
+| **Council** | Pauses at the gate. Nothing is on disk yet; **Approve & execute** is what grants Stage 2 permission. | No gate. Runs start to finish unattended, Stage 2 writing as it goes. |
+| **Chat** | Read-only. The assistant is invoked with its agent's read-only arguments (`--sandbox read-only`, `--permission-mode plan`) and can talk about the folder but not change it. | The assistant can create, modify and delete files, exactly as Stage 2 can. |
 
-Three properties hold in both modes, and they are covered by tests:
+Chat has no approval gate — nothing stands between the message and the reply
+for a human to review — so Zero-Touch is the *only* way to grant it write
+permission. That is deliberate: it means "what does this repo do?" is safe to
+ask by default, and arming it is a single, visible decision. The greeting says
+which of the two you are in and turns amber when it is armed.
+
+Four properties hold throughout, and they are covered by tests:
 
 - **Stage 1 never receives an auto-approve flag.** It is read-only by contract
   regardless of the toggle.
+- **Read-only and auto-approve are never both sent.** They are opposite grants;
+  a provider gets one or the other.
 - **The flags are never baked into the command template.** They live in a
   separate config field and are appended only when permission has actually been
   granted — so switching Zero-Touch off is sufficient to guarantee they are not
   passed.
-- **A safety snapshot is taken immediately before Stage 2 runs**, so any run is
-  reversible.
+- **Whatever writes is protected the same way.** The safety snapshot is taken
+  immediately before it and the diff collected immediately after, whether that
+  is Stage 2 or a Chat turn. A read-only run skips both, because reading a diff
+  after one would report your own uncommitted work as the agent's.
 
 > **Zero-Touch means what it says.** An agent will create, modify and delete
 > files in your working folder with no further confirmation. Use it on a
@@ -378,17 +401,19 @@ ChatGPT is. It has:
   to replay, your message reaches the CLI *exactly as typed* — no persona, no
   house rules, no folder preamble. Type something into that box and it is
   put in front of the message; that is the whole of it.
-- **No council furniture.** No draft, no approval gate, no Zero-Touch, no
-  pull request, no snapshot, no rollback and no member strip — just the
-  message and the reply.
-- **No write permission.** Chat is invoked with its agent's read-only
-  arguments (`--sandbox read-only` for `codex`, `--permission-mode plan` for
-  `claude`) and never receives an auto-approve flag. It reads the working
-  folder and talks about it; Council is the path for changing it.
+- **No draft and no approval gate**, and no member strip — just the message
+  and the reply.
+- **Read-only until you say otherwise.** By default Chat is invoked with its
+  agent's read-only arguments (`--sandbox read-only` for `codex`,
+  `--permission-mode plan` for `claude`) and never receives an auto-approve
+  flag. Turn Zero-Touch on and it can change files, takes a snapshot first and
+  shows the diff afterwards, exactly as the council's writing stage does. See
+  [Zero-Touch mode](#zero-touch-mode).
 
-Conversations from the two modes are kept apart: continuing one switches the
-selector to the mode it was held in, and the server refuses the mismatch
-outright rather than replay a council transcript into a plain chat.
+Conversations from the two modes are kept apart, in the sidebar and on the
+wire: each mode lists only its own, continuing one switches the selector to the
+mode it was held in, and the server refuses the mismatch outright rather than
+replay a council transcript into a plain chat.
 
 Configurations written before this existed are migrated on load. The old
 **Solo mode** toggle becomes the mode; the stage the old **Solo mode runs**

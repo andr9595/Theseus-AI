@@ -25,25 +25,39 @@ State machine (Solo)
 
     idle -> running -> complete | failed | cancelled
 
-Solo has no gate, no delivery branch, no safety snapshot and no diff, because
-it never writes: its provider is invoked with ``read_only_args`` instead of
-ever being granted the auto-approve flags. What it is for is a conversation
-with one agent, and what it produces is an answer.
+Solo has no approval gate: nothing stands between the message and the reply
+for a human to review. What it is for is a conversation with one agent, and
+what it produces is an answer.
 
 Neither mode requires a repository. A run works in the folder it was given -
 or in the scratch workspace when it was given none - and the git-backed half
 of the safety model (snapshot, rollback, diff, pull-request delivery) is
 available exactly when that folder happens to be a git repository.
 
-Permission to write to disk is carried by ``execute_approved``. It is true
-only when Zero-Touch Mode granted it up front or a human granted it at the
-gate, and it is what decides whether the Stage 2 CLI receives its
-auto-approve flags. Stage 1 is read-only and never receives them.
+Permission to write to disk
+---------------------------
+
+One rule, both modes: a CLI receives its auto-approve flags only where that
+permission has been granted, and is invoked with its ``read_only_args``
+everywhere else. The two modes differ only in who can grant it.
+
+* **Council** can always be granted it. Zero-Touch Mode grants it up front;
+  otherwise a human grants it at the gate. Stage 1 is read-only by role and
+  never receives it either way; Stage 2 carries it in ``execute_approved``.
+* **Solo** has no gate, so Zero-Touch is the only thing that can grant it.
+  Without Zero-Touch the conversation is read-only, which is the default and
+  what makes "what does this repo do?" safe to ask.
+
+Whatever writes gets the same protection: the snapshot is taken immediately
+before it, the diff is collected immediately after, and rollback is offered if
+the snapshot took. A read-only run skips all three - reading a diff after one
+would report whatever the operator had already left in the tree as though the
+agent had done it.
 
 Pull-request mode changes where that permission lands, not whether it is
-granted: the branch is created after the gate, Stage 2 works on it, and a
-successful run is committed, pushed and opened as a pull request. The branch
-the operator started on is never written to.
+granted: the branch is created once permission exists, the writing stage works
+on it, and a successful run is committed, pushed and opened as a pull request.
+The branch the operator started on is never written to.
 
 Only one run executes at a time. The engine owns a worker thread; every public
 method is safe to call from the HTTP handler threads.
@@ -485,10 +499,17 @@ class Pipeline:
         mode = str(conf.get("mode") or "council")
         if mode not in ("council", "solo"):
             mode = "council"
-        # Delivery is council machinery. Solo never writes, never branches and
-        # never commits, so there is nothing here for these to protect - and
-        # refusing a conversation because the tree is dirty would be absurd.
-        pull_request_mode = mode == "council" and bool(conf.get("pull_request_mode"))
+        # Whether this run may modify files at all. Council earns it either at
+        # the approval gate or up front with Zero-Touch, so it always *may*.
+        # Chat has no gate - there is no draft between the message and the
+        # reply to review - so Zero-Touch is the only way to grant it there,
+        # and without it the provider is invoked read-only.
+        zero_touch = bool(conf.get("zero_touch"))
+        writes = mode == "council" or zero_touch
+        # Delivery protects a run that writes. On a read-only conversation
+        # there is nothing to branch, nothing to commit, and refusing to start
+        # because the tree is dirty would be absurd.
+        pull_request_mode = writes and bool(conf.get("pull_request_mode"))
         if pull_request_mode:
             # Stricter than the toggle below and checked whether or not it is
             # on: every precondition for committing, pushing and opening the PR
@@ -496,7 +517,7 @@ class Pipeline:
             blocker = gitutil.pull_request_blocker(root)
             if blocker:
                 raise ValueError(blocker)
-        elif mode == "council" and conf.get("require_clean_worktree"):
+        elif writes and conf.get("require_clean_worktree"):
             st = gitutil.status(root)
             if not st.clean:
                 raise ValueError(
@@ -548,8 +569,6 @@ class Pipeline:
             if self.is_busy():
                 raise PipelineBusy("A run is already in progress.")
 
-            # Zero-Touch grants write permission, and Solo has none to grant.
-            zero_touch = mode == "council" and bool(conf.get("zero_touch"))
             providers = conf.get("providers", {})
 
             run_id = uuid.uuid4().hex[:12]
@@ -568,7 +587,7 @@ class Pipeline:
                     gitutil.branch_for(run_id, task) if pull_request_mode else ""
                 ),
                 snapshot_planned=(
-                    mode == "council"
+                    writes
                     and bool(conf.get("safety_snapshot", True))
                     and gitutil.repo_root(root) is not None
                 ),
@@ -776,30 +795,62 @@ class Pipeline:
     def _execute_solo(self, run: Run) -> None:
         """One assistant, one message, one answer.
 
-        No gate, no branch, no snapshot and no diff: there is nothing between
-        the message and the reply to review, and the provider is invoked
-        read-only so there is nothing to recover from either.
+        There is no gate here - nothing stands between the message and the
+        reply for a human to review - so whether it may write is settled before
+        it starts. Zero-Touch grants it, exactly as it does for the council;
+        without it the provider is invoked with its read-only arguments and
+        there is nothing to recover from either.
         """
         provider = (run.config.get("providers") or {}).get("solo", {})
+        # Read off the run, not the store: the toggle can be flipped mid-run,
+        # and what this conversation was granted was decided when it started.
+        writes = run.zero_touch
+
+        if writes:
+            self._prepare_branch(run)
+            self._take_snapshot(run)
+            if self._is_cancelled():
+                self._finish_cancelled(run)
+                return
+
         self._set_state(run, RUNNING)
         result = self._run_stage(
             run,
             "solo",
             provider,
+            # Still bare, even when it may write. Nothing is added that the
+            # operator did not put there: permission to change files is not a
+            # reason to start injecting a persona, the house rules or a
+            # repository preamble into a message they typed themselves.
             prompts.build_chat_prompt(
                 run.task,
                 run.conversation,
                 behavior=str(provider.get("behavior") or ""),
             ),
-            auto_approve=False,
-            read_only=True,
+            auto_approve=writes,
+            read_only=not writes,
         )
+
+        # Only when it could have written. Asking git for a diff after a
+        # read-only conversation would report whatever the operator had already
+        # left in the tree as though the assistant had done it.
+        if writes:
+            try:
+                run.diff = gitutil.working_diff(run.workspace)
+                run.diff_stat = gitutil.diff_stat(run.workspace)
+            except (gitutil.GitError, OSError) as exc:
+                self.bus.publish(
+                    "log", level="warn", message=f"Could not read the diff: {exc}"
+                )
 
         if self._is_cancelled():
             self._finish_cancelled(run)
         elif not result.ok:
             run.error = result.error or "The assistant failed."
             self._set_state(run, FAILED)
+        elif writes and run.pull_request_mode:
+            self._publish(run)
+            self._set_state(run, FAILED if run.error else COMPLETE)
         else:
             self._set_state(run, COMPLETE)
 
@@ -890,61 +941,11 @@ class Pipeline:
                 return
             execute_approved = True
 
-        # ---- Delivery branch --------------------------------------------
-        # Created here, after permission to write has been granted, so
+        # ---- Delivery branch and safety snapshot ------------------------
+        # Both happen here, after permission to write has been granted, so
         # rejecting at the gate still leaves the repository untouched.
-        if run.pull_request_mode:
-            gitutil.create_branch(run.workspace, run.work_branch)
-            self.bus.publish(
-                "log",
-                level="info",
-                message=(
-                    f"Working on {run.work_branch}. {run.base_branch} will "
-                    f"not change until you merge the pull request."
-                ),
-            )
-
-        # ---- Safety snapshot --------------------------------------------
-        # Taken immediately before the only stage that writes to disk.
-        if conf.get("safety_snapshot", True):
-            try:
-                run.snapshot = gitutil.take_snapshot(run.workspace)
-                if run.snapshot:
-                    self.bus.publish(
-                        "log",
-                        level="info",
-                        message=f"Safety snapshot taken at {run.snapshot.head[:8]}.",
-                    )
-                else:
-                    # Two ways to have nothing to anchor to, and the operator
-                    # can act on one of them. Saying "no commits yet" about a
-                    # folder that is not a repository at all sends them looking
-                    # for a git history that was never going to be there.
-                    why = (
-                        "this repository has no commits yet"
-                        if gitutil.repo_root(run.workspace)
-                        else "this folder is not a git repository"
-                    )
-                    self.bus.publish(
-                        "log",
-                        level="warn",
-                        message=(
-                            f"No safety snapshot: {why}, so there is no state "
-                            f"to restore. Rollback is unavailable for this run."
-                        ),
-                    )
-            except (gitutil.GitError, OSError) as exc:
-                # Leave no half-snapshot behind: an object that cannot restore
-                # anything must not be offered as a rollback point.
-                run.snapshot = None
-                self.bus.publish(
-                    "log",
-                    level="warn",
-                    message=(
-                        f"Could not take a safety snapshot ({exc}). "
-                        f"Rollback is unavailable for this run."
-                    ),
-                )
+        self._prepare_branch(run)
+        self._take_snapshot(run)
 
         if self._is_cancelled():
             self._finish_cancelled(run)
@@ -995,6 +996,68 @@ class Pipeline:
             self._set_state(run, FAILED if run.error else COMPLETE)
         else:
             self._set_state(run, COMPLETE)
+
+    def _prepare_branch(self, run: Run) -> None:
+        """Cut the delivery branch, if this run is delivering on one.
+
+        Called once permission to write exists, never before: a run that is
+        rejected at the gate, or a read-only conversation, must leave the
+        repository exactly as it found it.
+        """
+        if not run.pull_request_mode:
+            return
+        gitutil.create_branch(run.workspace, run.work_branch)
+        self.bus.publish(
+            "log",
+            level="info",
+            message=(
+                f"Working on {run.work_branch}. {run.base_branch} will "
+                f"not change until you merge the pull request."
+            ),
+        )
+
+    def _take_snapshot(self, run: Run) -> None:
+        """Anchor the tree immediately before anything writes to it."""
+        if not run.config.get("safety_snapshot", True):
+            return
+        try:
+            run.snapshot = gitutil.take_snapshot(run.workspace)
+            if run.snapshot:
+                self.bus.publish(
+                    "log",
+                    level="info",
+                    message=f"Safety snapshot taken at {run.snapshot.head[:8]}.",
+                )
+            else:
+                # Two ways to have nothing to anchor to, and the operator can
+                # act on one of them. Saying "no commits yet" about a folder
+                # that is not a repository at all sends them looking for a git
+                # history that was never going to be there.
+                why = (
+                    "this repository has no commits yet"
+                    if gitutil.repo_root(run.workspace)
+                    else "this folder is not a git repository"
+                )
+                self.bus.publish(
+                    "log",
+                    level="warn",
+                    message=(
+                        f"No safety snapshot: {why}, so there is no state "
+                        f"to restore. Rollback is unavailable for this run."
+                    ),
+                )
+        except (gitutil.GitError, OSError) as exc:
+            # Leave no half-snapshot behind: an object that cannot restore
+            # anything must not be offered as a rollback point.
+            run.snapshot = None
+            self.bus.publish(
+                "log",
+                level="warn",
+                message=(
+                    f"Could not take a safety snapshot ({exc}). "
+                    f"Rollback is unavailable for this run."
+                ),
+            )
 
     def _publish(self, run: Run) -> None:
         """Commit, push and open the pull request. Records failure on the run.
@@ -1089,8 +1152,13 @@ class Pipeline:
         except OSError:
             pass  # a transcript we cannot save is not worth failing a run over
 
-    def history(self, limit: int = 50) -> List[Dict[str, Any]]:
+    def history(self, limit: int = 50, mode: str = "") -> List[Dict[str, Any]]:
         """One summary per conversation, newest first.
+
+        ``mode`` narrows the list to conversations of that kind. The two are
+        not interchangeable - the server refuses to replay a council thread
+        into a chat, and the reverse - so listing them together offers the
+        operator conversations that clicking cannot continue.
 
         A follow-up is not a separate entry in the list. It carries every
         earlier turn of its thread inside its own transcript, so the newest run
@@ -1131,6 +1199,12 @@ class Pipeline:
         for name, data in loaded:
             if str(data.get("id") or "") in parents:
                 continue
+            # `solo` covers transcripts written before `mode` existed.
+            run_mode = str(data.get("mode") or "") or (
+                "solo" if data.get("solo") else "council"
+            )
+            if mode and run_mode != mode:
+                continue
             conversation = [
                 t for t in (data.get("conversation") or []) if isinstance(t, dict)
             ]
@@ -1147,9 +1221,7 @@ class Pipeline:
                     "created_at": data.get("created_at"),
                     # Served so the browser can switch to the right mode before
                     # continuing, rather than let the server refuse it after.
-                    # `solo` covers transcripts written before `mode` existed.
-                    "mode": str(data.get("mode") or "")
-                            or ("solo" if data.get("solo") else "council"),
+                    "mode": run_mode,
                     "zero_touch": data.get("zero_touch"),
                     "diff_stat": data.get("diff_stat") or {},
                     # Every earlier turn, plus this run's own message.
@@ -1185,13 +1257,69 @@ class Pipeline:
             ),
         }
 
-    def load_run(self, name: str) -> Optional[Dict[str, Any]]:
-        """Load a persisted transcript by filename."""
-        # Reject any path separator: this value comes from a query string.
-        if "/" in name or "\\" in name or ".." in name:
+    def _transcript_path(self, name: str) -> Optional[Path]:
+        """Resolve a transcript filename to a path inside the runs directory.
+
+        The name arrives from a query string or a request body, so anything
+        that could climb out of the directory is refused outright rather than
+        normalised - there is no legitimate transcript name containing a
+        separator, and this is the only guard between a client and `unlink`.
+        """
+        if not name or "/" in name or "\\" in name or ".." in name:
+            return None
+        if not name.endswith(".json"):
             return None
         path = self._runs_dir / name
-        if not path.exists():
+        return path if path.parent == self._runs_dir else None
+
+    def delete_run(self, name: str) -> bool:
+        """Delete one transcript. False if there was nothing to delete."""
+        path = self._transcript_path(name)
+        if path is None or not path.exists():
+            return False
+        try:
+            path.unlink()
+        except OSError:
+            return False
+        return True
+
+    def clear_history(self, mode: str = "") -> int:
+        """Delete every transcript, or every one of a given mode.
+
+        Returns how many went. Unreadable files are counted as neither kept
+        nor deleted when a mode is given: without knowing which mode a
+        transcript belongs to, removing it would be a guess.
+        """
+        try:
+            files = list(self._runs_dir.glob("*.json"))
+        except OSError:
+            return 0
+
+        removed = 0
+        for f in files:
+            if mode:
+                try:
+                    data = json.loads(f.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                run_mode = str(data.get("mode") or "") or (
+                    "solo" if data.get("solo") else "council"
+                )
+                if run_mode != mode:
+                    continue
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                continue
+        return removed
+
+    def load_run(self, name: str) -> Optional[Dict[str, Any]]:
+        """Load a persisted transcript by filename."""
+        path = self._transcript_path(name)
+        if path is None or not path.exists():
             return None
         try:
             return json.loads(path.read_text(encoding="utf-8"))

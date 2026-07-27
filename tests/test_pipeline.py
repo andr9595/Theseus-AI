@@ -278,10 +278,10 @@ class TestSoloMode(PipelineTestBase):
         self.assertEqual(run.mode, "solo")
         self.assertTrue(run.stages["solo"].output.strip())
 
-    def test_the_assistant_is_never_granted_write_permission(self):
-        # No gate to approve it at, and Zero-Touch is council machinery that
-        # must not leak across - so the flag can arrive by neither route.
-        self.store.update({"zero_touch": True})
+    def test_the_assistant_is_read_only_without_zero_touch(self):
+        # The default, and what makes "what does this repo do?" safe to ask:
+        # there is no gate to approve a write at, so nothing grants one.
+        self.store.update({"zero_touch": False})
         run = self.pipeline.start("what does this repo do?", str(self.repo))
         self.wait_terminal()
 
@@ -293,6 +293,37 @@ class TestSoloMode(PipelineTestBase):
         self.assertIn("--read-only", run.stages["solo"].command)
         self.assertTrue(gitutil.status(self.repo).clean)
 
+    def test_zero_touch_lets_the_assistant_write(self):
+        # Chat has no gate, so Zero-Touch is the only thing that can grant it -
+        # and when it does, the grant is the same one the council's writing
+        # stage gets, not a weaker variant.
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertTrue(run.zero_touch)
+        self.assertIn(
+            "--dangerously-skip-permissions", run.stages["solo"].command
+        )
+        self.assertNotIn("--read-only", run.stages["solo"].command)
+        # The two grants are opposites and must never both be sent.
+        self.assertFalse(gitutil.status(self.repo).clean)
+
+    def test_a_writing_conversation_is_protected_like_a_council_run(self):
+        # Whatever writes gets the snapshot before it and the diff after it.
+        # Offering one without the other would leave a run that changed files
+        # with no way back and nothing to show for it.
+        self.store.update({"zero_touch": True, "safety_snapshot": True})
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertIsNotNone(run.snapshot)
+        self.assertTrue(run.to_dict()["can_rollback"])
+        self.assertTrue(run.diff.strip())
+        self.assertTrue(run.diff_stat.get("files"))
+
     def test_no_gate_is_reached(self):
         self.store.update({"zero_touch": False})
         run = self.pipeline.start("what does this repo do?", str(self.repo))
@@ -302,6 +333,7 @@ class TestSoloMode(PipelineTestBase):
     def test_no_delivery_state_is_collected(self):
         # Nothing was written, so a diff, a snapshot or a rollback offer would
         # all be attributing the operator's own tree to the assistant.
+        self.store.update({"zero_touch": False})
         (self.repo / "scratch.txt").write_text("mine, not the assistant's\n")
         run = self.pipeline.start("what does this repo do?", str(self.repo))
         self.wait_terminal()
@@ -311,10 +343,11 @@ class TestSoloMode(PipelineTestBase):
         self.assertIsNone(run.snapshot)
         self.assertFalse(run.to_dict()["can_rollback"])
 
-    def test_council_delivery_settings_do_not_block_a_conversation(self):
+    def test_delivery_settings_do_not_block_a_read_only_conversation(self):
         # Refusing to answer a question because the tree is dirty would be
-        # absurd, and there is no branch for pull-request mode to create.
+        # absurd, and a chat that cannot write has no branch to deliver.
         self.store.update({
+            "zero_touch": False,
             "require_clean_worktree": True, "pull_request_mode": True,
         })
         (self.repo / "scratch.txt").write_text("uncommitted\n")
@@ -1319,6 +1352,93 @@ class TestRoleTemplates(unittest.TestCase):
         )
         self.assertIn("Custom behaviour.", prompt)
         self.assertIn("ALWAYS USE TABS", prompt)
+
+
+class TestHistoryScopeAndDeletion(PipelineTestBase):
+    """Two lists, and the ways to empty them."""
+
+    def setUp(self):
+        super().setUp()
+        self.store.update({
+            "zero_touch": True,
+            "providers": {"solo": mock_provider("solo", "Assistant")},
+        })
+
+    def run_in(self, mode, task):
+        self.store.update({"mode": mode})
+        run = self.pipeline.start(task, str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+        return run
+
+    def test_each_mode_lists_only_its_own_conversations(self):
+        # They cannot be continued in each other, so offering both in one list
+        # would show rows that clicking cannot do what the click promises.
+        council = self.run_in("council", "a council run")
+        chat = self.run_in("solo", "a chat")
+
+        self.assertEqual(
+            [r["file"] for r in self.pipeline.history(mode="council")],
+            [council.transcript_name],
+        )
+        self.assertEqual(
+            [r["file"] for r in self.pipeline.history(mode="solo")],
+            [chat.transcript_name],
+        )
+        # No filter still means everything, which is what the API default is.
+        self.assertEqual(len(self.pipeline.history()), 2)
+
+    def test_deleting_one_conversation_leaves_the_rest(self):
+        keep = self.run_in("council", "keep this one")
+        drop = self.run_in("council", "delete this one")
+
+        self.assertTrue(self.pipeline.delete_run(drop.transcript_name))
+        self.assertEqual(
+            [r["file"] for r in self.pipeline.history()], [keep.transcript_name]
+        )
+        # Gone from disk, not merely hidden from the listing.
+        self.assertIsNone(self.pipeline.load_run(drop.transcript_name))
+        # And deleting it again is a plain False, not an exception.
+        self.assertFalse(self.pipeline.delete_run(drop.transcript_name))
+
+    def test_clearing_one_mode_leaves_the_other_untouched(self):
+        council = self.run_in("council", "a council run")
+        self.run_in("solo", "a chat")
+        self.run_in("solo", "another chat")
+
+        self.assertEqual(self.pipeline.clear_history("solo"), 2)
+        self.assertEqual(self.pipeline.history(mode="solo"), [])
+        self.assertEqual(
+            [r["file"] for r in self.pipeline.history(mode="council")],
+            [council.transcript_name],
+        )
+
+    def test_clearing_without_a_mode_removes_everything(self):
+        self.run_in("council", "a council run")
+        self.run_in("solo", "a chat")
+
+        self.assertEqual(self.pipeline.clear_history(), 2)
+        self.assertEqual(self.pipeline.history(), [])
+
+    def test_a_transcript_name_cannot_escape_the_runs_directory(self):
+        # The name arrives from a request body, and this is the only thing
+        # between a client and `unlink`.
+        outside = self.tmp / "not-a-transcript.json"
+        outside.write_text("{}", encoding="utf-8")
+
+        for evil in (
+            "../not-a-transcript.json",
+            "../../etc/passwd",
+            "subdir/run.json",
+            "..\\run.json",
+            "",
+            "run",           # no .json suffix
+        ):
+            self.assertFalse(
+                self.pipeline.delete_run(evil), f"{evil!r} should be refused"
+            )
+            self.assertIsNone(self.pipeline.load_run(evil))
+        self.assertTrue(outside.exists(), "a file outside the runs dir was deleted")
 
 
 class TestConversationPrompt(unittest.TestCase):

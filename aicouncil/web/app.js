@@ -552,6 +552,9 @@ const state = {
   compactContext: false,
   // The conversation list in the sidebar, and the one open in the main pane.
   chats: [],
+  // Which mode `state.chats` was fetched for, so a list that arrives after the
+  // operator has switched away can be discarded rather than shown.
+  chatMode: '',
   openChat: null,
 };
 
@@ -1167,9 +1170,21 @@ function renderMode() {
   $('#hero-title').textContent = mode === 'solo'
     ? `Hey${who}. Ready to dive in?`
     : `Hey${who}. What shall we build today?`;
-  $('#hero-sub').textContent = mode === 'solo'
-    ? 'One agent, one conversation. It cannot change your files.'
-    : 'One agent drafts, you approve, the other applies.';
+  // What this mode may do to your files, which Zero-Touch changes. Chat has
+  // no gate, so Zero-Touch is the whole of the difference there between a
+  // conversation about the folder and one that rewrites it — worth saying
+  // plainly, and worth colouring, rather than leaving to a toggle elsewhere.
+  const armed = !!(state.config || {}).zero_touch;
+  const sub = $('#hero-sub');
+  sub.textContent = mode === 'solo'
+    ? (armed
+      ? 'One agent, one conversation — and Zero-Touch is on, so it can change files in your working folder.'
+      : 'One agent, one conversation. Read-only: turn Zero-Touch on to let it change files.')
+    : (armed
+      ? 'One agent drafts, the other applies — and Zero-Touch is on, so it will not stop to ask.'
+      : 'One agent drafts, you approve, the other applies.');
+  sub.classList.toggle('armed', armed);
+  $('#gear-btn').classList.toggle('armed', armed);
 
   $('#continue-copy').textContent = mode === 'solo'
     ? 'the assistant will be given that exchange as context.'
@@ -1728,13 +1743,14 @@ function openRoleMenu(anchor, providerId) {
 function openGearMenu(anchor) {
   closeModelMenu();
   const c = state.config || {};
-  // Neither toggle means anything to Chat — it has no gate to skip and no
-  // branch to deliver — so they say so rather than sitting there inert.
-  const council = uiMode() === 'council';
+  // Both apply in both modes. Zero-Touch means the same thing either way —
+  // the CLI gets its auto-approve flags — it is just that Council can also be
+  // granted that at the gate, and Chat, having no gate, cannot.
+  const chat = uiMode() === 'solo';
 
   const row = (key, label, on, danger) =>
     `<button class="menu-toggle${on ? ' on' : ''}${danger ? ' danger' : ''}" ` +
-      `data-toggle="${key}"${council ? '' : ' disabled'}>` +
+      `data-toggle="${key}">` +
       `<span class="menu-box">✓</span>${esc(label)}</button>`;
 
   const menu = document.createElement('div');
@@ -1748,9 +1764,12 @@ function openGearMenu(anchor) {
       `<span class="model-opt-note">Settings</span>` +
     `</button>` +
     `<div class="model-menu-source">` +
-      (council
-        ? 'Applies to every council run until changed.'
-        : 'Both are council settings. Chat has no gate and no branch.') +
+      (chat
+        ? (c.zero_touch
+          ? 'Chat can change files in the working folder.'
+          : 'Chat is read-only. Zero-Touch is the only way to let it write, ' +
+            'because it has no approval gate.')
+        : 'Applies to every council run until changed.') +
     `</div>`;
   document.body.appendChild(menu);
   positionModelMenu(menu, anchor);
@@ -2087,8 +2106,9 @@ function renderSettings() {
             (council ? '' :
               `<div class="field">` +
                 `<label>Read-only arguments ` +
-                  `<span class="field-hint">— always added; Chat has no ` +
-                  `approval gate, diff or rollback, so it never writes</span></label>` +
+                  `<span class="field-hint">— added whenever Chat is ` +
+                  `read-only, which is any run with Zero-Touch off. With it on, ` +
+                  `the auto-approve arguments are sent instead</span></label>` +
                 `<textarea rows="2" data-field="read_only_args">` +
                   `${esc((p.read_only_args || []).join('\n'))}</textarea>` +
               `</div>`) +
@@ -2290,12 +2310,19 @@ async function refreshDoctor(show = false) {
  *  runs into threads, so a follow-up does not appear as its own entry — it *is*
  *  the conversation it continued. */
 async function loadChats() {
+  // Ask for the mode on screen. Council and Chat conversations cannot be
+  // continued in each other, so a mixed list would offer rows that clicking
+  // one of cannot do what the click promises.
+  const mode = selectedMode();
+  state.chatMode = mode;
   const list = $('#chat-list');
   if (!list.childElementCount) {
     list.innerHTML = '<div class="picker-empty">Loading…</div>';
   }
   try {
-    const { runs } = await api('/api/history');
+    const { runs } = await api(`/api/history?mode=${encodeURIComponent(mode)}`);
+    // A mode switch while this was in flight makes the answer the wrong list.
+    if (state.chatMode !== mode) return;
     state.chats = runs;
     renderChats();
   } catch (err) {
@@ -2335,8 +2362,11 @@ function renderChats() {
   const chats = state.chats || [];
 
   if (!chats.length) {
-    list.innerHTML =
-      '<div class="picker-empty">No conversations yet. Ask something to start one.</div>';
+    list.innerHTML = '<div class="picker-empty">' +
+      (state.chatMode === 'solo'
+        ? 'No chats yet. Ask something to start one.'
+        : 'No council runs yet. Describe a change to start one.') +
+      '</div>';
     return;
   }
 
@@ -2347,14 +2377,20 @@ function renderChats() {
   list.innerHTML = GROUP_ORDER.filter(g => buckets.get(g).length).map(g =>
     `<div class="chat-group">${esc(g)}</div>` +
     buckets.get(g).map(c =>
+      `<div class="chat-item">` +
       `<button class="chat-row ${esc(c.state)}${c.file === open ? ' open' : ''}" ` +
         `type="button" data-chat-file="${esc(c.file)}" ` +
         `title="${esc(c.workspace || 'Scratch workspace')}">` +
         `<span class="chat-row-title">${esc(c.title || c.task || '(no task)')}</span>` +
         `<span class="chat-row-meta">${esc(chatWhen(c.created_at))}` +
-          `${c.mode === 'solo' ? ' · chat' : ''}` +
           `${c.zero_touch ? ' · zero-touch' : ''}</span>` +
-      `</button>`
+      `</button>` +
+      // Outside the row's own button, not inside it: a button within a button
+      // is invalid HTML and the browser hoists it out, which lands it in the
+      // wrong place. Hidden until the row is hovered or focused.
+      `<button class="chat-del" type="button" data-del-chat="${esc(c.file)}" ` +
+        `title="Delete this conversation" aria-label="Delete conversation">&times;</button>` +
+      `</div>`
     ).join('')
   ).join('');
 }
@@ -2387,6 +2423,75 @@ async function openChat(file) {
     toast(err.message, 'error');
     state.openChat = null;
     renderAll();
+  }
+}
+
+/** How many conversations each mode is holding, for the Settings buttons.
+ *  Counted server-side per mode rather than inferred from the sidebar, which
+ *  only ever holds the list for the mode currently on screen. */
+async function renderHistoryCounts() {
+  const set = (sel, n) => {
+    const node = $(sel);
+    node.textContent = n == null ? '' : `(${n})`;
+    // A button that would delete nothing says so by being inert, rather than
+    // asking for a confirmation and then reporting "0 deleted".
+    node.parentElement.disabled = n === 0;
+  };
+  set('#count-council', null);
+  set('#count-chat', null);
+  try {
+    const [council, chat] = await Promise.all([
+      api('/api/history?mode=council'),
+      api('/api/history?mode=solo'),
+    ]);
+    set('#count-council', (council.runs || []).length);
+    set('#count-chat', (chat.runs || []).length);
+  } catch {
+    // Leave the counts blank; the buttons still work and will report what
+    // they actually deleted.
+  }
+}
+
+/** Remove one conversation. The transcript is the only copy — there is no bin
+ *  to fish it out of — so this confirms by name rather than on a count. */
+async function deleteChat(file) {
+  const row = (state.chats || []).find(c => c.file === file);
+  const title = (row && (row.title || row.task)) || 'this conversation';
+  if (!confirm(`Delete "${title}"?\n\nThe transcript is deleted from disk. ` +
+               `This cannot be undone.`)) return;
+  try {
+    await api('/api/history/delete', { method: 'POST', body: { file } });
+    // It may be the one on screen, or the one the composer is attached to.
+    if (state.openChat && state.openChat.file === file) closeChat();
+    if (state.continueFrom === file) clearContinuation();
+    await loadChats();
+    toast('Conversation deleted.', 'ok', 2600);
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+/** Clear one mode's history, from Settings. Scoped to the mode on screen for
+ *  the same reason the sidebar is: they are two separate lists. */
+async function clearHistory(mode) {
+  const label = mode === 'solo' ? 'chat' : 'council';
+  const count = (state.chatMode === mode ? (state.chats || []).length : null);
+  if (!confirm(
+    `Delete every ${label} conversation?` +
+    (count != null ? `\n\n${count} conversation${count === 1 ? '' : 's'} ` +
+                     `will be deleted from disk.` : '') +
+    `\n\nThis cannot be undone.`
+  )) return;
+  try {
+    const { deleted } = await api('/api/history/delete',
+      { method: 'POST', body: { all: true, mode } });
+    closeChat();
+    clearContinuation();
+    await loadChats();
+    renderHistoryCounts();
+    toast(`${deleted} conversation${deleted === 1 ? '' : 's'} deleted.`, 'ok');
+  } catch (err) {
+    toast(err.message, 'error');
   }
 }
 
@@ -2563,7 +2668,11 @@ function connect() {
   });
 
   on('config', (d) => {
+    const was = selectedMode();
     state.config = d.config;
+    // Another tab, or a settings reset, can move the mode out from under this
+    // one. The sidebar is then showing the wrong mode's conversations.
+    if (selectedMode() !== was) loadChats();
     // Roles live in config now, so a change from another tab must refresh the
     // catalogue too - otherwise the dropdown and the list disagree.
     api('/api/roles').then(r => { state.roles = r.roles; renderRoleList(); })
@@ -2660,7 +2769,7 @@ async function startRun() {
 
 function wire() {
   // -- mode -------------------------------------------------------------
-  $('#mode-switch').addEventListener('click', (e) => {
+  $('#mode-switch').addEventListener('click', async (e) => {
     const btn = e.target.closest('[data-mode]');
     if (!btn || btn.disabled) return;
     const want = btn.dataset.mode;
@@ -2677,7 +2786,11 @@ function wire() {
     if (want !== selectedMode()) {
       if (state.continueFrom) clearContinuation();
       closeChat();
-      patchConfig({ mode: want });
+      // Awaited: the sidebar lists one mode's conversations, and `loadChats`
+      // reads the mode back out of the config it is about to be given. Fired
+      // without waiting, it asks for the list of the mode being left.
+      await patchConfig({ mode: want });
+      loadChats();
     } else {
       renderAll();
     }
@@ -2747,10 +2860,13 @@ function wire() {
     if (e.target.checked) {
       const ok = confirm(
         'Enable Zero-Touch Mode?\n\n' +
-        'Runs will proceed with no approval step, and auto-approve flags ' +
-        '(--dangerously-skip-permissions) will be passed to the CLI. Files ' +
-        'will be created, modified and deleted without asking you first.\n\n' +
-        'Keep "Safety snapshot" on so you can roll back.'
+        'Auto-approve flags (--dangerously-skip-permissions) will be passed ' +
+        'to the CLI. Files will be created, modified and deleted without ' +
+        'asking you first.\n\n' +
+        '· Council runs will not stop at the approval gate.\n' +
+        '· Chat stops being read-only and can change files too.\n\n' +
+        'This applies in both modes. Keep "Safety snapshot" on so you can ' +
+        'roll back.'
       );
       if (!ok) { e.target.checked = false; return; }
     }
@@ -2836,9 +2952,12 @@ function wire() {
     await refreshDoctor(true);
     renderSettings();
     renderRoleList();
+    renderHistoryCounts();
     switchSettingsTab('stages');
     openModal('settings');
   });
+  $('#clear-council').addEventListener('click', () => clearHistory('council'));
+  $('#clear-chat').addEventListener('click', () => clearHistory('solo'));
   $('.settings-tabs').addEventListener('click', (e) => {
     const tab = e.target.closest('.settings-tab');
     if (tab) switchSettingsTab(tab.dataset.settingsTab);
@@ -2916,6 +3035,8 @@ function wire() {
   // -- conversations ----------------------------------------------------
   // Delegated: the list is rebuilt whenever it is reloaded.
   $('#chat-list').addEventListener('click', (e) => {
+    const del = e.target.closest('[data-del-chat]');
+    if (del) { e.stopPropagation(); deleteChat(del.dataset.delChat); return; }
     const row = e.target.closest('[data-chat-file]');
     if (row) openChat(row.dataset.chatFile);
   });

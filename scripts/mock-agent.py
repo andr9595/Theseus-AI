@@ -170,14 +170,18 @@ def run_polisher(task: str, write: bool) -> int:
     return 0
 
 
-def run_solo(task: str) -> int:
-    """Answer the message. Solo Mode is a conversation, so nothing is written."""
+def run_solo(task: str, write: bool) -> int:
+    """Answer the message, and write if permission arrived with it.
+
+    Mirrors the real CLIs the same way `run_polisher` does: the edit only
+    happens when the auto-approve flag was actually passed, so a mock run
+    exercises the same permission path the live one takes.
+    """
     emit(f"You asked: **{task}**")
     emit()
     emit(
-        "I am the mock assistant. Solo Mode runs one agent with no draft "
-        "stage, no approval gate and no write permission, so this is a reply "
-        "rather than a change to your repository."
+        "I am the mock assistant. Chat runs one agent with no draft stage and "
+        "no approval gate, so this is a single reply rather than a pipeline."
     )
     files = repo_files(6)
     if files:
@@ -186,6 +190,28 @@ def run_solo(task: str) -> int:
         emit()
         for f in files:
             emit(f"- `{f}`")
+
+    if not write:
+        emit()
+        emit("_Read-only: no files were modified._")
+        return 0
+
+    target = Path("AI_COUNCIL_DEMO.md")
+    emit()
+    emit(f"Writing `{target}`.")
+    try:
+        target.write_text(
+            f"# Theseus AI demo artifact\n\n"
+            f"Written by the mock assistant in Chat mode.\n\n"
+            f"Task: {task}\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        print(f"mock-agent: could not write {target}: {exc}",
+              file=sys.stderr, flush=True)
+        return 1
+    emit()
+    emit(f"Done. `{target}` written.")
     return 0
 
 
@@ -224,7 +250,7 @@ def main() -> int:
         return 3
 
     if args.role == "solo":
-        return run_solo(task)
+        return run_solo(task, write=zero_touch)
     if args.role == "drafter":
         return run_drafter(task)
     # The senior stage only writes when it has been granted permission, which

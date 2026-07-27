@@ -275,8 +275,11 @@
            stacked down a sidebar that is now history. -->
       <section class="settings-panel" data-settings-panel="run">
         <p class="settings-note">
-          How a council run behaves. Chat has no gate, no branch and nothing to
-          roll back, so none of this applies there.
+          Zero-Touch applies in both modes: it is what hands the CLI its
+          auto-approve flags. Council can also be granted that at the approval
+          gate, so it writes either way; Chat has no gate, so Zero-Touch is the
+          only thing that lets it change files, and without it a chat is
+          read-only. Everything below protects whichever one is writing.
         </p>
 
         <label class="toggle toggle-danger" for="zero-touch">
@@ -360,6 +363,23 @@
               <input type="checkbox" id="open-browser"> Open a window on launch
             </label>
           </div>
+        </div>
+
+        <h4 class="settings-head">Conversations</h4>
+        <p class="settings-note">
+          Every run is written to a transcript in
+          <code>~/.config/ai-council/runs</code>. Council and Chat keep separate
+          histories because neither can be continued in the other. Deleting is
+          immediate and permanent &mdash; there is no bin to recover from, and
+          nothing here touches your files or your git history.
+        </p>
+        <div class="history-actions">
+          <button id="clear-council" class="btn btn-quiet btn-sm" type="button">
+            Delete all council conversations <span id="count-council" class="count"></span>
+          </button>
+          <button id="clear-chat" class="btn btn-quiet btn-sm" type="button">
+            Delete all chats <span id="count-chat" class="count"></span>
+          </button>
         </div>
       </section>
     </div>

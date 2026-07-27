@@ -159,6 +159,36 @@ html, body {
 }
 .chat-row.failed .chat-row-meta { color: var(--red); }
 
+/* The row and its delete button are siblings, not nested: a <button> inside a
+   <button> is invalid and the browser hoists the inner one out of the row
+   entirely. The × is hidden until the row is hovered or something in it takes
+   focus, so the list reads as titles rather than as a column of controls. */
+.chat-item { position: relative; }
+
+.chat-item .chat-row { padding-right: 30px; }
+
+.chat-del {
+  position: absolute;
+  top: 50%; right: 5px;
+  transform: translateY(-50%);
+  display: grid; place-items: center;
+  width: 20px; height: 20px;
+  font: inherit; font-size: 15px; line-height: 1;
+  color: var(--text-3);
+  background: none; border: 0; border-radius: 5px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .12s, color .12s, background .12s;
+}
+.chat-item:hover .chat-del,
+.chat-item:focus-within .chat-del { opacity: 1; }
+.chat-del:hover { color: var(--red); background: var(--bg-4); }
+/* Keyboard users never hover, so focus alone has to reveal it. */
+.chat-del:focus-visible {
+  opacity: 1;
+  outline: 2px solid var(--accent); outline-offset: -1px;
+}
+
 /* ---- Sidebar footer ---- */
 
 .sidebar-foot {
@@ -326,6 +356,9 @@ html, body {
 }
 .hero-sub { margin: 10px 0 0; font-size: 13px; color: var(--text-3); }
 .hero-sub:empty { display: none; }
+/* Zero-Touch is on: the agents may write without stopping to ask. Amber
+   rather than red - this is a state the operator chose, not a fault. */
+.hero-sub.armed { color: var(--amber); }
 
 .dock-spacer { flex: 0 0 auto; }
 
@@ -451,6 +484,11 @@ html, body {
 }
 .icon-round:hover { color: var(--text); background: var(--bg-3); }
 .icon-round.on { color: var(--accent-2); border-color: rgba(124, 92, 255, .5); }
+.icon-round.armed {
+  color: var(--amber);
+  border-color: rgba(245, 165, 36, .5);
+  background: rgba(245, 165, 36, .08);
+}
 
 .send-btn {
   position: relative;
@@ -1342,6 +1380,15 @@ html, body {
   white-space: pre-wrap;
 }
 .doctor:empty { display: none; }
+
+/* ---- Clearing history, in Settings ---- */
+
+.history-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.history-actions .btn:hover:not(:disabled) {
+  color: var(--red); border-color: rgba(244, 99, 99, .45);
+}
+.history-actions .btn:disabled { opacity: .45; cursor: default; }
+.count { font-family: var(--mono); font-size: 10.5px; color: var(--text-3); }
 
 /* Shown when the dashboard is opened without the launcher's session token. */
 .boot-error {
