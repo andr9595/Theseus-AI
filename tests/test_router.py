@@ -178,6 +178,29 @@ class TestSeating(unittest.TestCase):
             any("quota window used" in r for s in claude for r in s.reasons)
         )
 
+    def test_a_pinned_persona_beats_the_one_the_task_would_choose(self):
+        # The operator's behaviour for a seat has to win, or the picker on the
+        # seat is a suggestion box.
+        task = "is this auth check exploitable?"
+        routed = router.route(task, ALL, run_id="a")
+        self.assertEqual(routed.members[0].persona, "security_review")
+
+        pinned = router.route(task, ALL, run_id="a", personas={"seat1": "visionary"})
+        self.assertEqual(pinned.members[0].persona, "visionary")
+
+    def test_clearing_a_pin_routes_the_seat_again(self):
+        # An empty string is how the UI says "Auto". The config is deep-merged
+        # on save, so unpinning by dropping the key would keep the old pin -
+        # the panel writes a blank instead, and the router has to read that as
+        # unpinned rather than as an agent named "".
+        seating = router.route(
+            "anything", ALL, run_id="a", pins={"chair": "", "seat1": ""}
+        )
+        self.assertFalse(seating.chair.pinned)
+        self.assertIn(seating.chair.agent, ALL)
+        self.assertFalse(seating.members[0].pinned)
+        self.assertFalse([n for n in seating.notes if "is pinned" in n])
+
 
 class TestHistoryFeedback(unittest.TestCase):
     def test_history_is_recorded_only_against_the_axes_that_applied(self):

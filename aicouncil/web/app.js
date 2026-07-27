@@ -819,22 +819,21 @@ function activeSeating() {
   return state.seating;
 }
 
+/** Whether the bench is drawn at all. A display choice, toggled from the gear
+ *  beside the composer and kept in the config so it survives a reload. */
+function seatsShown() {
+  return ((state.config || {}).council || {}).show_seats !== false;
+}
+
 function renderStrip() {
   const strip = $('#council-strip');
-  const council = uiMode() === 'council';
-  strip.classList.toggle('hidden', !council);
-  if (!council) { strip.innerHTML = ''; return; }
-
   const seating = activeSeating();
-  if (!seating) {
-    // Before the first routing answer there is genuinely nothing to say about
-    // who will sit. Saying so beats drawing a placeholder bench that is about
-    // to be replaced by a different one.
-    strip.innerHTML =
-      '<div class="strip-inner"><span class="strip-empty">' +
-      'Describe the task and the council seats itself.</span></div>';
-    return;
-  }
+  // Nothing to draw is not the same as switched off, but on screen it is: an
+  // empty bordered row explaining itself is worse than no row. The sentence
+  // that used to live here is the composer's placeholder now.
+  const show = uiMode() === 'council' && seatsShown() && !!seating;
+  strip.classList.toggle('hidden', !show);
+  if (!show) { strip.innerHTML = ''; return; }
 
   const run = (state.openChat && state.openChat.run) || state.run;
   const providers = (state.config || {}).providers || {};
@@ -874,13 +873,14 @@ function seatHtml(seat, run, providers) {
     (p.effort ? ` · ${p.effort}` : '') +
     (available ? '' : ` · ${(p.command || [])[0] || 'CLI'} not found`) +
     (reasons ? `\n\nSeated because: ${reasons}` : '') +
-    (seat.pinned ? '\nPinned in Settings → Council.' : '') +
-    '\n\nClick to change CLI, model or effort.';
+    (seat.pinned ? '\nPinned to this seat, so the routing works around it.' : '') +
+    '\n\nClick to seat a CLI here, or to change its model, effort or behaviour.';
 
   return (
     `<button class="member ${st}${available ? '' : ' unavailable'}` +
       `${seat.chairman ? ' is-chair' : ''}" type="button" ` +
       `data-member="${esc(seat.provider_id)}" data-agent="${esc(seat.agent)}" ` +
+      `data-seat="${esc(seat.id)}" data-seat-label="${esc(role)}" ` +
       `title="${esc(title)}">` +
       `<span class="member-mark">${esc(String(who).slice(0, 2).toUpperCase())}</span>` +
       `<span class="member-body">` +
@@ -950,13 +950,16 @@ function renderCouncilSteps() {
 let seatingTimer = null;
 let seatingSeq = 0;
 function scheduleSeating() {
-  if (uiMode() !== 'council') return;
+  if (uiMode() !== 'council' || !seatsShown()) return;
   clearTimeout(seatingTimer);
   seatingTimer = setTimeout(refreshSeating, 250);
 }
 
 async function refreshSeating() {
-  if (uiMode() !== 'council') return;
+  if (uiMode() !== 'council' || !seatsShown()) return;
+  // An empty box is a real question, not a reason to skip: it asks who the
+  // standing bench is. That answer is what makes the seats clickable before a
+  // word has been typed, which is the only way to pick a council by hand.
   const task = $('#task-input').value || '';
   const seq = ++seatingSeq;
   try {
@@ -1331,9 +1334,13 @@ function renderMode() {
   $('#continue-copy').textContent = mode === 'solo'
     ? 'the assistant will be given that exchange as context.'
     : 'the council will be given that exchange as context.';
+  // Council's placeholder is where the routing is explained, because that is
+  // where the routing is *driven from*: the bench above changes as this box is
+  // typed into. Saying it on the empty strip instead put the sentence in the
+  // one place it could not be acted on.
   $('#task-input').placeholder = mode === 'solo'
     ? 'Ask Theseus AI…'
-    : 'Ask the council…';
+    : 'Describe the task and the council seats itself…';
 }
 
 function renderToggles() {
@@ -2395,39 +2402,71 @@ async function setEffort(providerId, value) {
   );
 }
 
-/** Everything about one council member, from one click on it. Each row opens
- *  the menu that already owns that setting rather than reimplementing it here:
- *  four settings, four existing menus, no fifth copy of the model list to drift
- *  out of step with the other one. */
-function openMemberMenu(anchor, providerId, { role = true, note = '' } = {}) {
+/** Everything about one seat, from one click on it. Each row opens the menu
+ *  that already owns that setting rather than reimplementing it here: four
+ *  settings, four existing menus, no fifth copy of the model list to drift out
+ *  of step with the other one. */
+function openMemberMenu(anchor, providerId, { note = '', seat = '', seatLabel = '' } = {}) {
   closeModelMenu();
+  const council = (state.config || {}).council || {};
   const provider = ((state.config || {}).providers || {})[providerId] || {};
   const agent = state.agents.find(a => a.id === agentOf(provider));
   const agentLabel = agent && (agent.command || []).length ? agent.label : 'custom command';
   const hasEffort = (provider.effort_args || []).length > 0;
 
-  // A project chair has no Role row. What it is told to do comes from the
-  // phase it is in — the architect designs in phase 1 and writes the README in
-  // phase 5 — so there is nothing for the Roles catalogue to override, and an
-  // entry that set one would be a setting the engine never reads.
-  const rows = [
+  // A council seat is not the same object as a project chair, and the first
+  // two rows differ because of it:
+  //
+  //  - "Seat" instead of "CLI". A council provider *is* its agent - the id is
+  //    `council_codex` - so rewriting its command to claude's would leave the
+  //    router seating a codex that runs claude. Which CLI sits here is a pin,
+  //    which the router honours and works around.
+  //  - "Behaviour" instead of "Role". A seat's lens comes from the persona the
+  //    router assigns it, held in `council.personas` and read straight off the
+  //    seating - the provider carries no behaviour at all. Wording is still
+  //    the Roles catalogue's.
+  //
+  // A project chair keeps neither: what it is told to do comes from the board.
+  const chair = seat === 'chair';
+  const pinned = (council.pins || {})[seat] || '';
+  const persona = (council.personas || {})[seat] || '';
+  const personaRole = (state.roles || []).find(r => r.id === persona);
+
+  const rows = seat ? [
+    ['seat', 'Seat', pinned ? `${agentLabel} — pinned` : `${agentLabel} — routed`],
+    ['model', 'Model', provider.model ? modelDetail(provider.model) : 'the CLI’s default'],
+    ...(hasEffort ? [['effort', 'Effort', provider.effort || 'the CLI’s default']] : []),
+    ...(chair ? [] : [['persona', 'Behaviour',
+      personaRole ? (personaRole.name || persona) : 'chosen per run']]),
+  ] : [
     ['agent', 'CLI', agentLabel],
     ['model', 'Model', provider.model ? modelDetail(provider.model) : 'the CLI’s default'],
     ...(hasEffort ? [['effort', 'Effort', provider.effort || 'the CLI’s default']] : []),
-    ...(role ? [['role', 'Role', provider.role || 'none']] : []),
   ];
+
+  const head = seat
+    ? `${seatLabel || (chair ? 'Chair' : 'Seat')} — ${provider.label || agentLabel}`
+    : (provider.label || providerId);
 
   const menu = document.createElement('div');
   menu.className = 'model-menu';
   menu.innerHTML =
-    `<div class="model-menu-head">${esc(provider.label || providerId)}</div>` +
+    `<div class="model-menu-head">${esc(head)}</div>` +
     rows.map(([key, label, value]) =>
       `<button class="model-opt" data-open="${key}">` +
         `<span class="model-opt-name">${esc(label)}</span>` +
         `<span class="model-opt-note">${esc(value)}</span>` +
       `</button>`
     ).join('') +
-    `<div class="model-menu-source">${esc(note || 'Applies to this stage only.')}</div>`;
+    `<div class="model-menu-source">` +
+      esc(note || (seat
+        ? (chair
+          ? 'The chair is the only seat that writes. Model and effort apply ' +
+            'wherever this CLI sits.'
+          : 'Pin a seat and the routing works around it. Model and effort ' +
+            'apply wherever this CLI sits.')
+        : 'Applies to this stage only.')) +
+    `</div>`;
   document.body.appendChild(menu);
   positionModelMenu(menu, anchor);
 
@@ -2435,9 +2474,10 @@ function openMemberMenu(anchor, providerId, { role = true, note = '' } = {}) {
     const opt = e.target.closest('[data-open]');
     if (!opt) return;
     closeModelMenu();
+    if (opt.dataset.open === 'seat') { openSeatMenu(anchor, seat); return; }
+    if (opt.dataset.open === 'persona') { openPersonaMenu(anchor, seat); return; }
     const open = {
-      agent: openAgentMenu, model: openModelMenu,
-      effort: openEffortMenu, role: openRoleMenu,
+      agent: openAgentMenu, model: openModelMenu, effort: openEffortMenu,
     }[opt.dataset.open];
     if (open) open(anchor, providerId);
   });
@@ -2447,52 +2487,130 @@ function openMemberMenu(anchor, providerId, { role = true, note = '' } = {}) {
   }, 0);
 }
 
-/** Role menu. The catalogue is the server's, the same one Settings edits, so
- *  a role written there is selectable here the moment it is saved. */
-function openRoleMenu(anchor, providerId) {
+/** Write one seat's pin or persona and re-seat.
+ *
+ *  "Auto" is stored as an empty string rather than by dropping the key. The
+ *  config is deep-merged on save — a key left out keeps whatever was there —
+ *  so unpinning by omission would silently do nothing at all. */
+async function patchSeat(field, seatId, value) {
+  if (!seatId) return;
+  await patchConfig({ council: { [field]: { [seatId]: value || '' } } });
+  await refreshSeating();
+}
+
+/** Which CLI holds a seat: the manual half of the routing.
+ *
+ *  This is the pin, not a command swap. Pinning is honoured whether or not the
+ *  routing is on, and the router fills the seats around it — so a bench can be
+ *  set by hand one seat at a time without switching the routing off wholesale.
+ *  Settings → Council still has the switch for freezing all of it. */
+function openSeatMenu(anchor, seatId) {
   closeModelMenu();
-  const provider = ((state.config || {}).providers || {})[providerId] || {};
-  const current = provider.role_template || '';
+  const council = (state.config || {}).council || {};
+  const current = (council.pins || {})[seatId] || '';
+  const manual = String(council.routing || 'auto') === 'manual';
+  const agents = (state.agents || []).filter(a => (a.command || []).length);
 
   const menu = document.createElement('div');
   menu.className = 'model-menu';
   menu.innerHTML =
-    `<div class="model-menu-head">${esc(provider.label || providerId)} role</div>` +
-    (state.roles || []).map(r =>
-      `<button class="model-opt${r.id === current ? ' active' : ''}" ` +
-        `data-value="${esc(r.id)}" title="${esc(r.summary || '')}">` +
-        `<span class="model-opt-name">${esc(r.name || r.id)}</span>` +
-        `<span class="model-opt-note">${r.writes ? 'writes files' : 'read-only'}</span>` +
-      `</button>`
-    ).join('') +
+    `<div class="model-menu-head">` +
+      `${esc(seatId === 'chair' ? 'Chair' : `Seat ${seatId.replace('seat', '')}`)}` +
+    `</div>` +
+    `<button class="model-opt${current ? '' : ' active'}" data-value="">` +
+      `<span class="model-opt-name">Auto</span>` +
+      `<span class="model-opt-note">routed from the prompt</span>` +
+    `</button>` +
+    agents.map(a => {
+      const info = state.providers.find(x => x.id === `council_${a.id}`);
+      const available = !info || info.available;
+      return (
+        `<button class="model-opt${a.id === current ? ' active' : ''}" ` +
+          `data-value="${esc(a.id)}">` +
+          `<span class="model-opt-name">${esc(a.label)}</span>` +
+          `<span class="model-opt-note">` +
+            `${esc(available ? a.command[0] : `${a.command[0]} — not installed`)}` +
+          `</span>` +
+        `</button>`
+      );
+    }).join('') +
     `<div class="model-menu-source">` +
-      (provider.role_system
-        ? 'This stage has edited role text; picking one here replaces it.'
-        : 'Wording is editable in Settings → Roles.') +
+      (manual
+        ? 'The routing is off, so every seat is whatever you pin here.'
+        : 'A pinned seat is fixed; the rest are still routed around it.') +
     `</div>`;
   document.body.appendChild(menu);
   positionModelMenu(menu, anchor);
 
-  menu.addEventListener('click', async (e) => {
+  menu.addEventListener('click', (e) => {
     const opt = e.target.closest('.model-opt');
     if (!opt) return;
     closeModelMenu();
-    const role = (state.roles || []).find(r => r.id === opt.dataset.value);
-    if (!role || role.id === current) return;
-    const roleName = role.name || role.id;
-    // `role_system` blank means "use the template", so it is cleared with the
-    // swap — otherwise the old role's edited text would be sent under the new
-    // role's name, which is the one combination that reads as neither.
-    await patchConfig({ providers: { [providerId]: {
-      role_template: role.id, role: roleName, role_system: '',
-    } } });
-    toast(`${provider.label || providerId} → ${roleName}`, 'ok', 2600);
+    if (opt.dataset.value === current) return;
+    patchSeat('pins', seatId, opt.dataset.value);
   });
 
   setTimeout(() => {
     document.addEventListener('click', onDocClickCloseModel, { once: true });
   }, 0);
 }
+
+/** What a seat is told to be. The list is the Roles catalogue, so a behaviour
+ *  written in Settings → Roles is selectable here the moment it is saved —
+ *  the wording lives in one place and this only chooses between them.
+ *
+ *  The chairman is not offered: it is what the third stage *is*, not a lens a
+ *  member can wear. A behaviour that expects to write says so, because a
+ *  member seat is read-only whatever it is told — the same mismatch Settings
+ *  warns about, reported before it is chosen rather than after. */
+function openPersonaMenu(anchor, seatId) {
+  closeModelMenu();
+  const council = (state.config || {}).council || {};
+  const current = (council.personas || {})[seatId] || '';
+
+  const menu = document.createElement('div');
+  menu.className = 'model-menu';
+  menu.innerHTML =
+    `<div class="model-menu-head">` +
+      `Seat ${esc(seatId.replace('seat', ''))} behaviour` +
+    `</div>` +
+    `<button class="model-opt${current ? '' : ' active'}" data-value="">` +
+      `<span class="model-opt-name">Auto</span>` +
+      `<span class="model-opt-note">a lens the task calls for</span>` +
+    `</button>` +
+    (state.roles || []).filter(r => r.id !== 'chairman').map(r =>
+      `<button class="model-opt${r.id === current ? ' active' : ''}" ` +
+        `data-value="${esc(r.id)}" title="${esc(r.summary || '')}">` +
+        `<span class="model-opt-name">${esc(r.name || r.id)}</span>` +
+        `<span class="model-opt-note">` +
+          `${esc(r.writes ? 'expects to write — this seat cannot' : (r.summary || 'read-only'))}` +
+        `</span>` +
+      `</button>`
+    ).join('') +
+    `<div class="model-menu-source">` +
+      'Wording is editable in Settings → Roles.' +
+    `</div>`;
+  document.body.appendChild(menu);
+  positionModelMenu(menu, anchor);
+
+  menu.addEventListener('click', (e) => {
+    const opt = e.target.closest('.model-opt');
+    if (!opt) return;
+    closeModelMenu();
+    if (opt.dataset.value === current) return;
+    patchSeat('personas', seatId, opt.dataset.value);
+  });
+
+  setTimeout(() => {
+    document.addEventListener('click', onDocClickCloseModel, { once: true });
+  }, 0);
+}
+
+// The per-provider Role menu is gone with the fixed Stage 1 / Stage 2 pair
+// it belonged to. A council seat's behaviour is its persona, chosen on the
+// seat itself (`openPersonaMenu`) and stored against the seat rather than
+// against the CLI - the same CLI can sit in two seats with two lenses. The
+// wording is still edited in one place: Settings -> Roles.
 
 /** The gear beside the composer: the two options that get changed per run.
  *  The rest are a click further on, in Settings, because they are decisions
@@ -2515,6 +2633,10 @@ function openGearMenu(anchor) {
   menu.innerHTML =
     row('zero_touch', 'Zero-Touch mode', !!c.zero_touch, true) +
     row('pull_request_mode', 'Pull request mode', !!c.pull_request_mode, false) +
+    // Council only: Chat has one agent and no bench to show. It is a display
+    // choice rather than a permission, so unlike the two above it is applied
+    // here directly - there is no confirmation for it to bypass.
+    (chat ? '' : row('show_seats', 'Show the council seats', seatsShown(), false)) +
     `<hr>` +
     `<button class="model-opt" data-open="settings">` +
       `<span class="model-opt-name">More…</span>` +
@@ -2540,6 +2662,15 @@ function openGearMenu(anchor) {
     const btn = e.target.closest('[data-toggle]');
     if (!btn || btn.disabled) return;
     closeModelMenu();
+    if (btn.dataset.toggle === 'show_seats') {
+      const show = !seatsShown();
+      // `patchConfig` re-renders, so the strip appears or goes on its own.
+      // The one thing it cannot do is fill a bench that was never asked for:
+      // switched off, the routing preview is skipped.
+      patchConfig({ council: { show_seats: show } })
+        .then(() => { if (show && !activeSeating()) refreshSeating(); });
+      return;
+    }
     // Routed through the real checkbox so the confirmations live in one place:
     // the gear must not be a second, quieter way to switch Zero-Touch on.
     const box = $(btn.dataset.toggle === 'zero_touch' ? '#zero-touch' : '#pull-request-mode');
@@ -2784,15 +2915,25 @@ function renderSettings() {
   // half of the form each one gets, because what a chair is *told to do*
   // arrives differently in each of the three:
   //
-  //   stage    a council stage is assigned a role here;
+  //   seat     a council CLI. It is told what to be by the persona its seat
+  //            carries, which is routed per run and pinned in the Council
+  //            panel - so there is no role box here. What is here is the CLI
+  //            itself: its command, model, effort and ceiling, wherever it
+  //            ends up sitting.
   //   chat     the assistant gets only a behaviour the operator typed, and
   //            picks its agent from its own card rather than from this panel;
   //   project  a project chair gets neither - its instruction comes from the
   //            phase it is in, so a role box here would be a setting nothing
   //            reads.
+  //
+  // There is no Stage 1 / Stage 2 pair any more. `drafter` and `polisher`
+  // survive in the config so archived transcripts still render, but they are
+  // not chairs anybody sits in, and a form for them would be one that decided
+  // nothing about the next run.
   const FORMS = [
-    { id: 'drafter', num: 'Stage 1', kind: 'stage' },
-    { id: 'polisher', num: 'Stage 2', kind: 'stage' },
+    ...(state.agents || []).filter(a => (a.command || []).length).map(a => ({
+      id: `council_${a.id}`, num: 'Council', kind: 'seat', name: a.label,
+    })),
     { id: 'solo', num: 'Chat', kind: 'chat' },
     { id: 'architect', num: 'Project', kind: 'project', name: 'Architect' },
     { id: 'coder', num: 'Project', kind: 'project', name: 'Developer' },
@@ -2800,7 +2941,6 @@ function renderSettings() {
   ];
 
   host.innerHTML = FORMS.map(({ id, num, kind, name }) => {
-    const council = kind === 'stage';
     const p = providers[id] || {};
     const info = state.providers.find(x => x.id === id);
     const probeHtml = info
@@ -2810,66 +2950,40 @@ function renderSettings() {
     return (
       `<div class="provider-form" data-provider="${id}" data-kind="${kind}">` +
         `<h4><span class="stage-num">${esc(num)}</span> ` +
-          `${esc(name || p.role || (council ? id : 'Assistant'))} ${probeHtml}</h4>` +
+          `${esc(name || p.label || 'Assistant')} ${probeHtml}</h4>` +
         (kind === 'project'
           ? `<p class="settings-note">` +
               `Its agent, model and reasoning depth are set in the Projects ` +
               `tab's matrix. There is no role to choose: what this chair is ` +
               `told to do comes from the phase it is in.</p>`
           : '') +
-        (council
-          ? `<div class="field-row">` +
-              `<div class="field">` +
-                `<label>Agent ` +
-                  `<span class="field-hint">— swaps command and flags</span></label>` +
-                `<select data-field="agent">` +
-                  state.agents.map(a =>
-                    `<option value="${esc(a.id)}"` +
-                    `${a.id === agentOf(p) ? ' selected' : ''}>${esc(a.label)}</option>`
-                  ).join('') +
-                `</select>` +
-              `</div>` +
-              `<div class="field">` +
-                `<label>Display name</label>` +
-                `<input type="text" data-field="label" value="${esc(p.label || '')}">` +
-              `</div>` +
-            `</div>`
-          // Chat's agent is the chip on its card, and a project chair's is its
-          // tile in the matrix. Two places to pick it would be two apparent
-          // sources of truth, and the modal is the slower one.
-          : `<div class="field">` +
-              `<label>Display name ` +
-                `<span class="field-hint">— the agent itself is picked on ` +
+        (kind === 'seat'
+          ? `<p class="settings-note">` +
+              `How this CLI runs whenever the council seats it. Which seat it ` +
+              `holds, and what it is told to be, are decided per run &mdash; ` +
+              `pin either on the <b>Council</b> tab or on the bench above the ` +
+              `composer. Members are read-only; only the chair writes.</p>`
+          : '') +
+        // Nobody picks an agent here. Chat's is the chip on its card, a
+        // project chair's is its tile in the matrix, and a council seat's card
+        // *is* one CLI — rewriting `council_codex` to run claude would leave
+        // the router seating a codex that is not one. Two places to pick it
+        // would be two apparent sources of truth, and the modal is the slower.
+        `<div class="field">` +
+          `<label>Display name ` +
+            (kind === 'seat'
+              ? `<span class="field-hint">— what this CLI is called on the ` +
+                `bench</span>`
+              : `<span class="field-hint">— the agent itself is picked on ` +
                 `${kind === 'project' ? "the Projects tab" : 'the Assistant card'}` +
-                `</span></label>` +
-              `<input type="text" data-field="label" value="${esc(p.label || '')}">` +
-            `</div>`) +
-        (council
-          ? `<div class="field">` +
-              `<label>Role — what this stage is told to do` +
-                `<span class="field-hint"> — the shipped text is a starting point</span>` +
-              `</label>` +
-              `<select data-field="role_template">` +
-                (state.roles || []).map(r =>
-                  `<option value="${esc(r.id)}"${r.id === (p.role_template || '') ? ' selected' : ''}>` +
-                    `${esc(r.name)} — ${esc(r.summary)}</option>`
-                ).join('') +
-              `</select>` +
-            `</div>` +
-            `<div class="field">` +
-              `<label>Behaviour ` +
-                `<button class="link-btn" type="button" data-reset-role="${id}">` +
-                  `reset to the template</button>` +
-              `</label>` +
-              `<textarea rows="5" class="role-system" data-field="role_system" ` +
-                `placeholder="Using the template above. Type here to override it.">` +
-                `${esc(p.role_system || '')}</textarea>` +
-              `<span class="field-hint" data-role-warn="${id}"></span>` +
-            `</div>`
-          // No role, no template and no fallback: blank here means blank, so a
-          // new Solo conversation reaches the CLI as the message alone. A
-          // project chair gets neither box - see FORMS.
-          : kind === 'chat'
+                `</span>`) +
+            `</label>` +
+          `<input type="text" data-field="label" value="${esc(p.label || '')}">` +
+        `</div>` +
+        // No role, no template and no fallback: blank here means blank, so a
+        // new Solo conversation reaches the CLI as the message alone. A
+        // council seat and a project chair get neither box — see FORMS.
+        (kind === 'chat'
           ? `<div class="field">` +
               `<label>Behaviour ` +
                 `<span class="field-hint">— optional; blank sends your message ` +
@@ -2893,16 +3007,20 @@ function renderSettings() {
               `<label>Auto-approve arguments (added only when execution is approved)</label>` +
               `<textarea rows="2" data-field="auto_approve_args">${esc((p.auto_approve_args || []).join('\n'))}</textarea>` +
             `</div>` +
-            // Only Chat is ever invoked read-only. A council stage's
-            // permission is decided at the gate, and a project chair always
-            // writes - showing the field on either would offer a setting
-            // nothing sends.
-            (kind === 'chat'
+            // Chat and council seats are both invoked read-only; a project
+            // chair always writes, so showing the field there would offer a
+            // setting nothing sends.
+            (kind === 'chat' || kind === 'seat'
               ? `<div class="field">` +
                 `<label>Read-only arguments ` +
-                  `<span class="field-hint">— added whenever Chat is ` +
-                  `read-only, which is any run with Zero-Touch off. With it on, ` +
-                  `the auto-approve arguments are sent instead</span></label>` +
+                  (kind === 'seat'
+                    ? `<span class="field-hint">— added to every deliberating ` +
+                      `and critiquing seat. Only the chair is invoked without ` +
+                      `them, and only once approved</span>`
+                    : `<span class="field-hint">— added whenever Chat is ` +
+                      `read-only, which is any run with Zero-Touch off. With ` +
+                      `it on, the auto-approve arguments are sent instead</span>`) +
+                  `</label>` +
                 `<textarea rows="2" data-field="read_only_args">` +
                   `${esc((p.read_only_args || []).join('\n'))}</textarea>` +
               `</div>`
@@ -2959,7 +3077,6 @@ function renderSettings() {
     );
   }).join('');
 
-  $$('.provider-form').forEach(updateRoleWarning);
   $('#house-rules').value = conf.house_rules || '';
   $('#display-name').value = conf.display_name || '';
   $('#port-input').value = conf.port || 8760;
@@ -3014,27 +3131,42 @@ function renderCouncilSettings() {
   $('#council-strictness').value = council.strictness ?? 2;
   updateStrictnessNote();
 
-  // Seating. One row per chair, each choosing a CLI or leaving it to the
-  // router - the same shape as the project agent matrix, so a chair is
-  // reassigned the same way wherever it lives.
+  // Seating. One row per seat: which CLI holds it, and what it is told to be.
+  // The same two choices the strip offers on a click - this is the whole bench
+  // at once, and there it is one seat at a time.
+  //
+  // The chair has no behaviour column: the chairman is what the third stage
+  // is, not a lens over it.
   const seats = ['chair'];
   for (let i = 1; i <= (Number(council.seat_count) || 3); i++) seats.push(`seat${i}`);
   const pins = council.pins || {};
+  const personas = council.personas || {};
   const agents = (state.agents || []).filter(a => (a.command || []).length);
+  const behaviours = (state.roles || []).filter(r => r.id !== 'chairman');
 
   $('#council-pins').innerHTML = seats.map(id => {
     const label = id === 'chair' ? 'Chair' : `Seat ${id.replace('seat', '')}`;
     return (
-      `<label class="council-pin-row">` +
+      `<div class="council-pin-row">` +
         `<span class="council-pin-label">${esc(label)}</span>` +
-        `<select data-pin="${esc(id)}">` +
+        `<select data-pin="${esc(id)}" aria-label="${esc(label)} CLI">` +
           `<option value=""${pins[id] ? '' : ' selected'}>Auto — routed per run</option>` +
           agents.map(a =>
             `<option value="${esc(a.id)}"${pins[id] === a.id ? ' selected' : ''}>` +
             `${esc(a.label)}</option>`
           ).join('') +
         `</select>` +
-      `</label>`
+        (id === 'chair'
+          ? `<span class="council-pin-fixed">Chairman</span>`
+          : `<select data-persona="${esc(id)}" aria-label="${esc(label)} behaviour">` +
+              `<option value=""${personas[id] ? '' : ' selected'}>` +
+                `Auto — a lens the task calls for</option>` +
+              behaviours.map(r =>
+                `<option value="${esc(r.id)}"${personas[id] === r.id ? ' selected' : ''}>` +
+                `${esc(r.name || r.id)}</option>`
+              ).join('') +
+            `</select>`) +
+      `</div>`
     );
   }).join('');
 
@@ -3074,9 +3206,15 @@ function updateStrictnessNote() {
 
 /** The council block, read back off the panel. */
 function readCouncilSettings() {
+  // "Auto" is written as an empty string rather than by leaving the key out.
+  // The server deep-merges a saved config, so an omitted seat keeps the pin it
+  // already had - setting one back to Auto would appear to work and change
+  // nothing. An empty value overwrites; the router reads it as unpinned.
   const pins = {};
-  $$('#council-pins select').forEach(sel => {
-    if (sel.value) pins[sel.dataset.pin] = sel.value;
+  const personas = {};
+  $$('#council-pins [data-pin]').forEach(sel => { pins[sel.dataset.pin] = sel.value; });
+  $$('#council-pins [data-persona]').forEach(sel => {
+    personas[sel.dataset.persona] = sel.value;
   });
 
   const capabilities = {};
@@ -3100,40 +3238,16 @@ function readCouncilSettings() {
     chair_deliberates: $('#council-chair-deliberates').checked,
     strictness: Number($('#council-strictness').value),
     pins,
+    personas,
     capabilities,
   };
 }
 
-/** Flag a behaviour whose write expectation disagrees with the stage's actual
- *  permission. Not resolved automatically: guessing which of the two the
- *  operator meant is how a safety setting stops being trustworthy. */
-function updateRoleWarning(form) {
-  // Only a council stage has both a role and a permission that can disagree
-  // with it. Chat has no role; a project chair has no role either, and always
-  // writes - there is no mismatch available to either of them.
-  if (!form || form.dataset.kind !== 'stage') return;
-  const id = form.dataset.provider;
-  const chosen = $('[data-field="role_template"]', form).value;
-  const role = (state.roles || []).find(r => r.id === chosen);
-  const note = $(`[data-role-warn="${id}"]`, form.parentElement) || $(`[data-role-warn="${id}"]`);
-  if (!note || !role) return;
-
-  // Today permission is per stage: the drafter is read-only, the polisher
-  // writes once approved.
-  const stageWrites = id === 'polisher';
-  if (role.writes && !stageWrites) {
-    note.textContent = `"${role.name}" expects to modify files, but this stage `
-      + `is read-only — it will produce a proposal, not changes.`;
-    note.className = 'field-hint warn';
-  } else if (!role.writes && stageWrites) {
-    note.textContent = `"${role.name}" is a report-only behaviour, but this `
-      + `stage may write once approved. It will be told not to.`;
-    note.className = 'field-hint warn';
-  } else {
-    note.textContent = '';
-    note.className = 'field-hint';
-  }
-}
+// The write-expectation warning that used to live here belonged to the fixed
+// Stage 1 / Stage 2 pair, where a stage's permission was known from its id. It
+// is not: a seat's permission comes from where it sits, so the same check now
+// runs where the behaviour is *chosen* — see `openPersonaMenu`, which marks a
+// behaviour that expects to write as one this seat cannot honour.
 
 async function saveSettings() {
   const providers = {};
@@ -3160,12 +3274,9 @@ async function saveSettings() {
 
     providers[id] = {
       id,
-      // The server expands this into the agent's command and permission
-      // flags when it differs from what the stage runs today, and ignores it
-      // otherwise - so a hand-edited command below still wins. Solo has no
-      // field here: it picks its agent on its card, and a stale value carried
-      // by this form would quietly undo that on the next save.
-      ...(field('agent') ? { agent: field('agent').value } : {}),
+      // No `agent` key from this panel. Every card here is one CLI already,
+      // and a stale value carried by the form would quietly undo a choice made
+      // on the card or the bench at the next save.
       label: field('label').value.trim() || id,
       command,
       auto_approve_args: lines('auto_approve_args'),
@@ -3175,10 +3286,7 @@ async function saveSettings() {
       // in. Writing another kind's keys would leave a dead setting behind that
       // still reads as though it decided something.
       ...({
-        stage: () => ({
-          role_template: field('role_template').value,
-          role_system: field('role_system').value.trim(),
-        }),
+        seat: () => ({ read_only_args: lines('read_only_args') }),
         chat: () => ({
           behavior: field('behavior').value.trim(),
           read_only_args: lines('read_only_args'),
@@ -3197,7 +3305,7 @@ async function saveSettings() {
   });
 
   if (!valid) {
-    toast('Every stage needs a command.', 'error');
+    toast('Every agent needs a command.', 'error');
     return;
   }
 
@@ -3818,6 +3926,10 @@ function wire() {
     } else {
       renderAll();
     }
+    // Arriving in Council with an empty box: ask who the standing bench is,
+    // so the seats are there to be clicked rather than appearing on the first
+    // keystroke.
+    refreshSeating();
   });
 
   // -- composer ---------------------------------------------------------
@@ -3874,7 +3986,6 @@ function wire() {
     e.stopPropagation();
     if ($('.model-menu')) { closeModelMenu(); return; }
     openMemberMenu(chair, chair.dataset.chair, {
-      role: false,
       note: 'What this chair is told to do comes from the board, not a role.',
     });
   });
@@ -4018,7 +4129,13 @@ function wire() {
     if (!member) return;
     e.stopPropagation();
     if ($('.model-menu')) { closeModelMenu(); return; }  // toggle
-    openMemberMenu(member, member.dataset.member);
+    // The seat id is what turns this into a bench editor: with it the menu
+    // offers which CLI sits here and what it is told to be, both of which are
+    // council settings rather than provider ones.
+    openMemberMenu(member, member.dataset.member, {
+      seat: member.dataset.seat || '',
+      seatLabel: member.dataset.seatLabel || '',
+    });
   });
 
   $('#composer-chips').addEventListener('click', (e) => {
@@ -4072,21 +4189,6 @@ function wire() {
     const tab = e.target.closest('.settings-tab');
     if (tab) switchSettingsTab(tab.dataset.settingsTab);
   });
-  $('#provider-forms').addEventListener('click', (e) => {
-    const reset = e.target.closest('[data-reset-role]');
-    if (!reset) return;
-    const form = reset.closest('.provider-form');
-    $('[data-field="role_system"]', form).value = '';
-    updateRoleWarning(form);
-    toast('Back to the template text.', 'ok', 2400);
-  });
-
-  $('#provider-forms').addEventListener('change', (e) => {
-    if (e.target.matches('[data-field="role_template"]')) {
-      updateRoleWarning(e.target.closest('.provider-form'));
-    }
-  });
-
   $('#commit-btn').addEventListener('click', doCommit);
   $('#commit-message').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') doCommit();
@@ -4100,31 +4202,11 @@ function wire() {
 
   $('#save-settings').addEventListener('click', saveSettings);
 
-  // Picking a council stage's agent fills in its command and flags straight
-  // away, so the form shows what will actually be saved. The server performs
-  // the same swap on save; this is the preview, not the source of truth.
-  // Delegated because the provider forms are rebuilt every time Settings opens.
-  $('#provider-forms').addEventListener('change', (e) => {
-    if (e.target.dataset.field !== 'agent') return;
-    const preset = state.agents.find(a => a.id === e.target.value);
-    if (!preset || !(preset.command || []).length) return;  // "Custom": leave it
-    const form = e.target.closest('.provider-form');
-    $('[data-field="label"]', form).value = preset.label;
-    $('[data-field="command"]', form).value = preset.command.join('\n');
-    $('[data-field="auto_approve_args"]', form).value =
-      (preset.auto_approve_args || []).join('\n');
-    $('[data-field="stream_args"]', form).value =
-      (preset.stream_args || []).join('\n');
-    // No read-only arguments to preview: they are Solo's, and Solo picks its
-    // agent on its card. The server still swaps them there, in one step with
-    // the command, which is the pairing that has to stay honest.
-    $('[data-field="model_args"]', form).value = (preset.model_args || []).join(' ');
-    $('[data-field="effort_args"]', form).value = (preset.effort_args || []).join(' ');
-    // Neither model names nor effort levels are interchangeable between CLIs.
-    $('[data-field="model"]', form).value = '';
-    $('[data-field="models"]', form).value = '';
-    $('[data-field="effort"]', form).value = '';
-  });
+  // No agent picker lives on these forms any more, so there is nothing here to
+  // preview a swap for. Every card is one CLI: Chat's is chosen on its card,
+  // a project chair's in the matrix, and a council seat's card *is* the CLI.
+  // The server still pairs a command with its permission flags on the paths
+  // that do swap - that pairing is the part that has to stay honest.
 
   // The probe results print into the Stages panel, so show it.
   $('#run-doctor').addEventListener('click', () => {
@@ -4236,6 +4318,8 @@ async function boot() {
   await loadChats();
   connect();
   prefetchResolvedModels();
+  // After `refreshDoctor`, which is what decides who is available to seat.
+  refreshSeating();
   // A project outlives the window it was started from, so the tab is opened
   // for you when one is still running - the alternative is an app that looks
   // idle while three agents rewrite a folder.

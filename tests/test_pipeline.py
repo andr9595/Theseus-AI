@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from aicouncil import config as cfg  # noqa: E402
 from aicouncil import gitutil  # noqa: E402
+from aicouncil import router  # noqa: E402
 from aicouncil.config import ConfigStore  # noqa: E402
 from aicouncil.events import EventBus  # noqa: E402
 from aicouncil.pipeline import Pipeline, PipelineBusy  # noqa: E402
@@ -1461,11 +1462,25 @@ class TestDraftFailureDoesNotEscalate(PipelineTestBase):
         self.assertNotEqual(run.state, "awaiting_approval")
 
 
-class TestRoleTemplates(unittest.TestCase):
+def seat(persona="", seat_id="seat1", agent="codex"):
+    """One routed seat, as the seating hands it to the pipeline."""
+    return router.Seat(
+        id=seat_id,
+        agent=agent,
+        provider_id=cfg.council_provider_id(agent),
+        alias="Agent A",
+        persona=persona,
+    )
+
+
+class TestRoleTemplates(PipelineTestBase):
     """Role behaviour is a setting, not a constant.
 
     The shipped prompts are defaults the operator can replace; what must not
-    change is that the resolved text actually reaches the CLI.
+    change is that the resolved text actually reaches the CLI. Which role a
+    seat gets is no longer a per-stage setting at all - it is the persona the
+    router assigned, resolved by `Pipeline._persona_system` against the same
+    catalogue - so that is what these drive.
     """
 
     def test_catalog_entries_are_complete(self):
@@ -1479,54 +1494,72 @@ class TestRoleTemplates(unittest.TestCase):
             self.assertTrue(role["system"].strip())
             self.assertIsInstance(role["writes"], bool)
 
-    def test_stage_defaults_when_nothing_is_configured(self):
-        from aicouncil import prompts
-
-        self.assertIn("JUNIOR ENGINEER", prompts.resolve_system("drafter", {}))
-        self.assertIn("SENIOR STAFF ARCHITECT", prompts.resolve_system("polisher", {}))
-
-    def test_a_template_replaces_the_stage_default(self):
-        from aicouncil import prompts
-
-        text = prompts.resolve_system("drafter", {"role_template": "security_review"})
+    def test_a_seat_gets_the_persona_it_was_routed(self):
+        text = self.pipeline._persona_system(seat("security_review"), {})
         self.assertIn("SECURITY REVIEWER", text)
-        self.assertNotIn("JUNIOR ENGINEER", text)
 
-    def test_edited_text_beats_the_template(self):
-        from aicouncil import prompts
-
-        text = prompts.resolve_system(
-            "drafter",
-            {"role_template": "security_review", "role_system": "Be a poet."},
+    def test_an_edited_persona_beats_the_shipped_text(self):
+        text = self.pipeline._persona_system(
+            seat("security_review"), {"security_review": {"system": "Be a poet."}}
         )
         self.assertEqual(text, "Be a poet.")
+        self.assertNotIn("SECURITY REVIEWER", text)
 
-    def test_blank_override_falls_back_rather_than_sending_nothing(self):
-        # Clearing the box in Settings must restore the template, not ship an
-        # empty system prompt.
+    def test_an_unrouted_seat_gets_no_lens_rather_than_a_default(self):
+        # There is no per-stage fallback any more, and inventing one would put
+        # a behaviour nobody chose in front of a seat. Blank is the neutral
+        # council member: the stage contract and nothing else.
+        self.assertEqual(self.pipeline._persona_system(seat(""), {}), "")
+
+    def test_a_persona_that_no_longer_exists_adds_no_lens(self):
+        # Deleting a role the Council panel still pins must not resurrect some
+        # other role's wording under that seat's name.
+        self.assertEqual(self.pipeline._persona_system(seat("gone"), {}), "")
+
+    def test_an_emptied_persona_adds_no_lens(self):
+        # Blanking a role's text in the editor is the operator saying "no
+        # lens", which composes onto the stage contract as nothing at all.
+        text = self.pipeline._persona_system(
+            seat("pragmatist"), {"pragmatist": {"system": "   "}}
+        )
+        self.assertEqual(text.strip(), "")
+
+    def test_the_resolved_persona_reaches_the_agent(self):
         from aicouncil import prompts
 
-        for blank in ("", "   ", "\n\t "):
-            text = prompts.resolve_system("drafter", {"role_system": blank})
-            self.assertIn("JUNIOR ENGINEER", text)
-
-    def test_an_unknown_template_falls_back_to_the_stage_default(self):
-        from aicouncil import prompts
-
-        text = prompts.resolve_system("polisher", {"role_template": "no_such_role"})
-        self.assertIn("SENIOR STAFF ARCHITECT", text)
-
-    def test_the_resolved_role_reaches_the_agent(self):
-        from aicouncil import prompts
-
-        prompt = prompts.build_draft_prompt(
+        prompt = prompts.build_member_prompt(
             "add a feature", "/tmp/r", None, "",
-            system=prompts.resolve_system(
-                "drafter", {"role_template": "adversarial_review"}
+            persona_system=self.pipeline._persona_system(
+                seat("adversarial_review"), {}
             ),
         )
         self.assertIn("ADVERSARIAL REVIEWER", prompt)
         self.assertIn("add a feature", prompt)
+        # Composed onto the stage contract, not in place of it: a persona must
+        # not be able to talk a read-only seat out of being read-only.
+        self.assertIn("# Your lens", prompt)
+
+    def test_a_seat_with_no_persona_leaves_the_contract_alone(self):
+        from aicouncil import prompts
+
+        prompt = prompts.build_member_prompt(
+            "add a feature", "/tmp/r", None, "",
+            persona_system=self.pipeline._persona_system(seat(""), {}),
+        )
+        self.assertNotIn("# Your lens", prompt)
+        self.assertIn("add a feature", prompt)
+
+    def test_the_persona_also_reaches_the_critique_turn(self):
+        # The lens is the seat's, not the stage's: a Pragmatist that turned
+        # neutral the moment it started reviewing peers would be half a seat.
+        from aicouncil import prompts
+
+        prompt = prompts.build_critique_prompt(
+            "task", [{"alias": "Agent B", "output": "their answer"}],
+            "/tmp/r", None, "",
+            persona_system=self.pipeline._persona_system(seat("pragmatist"), {}),
+        )
+        self.assertIn("PRAGMATISM", prompt.upper())
 
     def test_house_rules_still_apply_over_a_custom_role(self):
         from aicouncil import prompts
@@ -1911,16 +1944,36 @@ class TestWorkspaceMigration(unittest.TestCase):
         store = self.write({"providers": {"drafter": {"cwd_mode": "repo"}}})
         self.assertNotIn("cwd_mode", store.get("providers")["drafter"])
 
+    def test_a_seat_can_be_unpinned_again(self):
+        # `update` deep-merges, so a save that dropped the key would leave the
+        # old pin in place and the panel would appear to set the seat back to
+        # Auto without doing it. The UI writes a blank instead, which
+        # overwrites - and the router reads a blank as unpinned.
+        store = self.write({"council": {"pins": {"chair": "claude"}}})
+        store.update({"council": {"pins": {"chair": ""}}})
+        self.assertEqual(store.get("council")["pins"]["chair"], "")
 
-class TestEditableRoles(unittest.TestCase):
-    """Built-ins are defaults, not laws — and a role you add is not a lesser one."""
+        store.update({"council": {"personas": {"seat1": "visionary"}}})
+        store.update({"council": {"personas": {"seat1": ""}}})
+        self.assertEqual(store.get("council")["personas"]["seat1"], "")
 
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-roles-"))
-        self.store = ConfigStore(self.tmp / "config.json")
+    def test_the_bench_is_shown_unless_it_has_been_switched_off(self):
+        # A display toggle, but one that decides whether the only place to pin
+        # a seat by hand is on screen at all.
+        self.assertTrue(cfg.DEFAULTS["council"]["show_seats"])
+        store = self.write({})
+        self.assertTrue(store.get("council")["show_seats"])
+        store.update({"council": {"show_seats": False}})
+        self.assertFalse(store.get("council")["show_seats"])
 
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
+
+class TestEditableRoles(PipelineTestBase):
+    """Built-ins are defaults, not laws — and a role you add is not a lesser one.
+
+    On the base fixture rather than a bare ConfigStore, because what a role
+    edit has to survive is the trip through `Pipeline._persona_system` onto a
+    seat - the only path that puts one in front of a CLI.
+    """
 
     def test_an_untouched_builtin_reports_the_shipped_text(self):
         from aicouncil import prompts
@@ -1961,11 +2014,13 @@ class TestEditableRoles(unittest.TestCase):
         self.assertEqual(set(perf), set(catalog[0]))
 
     def test_a_custom_role_reaches_the_prompt(self):
-        from aicouncil import prompts
-
+        # A role the operator wrote is seatable on exactly the same terms as a
+        # built-in: pin it to a seat and its text is the lens that seat brings.
         stored = {"perf": {"name": "Perf", "system": "PROFILE-FIRST-SENTINEL"}}
-        text = prompts.resolve_system("drafter", {"role_template": "perf"}, stored)
-        self.assertEqual(text, "PROFILE-FIRST-SENTINEL")
+        self.assertEqual(
+            self.pipeline._persona_system(seat("perf"), stored),
+            "PROFILE-FIRST-SENTINEL",
+        )
 
     def test_deleting_a_builtin_edit_restores_the_shipped_text(self):
         from aicouncil import prompts
@@ -1982,16 +2037,36 @@ class TestEditableRoles(unittest.TestCase):
         self.assertIn("JUNIOR ENGINEER", role["system"])
         self.assertFalse(role["edited"])
 
-    def test_a_stage_pointing_at_a_deleted_role_falls_back(self):
-        from aicouncil import prompts
+    def test_a_seat_pinned_to_a_deleted_role_runs_neutral(self):
+        # Deleting a role the Council panel is still pinned to must not take
+        # the seat down with it, and must not seat some other role's wording
+        # under that seat's name. It loses its lens and nothing else.
+        self.store.update({
+            "roles": {"perf": {"name": "Perf", "system": "PROFILE-FIRST."}},
+            "council": {"personas": {"seat1": "perf"}},
+        })
+        self.assertEqual(
+            self.pipeline._persona_system(seat("perf"), self.store.get("roles")),
+            "PROFILE-FIRST.",
+        )
 
-        text = prompts.resolve_system("polisher", {"role_template": "gone"}, {})
-        self.assertIn("SENIOR STAFF ARCHITECT", text)
+        self.store.replace_roles({})
+        # The pin outlives the role - nothing rewrites it - so this is what a
+        # seating built from that config actually hands the pipeline.
+        self.assertEqual(self.store.get("council")["personas"]["seat1"], "perf")
+        self.assertEqual(
+            self.pipeline._persona_system(seat("perf"), self.store.get("roles")), ""
+        )
 
     def test_an_empty_role_never_produces_an_empty_prompt(self):
+        # A role blanked in the editor contributes no lens. The stage contract
+        # is not the role's to erase, though, so the prompt is still whole.
         from aicouncil import prompts
 
         stored = {"hollow": {"name": "Hollow", "system": "   "}}
-        text = prompts.resolve_system("drafter", {"role_template": "hollow"}, stored)
-        self.assertTrue(text.strip())
-        self.assertIn("JUNIOR ENGINEER", text)
+        prompt = prompts.build_member_prompt(
+            "task", "/tmp/r", None, "",
+            persona_system=self.pipeline._persona_system(seat("hollow"), stored),
+        )
+        self.assertNotIn("# Your lens", prompt)
+        self.assertIn("one member of an AI council", prompt)

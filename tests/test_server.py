@@ -207,8 +207,8 @@ class TestAgentAssignment(unittest.TestCase):
             polisher["auto_approve_args"],
             ["--dangerously-bypass-approvals-and-sandbox"],
         )
-        # The job itself is untouched: only the agent doing it changed.
-        self.assertEqual(polisher["role"], "Senior Polish")
+        # Everything that is not the CLI is untouched: only the agent changed.
+        self.assertEqual(polisher["id"], "polisher")
         self.assertEqual(polisher["timeout_seconds"], 1800)
 
     def test_the_same_agent_may_hold_both_jobs(self):
@@ -364,6 +364,32 @@ class TestSoloConfigMigration(unittest.TestCase):
         self.assertNotIn("solo_mode", conf)
         self.assertNotIn("solo_stage", conf)
 
+    def test_a_providers_council_role_is_swept_wherever_it_sits(self):
+        # A config written before Council became a deliberating bench carries
+        # a behaviour on the provider. Nothing reads one now - a seat's lens is
+        # the persona the router assigns it - so leaving the key would show the
+        # operator an instruction that has not been followed since the rewrite.
+        conf = self.load({"providers": {
+            "drafter": {"role": "Junior Draft",
+                        "role_template": "junior_draft",
+                        "role_system": "Be terse."},
+            "council_codex": {"role_template": "security_review"},
+        }})
+        for pid in ("drafter", "council_codex", "polisher", "solo"):
+            provider = conf["providers"][pid]
+            self.assertFalse(
+                {"role", "role_template", "role_system"} & set(provider),
+                f"{pid} still carries a council role: {sorted(provider)}",
+            )
+        # Swept, not reset: the rest of the provider is the operator's.
+        self.assertEqual(conf["providers"]["drafter"]["timeout_seconds"], 900)
+
+    def test_a_pinned_persona_is_not_swept_with_the_dead_role_keys(self):
+        # `council.personas` is where a behaviour lives now. The sweep above
+        # must not take the live setting out with the dead ones.
+        conf = self.load({"council": {"personas": {"seat1": "security_review"}}})
+        self.assertEqual(conf["council"]["personas"]["seat1"], "security_review")
+
     def test_an_unknown_mode_falls_back_to_council(self):
         self.assertEqual(self.load({"mode": "committee"})["mode"], "council")
 
@@ -416,10 +442,12 @@ class TestApi(ServerTestBase):
         ids = {p["id"] for p in data["providers"]}
         # Against the configured chairs rather than a literal, for the same
         # reason as the agent catalogue above. What must not silently vanish is
-        # named separately: the two council stages, chat, and the three
-        # Projects roles.
+        # named separately: every council seat - Settings draws one card per
+        # seat provider and reads its availability from here - plus chat and
+        # the three Projects roles.
         self.assertEqual(ids, set(cfg.DEFAULTS["providers"]))
-        self.assertLessEqual({"drafter", "polisher", "solo"}, ids)
+        self.assertLessEqual(set(cfg.COUNCIL_PROVIDERS), ids)
+        self.assertLessEqual({"solo"}, ids)
         self.assertLessEqual({"architect", "coder", "qa"}, ids)
         for p in data["providers"]:
             self.assertIn("available", p)

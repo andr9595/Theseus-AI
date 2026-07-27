@@ -483,14 +483,13 @@ ROLE_TEMPLATES: Dict[str, Dict] = {
     },
 }
 
-# Which template a stage falls back to when its setting is missing or unknown.
-# The council's numbered seats are not listed: they are routed per run and
-# their persona is resolved from the seating, not from a fixed stage id.
-DEFAULT_TEMPLATE = {
-    "drafter": "junior_draft",
-    "polisher": "senior_polish",
-    "chair": "chairman",
-}
+# There is no per-stage default template any more. Nothing resolves a role
+# from a stage id: a council seat's lens is the persona the router assigns it,
+# read from the seating by `Pipeline._persona_system`, and the chairman's is
+# fixed at `chairman` when the seating is built. The entries above are the
+# catalogue those personas are looked up in - `junior_draft` and
+# `senior_polish` among them, still selectable, just no longer wired to a
+# stage that resolves them by name.
 
 
 def shipped_role(role_id: str) -> Optional[Dict]:
@@ -547,36 +546,6 @@ def role_by_id(role_id: str, stored: Optional[Dict[str, Dict]] = None) -> Option
         if role["id"] == role_id:
             return role
     return None
-
-
-def resolve_system(
-    stage_id: str,
-    provider: Optional[Dict] = None,
-    stored_roles: Optional[Dict[str, Dict]] = None,
-) -> str:
-    """The system prompt a stage should actually use.
-
-    Precedence: text typed against the stage itself, then the role it is
-    assigned (as edited, if it has been), then the shipped default for the
-    stage. Blank at any level means "fall through", so clearing a box restores
-    the layer beneath rather than sending an empty prompt.
-    """
-    provider = provider or {}
-    custom = str(provider.get("role_system") or "").strip()
-    if custom:
-        return custom
-
-    key = str(provider.get("role_template") or "").strip()
-    role = role_by_id(key, stored_roles) if key else None
-    if role and str(role.get("system") or "").strip():
-        return role["system"]
-
-    fallback = role_by_id(DEFAULT_TEMPLATE.get(stage_id, "solo"), stored_roles)
-    if fallback and str(fallback.get("system") or "").strip():
-        return fallback["system"]
-    # Every layer empty: a hand-edited config could do this, and an empty
-    # system prompt is worse than the shipped one.
-    return ROLE_TEMPLATES[DEFAULT_TEMPLATE.get(stage_id, "solo")]["system"]
 
 
 def clip(text: str, limit: int) -> str:

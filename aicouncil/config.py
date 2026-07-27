@@ -250,16 +250,18 @@ def agent_catalog() -> List[Dict[str, Any]]:
 # Defaults
 # --------------------------------------------------------------------------
 
-# Stage 1 - the "junior". Cheap, fast, generous quota. Drafts the solution.
+# The retired Stage 1 - the "junior" that drafted for the two-stage council.
+#
+# Nothing dispatches on it since Council became a deliberating bench. It
+# survives for the reason given at PROVIDER_ORDER: transcripts written before
+# the rewrite name this stage, and it must still have a provider to render
+# against. What it no longer carries is a role. `role_template`, `role_system`
+# and the `role` label all described a behaviour resolved per stage, by a
+# `prompts.resolve_system` that no longer exists; a seat's behaviour now comes
+# from the persona the router assigns it. Kept, they would read as settings
+# that decide something, which none of them has since the rewrite.
 DEFAULT_DRAFTER = {
     "id": "drafter",
-    # --- Role -------------------------------------------------------------
-    # Which behaviour this stage performs. The catalogue lives in prompts.py;
-    # `role_system` overrides it with edited text, and blank means "use the
-    # template", so clearing the box in Settings restores the default.
-    "role_template": "junior_draft",
-    "role_system": "",
-    "role": "Junior Draft",
     "enabled": True,
     # When true the prompt is piped on stdin and `{prompt}` is dropped from
     # argv. Useful for very long prompts that would blow the ARG_MAX limit.
@@ -282,21 +284,14 @@ DEFAULT_DRAFTER = {
     # are per-model and the picker reads them at open time.
     "effort": "",
     # --- Agent -------------------------------------------------------------
-    # Codex drafts by default because its quota is the generous one. Reassign
-    # it in Settings; nothing else about this stage has to change.
+    # Codex drafted by default because its quota was the generous one.
     **copy.deepcopy(AGENTS["codex"]),
 }
 
-# Stage 2 - the "senior". Expensive, rationed. Reviews and applies.
+# The retired Stage 2 - the "senior" that reviewed and applied the draft. Kept
+# for the same reason as the drafter above, and roleless for the same reason.
 DEFAULT_POLISHER = {
     "id": "polisher",
-    # --- Role -------------------------------------------------------------
-    # Which behaviour this stage performs. The catalogue lives in prompts.py;
-    # `role_system` overrides it with edited text, and blank means "use the
-    # template", so clearing the box in Settings restores the default.
-    "role_template": "senior_polish",
-    "role_system": "",
-    "role": "Senior Polish",
     "enabled": True,
     "prompt_on_stdin": False,
     "timeout_seconds": 1800,
@@ -324,9 +319,9 @@ DEFAULT_SOLO = {
     # Free text put in front of the message, and the only instruction this
     # assistant ever carries. Empty by default and left empty until the
     # operator writes something: opening a plain conversation should not
-    # quietly enrol the agent in a persona nobody asked for. That is the
-    # difference between this and a stage's `role_system`, where blank means
-    # "fall back to the template".
+    # quietly enrol the agent in a persona nobody asked for. Blank means blank
+    # here, and there is no catalogue behind it to fall through to - unlike a
+    # council seat, whose lens the router picks when nobody has pinned one.
     "behavior": "",
     "prompt_on_stdin": False,
     "timeout_seconds": 1800,
@@ -345,10 +340,10 @@ DEFAULT_SOLO = {
 #
 # Configured as ordinary providers, under the role ids the engine dispatches
 # on, so every picker the council already has - agent, model, reasoning effort,
-# availability probe, quota chip - works on these with no new code. What they
-# do *not* carry is a `role_template`: a project's instructions come from the
-# phase it is in rather than from a role assigned once, so there is nothing
-# here for the Roles catalogue to override.
+# availability probe, quota chip - works on these with no new code. What none
+# of them takes is a behaviour: a project chair is told what to do by the
+# phase it is in rather than by a role assigned once, so the Roles catalogue
+# has nothing to say about these three.
 #
 # The default pairing follows the work rather than the vendor: design and
 # review to the model with the best judgement, bulk implementation to the one
@@ -381,10 +376,12 @@ DEFAULT_QA = _project_role("qa", "agy", 1800)
 def _council_seat(agent: str) -> Dict[str, Any]:
     """One CLI's standing council configuration.
 
-    No `role_template`: a seat's persona is decided by the router per run, from
-    what the prompt is about, so pinning one here would defeat the routing. Pin
-    the persona in the Council panel instead, where it sits next to the agent
-    pin that has the same effect on the same seat.
+    Carries no behaviour of its own. A seat's persona is decided by the router
+    per run, from what the prompt is about, so a persona stored against the CLI
+    would defeat the routing - and would follow that CLI into whichever seat it
+    landed in, which is not what "this seat is the sceptic" means. Pin it in
+    `council.personas` instead, keyed by seat, where it sits beside the agent
+    pin that has the same effect on the same chair.
 
     The timeout is a ceiling rather than an expectation. A member is read-only
     and usually quick; the chairman writes, and takes its own longer ceiling
@@ -493,8 +490,15 @@ DEFAULTS: Dict[str, Any] = {
         # pinned seat is still profiled and still explains itself; it simply
         # cannot be moved. Unpinned seats route around whatever is pinned.
         "pins": {},
-        # seat id -> role template id, fixing a seat's lens the same way.
+        # seat id -> role template id, fixing a seat's lens the same way. The
+        # chair is not listed: its behaviour is the chairman's, which is what
+        # the stage *is* rather than a lens over it.
         "personas": {},
+        # Whether the bench is drawn above the thread. On, because the seats
+        # are the control surface - clicking one pins it - and a strip that
+        # only appeared once a run started could not be used to set one up.
+        # Off is for when the routing is trusted and the row is just noise.
+        "show_seats": True,
         # The chair applies the patch, so it gets a longer ceiling than the
         # read-only members even though it is usually the same CLI.
         "chair_timeout_seconds": 1800,
@@ -610,6 +614,11 @@ def _migrate(merged: Dict[str, Any], raw: Dict[str, Any]) -> Dict[str, Any]:
         source = (merged.get("providers") or {}).get(str(raw.get("solo_stage") or ""))
         if raw.get("solo_mode") and isinstance(source, dict):
             carried = copy.deepcopy(source)
+            # The role keys are swept from every provider below, so listing
+            # them here is belt and braces - but this is the one place where
+            # dropping them is the *point* rather than tidying: what Solo
+            # borrows from the stage is the operator's choice of CLI, model
+            # and effort, never the council behaviour it was carrying.
             for key in ("id", "role", "role_template", "role_system", "enabled"):
                 carried.pop(key, None)
             merged["providers"]["solo"] = _deep_merge(DEFAULT_SOLO, carried)
@@ -623,9 +632,19 @@ def _migrate(merged: Dict[str, Any], raw: Dict[str, Any]) -> Dict[str, Any]:
     # `cwd_mode` never decided anything - every stage has always run in the
     # working folder - and now that the folder need not be a repository, the
     # one value it ever held ("repo") does not even describe the default.
+    #
+    # The role keys stopped deciding anything when Council became a
+    # deliberating bench: a seat's behaviour is the persona the router assigns
+    # it, and no code reads a behaviour off a provider any more. Left in a
+    # config the operator opens, `"role_system": "Be terse."` reads like an
+    # instruction still being followed. Personas pinned in `council.personas`
+    # are untouched - that is where a behaviour lives now.
     for provider in (merged.get("providers") or {}).values():
         if isinstance(provider, dict):
             provider.pop("cwd_mode", None)
+            provider.pop("role", None)
+            provider.pop("role_template", None)
+            provider.pop("role_system", None)
     if merged.get("mode") not in ("council", "solo"):
         merged["mode"] = "council"
     return merged
