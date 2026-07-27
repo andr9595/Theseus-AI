@@ -1613,40 +1613,106 @@ html, body {
   color: var(--text-3);
 }
 
-/* Phase 1 to 5. The running one carries the agent doing the work, so "who is
-   doing what right now" is answered in one glance. */
-.project-phases {
+/* Build health, who is working, and why the board chose them. There is no
+   phase to show any more, so what replaces it is the state the loop actually
+   dispatches on. */
+.project-strip {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 6px;
-  margin: 0; padding: 0;
-  list-style: none;
 }
-.phase {
+.strip-cell {
   padding: 10px 11px;
   background: var(--bg-1);
   border: 1px solid var(--line-soft);
   border-top: 2px solid var(--line);
   border-radius: var(--radius-sm);
   min-width: 0;
+  display: block;
 }
-.phase-n { font-size: 10px; letter-spacing: .8px; color: var(--text-3); }
-.phase-name {
-  font-size: 12px; font-weight: 600;
+.strip-label { display: block; font-size: 10px; letter-spacing: .8px;
+  text-transform: uppercase; color: var(--text-3); }
+.strip-value {
+  display: block; font-size: 12px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  text-transform: capitalize;
+}
+.strip-note {
+  display: block; font-size: 11px; color: var(--text-3); margin-top: 2px;
+  min-height: 16px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.phase-who { font-size: 11px; color: var(--text-3); margin-top: 2px; min-height: 16px; }
-.phase.done { border-top-color: var(--green); }
-.phase.done .phase-name { color: var(--text-2); }
-.phase.active {
-  background: var(--bg-2);
-  border-color: var(--line);
-  border-top-color: var(--accent);
+.strip-cell.live { background: var(--bg-2); border-top-color: var(--accent); }
+.strip-cell.live .strip-value { color: var(--accent-2); }
+.strip-health.ok { border-top-color: var(--green); }
+.strip-health.ok .strip-value { color: var(--green); }
+.strip-health.bad { border-top-color: var(--red); }
+.strip-health.bad .strip-value { color: var(--red); }
+.strip-health.unknown { border-top-color: var(--yellow); }
+.strip-health.unknown .strip-value { color: var(--yellow); }
+
+/* The board. Four columns of cards, rendered from BOARD.json - the same shape
+   the agents read, so what is on screen and what they were told cannot drift. */
+.project-board {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  align-items: start;
 }
-.phase.active .phase-name { color: var(--text); }
-.phase.active .phase-who { color: var(--accent-2); }
-.phase.failed { border-top-color: var(--red); }
-.phase.failed .phase-name { color: var(--red); }
+.board-col {
+  background: var(--bg-1);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  min-width: 0;
+  padding: 8px;
+}
+.board-col-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 6px; margin: 0 0 8px;
+  font-size: 11px; font-weight: 600; letter-spacing: .4px;
+  text-transform: uppercase; color: var(--text-3);
+}
+.board-col-head .count {
+  font-family: var(--mono); font-size: 11px;
+  color: var(--text-3); background: var(--bg-2);
+  border-radius: 999px; padding: 1px 7px;
+}
+.board-col[data-column="done"] .board-col-head { color: var(--green); }
+.board-cards { list-style: none; margin: 0; padding: 0;
+  display: flex; flex-direction: column; gap: 6px; }
+.board-empty { font-size: 12px; color: var(--text-3); padding: 4px 2px; }
+.board-card {
+  padding: 8px 9px;
+  background: var(--bg-2);
+  border: 1px solid var(--line-soft);
+  border-left: 2px solid var(--line);
+  border-radius: var(--radius-sm);
+  min-width: 0;
+}
+.board-card-top { display: flex; align-items: center; gap: 6px; }
+.board-card-id { font-family: var(--mono); font-size: 10px; color: var(--text-3); }
+.board-card-title {
+  font-size: 12px; color: var(--text-2); margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+.board-card-note { font-size: 11px; color: var(--yellow); margin-top: 4px; }
+.board-card.bug { border-left-color: var(--red); }
+.board-card.done { opacity: .72; }
+.board-card.done .board-card-title { color: var(--text-3); }
+.board-tag {
+  font-size: 9px; letter-spacing: .5px; text-transform: uppercase;
+  padding: 1px 5px; border-radius: 999px;
+}
+.board-tag.bug { background: rgba(244, 99, 99, .16); color: var(--red); }
+.board-tag.idea { background: rgba(124, 92, 255, .16); color: var(--accent-2); }
+
+/* The innovation slider: how much the council may invent once the goal is met. */
+.project-slider { display: flex; align-items: center; gap: 10px; }
+.project-slider input[type="range"] { flex: 1; min-width: 0; accent-color: var(--accent); }
+.project-slider output {
+  font-family: var(--mono); font-size: 12px; color: var(--text-2);
+  min-width: 66px; text-align: right;
+}
 
 .project-banner {
   padding: 10px 13px;
@@ -1679,32 +1745,11 @@ html, body {
 }
 .project-col { min-width: 0; }
 
-.project-tasks, .project-steps {
+.project-steps {
   margin: 0; padding: 0; list-style: none;
   display: flex; flex-direction: column; gap: 5px;
   max-height: 340px; overflow-y: auto;
 }
-.task {
-  display: flex; align-items: flex-start; gap: 8px;
-  padding: 7px 10px;
-  background: var(--bg-1);
-  border: 1px solid var(--line-soft);
-  border-radius: var(--radius-sm);
-  font-size: 12.5px;
-}
-.task-box {
-  flex: 0 0 auto; margin-top: 3px;
-  width: 13px; height: 13px;
-  border: 1px solid var(--line); border-radius: 3px;
-  display: grid; place-items: center;
-  font-size: 9px; color: var(--bg);
-}
-.task.completed .task-box { background: var(--green); border-color: var(--green); }
-.task.completed .task-text { color: var(--text-3); }
-.task.in_progress { border-color: rgba(124, 92, 255, .28); }
-.task.in_progress .task-box { border-color: var(--accent); }
-.task-text { min-width: 0; }
-.task-id { font-family: var(--mono); font-size: 11px; color: var(--text-3); margin-right: 6px; }
 
 .step {
   padding: 8px 10px;
@@ -1722,6 +1767,13 @@ html, body {
 .step-who { font-weight: 600; }
 .step-meta { margin-left: auto; font-size: 11px; color: var(--text-3); flex: 0 0 auto; }
 .step-why { color: var(--text-2); margin-top: 2px; }
+.step-trigger { color: var(--text-3); font-size: 11px; margin-top: 2px; }
+.step-tag {
+  font-size: 9px; letter-spacing: .5px; text-transform: uppercase;
+  padding: 1px 5px; border-radius: 999px;
+  background: rgba(148, 163, 184, .16); color: var(--text-3);
+  flex: 0 0 auto;
+}
 .step-err { color: var(--red); margin-top: 3px; word-break: break-word; }
 .step-files {
   margin-top: 4px;
@@ -1757,9 +1809,10 @@ pre.project-file {
   /* The strip is the one thing here that cannot wrap without losing its
      shape, so it scrolls sideways instead. */
   .council-strip { justify-content: flex-start; }
-  /* Five phases across a phone is four characters each. Stacked, the numbers
-     still read as a sequence and each one keeps its agent line. */
-  .project-phases { grid-template-columns: repeat(2, 1fr); }
+  /* Four board columns across a phone is four characters each. Two by two
+     keeps every card readable and the flow still reads left to right. */
+  .project-board { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .project-strip { grid-template-columns: minmax(0, 1fr); }
   .project-grid { grid-template-columns: minmax(0, 1fr); }
 }
 

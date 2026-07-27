@@ -93,21 +93,23 @@
           <section id="project-setup" class="project-setup">
             <h2 class="project-title">Build something, unattended</h2>
             <p class="project-sub">
-              Three agents take turns against one folder &mdash; an architect
-              plans, a developer writes, QA builds and tests &mdash; looping
-              until it works and has a README. There is no approval gate:
-              <b>every step runs with its CLI's auto-approve flags</b>, so
-              files change without asking. Pick the folder deliberately.
+              Three agents work one folder around a shared board &mdash; an
+              architect plans and reviews, a developer builds, QA tests &mdash;
+              and the board decides who goes next. The first turn is a
+              read-only look at what is already there. Every turn after it
+              <b>runs with its CLI's auto-approve flags</b>, so files change
+              without asking. Pick the folder deliberately.
             </p>
 
             <div class="field">
-              <label for="project-brief">What should it build?</label>
-              <textarea id="project-brief" rows="5" spellcheck="false"
+              <label for="project-goal">What should it build?</label>
+              <textarea id="project-goal" rows="5" spellcheck="false"
                 placeholder="e.g. A cross-platform CLI that watches a directory and reports file-size changes as JSON, with tests and a systemd unit."></textarea>
               <span class="field-hint">
                 The only thing in the whole run that comes from you. Say what
-                it is for and what &ldquo;finished&rdquo; means; the architect
-                turns that into a spec and a task list.
+                it is for and what &ldquo;finished&rdquo; means &mdash; that is
+                what the architect decomposes, and what the council measures
+                itself as done against.
               </span>
             </div>
 
@@ -134,6 +136,17 @@
               </span>
             </div>
 
+            <!-- How much the council may invent once the goal is met. Zero is
+                 a real answer and the right one for somebody's live repo. -->
+            <div class="field">
+              <label for="project-innovation">Proactive innovation</label>
+              <div class="project-slider">
+                <input id="project-innovation" type="range" min="0" max="5" step="1" value="2">
+                <output id="project-innovation-out" for="project-innovation"></output>
+              </div>
+              <span class="field-hint" id="project-innovation-hint"></span>
+            </div>
+
             <div class="project-start-row">
               <button id="project-start" class="btn btn-primary" type="button">
                 Start project
@@ -149,7 +162,7 @@
           <section id="project-live" class="project-live hidden">
             <header class="project-head">
               <div class="project-head-main">
-                <h2 id="project-brief-line" class="project-title"></h2>
+                <h2 id="project-goal-line" class="project-title"></h2>
                 <p id="project-where" class="project-sub"></p>
               </div>
               <div class="project-controls">
@@ -161,18 +174,16 @@
               </div>
             </header>
 
-            <!-- Phase 1 to 5, with the running agent on the active one. -->
-            <ol id="project-phases" class="project-phases"></ol>
+            <!-- Build health, who is working, and why the board chose them.
+                 The three facts that explain any single moment of a run. -->
+            <div id="project-status-strip" class="project-strip"></div>
 
             <div id="project-banner" class="project-banner hidden"></div>
 
+            <!-- The board. Four columns, rendered straight from BOARD.json. -->
+            <div id="project-board" class="project-board"></div>
+
             <div class="project-grid">
-              <div class="project-col">
-                <h4 class="project-head-sm">
-                  Tasks <span id="project-task-count" class="count"></span>
-                </h4>
-                <ul id="project-tasks" class="project-tasks"></ul>
-              </div>
               <div class="project-col">
                 <h4 class="project-head-sm">Turns</h4>
                 <ol id="project-steps" class="project-steps"></ol>
@@ -184,14 +195,14 @@
                  scroll positions and two sets of lines to keep in step. -->
             <div id="project-console-slot"></div>
 
-            <details id="project-roadmap-block" class="console-block">
-              <summary>Roadmap &mdash; <code>.theseus/ROADMAP.md</code></summary>
-              <div id="project-roadmap" class="project-file markdown"></div>
+            <details id="project-build-block" class="console-block hidden">
+              <summary>Last build output</summary>
+              <pre id="project-build-log" class="project-file mono"></pre>
             </details>
 
-            <details id="project-state-block" class="console-block">
-              <summary>State &mdash; <code>.theseus/STATE.json</code></summary>
-              <pre id="project-state-json" class="project-file mono"></pre>
+            <details id="project-board-block" class="console-block">
+              <summary>Board &mdash; <code>.theseus/BOARD.json</code></summary>
+              <pre id="project-board-json" class="project-file mono"></pre>
             </details>
 
             <details id="project-critique-block" class="console-block">
@@ -455,9 +466,9 @@
             <span class="field-hint">Failing builds in a row before giving up.</span>
           </div>
           <div class="field">
-            <label for="project-expansions">Expansion rounds</label>
-            <input id="project-expansions" type="number" min="0" max="10">
-            <span class="field-hint">Rounds of &ldquo;what should v1.1 be?&rdquo;. Zero ships the brief and nothing more.</span>
+            <label for="project-innovation-default">Innovation rounds</label>
+            <input id="project-innovation-default" type="number" min="0" max="10">
+            <span class="field-hint">Where the initializer's slider starts. Zero builds what was asked for and stops.</span>
           </div>
         </div>
       </section>

@@ -572,10 +572,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_project_start(self, params: Dict[str, list]) -> Dict[str, Any]:
         body = self._read_body()
+        # `innovation` is per-run, not a saved setting: it is the slider on the
+        # initializer, and the answer to "how much may it invent this time" is
+        # different for a throwaway prototype and somebody's production repo.
         project = self.app.projects.start(
-            str(body.get("brief") or ""),
+            str(body.get("goal") or body.get("brief") or ""),
             str(body.get("workspace") or self.app.store.get("workspace") or ""),
             resume=bool(body.get("resume")),
+            innovation=_opt_int(body.get("innovation")),
         )
         return {"ok": True, "project": project.to_dict()}
 
@@ -600,10 +604,10 @@ class Handler(BaseHTTPRequestHandler):
 
         A fixed set of names, never a path from the client: this endpoint reads
         a folder the operator chose, and taking a filename would turn "show me
-        the roadmap" into an arbitrary-file read over an authenticated but
+        the board" into an arbitrary-file read over an authenticated but
         drive-by-reachable local port.
         """
-        name = (params.get("name") or ["roadmap"])[0]
+        name = (params.get("name") or ["board"])[0]
         workspace = (params.get("workspace") or [""])[0].strip()
         if not workspace:
             # Nothing asked for: the running project's folder, then the chosen
@@ -619,9 +623,8 @@ class Handler(BaseHTTPRequestHandler):
 
         ws = projects.Workspace(workspace)
         readable = {
-            "roadmap": ws.roadmap_path,
+            "board": ws.board_path,
             "critique": ws.critique_path,
-            "state": ws.state_path,
             "spec": ws.spec_path,
         }
         if name not in readable:
@@ -693,6 +696,29 @@ class Server(ThreadingHTTPServer):
     # SSE holds a socket open indefinitely; the default request queue would
     # otherwise fill up with parked connections from multiple tabs.
     request_queue_size = 32
+
+
+def _opt_int(value: Any) -> Optional[int]:
+    """An optional integer from a JSON body: the number, or None if absent.
+
+    Written out rather than done inline because the obvious one-liner
+    (``int(v) if str(v or "").strip().isdigit() else None``) turns a deliberate
+    **0** into None - ``0 or ""`` is ``""`` - and silently falls back to the
+    saved default. For the innovation slider that is the difference between
+    "build what I asked for and stop" and "invent three more rounds of work in
+    my repository", so zero has to survive the trip.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lstrip("-").isdigit():
+            return int(text)
+    return None
 
 
 def find_free_port(preferred: int, host: str = "127.0.0.1") -> int:

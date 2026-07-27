@@ -20,12 +20,13 @@ Or run `./run.sh --doctor` after setting AI_COUNCIL_MOCK=1 to have the
 defaults point here automatically.
 
 It also speaks Projects Mode. Point the architect, coder and QA chairs at it
-and the whole five-phase loop runs for real against a real directory: it
-writes a spec, implements a two-file Python module with a genuine bug in it,
-fails its own test suite, is handed the trace, fixes it, proposes an
-enhancement and writes a README. Nothing about that sequence is faked - the
-tests really run and really fail - which is the only way to know the loop
-works rather than merely to believe it.
+and the whole decision loop runs for real against a real directory: it audits
+the folder read-only, plans two cards, implements a Python module with a
+genuine bug in it, fails its own test suite, is handed the trace, fixes it,
+gets the cards reviewed and proposes one enhancement before declaring itself
+finished. Nothing about that sequence is faked - the tests really run and
+really fail - which is the only way to know the loop works rather than merely
+to believe it.
 """
 
 from __future__ import annotations
@@ -230,33 +231,50 @@ def run_solo(task: str, write: bool) -> int:
 # --------------------------------------------------------------------------
 #
 # A project turn is dispatched on what the prompt asks for rather than on
-# `--role`, because the same chair is asked for different things in different
-# phases: the architect designs in phase 1 and writes the README in phase 5,
-# and QA verifies a round in phase 3 and the whole build in phase 5. The
-# engine's prompts name the turn on one line, so that line is what this reads.
+# `--role`, because the board decides who does what and the same chair is asked
+# for different things at different times: the architect plans, reviews and
+# innovates, and QA both audits and verifies. The engine's prompts name the
+# turn on one line, so that line is what this reads.
 #
 # What it builds is deliberately tiny and real: a module, a test for it, and a
-# test run that genuinely passes or fails. That is enough for the five-phase
-# loop to be exercised end to end - including a failing build handed back to
-# the developer - without any of it being pretended.
+# test run that genuinely passes or fails. That is enough for the whole
+# decision loop to be exercised end to end - including a failing build handed
+# back to the developer - without any of it being pretended.
 
 PROJECT_TURNS = [
-    ("# Your turn: architecture", "architecture"),
+    ("# Your turn: audit", "audit"),
+    ("# Your turn: plan", "plan"),
     ("# Your turn: implement", "implement"),
     ("# Your turn: fix the build", "fix"),
-    ("# Your turn: build and verify", "qa"),
-    ("# Your turn: decide what comes next", "expand"),
-    ("# Your turn: final integrity check", "integrity"),
-    ("# Your turn: hand it over", "handoff"),
+    ("# Your turn: verify", "verify"),
+    ("# Your turn: review", "review"),
+    ("# Your turn: innovate", "innovate"),
 ]
 
 
 def project_turn(prompt: str) -> str:
-    """Which phase this prompt is asking for, or '' if it is not a project."""
+    """Which turn this prompt is asking for, or '' if it is not a project."""
     for marker, name in PROJECT_TURNS:
         if marker in prompt:
             return name
     return ""
+
+
+def read_board() -> dict:
+    """The board, read the way a real agent reads it: off disk, in the cwd."""
+    try:
+        with open(Path(".theseus") / "BOARD.json", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def column(board: dict, name: str) -> list:
+    columns = board.get("columns")
+    if not isinstance(columns, dict):
+        return []
+    return [c for c in (columns.get(name) or []) if isinstance(c, dict)]
 
 
 def report(**fields) -> int:
@@ -265,7 +283,6 @@ def report(**fields) -> int:
         "reasoning": "",
         "files_modified": [],
         "status": "ok",
-        "notes": "mock-agent: this build is a fixture, not real engineering.",
     }
     payload.update(fields)
     emit()
@@ -276,47 +293,68 @@ def report(**fields) -> int:
     return 0
 
 
-def run_project_turn(turn: str, brief: str) -> int:
-    theseus = Path(".theseus")
-    theseus.mkdir(parents=True, exist_ok=True)
+def run_tests() -> tuple[bool, str]:
+    """Actually run the fixture's test suite. Nothing here is simulated."""
+    proc = subprocess.run(
+        [sys.executable, "-m", "unittest", "discover", "-s", ".", "-q"],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+    output = (proc.stdout + proc.stderr).strip()
+    return proc.returncode == 0, (
+        f"$ python3 -m unittest discover -s . -q\nexit {proc.returncode}\n{output}"
+    )
 
-    if turn == "architecture":
-        Path("SPEC.md").write_text(
-            f"# Specification\n\n**Brief:** {brief}\n\n"
+
+def run_project_turn(turn: str, goal: str) -> int:
+    board = read_board()
+    theseus = Path(".theseus")
+
+    if turn == "audit":
+        # Read-only, and it means it: this turn is invoked without a write
+        # grant, so writing here would be the fixture lying about the one
+        # property the audit turn exists to have.
+        listing = sorted(p.name for p in Path(".").iterdir() if not p.name.startswith("."))
+        emit(f"Inspected the workspace: {len(listing)} visible entries.")
+        return report(
+            reasoning=(
+                f"Workspace contains: {', '.join(listing) or '(empty)'}. "
+                f"Python 3, standard library only; tests run with "
+                f"`python3 -m unittest discover -s . -q`. Nothing of the goal "
+                f"is implemented yet."
+            ),
+        )
+
+    if turn == "plan":
+        theseus.mkdir(parents=True, exist_ok=True)
+        (theseus / "SPEC.md").write_text(
+            f"# Specification\n\n**Goal:** {goal}\n\n"
             "## Toolchain\n\nPython 3, standard library only.\n\n"
-            "- Build command: `python3 -m compileall -q .`\n"
             "- Test command: `python3 -m unittest discover -s . -q`\n\n"
             "## Layout\n\n- `greeter.py` - the module.\n"
-            "- `test_greeter.py` - its tests.\n\n"
-            "## Acceptance criteria\n\n"
-            "1. `greet(name)` returns a greeting containing the name.\n"
-            "2. The test suite passes.\n",
+            "- `test_greeter.py` - its tests.\n",
             encoding="utf-8",
         )
-        (theseus / "ROADMAP.md").write_text(
-            "# Roadmap\n\n- [ ] task_1 - write `greeter.py`\n"
-            "- [ ] task_2 - write `test_greeter.py`\n",
-            encoding="utf-8",
-        )
-        emit("Designed a two-file Python module and wrote the spec.")
+        emit("Planned a two-file Python module.")
         return report(
-            reasoning="Laid out a minimal Python module and its test suite.",
-            files_modified=["SPEC.md", ".theseus/ROADMAP.md"],
+            reasoning="Broke the goal into a module and its test suite.",
+            files_modified=[".theseus/SPEC.md"],
             tasks=[
-                {"id": "task_1", "description": "write greeter.py",
-                 "status": "pending", "assigned_to": "coder"},
-                {"id": "task_2", "description": "write test_greeter.py",
-                 "status": "pending", "assigned_to": "coder"},
+                {"id": "t1", "title": "write greeter.py",
+                 "detail": "greet(name) returns a greeting containing the name",
+                 "column": "backlog", "kind": "task", "assigned_to": "coder"},
+                {"id": "t2", "title": "write test_greeter.py",
+                 "detail": "cover greet() with a real assertion",
+                 "column": "backlog", "kind": "task", "assigned_to": "coder"},
             ],
         )
 
     if turn in ("implement", "fix"):
-        # The first pass leaves a real bug in, so the QA turn genuinely fails
-        # and the build-failure path is exercised rather than described. The
-        # fix turn writes the correct version.
+        # The first implementation leaves a real bug in, so the verify turn
+        # genuinely fails and the build-failure path is exercised rather than
+        # described. The fix turn writes the correct version.
         broken = turn == "implement" and not Path("greeter.py").exists()
         Path("greeter.py").write_text(
-            'def greet(name):\n'
+            "def greet(name):\n"
             + ('    return "Hello"\n' if broken else '    return f"Hello, {name}!"\n'),
             encoding="utf-8",
         )
@@ -327,58 +365,68 @@ def run_project_turn(turn: str, brief: str) -> int:
             '        self.assertIn("Ada", greet("Ada"))\n',
             encoding="utf-8",
         )
-        emit(f"{'Implemented' if turn == 'implement' else 'Fixed'} the module and its test.")
+        files = ["greeter.py", "test_greeter.py"]
+
+        if turn == "fix":
+            emit("Read the trace, fixed the return value.")
+            return report(
+                reasoning="greet() ignored its argument. It now interpolates it.",
+                files_modified=files,
+            )
+
+        # The engine has already moved the claimed card to In progress, so the
+        # board says which one this turn is holding.
+        claimed = column(board, "in_progress")
+        emit(f"Implemented {len(files)} file(s).")
         return report(
-            reasoning="Wrote the module and the unit test.",
-            files_modified=["greeter.py", "test_greeter.py"],
-            tasks=[
-                {"id": "task_1", "status": "completed"},
-                {"id": "task_2", "status": "completed"},
+            reasoning="Wrote the module and its unit test.",
+            files_modified=files,
+            tasks=[{"id": c["id"], "column": "in_review"} for c in claimed],
+        )
+
+    if turn == "verify":
+        passing, output = run_tests()
+        emit(f"Ran the test suite: {'passed' if passing else 'FAILED'}.")
+        theseus.mkdir(parents=True, exist_ok=True)
+        with (theseus / "CRITIQUE.log").open("a", encoding="utf-8") as fh:
+            fh.write(f"\n## mock-agent verify: {'passing' if passing else 'failing'}\n")
+        return report(
+            reasoning=f"Ran the suite; it {'passed' if passing else 'failed'}.",
+            build={
+                "health": "PASSING" if passing else "FAILING",
+                "log": "" if passing else output,
+            },
+        )
+
+    if turn == "review":
+        pending = column(board, "in_review")
+        emit(f"Reviewed {len(pending)} card(s).")
+        return report(
+            reasoning="Read the diff; the implementation matches the cards.",
+            reviews=[
+                {"id": c["id"], "verdict": "approve", "note": ""} for c in pending
             ],
         )
 
-    if turn in ("qa", "integrity"):
-        proc = subprocess.run(
-            [sys.executable, "-m", "unittest", "discover", "-s", ".", "-q"],
-            capture_output=True, text=True, timeout=120, check=False,
-        )
-        passing = proc.returncode == 0
-        output = (proc.stdout + proc.stderr).strip()
-        emit(f"Ran the test suite: exit {proc.returncode}.")
-        with (theseus / "CRITIQUE.log").open("a", encoding="utf-8") as fh:
-            fh.write(f"\n## mock-agent {turn}: {'passing' if passing else 'failing'}\n")
-        return report(
-            reasoning=f"Ran the suite; it {'passed' if passing else 'failed'}.",
-            build_status="passing" if passing else "failing",
-            last_execution_error=(
-                "" if passing
-                else f"$ python3 -m unittest discover -s . -q\n"
-                     f"exit {proc.returncode}\n{output}"
-            ),
-        )
+    # innovate. One proposal, then nothing - so the loop terminates rather than
+    # inventing work forever, which is the behaviour worth having a fixture for.
+    already = [
+        c for name in ("backlog", "in_progress", "in_review", "done")
+        for c in column(board, name)
+        if str(c.get("origin")) == "innovation"
+    ]
+    if already:
+        emit("Nothing further worth adding.")
+        return report(reasoning="The project is finished; more would be padding.")
 
-    if turn == "expand":
-        with (theseus / "ROADMAP.md").open("a", encoding="utf-8") as fh:
-            fh.write("\n## Expansion\n\n- [ ] task_3 - accept an empty name\n")
-        emit("Proposed one enhancement.")
-        return report(
-            reasoning="Empty input is the obvious gap in v1.",
-            files_modified=[".theseus/ROADMAP.md"],
-            tasks=[{"id": "task_3", "description": "accept an empty name",
-                    "status": "pending", "assigned_to": "coder"}],
-        )
-
-    # handoff
-    Path("README.md").write_text(
-        f"# Greeter\n\n{brief}\n\n## Usage\n\n"
-        "```python\nfrom greeter import greet\ngreet(\"Ada\")\n```\n\n"
-        "## Tests\n\n```\npython3 -m unittest discover -s . -q\n```\n\n"
-        "## Not verified\n\nBuilt by mock-agent as a fixture.\n",
-        encoding="utf-8",
+    emit("Proposed one enhancement.")
+    return report(
+        reasoning="Empty input is the obvious gap in v1.",
+        tasks=[{"id": "idea_1", "title": "handle an empty name",
+                "detail": "greet('') should not return a bare comma",
+                "column": "backlog", "kind": "task", "assigned_to": "coder",
+                "origin": "innovation"}],
     )
-    emit("Wrote the README.")
-    return report(reasoning="Documented usage and tests.",
-                  files_modified=["README.md"])
 
 
 def main() -> int:

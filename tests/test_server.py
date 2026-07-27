@@ -531,10 +531,11 @@ class TestProjectRoutes(ServerTestBase):
     def test_a_project_on_disk_is_reported(self):
         theseus = self.folder / ".theseus"
         theseus.mkdir()
-        (theseus / "STATE.json").write_text(
+        (theseus / "BOARD.json").write_text(
             json.dumps({
                 "project_id": "abc123", "status": "IMPLEMENTING",
-                "current_phase": 2, "brief": "half a thing", "tasks": [],
+                "goal": "half a thing",
+                "columns": {"backlog": [{"id": "t1", "title": "finish it"}]},
             }),
             encoding="utf-8",
         )
@@ -543,15 +544,46 @@ class TestProjectRoutes(ServerTestBase):
         )
         self.assertEqual(status, 200)
         self.assertTrue(data["resumable"])
-        self.assertEqual(data["project"]["brief"], "half a thing")
+        self.assertEqual(data["project"]["goal"], "half a thing")
+        self.assertEqual(data["project"]["counts"]["backlog"], 1)
 
-    def test_starting_without_a_brief_is_refused(self):
+    def test_starting_without_a_goal_is_refused(self):
         status, data = self.request(
             "/api/project/start", method="POST",
-            body={"brief": "", "workspace": str(self.folder)},
+            body={"goal": "", "workspace": str(self.folder)},
         )
         self.assertEqual(status, 400)
         self.assertFalse(data["ok"])
+
+    def test_an_innovation_of_zero_is_not_read_as_unset(self):
+        # The falsy-zero trap, pinned. `0 or ""` is `""`, so the obvious
+        # one-liner turns "build what I asked for and stop" into "use the saved
+        # default" — which on a stock config means three rounds of work nobody
+        # asked for, in somebody's repository.
+        from aicouncil.server import _opt_int
+
+        self.assertEqual(_opt_int(0), 0)
+        self.assertEqual(_opt_int("0"), 0)
+        self.assertIsNone(_opt_int(None))
+        self.assertIsNone(_opt_int(""))
+        self.assertIsNone(_opt_int("three"))
+        # A JSON `true` is not a count, and int(True) == 1 would be a silent
+        # round of invented work.
+        self.assertIsNone(_opt_int(True))
+
+    def test_starting_with_innovation_off_reaches_the_engine(self):
+        seen = {}
+
+        def fake_start(goal, workspace="", resume=False, innovation=None):
+            seen["innovation"] = innovation
+            raise ValueError("stop here — the argument is what is under test")
+
+        self.state.projects.start = fake_start
+        self.request(
+            "/api/project/start", method="POST",
+            body={"goal": "build it", "workspace": str(self.folder), "innovation": 0},
+        )
+        self.assertEqual(seen["innovation"], 0)
 
     def test_controls_refuse_when_nothing_is_running(self):
         for path in ("/api/project/pause", "/api/project/resume"):
@@ -569,7 +601,7 @@ class TestProjectRoutes(ServerTestBase):
     def test_the_file_reader_takes_a_name_not_a_path(self):
         # This endpoint reads a folder the operator chose, over a port any
         # local process can reach. Taking a filename would turn "show me the
-        # roadmap" into an arbitrary-file read.
+        # board" into an arbitrary-file read.
         for name in ("../../etc/passwd", "/etc/passwd", "id_rsa"):
             status, data = self.request(
                 f"/api/project/file?name={urllib.parse.quote(name)}"
@@ -578,16 +610,17 @@ class TestProjectRoutes(ServerTestBase):
             self.assertEqual(status, 400, name)
             self.assertIn("Not a project file", data["error"])
 
-    def test_the_file_reader_serves_the_four_it_knows(self):
+    def test_the_file_reader_serves_the_three_it_knows(self):
         theseus = self.folder / ".theseus"
         theseus.mkdir()
-        (theseus / "ROADMAP.md").write_text("# Roadmap\n\n- [ ] one\n", encoding="utf-8")
+        (theseus / "CRITIQUE.log").write_text("# Critique log\n\nfound one\n",
+                                              encoding="utf-8")
         status, data = self.request(
-            f"/api/project/file?name=roadmap"
+            f"/api/project/file?name=critique"
             f"&workspace={urllib.parse.quote(str(self.folder))}"
         )
         self.assertEqual(status, 200)
-        self.assertIn("- [ ] one", data["text"])
+        self.assertIn("found one", data["text"])
 
     def test_a_project_and_a_run_refuse_each_other(self):
         # Both drive coding agents against the same folder. Two of them editing

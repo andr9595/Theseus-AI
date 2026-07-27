@@ -1407,9 +1407,26 @@ function renderThread() {
    it kept somewhere else.
    ---------------------------------------------------------------------- */
 
-const PHASE_ORDER = [1, 2, 3, 4, 5];
+const BOARD_COLUMNS = ['backlog', 'in_progress', 'in_review', 'done'];
+const COLUMN_NAMES = {
+  backlog: 'Backlog', in_progress: 'In progress', in_review: 'Review', done: 'Done',
+};
 const PROJECT_ROLES = ['architect', 'coder', 'qa'];
 const ROLE_NAMES = { architect: 'Architect', coder: 'Developer', qa: 'QA' };
+
+/** What the slider is promising, in words. The number on its own says nothing
+ *  about the thing people actually want to know: will it touch my repo beyond
+ *  what I asked for? */
+const INNOVATION_NOTES = [
+  'Builds exactly what you asked for, then stops. The right setting for a ' +
+    'repository you care about.',
+  'One round: once the board is clear and the build is green, the architect ' +
+    'proposes a few additions and the council builds them.',
+  'Two rounds of proposals after the goal is met.',
+  'Three rounds. Each one builds on what the last added.',
+  'Four rounds. Expect work you did not ask for and will have to read.',
+  'Five rounds. The goal becomes a starting point rather than a target.',
+];
 
 /** Whether a project is on screen at all — running, paused or finished. */
 function hasProject() {
@@ -1439,6 +1456,7 @@ function renderProjectSetup() {
       'directory of the app\'s own. Pick a folder to build somewhere you keep.';
 
   $('#project-matrix').innerHTML = PROJECT_ROLES.map(chairHtml).join('');
+  renderInnovation();
 
   // Resuming is offered only when the server found a build on disk. A project
   // left half-finished by a closed window is the one case where the empty form
@@ -1453,6 +1471,31 @@ function renderProjectSetup() {
       `${missing.length === 1 ? 'has' : 'have'} no CLI installed. ` +
       `A project runs unattended, so it will not start with a seat it cannot fill.`
     : '';
+}
+
+/** The innovation slider: how much the council may invent once the goal is met.
+ *
+ *  Seeded from the saved default exactly once, and only once the server has
+ *  actually said what that default is — the pane renders before
+ *  `/api/project` answers, so seeding from a placeholder would pin the slider
+ *  to a number nobody chose and then mark itself done, and the real setting
+ *  would never arrive.
+ *
+ *  A touch by the operator settles it for good. Otherwise a drag to zero made
+ *  while that request was still in flight would be overwritten by the default
+ *  landing a moment later — and this is the one control where the difference
+ *  between 0 and 2 is "does it touch my repository beyond what I asked for". */
+function renderInnovation() {
+  const slider = $('#project-innovation');
+  const saved = (state.projectSettings || {}).innovation_rounds;
+  if (!slider.dataset.settled && saved !== undefined) {
+    slider.value = String(saved);
+    slider.dataset.settled = '1';
+  }
+  const n = Math.max(0, Math.min(5, parseInt(slider.value, 10) || 0));
+  $('#project-innovation-out').textContent =
+    n === 0 ? 'off' : `${n} round${n === 1 ? '' : 's'}`;
+  $('#project-innovation-hint').textContent = INNOVATION_NOTES[n];
 }
 
 /** One chair in the agent matrix. The same provider object the council strip
@@ -1492,12 +1535,14 @@ function renderProjectLive() {
   const running = state.projectRunning;
   const done = !!p.done;
 
-  $('#project-brief-line').textContent = p.brief || '(no brief recorded)';
-  $('#project-brief-line').title = p.brief || '';
+  $('#project-goal-line').textContent = p.goal || '(no goal recorded)';
+  $('#project-goal-line').title = p.goal || '';
   $('#project-where').textContent =
-    `${shortPath(p.workspace)} · ${p.steps_used} turn${p.steps_used === 1 ? '' : 's'} · ` +
-    `build ${p.build_status}` +
-    (p.expansions_remaining ? ` · ${p.expansions_remaining} expansion round left` : '');
+    `${shortPath(p.workspace)} · ${p.steps_used} turn${p.steps_used === 1 ? '' : 's'}` +
+    (((p.tooling || {}).stack || []).length ? ` · ${p.tooling.stack.join(', ')}` : '') +
+    (p.innovation_rounds
+      ? ` · ${p.innovation_rounds} innovation round${p.innovation_rounds === 1 ? '' : 's'} left`
+      : '');
   $('#project-where').title = p.workspace;
 
   // Controls. Pause and Resume are the same button's two states rather than
@@ -1508,30 +1553,21 @@ function renderProjectLive() {
   $('#project-stop').classList.toggle('hidden', !running);
   $('#project-new').classList.toggle('hidden', running);
 
-  renderPhases(p, running, done);
+  renderStatusStrip(p, running, done);
   renderProjectBanner(p, running, done);
-
-  const tasks = p.tasks || [];
-  const finished = tasks.filter(t => t.status === 'completed').length;
-  $('#project-task-count').textContent = tasks.length ? `${finished}/${tasks.length}` : '';
-  $('#project-tasks').innerHTML = tasks.length
-    ? tasks.map(t =>
-        `<li class="task ${esc(t.status)}">` +
-          `<span class="task-box">${t.status === 'completed' ? '&#10003;' : ''}</span>` +
-          `<span class="task-text">` +
-            `<span class="task-id">${esc(t.id)}</span>` +
-            `${esc(t.description || '(no description)')}` +
-          `</span>` +
-        `</li>`
-      ).join('')
-    : '<li class="task"><span class="task-text">Waiting for the architect.</span></li>';
+  renderBoard(p);
 
   // Newest first: a run of thirty turns is read from the end.
   $('#project-steps').innerHTML = (p.steps || []).slice().reverse().map(stepHtml).join('')
     || '<li class="step"><span class="step-why">Nothing has run yet.</span></li>';
 
-  $('#project-roadmap').innerHTML = renderMarkdown(p.roadmap || '_Not written yet._');
-  $('#project-state-json').textContent = p.state_json || '';
+  // The last build output, shown only when there is a failure to read. A
+  // passing build has nothing to say and an empty block invites a click.
+  const hasLog = !!(p.last_build_log || '').trim();
+  $('#project-build-block').classList.toggle('hidden', !hasLog);
+  $('#project-build-log').textContent = p.last_build_log || '';
+
+  $('#project-board-json').textContent = p.board_json || '';
 
   // Adopt the shared console. `renderThread` parks it on every render, so this
   // has to claim it back each time rather than only once.
@@ -1559,32 +1595,102 @@ async function loadProjectCritique() {
   }
 }
 
-function renderPhases(p, running, done) {
-  const names = p.phase_names || {};
-  $('#project-phases').innerHTML = PHASE_ORDER.map(n => {
-    // "Done" is not simply "earlier than the current phase": the cycle goes
-    // backwards, so phase 3 sending the build back to phase 2 must not un-tick
-    // phases that really did happen. What decides it is whether a step for
-    // that phase has run and finished.
-    const steps = (p.steps || []).filter(s => s.phase === n);
-    const current = p.current_phase === n && !done;
-    let cls = '';
-    if (current) cls = running ? 'active' : (p.status === 'FAILED' ? 'failed' : 'active');
-    else if (steps.some(s => s.state === 'done')) cls = 'done';
-    if (done && p.status === 'FAILED' && p.current_phase === n) cls = 'failed';
+/** Build health, who is working, and why. There is no phase number to show
+ *  any more — the board decides each turn — so what replaces it is the state
+ *  the board actually dispatches on. */
+function renderStatusStrip(p, running, done) {
+  const health = p.build_health || 'UNKNOWN';
+  const healthClass =
+    health === 'PASSING' ? 'ok' : health === 'FAILING' ? 'bad' : 'unknown';
+  const healthNote = {
+    PASSING: 'built and tested since the last edit',
+    FAILING: 'the developer has the trace',
+    UNKNOWN: 'changed since anyone last ran it',
+  }[health] || '';
 
-    const who = current
-      ? (p.paused ? 'paused' : `${ROLE_NAMES[p.active_agent] || p.active_agent} working`)
-      : (steps.length ? `${steps.length} turn${steps.length === 1 ? '' : 's'}` : '');
+  const last = (p.steps || [])[(p.steps || []).length - 1];
+  const who = done
+    ? ''
+    : p.paused
+      ? 'Paused'
+      : running
+        ? `${ROLE_NAMES[p.active_agent] || p.active_agent} working`
+        : 'Idle';
+  const why = !done && running && last ? last.trigger || '' : '';
 
+  $('#project-status-strip').innerHTML =
+    `<span class="strip-cell strip-health ${healthClass}">` +
+      `<span class="strip-label">Build</span>` +
+      `<span class="strip-value">${esc(health.toLowerCase())}</span>` +
+      `<span class="strip-note">${esc(healthNote)}</span>` +
+    `</span>` +
+    (who
+      ? `<span class="strip-cell${running && !p.paused ? ' live' : ''}">` +
+          `<span class="strip-label">Now</span>` +
+          `<span class="strip-value">${esc(who)}</span>` +
+          `<span class="strip-note">${esc(why ? `because: ${why}` : '')}</span>` +
+        `</span>`
+      : '') +
+    `<span class="strip-cell">` +
+      `<span class="strip-label">Status</span>` +
+      `<span class="strip-value">${esc((p.status || '').toLowerCase())}</span>` +
+      `<span class="strip-note">${esc(cardTally(p))}</span>` +
+    `</span>`;
+}
+
+/** "3 of 7 cards done", counted off the columns - which is what the payload
+ *  actually carries. The engine holds cards flat and publishes them grouped. */
+function cardTally(p) {
+  const counts = p.counts || {};
+  const total = BOARD_COLUMNS.reduce((n, c) => n + (counts[c] || 0), 0);
+  if (!total) return 'no cards yet';
+  return `${counts.done || 0} of ${total} card${total === 1 ? '' : 's'} done`;
+}
+
+/** The board itself, straight from BOARD.json. */
+function renderBoard(p) {
+  const counts = p.counts || {};
+  const labels = p.column_labels || COLUMN_NAMES;
+  const cards = p.columns || {};
+
+  $('#project-board').innerHTML = BOARD_COLUMNS.map(name => {
+    const list = cards[name] || [];
     return (
-      `<li class="phase ${cls}">` +
-        `<div class="phase-n">PHASE ${n}</div>` +
-        `<div class="phase-name">${esc(names[n] || names[String(n)] || '')}</div>` +
-        `<div class="phase-who">${esc(who)}</div>` +
-      `</li>`
+      `<section class="board-col" data-column="${name}">` +
+        `<h4 class="board-col-head">` +
+          `${esc(labels[name] || name)}` +
+          `<span class="count">${counts[name] || 0}</span>` +
+        `</h4>` +
+        `<ul class="board-cards">` +
+          (list.length
+            ? list.map(c => cardHtml(c, name)).join('')
+            : `<li class="board-empty">&mdash;</li>`) +
+        `</ul>` +
+      `</section>`
     );
   }).join('');
+}
+
+function cardHtml(c, column) {
+  const bug = c.kind === 'bug';
+  const invented = c.origin === 'innovation';
+  const title = c.title || c.id;
+  const tip = [c.detail, c.note && `Note: ${c.note}`].filter(Boolean).join('\n\n');
+
+  return (
+    `<li class="board-card${bug ? ' bug' : ''}${column === 'done' ? ' done' : ''}"` +
+      `${tip ? ` title="${esc(tip)}"` : ''}>` +
+      `<div class="board-card-top">` +
+        `<span class="board-card-id">${esc(c.id)}</span>` +
+        (bug ? `<span class="board-tag bug">bug</span>` : '') +
+        (invented ? `<span class="board-tag idea" title="Proposed by the ` +
+          `council, not asked for">idea</span>` : '') +
+      `</div>` +
+      `<div class="board-card-title">${esc(title)}</div>` +
+      (c.note && column === 'backlog'
+        ? `<div class="board-card-note">${esc(c.note)}</div>` : '') +
+    `</li>`
+  );
 }
 
 function renderProjectBanner(p, running, done) {
@@ -1595,31 +1701,40 @@ function renderProjectBanner(p, running, done) {
   if (p.status === 'COMPLETED') {
     kind = 'ok';
     text = `${p.note || 'Finished.'} Everything is in ${p.workspace} — read ` +
-           `README.md first, then .theseus/CRITIQUE.log for what was left open.`;
+           `the diff first, then .theseus/CRITIQUE.log for what was left open.`;
   } else if (p.status === 'FAILED') {
     kind = 'error';
     text = p.error || 'The project stopped.';
   } else if (p.paused) {
     kind = 'warn';
-    text = 'Paused. The agent that was running finished its step, so the tree ' +
+    text = 'Paused. The agent that was running finished its turn, so the tree ' +
            'is consistent — nothing was interrupted mid-write.';
   } else if (!running) {
     kind = 'warn';
     text = 'Not running. Everything so far is on disk; starting it again picks ' +
-           'up from the state file.';
-  } else if (p.continuation_token_needed) {
+           'up from the board.';
+  } else if (p.continuation_needed) {
     kind = 'warn';
-    text = 'An agent ran out of context or quota. The step was handed to ' +
-           'another one, which starts from the state file rather than from a ' +
+    text = 'An agent ran out of context or quota. The turn was handed to ' +
+           'another one, which starts from the board rather than from a ' +
            'conversation it never saw.';
-  } else if (p.build_status === 'failing' && p.current_phase === 2) {
+  } else if (p.build_health === 'FAILING') {
     kind = 'warn';
     text = `Build failing — the developer has the trace and is on attempt ` +
-           `${p.fix_attempts}.`;
+           `${(p.fix_attempts || 0) + 1}.`;
+  } else if (p.status === 'AUDITING') {
+    kind = '';
+    text = 'Reading the workspace. This turn runs read-only — it has no write ' +
+           'permission at all, so nothing here can change yet.';
+  } else if (p.status === 'INNOVATING') {
+    kind = 'warn';
+    text = 'The goal is met and the build is green. The architect is now ' +
+           'proposing work you did not ask for; the slider on the initializer ' +
+           'is what bounds this.';
   } else {
     kind = '';
-    text = 'Running unattended. Every step carries its CLI\'s auto-approve ' +
-           'flags, so files are changing without confirmation.';
+    text = 'Running unattended. Every turn after the audit carries its CLI\'s ' +
+           'auto-approve flags, so files are changing without confirmation.';
   }
 
   banner.className = `project-banner${kind ? ' ' + kind : ''}`;
@@ -1634,10 +1749,14 @@ function stepHtml(s) {
       `<div class="step-head">` +
         `<span class="step-who">${esc(s.role_label || s.role)}</span>` +
         `<span>${esc(s.heading)}</span>` +
+        (s.read_only
+          ? `<span class="step-tag" title="Invoked with no write permission">read-only</span>`
+          : '') +
         `<span class="step-meta">` +
           `${esc(s.label)}${s.duration ? ' · ' + esc(fmtDuration(s.duration)) : ''}` +
         `</span>` +
       `</div>` +
+      (s.trigger ? `<div class="step-trigger">chosen because: ${esc(s.trigger)}</div>` : '') +
       (s.handoff_from
         ? `<div class="step-handoff">Handed over from the ` +
           `${esc(ROLE_NAMES[s.handoff_from] || s.handoff_from)} chair.</div>`
@@ -1663,19 +1782,26 @@ function stepHtml(s) {
  *  in the prompt is the part that matters: it is the one thing that turns a
  *  misclick into a question. */
 async function startProject(resume) {
-  const brief = $('#project-brief').value.trim();
+  const goal = $('#project-goal').value.trim();
   const folder = workspacePath();
+  const innovation = Math.max(0, Math.min(5,
+    parseInt($('#project-innovation').value, 10) || 0));
   const where = folder || `the scratch workspace (${state.scratchWorkspace || 'app folder'})`;
 
-  if (!resume && !brief) {
+  if (!resume && !goal) {
     toast('Describe what you want built.', 'warn');
-    $('#project-brief').focus();
+    $('#project-goal').focus();
     return;
   }
   if (!confirm(
     `Start an autonomous build in:\n\n${where}\n\n` +
     `Three agents will create, edit and delete files there without asking, ` +
     `for as long as it takes — no approval gate.` +
+    (innovation
+      ? `\n\nInnovation is set to ${innovation} round${innovation === 1 ? '' : 's'}, ` +
+        `so once your goal is met it will also design and build things you ` +
+        `did not ask for. Set the slider to zero to stop at the goal.`
+      : '') +
     (workspaceIsRepo()
       ? '\n\nA git snapshot is taken first, so the whole build can be undone.'
       : '\n\nThis is not a git repository, so nothing is snapshotted and ' +
@@ -1685,9 +1811,9 @@ async function startProject(resume) {
   try {
     await api('/api/project/start', {
       method: 'POST',
-      body: { brief, workspace: folder, resume: !!resume },
+      body: { goal, workspace: folder, resume: !!resume, innovation },
     });
-    $('#project-brief').value = '';
+    $('#project-goal').value = '';
     await loadProject(false);
     toast(resume ? 'Project resumed.' : 'Project started.', 'ok');
   } catch (err) {
@@ -2635,7 +2761,7 @@ function renderSettings() {
   const proj = conf.project || {};
   $('#project-max-steps').value = proj.max_steps ?? 40;
   $('#project-max-fixes').value = proj.max_fix_attempts ?? 3;
-  $('#project-expansions').value = proj.expansion_rounds ?? 1;
+  $('#project-innovation-default').value = proj.innovation_rounds ?? 2;
 }
 
 /** Flag a behaviour whose write expectation disagrees with the stage's actual
@@ -2750,8 +2876,8 @@ async function saveSettings() {
             Math.max(1, parseInt($('#project-max-fixes').value, 10) || 3),
           // The only one of the three that may legitimately be zero: no
           // expansion rounds ships the brief and nothing more.
-          expansion_rounds:
-            Math.max(0, parseInt($('#project-expansions').value, 10) || 0),
+          innovation_rounds:
+            Math.max(0, parseInt($('#project-innovation-default').value, 10) || 0),
         },
       },
     });
@@ -3153,10 +3279,11 @@ function connect() {
     state.tab = 'project';
     clearStream();
     pushDivider('Project started');
-    pushLine('sys', 'project', `Brief: ${d.project.brief}`);
+    pushLine('sys', 'project', `Goal: ${d.project.goal}`);
     pushLine('sys', 'project', `Folder: ${d.project.workspace}`);
     pushLine('warn', 'project',
-      'Every step runs with auto-approve. Files will change without asking.');
+      'The first turn is a read-only audit. Every turn after it runs with ' +
+      'auto-approve, so files change without asking.');
     $('#console-block').open = true;
     renderAll();
     loadProject();
@@ -3386,7 +3513,7 @@ function wire() {
     if ($('.model-menu')) { closeModelMenu(); return; }
     openMemberMenu(chair, chair.dataset.chair, {
       role: false,
-      note: 'What this chair is told to do comes from the phase, not a role.',
+      note: 'What this chair is told to do comes from the board, not a role.',
     });
   });
 
@@ -3396,6 +3523,12 @@ function wire() {
     openModal('picker');
   });
 
+  // Touching it settles it: a deliberate drag outranks the saved default,
+  // even if that default is still in flight when the drag happens.
+  $('#project-innovation').addEventListener('input', (e) => {
+    e.currentTarget.dataset.settled = '1';
+    renderInnovation();
+  });
   $('#project-start').addEventListener('click', () => startProject(false));
   $('#project-resume-found').addEventListener('click', () => startProject(true));
 
@@ -3412,7 +3545,7 @@ function wire() {
       'Stop the project?\n\n' +
       'The agent that is running is killed where it stands, so a file it was ' +
       'part-way through writing stays part-written. Pause instead if you only ' +
-      'want it to hold — that waits for the step to finish.'
+      'want it to hold — that waits for the turn to finish.'
     )) return;
     try {
       await api('/api/project/stop', { method: 'POST' });

@@ -1,22 +1,28 @@
 """Tests for the Projects engine.
 
-Two kinds here, deliberately separated:
+Three kinds here, deliberately separated:
 
-* Unit tests over the parts that decide things - report parsing, task merging,
-  the state file, exhaustion detection. These run in milliseconds and are where
+* Unit tests over the parts that decide things - report parsing, card merging,
+  tooling detection, the board file. These run in milliseconds and are where
   the edge cases live.
 
-* One end-to-end test that drives the whole five-phase loop against a real
-  directory using ``scripts/mock-agent.py``. It writes real files, runs a real
-  test suite that really fails, gets handed the real trace, and finishes with a
-  README. That one is slow and worth it: every unit test above it would still
-  pass if the phases never actually connected.
+* Tests of the decision engine itself, driven by handing it a board and asking
+  what it would do next. No agent is launched, so the ordering policy - a
+  failing build outranks a review, a review outranks new work - is pinned
+  directly rather than inferred from a run.
+
+* One end-to-end test that drives the whole loop against a real directory using
+  ``scripts/mock-agent.py``. It writes real files, runs a real test suite that
+  really fails, and gets handed the real trace. That one is slow and worth it:
+  every unit test above it would still pass if the turns never actually
+  connected to each other.
 """
 
 from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -29,19 +35,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from aicouncil.config import ConfigStore  # noqa: E402
 from aicouncil.events import EventBus  # noqa: E402
 from aicouncil.projects import (  # noqa: E402
+    COL_BACKLOG,
+    COL_DONE,
+    COL_IN_PROGRESS,
+    COL_IN_REVIEW,
     COMPLETED,
     FAILED,
-    IMPLEMENTING,
-    PHASE_ARCHITECTURE,
-    PHASE_FINALISATION,
-    PHASE_IMPLEMENTATION,
-    PHASE_QA,
-    PLANNING,
+    HEALTH_FAILING,
+    HEALTH_PASSING,
+    HEALTH_UNKNOWN,
+    KIND_BUG,
+    ORIGIN_INNOVATION,
     ROLES,
+    STALL_LIMIT,
     Project,
     ProjectEngine,
     StepRecord,
     Workspace,
+    detect_tooling,
+    ensure_gitignored,
     merge_tasks,
     parse_report,
 )
@@ -68,6 +80,15 @@ def mock_provider(role: str, timeout: int = 180) -> dict:
     }
 
 
+def card(cid, column=COL_BACKLOG, kind="task", **extra) -> dict:
+    base = {
+        "id": cid, "title": cid, "detail": "", "column": column, "kind": kind,
+        "assigned_to": "coder", "origin": "goal", "note": "",
+    }
+    base.update(extra)
+    return base
+
+
 class TestReportParsing(unittest.TestCase):
     """The one channel the engine reads structured answers through."""
 
@@ -92,6 +113,13 @@ class TestReportParsing(unittest.TestCase):
         report = parse_report('Done.\n{"status": "ok", "reasoning": "wrote it"}')
         self.assertEqual(report["reasoning"], "wrote it")
 
+    def test_a_board_only_report_is_read(self):
+        # A QA turn reports a build and nothing else; a reviewer reports
+        # verdicts and nothing else. Neither carries `status`, and both are
+        # real reports.
+        self.assertIn("build", parse_report('```json\n{"build": {"health": "PASSING"}}\n```'))
+        self.assertIn("reviews", parse_report('```json\n{"reviews": []}\n```'))
+
     def test_junk_is_not_a_report(self):
         # Never raises, and never invents. An unparseable reply means "it did
         # not tell me", which the engine treats very differently from failure.
@@ -102,183 +130,639 @@ class TestReportParsing(unittest.TestCase):
         self.assertEqual(parse_report('```json\n["a", "b"]\n```'), {})
 
 
-class TestTaskMerging(unittest.TestCase):
+class TestCardMerging(unittest.TestCase):
     def test_a_new_id_is_appended(self):
-        out = merge_tasks([], [{"id": "task_1", "description": "do it"}])
+        out = merge_tasks([], [{"id": "t1", "title": "do it"}])
         self.assertEqual(len(out), 1)
-        self.assertEqual(out[0]["status"], "pending")
+        self.assertEqual(out[0]["column"], COL_BACKLOG)
         self.assertEqual(out[0]["assigned_to"], "coder")
 
-    def test_a_status_only_report_keeps_the_description(self):
-        existing = [
-            {"id": "task_1", "description": "write it", "status": "pending",
-             "assigned_to": "coder"}
-        ]
-        out = merge_tasks(existing, [{"id": "task_1", "status": "completed"}])
-        self.assertEqual(out[0]["description"], "write it")
-        self.assertEqual(out[0]["status"], "completed")
+    def test_a_move_only_report_keeps_the_title(self):
+        out = merge_tasks(
+            [card("t1", title="write the parser", detail="in parse.py")],
+            [{"id": "t1", "column": COL_DONE}],
+        )
+        self.assertEqual(out[0]["column"], COL_DONE)
+        self.assertEqual(out[0]["title"], "write the parser")
+        self.assertEqual(out[0]["detail"], "in parse.py")
 
     def test_omission_is_not_deletion(self):
-        # Silence about a task says nothing about it. Reading it as removal
-        # would let one forgetful reply erase the roadmap.
-        existing = [
-            {"id": "task_1", "description": "a", "status": "pending",
-             "assigned_to": "coder"},
-            {"id": "task_2", "description": "b", "status": "pending",
-             "assigned_to": "coder"},
-        ]
-        out = merge_tasks(existing, [{"id": "task_1", "status": "completed"}])
-        self.assertEqual([t["id"] for t in out], ["task_1", "task_2"])
-        self.assertEqual(out[1]["status"], "pending")
+        # An agent that forgets a card has said nothing about it. Reading
+        # silence as a delete would let one careless reply wipe the board.
+        out = merge_tasks(
+            [card("t1"), card("t2"), card("t3")],
+            [{"id": "t2", "column": COL_DONE}],
+        )
+        self.assertEqual([c["id"] for c in out], ["t1", "t2", "t3"])
+        self.assertEqual([c["column"] for c in out],
+                         [COL_BACKLOG, COL_DONE, COL_BACKLOG])
 
-    def test_an_unknown_status_falls_back_to_pending(self):
-        out = merge_tasks([], [{"id": "task_1", "status": "nearly"}])
-        self.assertEqual(out[0]["status"], "pending")
+    def test_an_unknown_column_falls_back_to_backlog(self):
+        out = merge_tasks([], [{"id": "t1", "column": "shipped"}])
+        self.assertEqual(out[0]["column"], COL_BACKLOG)
 
     def test_entries_without_an_id_are_dropped(self):
-        out = merge_tasks([], [{"description": "no id"}, "not a dict", None])
-        self.assertEqual(out, [])
+        self.assertEqual(merge_tasks([], [{"title": "no id"}, "nonsense", 7]), [])
 
-    def test_an_unknown_role_is_not_stored(self):
-        # `assigned_to` is a role, not an agent. A task that named a binary
-        # would be wrong the moment the operator reassigned that chair.
-        out = merge_tasks([], [{"id": "t", "assigned_to": "claude"}])
-        self.assertEqual(out[0]["assigned_to"], "coder")
+    def test_a_bug_keeps_its_kind(self):
+        out = merge_tasks([], [{"id": "b1", "title": "npe", "kind": "bug"}])
+        self.assertEqual(out[0]["kind"], KIND_BUG)
+        self.assertEqual(out[0]["origin"], "bug")
 
 
-class TestStateFile(unittest.TestCase):
+class TestToolingDetection(unittest.TestCase):
+    """Adopting the project's own commands instead of inventing a build."""
+
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="theseus-proj-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="theseus-tool-"))
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_ensure_seeds_the_agent_owned_files(self):
-        ws = Workspace(self.tmp)
-        ws.ensure()
-        self.assertTrue(ws.roadmap_path.exists())
-        self.assertTrue(ws.critique_path.exists())
+    def test_an_empty_folder_has_no_tooling(self):
+        found = detect_tooling(self.tmp)
+        self.assertEqual(found["commands"], [])
+        self.assertEqual(found["stack"], [])
+
+    def test_go_is_detected_from_go_mod(self):
+        (self.tmp / "go.mod").write_text("module x\n", encoding="utf-8")
+        found = detect_tooling(self.tmp)
+        self.assertEqual(found["stack"], ["Go"])
+        self.assertIn("go test ./...", found["commands"])
+
+    def test_node_scripts_are_read_not_guessed(self):
+        # `npm test` against a package with no test script fails in a way that
+        # looks exactly like a broken build, so only declared scripts are used.
+        (self.tmp / "package.json").write_text(
+            json.dumps({"scripts": {"build": "tsc", "lint": "eslint ."}}),
+            encoding="utf-8",
+        )
+        found = detect_tooling(self.tmp)
+        self.assertIn("npm run build", found["commands"])
+        self.assertIn("npm run lint", found["commands"])
+        self.assertNotIn("npm test", found["commands"])
+
+    def test_a_corrupt_package_json_does_not_raise(self):
+        (self.tmp / "package.json").write_text("{not json", encoding="utf-8")
+        found = detect_tooling(self.tmp)
+        self.assertEqual(found["stack"], ["Node"])
+        self.assertEqual(found["commands"], [])
+
+    def test_several_markers_all_contribute(self):
+        (self.tmp / "go.mod").write_text("module x\n", encoding="utf-8")
+        (self.tmp / "Makefile").write_text("all:\n\techo hi\n", encoding="utf-8")
+        found = detect_tooling(self.tmp)
+        self.assertEqual(found["stack"], ["Go", "Make"])
+        self.assertIn("make", found["commands"])
+
+
+class TestGitignoreSafety(unittest.TestCase):
+    """`.theseus/` must not turn up in somebody's pull request."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="theseus-ignore-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def git_init(self) -> None:
+        subprocess.run(["git", "init", "-q"], cwd=self.tmp, check=True)
+
+    def test_a_non_repository_is_left_alone(self):
+        self.assertEqual(ensure_gitignored(self.tmp), "")
+        self.assertFalse((self.tmp / ".gitignore").exists())
+
+    def test_it_is_added_to_a_repository(self):
+        self.git_init()
+        self.assertIn(".theseus", ensure_gitignored(self.tmp))
+        self.assertIn("/.theseus/", (self.tmp / ".gitignore").read_text())
+
+    def test_an_existing_gitignore_is_appended_to_not_replaced(self):
+        self.git_init()
+        (self.tmp / ".gitignore").write_text("*.pyc\nnode_modules/\n", encoding="utf-8")
+        ensure_gitignored(self.tmp)
+        text = (self.tmp / ".gitignore").read_text()
+        self.assertIn("*.pyc", text)
+        self.assertIn("node_modules/", text)
+        self.assertIn("/.theseus/", text)
+
+    def test_it_is_not_added_twice(self):
+        self.git_init()
+        ensure_gitignored(self.tmp)
+        self.assertEqual(ensure_gitignored(self.tmp), "")
+        text = (self.tmp / ".gitignore").read_text()
+        self.assertEqual(text.count(".theseus"), 1)
+
+    def test_an_already_ignored_project_is_recognised(self):
+        self.git_init()
+        (self.tmp / ".gitignore").write_text(".theseus\n", encoding="utf-8")
+        self.assertEqual(ensure_gitignored(self.tmp), "")
+
+
+class TestBoardFile(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="theseus-board-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_ensure_seeds_the_log(self):
+        Workspace(self.tmp).ensure()
+        self.assertTrue((self.tmp / ".theseus" / "CRITIQUE.log").exists())
 
     def test_ensure_does_not_overwrite(self):
         ws = Workspace(self.tmp)
         ws.ensure()
-        ws.roadmap_path.write_text("mine", encoding="utf-8")
+        ws.critique_path.write_text("mine\n", encoding="utf-8")
         ws.ensure()
-        self.assertEqual(ws.roadmap_path.read_text(encoding="utf-8"), "mine")
+        self.assertEqual(ws.critique_path.read_text(), "mine\n")
 
-    def test_the_schema_keys_are_all_written(self):
-        project = Project(id="abc", brief="build a thing", workspace=str(self.tmp))
-        doc = project.state_document()
-        for key in (
-            "project_id", "status", "current_phase", "active_agent",
-            "last_run_timestamp", "continuation_token_needed", "tasks",
-            "last_execution_error", "build_status",
-        ):
-            self.assertIn(key, doc)
+    def test_the_columns_are_all_written(self):
+        project = Project(id="p1", goal="g", workspace=str(self.tmp))
+        project.tasks = [card("t1", COL_DONE), card("t2", COL_BACKLOG)]
+        doc = project.board_document()
+        self.assertEqual(
+            sorted(doc["columns"]),
+            ["backlog", "done", "in_progress", "in_review"],
+        )
+        self.assertEqual([c["id"] for c in doc["columns"]["done"]], ["t1"])
+        # The column is the key, so carrying it inside the card too would give
+        # the file two places to disagree with itself.
+        self.assertNotIn("column", doc["columns"]["done"][0])
 
-    def test_a_corrupt_state_file_reads_as_absent(self):
-        # It sits in a folder three coding agents can write to. A truncated
-        # file has to degrade to "keep what the engine had", not take the run
-        # down with a JSONDecodeError on a worker thread.
+    def test_a_corrupt_board_reads_as_absent(self):
         ws = Workspace(self.tmp)
         ws.ensure()
-        ws.state_path.write_text("{ this is not json", encoding="utf-8")
-        self.assertEqual(ws.read_state(), {})
+        ws.board_path.write_text("{ this is not json", encoding="utf-8")
+        self.assertEqual(ws.read_board(), {})
 
     def test_a_project_round_trips_through_disk(self):
         ws = Workspace(self.tmp)
         ws.ensure()
-        before = Project(id="abc", brief="a brief", workspace=str(self.tmp))
-        before.status = IMPLEMENTING
-        before.phase = PHASE_IMPLEMENTATION
-        before.tasks = merge_tasks([], [{"id": "task_1", "description": "x"}])
-        ws.write_state(before.state_document())
+        original = Project(id="p1", goal="build it", workspace=str(self.tmp))
+        original.tasks = [card("t1", COL_IN_REVIEW), card("b1", COL_BACKLOG, KIND_BUG)]
+        original.build_health = HEALTH_FAILING
+        original.last_build_log = "boom"
+        original.innovation_rounds = 3
+        ws.write_board(original.board_document())
 
-        after = Project.from_state(str(self.tmp), ws.read_state())
-        self.assertEqual(after.id, "abc")
-        self.assertEqual(after.brief, "a brief")
-        self.assertEqual(after.status, IMPLEMENTING)
-        self.assertEqual(after.phase, PHASE_IMPLEMENTATION)
-        self.assertEqual([t["id"] for t in after.tasks], ["task_1"])
+        back = Project.from_board(str(self.tmp), ws.read_board())
+        self.assertEqual(back.goal, "build it")
+        self.assertEqual(back.build_health, HEALTH_FAILING)
+        self.assertEqual(back.last_build_log, "boom")
+        self.assertEqual(back.innovation_rounds, 3)
+        # Cards come back grouped by column, because that is how the file
+        # stores them - insertion order across columns is not preserved, and
+        # order *within* a column, which is what claiming reads, is.
+        self.assertEqual(sorted(c["id"] for c in back.tasks), ["b1", "t1"])
+        self.assertEqual(back.column(COL_IN_REVIEW)[0]["id"], "t1")
+        self.assertEqual(back.column(COL_BACKLOG)[0]["kind"], KIND_BUG)
 
-    def test_a_hand_mangled_state_resumes_at_the_start(self):
-        # A phase of 99 or a status of "nearly" must not be dispatched on.
-        after = Project.from_state(
-            str(self.tmp),
-            {"project_id": "x", "status": "nearly", "current_phase": 99,
-             "active_agent": "nobody"},
-        )
-        self.assertEqual(after.status, PLANNING)
-        self.assertEqual(after.phase, PHASE_ARCHITECTURE)
-        self.assertIn(after.active_role, ROLES)
+    def test_a_mangled_health_resumes_as_unknown_never_passing(self):
+        # The one field that must never fail open. A board somebody hand-edited
+        # into nonsense resumes as unverified, not as green.
+        back = Project.from_board(str(self.tmp), {"build_health": "probably fine"})
+        self.assertEqual(back.build_health, HEALTH_UNKNOWN)
 
     def test_critique_is_append_only(self):
         ws = Workspace(self.tmp)
         ws.ensure()
         ws.append_critique("first")
         ws.append_critique("second")
-        text = ws.critique_path.read_text(encoding="utf-8")
-        self.assertIn("first", text)
-        self.assertIn("second", text)
+        text = ws.critique_path.read_text()
+        self.assertLess(text.index("first"), text.index("second"))
 
 
 class TestExhaustionDetection(unittest.TestCase):
-    """What decides whether a failure gets handed to another agent."""
+    """Deciding a failure was "no room left" rather than "no"."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="theseus-proj-"))
-        self.engine = ProjectEngine(ConfigStore(self.tmp / "config.json"), EventBus())
+        self.tmp = Path(tempfile.mkdtemp(prefix="theseus-exh-"))
+        self.engine = ProjectEngine(ConfigStore(self.tmp / "c.json"), EventBus())
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def result(self, **kw) -> ProviderResult:
         base = dict(
-            provider_id="coder", ok=False, exit_code=1, stdout="", stderr="",
-            duration=1.0, command=[],
+            provider_id="qa", ok=False, stdout="", stderr="", error="",
+            command=[], duration=1.0, timed_out=False, cancelled=False,
+            exit_code=1,
         )
         base.update(kw)
         return ProviderResult(**base)
 
     def test_a_context_limit_is_exhaustion(self):
         for text in (
-            "Error: prompt is too long: 210000 tokens > 200000 maximum",
+            "Error: prompt is too long",
             "context window exceeded",
-            "You have hit your usage limit reached for this week",
-            "rate limit exceeded, please try again later",
+            "usage limit reached, try again at 4pm",
+            "quota exhausted",
         ):
             self.assertTrue(
-                self.engine._looks_exhausted(self.result(error=text)), text
+                self.engine._looks_exhausted(self.result(stderr=text)), text
             )
 
     def test_a_timeout_is_exhaustion(self):
-        # The CLIs do not distinguish a model grinding through an oversized
-        # context from one that is merely slow, and re-running the same prompt
-        # on the same agent would only time out again.
-        self.assertTrue(
-            self.engine._looks_exhausted(self.result(timed_out=True, error="Timed out"))
-        )
+        self.assertTrue(self.engine._looks_exhausted(self.result(timed_out=True)))
 
     def test_an_ordinary_failure_is_not(self):
-        self.assertFalse(
-            self.engine._looks_exhausted(
-                self.result(error="SyntaxError: invalid syntax in greeter.py")
+        for text in ("SyntaxError: invalid syntax", "test failed", ""):
+            self.assertFalse(
+                self.engine._looks_exhausted(self.result(stderr=text)), text
             )
-        )
 
 
-class TestPreflight(unittest.TestCase):
-    """Everything that can refuse a project, before any quota is spent."""
+class TestDecisionEngine(unittest.TestCase):
+    """What the board says to do next. No agents are launched here.
+
+    This is the policy, stated once: a failing build outranks everything, an
+    unverified one outranks a review, a review outranks starting more work, and
+    only an empty board with a green build gets to invent anything.
+    """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="theseus-proj-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="theseus-decide-"))
         self.store = ConfigStore(self.tmp / "config.json")
         self.root = self.tmp / "build"
         self.root.mkdir()
-        self.store.update(
-            {"providers": {r: mock_provider(r) for r in ROLES},
-             "workspace": str(self.root)}
+        Workspace(self.root).ensure()
+        self.engine = ProjectEngine(self.store, EventBus())
+        self.project = Project(id="p1", goal="build it", workspace=str(self.root))
+        self.project.config = self.store.all()
+        self.project.audited = True
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def decide(self):
+        return self.engine._decide(self.project)
+
+    def test_the_first_turn_is_a_read_only_audit(self):
+        self.project.audited = False
+        d = self.decide()
+        self.assertEqual((d.role, d.kind), ("qa", "audit"))
+        # The whole point of it being first: nothing has written yet, and this
+        # turn is not allowed to either.
+        self.assertTrue(d.read_only)
+
+    def test_an_empty_board_is_planned(self):
+        d = self.decide()
+        self.assertEqual((d.role, d.kind), ("architect", "plan"))
+
+    def test_a_failing_build_outranks_everything(self):
+        self.project.tasks = [card("t1", COL_IN_REVIEW), card("t2", COL_BACKLOG)]
+        self.project.build_health = HEALTH_FAILING
+        d = self.decide()
+        self.assertEqual((d.role, d.kind), ("coder", "fix"))
+
+    def test_an_unverified_build_outranks_a_review(self):
+        # Reviewing code nobody has compiled wastes the reviewer's turn and
+        # half the time reviews something that does not build.
+        self.project.tasks = [card("t1", COL_IN_REVIEW)]
+        self.project.needs_verification = True
+        d = self.decide()
+        self.assertEqual((d.role, d.kind), ("qa", "verify"))
+
+    def test_a_review_outranks_new_work(self):
+        self.project.tasks = [card("t1", COL_IN_REVIEW), card("t2", COL_BACKLOG)]
+        self.project.build_health = HEALTH_PASSING
+        d = self.decide()
+        self.assertEqual((d.role, d.kind), ("architect", "review"))
+        self.assertEqual([c["id"] for c in d.tasks], ["t1"])
+
+    def test_the_backlog_is_worked_when_nothing_else_is_pending(self):
+        self.project.tasks = [card("t1"), card("t2")]
+        self.project.build_health = HEALTH_PASSING
+        d = self.decide()
+        self.assertEqual((d.role, d.kind), ("coder", "implement"))
+        self.assertEqual(d.tasks[0]["id"], "t1")
+
+    def test_a_bug_jumps_the_queue(self):
+        self.project.tasks = [card("t1"), card("b1", kind=KIND_BUG)]
+        self.project.build_health = HEALTH_PASSING
+        d = self.decide()
+        self.assertEqual(d.tasks[0]["id"], "b1")
+
+    def test_a_card_left_in_progress_is_finished_before_a_new_one(self):
+        # A turn that died holding a card must not have that card duplicated by
+        # the next developer turn.
+        self.project.tasks = [card("t1"), card("t2", COL_IN_PROGRESS)]
+        self.project.build_health = HEALTH_PASSING
+        d = self.decide()
+        self.assertEqual(d.tasks[0]["id"], "t2")
+
+    def test_a_clear_green_board_innovates(self):
+        self.project.tasks = [card("t1", COL_DONE)]
+        self.project.build_health = HEALTH_PASSING
+        self.project.innovation_rounds = 1
+        d = self.decide()
+        self.assertEqual((d.role, d.kind), ("architect", "innovate"))
+
+    def test_a_clear_green_board_with_no_budget_is_finished(self):
+        self.project.tasks = [card("t1", COL_DONE)]
+        self.project.build_health = HEALTH_PASSING
+        self.project.innovation_rounds = 0
+        self.assertIsNone(self.decide())
+
+    def test_endless_fixing_is_bounded(self):
+        self.project.tasks = [card("t1")]
+        self.project.build_health = HEALTH_FAILING
+        self.project.fix_attempts = 3  # the configured max
+        self.assertIsNone(self.decide())
+        self.assertEqual(self.project.status, FAILED)
+        self.assertIn("failed 3 times", self.project.error)
+
+
+class TestApplyingReports(unittest.TestCase):
+    """Folding one agent's answer back onto the board."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="theseus-apply-"))
+        self.store = ConfigStore(self.tmp / "config.json")
+        self.root = self.tmp / "build"
+        self.root.mkdir()
+        Workspace(self.root).ensure()
+        self.engine = ProjectEngine(self.store, EventBus())
+        self.project = Project(id="p1", goal="build it", workspace=str(self.root))
+        self.project.config = self.store.all()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def step(self, role="qa", ok=True) -> StepRecord:
+        s = StepRecord(index=1, role=role, label="stub", heading="h", trigger="t")
+        s.ok = ok
+        s.error = "" if ok else "Exited with status 1."
+        return s
+
+    # -- verification is fail-closed ---------------------------------------
+
+    def test_a_passing_verdict_is_taken(self):
+        self.engine._apply_verify(
+            self.project, None, self.step(),
+            {"build": {"health": "PASSING", "log": ""}},
         )
+        self.assertEqual(self.project.build_health, HEALTH_PASSING)
+        self.assertFalse(self.project.needs_verification)
+
+    def test_no_verdict_is_failing_never_passing(self):
+        # The one place the engine must not give an agent the benefit of the
+        # doubt: everything downstream reads PASSING as "somebody ran the
+        # tests", so a silent QA turn cannot be allowed to mean that.
+        self.engine._apply_verify(self.project, None, self.step(), {})
+        self.assertEqual(self.project.build_health, HEALTH_FAILING)
+        self.assertIn("without reporting a build status", self.project.last_build_log)
+
+    def test_an_unrecognised_verdict_is_failing(self):
+        self.engine._apply_verify(
+            self.project, None, self.step(), {"build": {"health": "probably fine"}}
+        )
+        self.assertEqual(self.project.build_health, HEALTH_FAILING)
+
+    def test_a_passing_verdict_resets_the_fix_budget(self):
+        self.project.fix_attempts = 2
+        self.engine._apply_verify(
+            self.project, None, self.step(), {"build": {"health": "PASSING"}}
+        )
+        self.assertEqual(self.project.fix_attempts, 0)
+
+    def test_qa_may_raise_bugs(self):
+        self.engine._apply_verify(
+            self.project, None, self.step(),
+            {"build": {"health": "FAILING", "log": "npe"},
+             "tasks": [{"id": "b1", "title": "null deref", "kind": "bug"}]},
+        )
+        self.assertEqual(self.project.column(COL_BACKLOG)[0]["kind"], KIND_BUG)
+
+    # -- writing code invalidates a green build ----------------------------
+
+    def test_writing_code_makes_the_build_unverified_again(self):
+        self.project.build_health = HEALTH_PASSING
+        self.project.tasks = [card("t1", COL_IN_PROGRESS)]
+        self.engine._apply_implement(
+            self.project, _decision([card("t1", COL_IN_PROGRESS)]),
+            self.step("coder"), {"files_modified": ["a.py"]},
+        )
+        self.assertEqual(self.project.build_health, HEALTH_UNKNOWN)
+        self.assertTrue(self.project.needs_verification)
+
+    def test_a_clean_implement_turn_puts_its_card_up_for_review(self):
+        self.project.tasks = [card("t1", COL_IN_PROGRESS)]
+        self.engine._apply_implement(
+            self.project, _decision([card("t1", COL_IN_PROGRESS)]),
+            self.step("coder"), {},
+        )
+        self.assertEqual(self.project.column(COL_IN_REVIEW)[0]["id"], "t1")
+
+    def test_a_failed_implement_turn_leaves_its_card_in_progress(self):
+        self.project.tasks = [card("t1", COL_IN_PROGRESS)]
+        self.engine._apply_implement(
+            self.project, _decision([card("t1", COL_IN_PROGRESS)]),
+            self.step("coder", ok=False), {},
+        )
+        self.assertEqual(self.project.column(COL_IN_PROGRESS)[0]["id"], "t1")
+
+    # -- review --------------------------------------------------------------
+
+    def test_approval_moves_a_card_to_done(self):
+        self.project.tasks = [card("t1", COL_IN_REVIEW)]
+        self.engine._apply_review(
+            self.project, _decision([card("t1", COL_IN_REVIEW)]),
+            self.step("architect"),
+            {"reviews": [{"id": "t1", "verdict": "approve"}]},
+        )
+        self.assertEqual(self.project.column(COL_DONE)[0]["id"], "t1")
+
+    def test_changes_send_a_card_back_carrying_the_note(self):
+        self.project.tasks = [card("t1", COL_IN_REVIEW)]
+        self.engine._apply_review(
+            self.project, _decision([card("t1", COL_IN_REVIEW)]),
+            self.step("architect"),
+            {"reviews": [{"id": "t1", "verdict": "changes", "note": "stubbed out"}]},
+        )
+        back = self.project.column(COL_BACKLOG)[0]
+        self.assertEqual(back["id"], "t1")
+        self.assertEqual(back["note"], "stubbed out")
+
+    def test_a_card_with_no_verdict_stays_in_review(self):
+        # Not approved by default. An unreviewed card sitting in review shows
+        # up as a stall, which is more honest than passing it silently.
+        self.project.tasks = [card("t1", COL_IN_REVIEW)]
+        self.engine._apply_review(
+            self.project, _decision([card("t1", COL_IN_REVIEW)]),
+            self.step("architect"), {},
+        )
+        self.assertEqual(self.project.column(COL_IN_REVIEW)[0]["id"], "t1")
+
+    # -- innovation ----------------------------------------------------------
+
+    def test_ideas_become_backlog_cards_and_spend_a_round(self):
+        self.project.innovation_rounds = 2
+        self.engine._apply_innovate(
+            self.project, None, self.step("architect"),
+            {"ideas": [{"title": "add telemetry", "detail": "in main.go"}]},
+        )
+        self.assertEqual(self.project.innovation_rounds, 1)
+        added = self.project.column(COL_BACKLOG)[0]
+        self.assertEqual(added["title"], "add telemetry")
+        self.assertEqual(added["origin"], ORIGIN_INNOVATION)
+
+    def test_proposing_nothing_ends_the_innovation_budget(self):
+        # Out of ideas is a finished project, not a reason to ask again next
+        # turn and every turn after it.
+        self.project.innovation_rounds = 3
+        self.engine._apply_innovate(self.project, None, self.step("architect"), {})
+        self.assertEqual(self.project.innovation_rounds, 0)
+
+    # -- the stall guard -----------------------------------------------------
+
+    def test_a_board_that_stops_moving_ends_the_run(self):
+        self.project.tasks = [card("t1", COL_IN_REVIEW)]
+        self.project.last_fingerprint = self.project.fingerprint()
+        for _ in range(STALL_LIMIT):
+            self.engine._note_progress(self.project)
+        self.assertEqual(self.project.status, FAILED)
+        self.assertIn("has not moved", self.project.error)
+
+    def test_progress_resets_the_stall_counter(self):
+        self.project.tasks = [card("t1", COL_IN_REVIEW)]
+        self.project.last_fingerprint = self.project.fingerprint()
+        self.engine._note_progress(self.project)
+        self.assertEqual(self.project.stall_count, 1)
+        self.engine._move(self.project, "t1", COL_DONE)
+        self.engine._note_progress(self.project)
+        self.assertEqual(self.project.stall_count, 0)
+        self.assertNotEqual(self.project.status, FAILED)
+
+
+def _decision(cards):
+    """A stand-in Decision carrying only what the appliers read off it."""
+    from aicouncil.projects import Decision
+
+    return Decision(
+        role="coder", kind="implement", heading="h", trigger="t",
+        status="IMPLEMENTING", build=lambda ctx: "", tasks=cards,
+    )
+
+
+class TestHandOff(unittest.TestCase):
+    """Moving a turn to a different chair - the reason there are three.
+
+    Driven with a stubbed CLI rather than through a live run: which agent gets
+    turn seven depends on what turn six did, and a test that has to guess that
+    is testing the mock's script rather than the hand-off.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="theseus-handoff-"))
+        self.store = ConfigStore(self.tmp / "config.json")
+        self.root = self.tmp / "build"
+        self.root.mkdir()
+        Workspace(self.root).ensure()
+        self.store.update({"providers": {r: mock_provider(r) for r in ROLES}})
+        self.engine = ProjectEngine(self.store, EventBus())
+        self.project = Project(id="p1", goal="build it", workspace=str(self.root))
+        self.project.config = self.store.all()
+        self.project.status = "IMPLEMENTING"
+        self.engine._project = self.project
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def result(self, ok=True, **kw) -> ProviderResult:
+        base = dict(
+            provider_id="x", ok=ok, exit_code=0 if ok else 1,
+            stdout='```json\n{"status": "ok"}\n```', stderr="", duration=0.1,
+            command=["stub"], error="" if ok else "boom",
+        )
+        base.update(kw)
+        return ProviderResult(**base)
+
+    def stub_invokes(self, results):
+        """Return canned results in order, recording which chair each ran on."""
+        self.ran = []
+
+        def fake(project, provider, prompt, read_only):
+            self.ran.append(provider.get("id"))
+            return results[len(self.ran) - 1]
+
+        self.engine._invoke = fake
+
+    def decision(self, role="architect"):
+        from aicouncil.projects import Decision
+
+        return Decision(role=role, kind="plan", heading="h", trigger="t",
+                        status="PLANNING", build=lambda ctx: "prompt")
+
+    def test_an_operator_hand_off_forces_the_next_chair(self):
+        self.stub_invokes([self.result()])
+        self.engine.handoff("coder")
+        step, _ = self.engine._run_role(self.project, self.decision("architect"))
+        self.assertEqual(self.ran, ["coder"])
+        self.assertEqual(step.role, "coder")
+        self.assertEqual(step.handoff_from, "architect")
+
+    def test_a_hand_off_is_spent_once(self):
+        self.stub_invokes([self.result(), self.result()])
+        self.engine.handoff("qa")
+        self.engine._run_role(self.project, self.decision("architect"))
+        step, _ = self.engine._run_role(self.project, self.decision("architect"))
+        self.assertEqual(self.ran, ["qa", "architect"])
+        self.assertEqual(step.handoff_from, "")
+
+    def test_exhaustion_moves_the_turn_to_another_agent(self):
+        # The whole reason the three chairs are three independent providers:
+        # the same turn is retried on a different CLI, rebuilt from the board
+        # rather than replayed from the first one's transcript.
+        self.stub_invokes([
+            self.result(ok=False, stderr="Error: prompt is too long"),
+            self.result(),
+        ])
+        step, _ = self.engine._run_role(self.project, self.decision("architect"))
+        self.assertEqual(len(self.ran), 2)
+        self.assertNotEqual(self.ran[0], self.ran[1])
+        self.assertEqual(step.handoff_from, "architect")
+        self.assertEqual(self.project.steps_used, 2)
+        # Cleared once somebody completed the turn, so a later resume does not
+        # think it is still mid-continuation.
+        self.assertFalse(self.project.continuation_needed)
+
+    def test_an_ordinary_failure_is_not_handed_off(self):
+        # A compile error is the agent's answer, not its exhaustion. Retrying
+        # it on a different CLI would just spend a second agent's quota.
+        self.stub_invokes([self.result(ok=False, stderr="SyntaxError")])
+        self.engine._run_role(self.project, self.decision("architect"))
+        self.assertEqual(self.ran, ["architect"])
+
+    def test_exhaustion_gives_up_after_every_chair_has_tried(self):
+        self.stub_invokes([
+            self.result(ok=False, stderr="context window exceeded"),
+            self.result(ok=False, stderr="context window exceeded"),
+            self.result(ok=False, stderr="context window exceeded"),
+        ])
+        step, _ = self.engine._run_role(self.project, self.decision("architect"))
+        self.assertEqual(len(self.ran), 3)
+        self.assertEqual(sorted(self.ran), sorted(ROLES))
+        self.assertFalse(step.ok)
+
+    def test_a_hand_off_to_a_role_that_is_not_one_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.engine.handoff("manager")
+
+
+class TestPreflight(unittest.TestCase):
+    """Everything that can refuse a run, before any quota is spent."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="theseus-pre-"))
+        self.store = ConfigStore(self.tmp / "config.json")
+        self.root = self.tmp / "build"
+        self.root.mkdir()
+        self.store.update({
+            "providers": {r: mock_provider(r) for r in ROLES},
+            "workspace": str(self.root),
+        })
         self.engine = ProjectEngine(self.store, EventBus())
 
     def tearDown(self):
@@ -286,24 +770,20 @@ class TestPreflight(unittest.TestCase):
         self.engine.wait_for_worker(30)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_an_empty_brief_is_refused(self):
+    def test_an_empty_goal_is_refused(self):
         with self.assertRaises(ValueError):
-            self.engine.start("   ", str(self.root))
+            self.engine.start("", str(self.root))
 
     def test_a_folder_that_does_not_exist_is_refused(self):
-        with self.assertRaises(ValueError) as ctx:
-            self.engine.start("build it", str(self.tmp / "nowhere"))
-        self.assertIn("not a folder that exists", str(ctx.exception))
+        with self.assertRaises(ValueError):
+            self.engine.start("build it", str(self.root / "nope"))
 
     def test_a_missing_cli_is_refused_by_name(self):
-        # A project runs unattended. Discovering in phase 3 that the QA binary
-        # was never installed costs two rounds of everyone's quota.
         self.store.update({"providers": {"qa": {"command": ["definitely-not-installed"]}}})
         with self.assertRaises(ValueError) as ctx:
             self.engine.start("build it", str(self.root))
-        message = str(ctx.exception)
-        self.assertIn("QA", message)
-        self.assertIn("definitely-not-installed", message)
+        self.assertIn("QA", str(ctx.exception))
+        self.assertIn("definitely-not-installed", str(ctx.exception))
 
     def test_a_council_run_blocks_a_project(self):
         def busy():
@@ -316,36 +796,59 @@ class TestPreflight(unittest.TestCase):
     def test_resuming_nothing_is_refused(self):
         with self.assertRaises(ValueError) as ctx:
             self.engine.start("", str(self.root), resume=True)
-        self.assertIn("no project to resume", str(ctx.exception).lower())
+        self.assertIn("BOARD.json", str(ctx.exception))
 
     def test_a_second_project_in_the_same_folder_is_refused(self):
         ws = Workspace(self.root)
         ws.ensure()
-        ws.write_state({"project_id": "earlier", "status": IMPLEMENTING})
+        ws.write_board({"project_id": "abc", "status": "IMPLEMENTING"})
         with self.assertRaises(ValueError) as ctx:
-            self.engine.start("build something else", str(self.root))
-        self.assertIn("already has a project in progress", str(ctx.exception))
+            self.engine.start("build it", str(self.root))
+        self.assertIn("already has a project", str(ctx.exception))
 
     def test_a_finished_project_does_not_block_a_new_one(self):
         ws = Workspace(self.root)
         ws.ensure()
-        ws.write_state({"project_id": "earlier", "status": COMPLETED})
+        ws.write_board({"project_id": "abc", "status": COMPLETED})
         project = self.engine.start("build something else", str(self.root))
-        self.assertNotEqual(project.id, "earlier")
+        self.assertNotEqual(project.id, "abc")
+        self.engine.stop()
+
+    def test_the_innovation_slider_overrides_the_setting(self):
+        self.store.update({"project": {"innovation_rounds": 2}})
+        project = self.engine.start("build it", str(self.root), innovation=0)
+        self.assertEqual(project.innovation_rounds, 0)
+        self.engine.stop()
+
+    def test_an_existing_codebase_gets_a_baseline_verification(self):
+        # Being handed a repository that was already red matters: without this
+        # the first failure looks like the developer broke it.
+        (self.root / "go.mod").write_text("module x\n", encoding="utf-8")
+        project = self.engine.start("improve it", str(self.root))
+        self.assertTrue(project.needs_verification)
+        self.assertIn("go test ./...", project.tooling["commands"])
+        self.engine.stop()
+
+    def test_an_empty_folder_is_not_verified_before_anything_exists(self):
+        # Verifying an empty directory reports a failing build ("no tests ran")
+        # and sends the developer off to fix a project that does not exist yet.
+        project = self.engine.start("build it", str(self.root))
+        self.assertFalse(project.needs_verification)
+        self.engine.stop()
 
     def test_the_root_is_not_collapsed_to_the_repository(self):
-        # A council run resolves into a repo root; a project must not. It lays
-        # out its own tree, and silently redirecting it up a level would have
-        # it build over a codebase nobody pointed at.
-        sub = self.root / "nested"
-        sub.mkdir()
-        self.assertEqual(self.engine._resolve_root(str(sub)), str(sub.resolve()))
+        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
+        nested = self.root / "service"
+        nested.mkdir()
+        project = self.engine.start("build it", str(nested))
+        self.assertEqual(project.workspace, str(nested.resolve()))
+        self.engine.stop()
 
 
 class TestTheLoop(unittest.TestCase):
-    """The whole five-phase cycle, against a real directory.
+    """The whole decision loop, against a real directory.
 
-    Slow, and the only test here that would notice if the phases stopped
+    Slow, and the only test here that would notice if the turns stopped
     connecting to each other.
     """
 
@@ -357,8 +860,8 @@ class TestTheLoop(unittest.TestCase):
         self.store.update({
             "providers": {r: mock_provider(r) for r in ROLES},
             "workspace": str(self.root),
-            "project": {"max_steps": 20, "max_fix_attempts": 3,
-                        "expansion_rounds": 1},
+            "project": {"max_steps": 24, "max_fix_attempts": 3,
+                        "innovation_rounds": 1},
         })
         self.bus = EventBus()
         self.engine = ProjectEngine(self.store, self.bus)
@@ -368,7 +871,7 @@ class TestTheLoop(unittest.TestCase):
         self.engine.wait_for_worker(60)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def drain(self, timeout: float = 300.0) -> None:
+    def drain(self, timeout: float = 400.0) -> None:
         deadline = time.time() + timeout
         while time.time() < deadline:
             if not self.engine.is_running():
@@ -376,76 +879,81 @@ class TestTheLoop(unittest.TestCase):
             time.sleep(0.25)
         self.fail("The project never finished.")
 
-    def test_a_project_runs_from_brief_to_readme(self):
+    def test_a_project_runs_from_goal_to_a_clear_board(self):
         self.engine.start("A greeting module in Python.", str(self.root))
         self.drain()
 
         project = self.engine.project
         self.assertEqual(project.status, COMPLETED, project.error)
 
-        # Every phase left its artefact behind, and they are real files.
-        self.assertTrue((self.root / "SPEC.md").exists())
+        # Real files, written by real turns.
         self.assertTrue((self.root / "greeter.py").exists())
         self.assertTrue((self.root / "test_greeter.py").exists())
-        self.assertTrue((self.root / "README.md").exists())
 
         # The build genuinely failed once and was genuinely fixed. The mock's
         # first implementation drops the name from the greeting, so its own
         # test suite really fails; QA really runs it, really captures the
         # trace, and the developer is really handed it back.
-        self.assertEqual(project.build_status, "passing")
-        self.assertIn(
-            "{name}", (self.root / "greeter.py").read_text(encoding="utf-8")
-        )
-        headings = [s.heading for s in project.steps]
-        self.assertIn("Fix the build", headings)
+        self.assertEqual(project.build_health, HEALTH_PASSING)
+        self.assertIn("{name}", (self.root / "greeter.py").read_text(encoding="utf-8"))
+        triggers = [s.trigger for s in project.steps]
+        self.assertIn("build FAILING", triggers)
         # And the counter was reset once it passed, so the next failure starts
         # from a full budget rather than from a spent one.
         self.assertEqual(project.fix_attempts, 0)
 
-        # The expansion round happened and its task is on the list.
-        self.assertIn("task_3", {t["id"] for t in project.tasks})
-
-        # All five phases were visited.
-        self.assertEqual(
-            {s.phase for s in project.steps},
-            {1, 2, 3, 4, 5},
+        # Every card reached Done, including the one nobody asked for.
+        self.assertEqual(project.column(COL_BACKLOG), [])
+        self.assertEqual(project.column(COL_IN_REVIEW), [])
+        self.assertTrue(
+            any(c["origin"] == ORIGIN_INNOVATION for c in project.column(COL_DONE))
         )
 
-    def test_the_state_file_tracks_the_run(self):
+    def test_the_first_turn_writes_nothing(self):
+        # The read-only audit is the promise that pointing this at somebody's
+        # repository looks before it touches. It is checked here against a real
+        # invocation rather than trusted from the decision table.
+        self.engine.start("A greeting module in Python.", str(self.root))
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            project = self.engine.project
+            if project and project.steps and project.steps[0].ended_at:
+                break
+            time.sleep(0.1)
+        first = self.engine.project.steps[0]
+        self.assertTrue(first.read_only)
+        self.assertEqual(first.role, "qa")
+        self.assertEqual(first.files_modified, [])
+
+    def test_the_board_tracks_the_run(self):
         self.engine.start("A greeting module in Python.", str(self.root))
         self.drain()
-
-        state = Workspace(self.root).read_state()
-        self.assertEqual(state["status"], COMPLETED)
-        self.assertEqual(state["build_status"], "passing")
-        self.assertFalse(state["continuation_token_needed"])
-        self.assertTrue(state["tasks"])
-        # Written as ISO-8601, which is what the schema asks for.
-        self.assertRegex(state["last_run_timestamp"], r"^\d{4}-\d{2}-\d{2}T\d{2}:")
+        board = Workspace(self.root).read_board()
+        self.assertEqual(board["status"], COMPLETED)
+        self.assertEqual(board["build_health"], HEALTH_PASSING)
+        self.assertGreater(board["steps_used"], 5)
+        self.assertEqual(board["columns"]["backlog"], [])
 
     def test_the_critique_log_accumulates(self):
         self.engine.start("A greeting module in Python.", str(self.root))
         self.drain()
-        log = Workspace(self.root).critique_path.read_text(encoding="utf-8")
-        self.assertIn("QA", log)
-        self.assertIn("Project completed", log)
+        text = Workspace(self.root).critique()
+        self.assertIn("Verification", text)
+        self.assertIn("FAILING", text)
 
     def test_events_narrate_the_run(self):
-        seen = []
         q = self.bus.subscribe()
         self.engine.start("A greeting module in Python.", str(self.root))
         self.drain()
+        seen = set()
         while not q.empty():
-            seen.append(q.get_nowait()["kind"])
-        for kind in ("project_started", "project_step", "project_step_done",
+            seen.add(q.get_nowait().get("kind"))
+        for name in ("project_started", "project_step", "project_step_done",
                      "project_state", "project_log"):
-            self.assertIn(kind, seen)
+            self.assertIn(name, seen, name)
 
     def test_stopping_ends_the_run(self):
         self.engine.start("A greeting module in Python.", str(self.root))
-        # Let the first agent actually get going, so this exercises killing a
-        # child process rather than a race with the thread start.
         time.sleep(1.0)
         self.engine.stop()
         self.assertTrue(self.engine.wait_for_worker(60))
@@ -458,116 +966,44 @@ class TestTheLoop(unittest.TestCase):
         self.engine.stop()
         self.engine.wait_for_worker(60)
 
-        # A stopped project is FAILED, which is terminal - resuming it is a new
-        # decision, so the operator starts it again rather than continuing a
-        # run the engine had already written off.
-        Workspace(self.root).write_state({
-            **Workspace(self.root).read_state(), "status": PLANNING,
-        })
-        project = self.engine.start("", str(self.root), resume=True)
-        self.assertEqual(project.brief, "A greeting module in Python.")
-        self.engine.stop()
-        self.engine.wait_for_worker(60)
+        board = Workspace(self.root).read_board()
+        board["status"] = "IMPLEMENTING"  # a crash leaves it mid-run, not FAILED
+        Workspace(self.root).write_board(board)
 
-    def test_pausing_halts_between_steps(self):
+        resumed = self.engine.start("", str(self.root), resume=True)
+        self.assertEqual(resumed.goal, "A greeting module in Python.")
+        self.drain()
+        self.assertEqual(self.engine.project.status, COMPLETED)
+
+    def test_pausing_halts_between_turns(self):
         self.engine.start("A greeting module in Python.", str(self.root))
+        time.sleep(1.0)
         self.engine.pause()
-        self.assertTrue(self.engine.project.paused)
-        # The step in flight is allowed to finish - killing a CLI between two
-        # file writes leaves a tree nothing in the run knows is half-written.
-        deadline = time.time() + 180
-        while time.time() < deadline:
-            if self.engine.project.steps and all(
-                s.state != "running" for s in self.engine.project.steps
-            ):
-                break
-            time.sleep(0.25)
-        self.assertTrue(self.engine.project.paused)
-        self.assertNotIn(self.engine.project.status, (COMPLETED, FAILED))
-        self.engine.stop()
-        self.engine.wait_for_worker(60)
-
-    def test_a_hand_off_moves_the_next_step(self):
-        self.engine.start("A greeting module in Python.", str(self.root))
-        self.engine.handoff("qa")
+        deadline = time.time() + 200
+        while time.time() < deadline and not self.engine.project.paused:
+            time.sleep(0.2)
+        used = self.engine.project.steps_used
+        time.sleep(2.0)
+        # Paused means paused: no further turn may start.
+        self.assertEqual(self.engine.project.steps_used, used)
+        self.engine.resume()
         self.drain()
-        # Somewhere in the run a step ran on the QA chair having been forced
-        # there, rather than because its phase called for it.
-        self.assertTrue(
-            any(s.role == "qa" and s.handoff_from for s in self.engine.project.steps)
-            or any(s.phase == PHASE_ARCHITECTURE and s.role == "qa"
-                   for s in self.engine.project.steps)
-        )
+        self.assertEqual(self.engine.project.status, COMPLETED)
 
-    def test_the_step_limit_stops_a_project_that_cannot_finish(self):
-        self.store.update({"project": {"max_steps": 2}})
+    def test_the_turn_limit_stops_a_project_that_cannot_finish(self):
+        self.store.update({"project": {"max_steps": 2, "max_fix_attempts": 3,
+                                       "innovation_rounds": 0}})
         self.engine.start("A greeting module in Python.", str(self.root))
         self.drain()
-        project = self.engine.project
-        self.assertEqual(project.status, FAILED)
-        self.assertIn("step limit", project.error)
-        self.assertLessEqual(project.steps_used, 3)
-
-
-class TestPhaseOne(unittest.TestCase):
-    """Phase 1 is judged on what is on disk, not on an exit status."""
-
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="theseus-proj-"))
-        self.store = ConfigStore(self.tmp / "config.json")
-        self.root = self.tmp / "build"
-        self.root.mkdir()
-        self.engine = ProjectEngine(self.store, EventBus())
-        self.project = Project(
-            id="p1", brief="build a thing", workspace=str(self.root)
-        )
-        self.project.config = self.store.all()
-        Workspace(self.root).ensure()
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def stub_step(self, ok, report):
-        """Stand in for one agent turn, without launching one."""
-        step = StepRecord(index=1, phase=1, role="architect", label="stub",
-                          heading="Design the system")
-        step.ok = ok
-        step.error = "" if ok else "Exited with status 1."
-        step.state = "done" if ok else "failed"
-        self.engine._run_role = lambda *a, **k: (step, report)
-        return step
-
-    def test_a_failed_architect_that_left_a_plan_carries_on(self):
-        # A CLI that wrote the spec and the roadmap and *then* fell over has
-        # done phase 1. Failing on the exit code would throw that away and make
-        # the operator start again from a folder that already has the answer.
-        Workspace(self.root).spec_path.write_text("# Spec\n", encoding="utf-8")
-        self.stub_step(False, {"tasks": [{"id": "task_1", "description": "go"}]})
-        self.engine._phase_architecture(self.project)
-        self.assertEqual(self.project.phase, PHASE_IMPLEMENTATION)
-        self.assertEqual(self.project.status, IMPLEMENTING)
-        self.assertEqual([t["id"] for t in self.project.tasks], ["task_1"])
-
-    def test_an_architect_that_left_nothing_ends_the_project(self):
-        self.stub_step(False, {})
-        self.engine._phase_architecture(self.project)
-        self.assertEqual(self.project.status, FAILED)
-        self.assertIn("nothing for the developer to build", self.project.error)
-
-    def test_a_spec_with_no_task_list_is_enough_to_continue(self):
-        # The developer can work from SPEC.md; an empty task list is thin, not
-        # fatal.
-        Workspace(self.root).spec_path.write_text("# Spec\n", encoding="utf-8")
-        self.stub_step(True, {})
-        self.engine._phase_architecture(self.project)
-        self.assertEqual(self.project.phase, PHASE_IMPLEMENTATION)
+        self.assertEqual(self.engine.project.status, FAILED)
+        self.assertIn("turn limit", self.engine.project.error)
 
 
 class TestSnapshotState(unittest.TestCase):
-    """What the Projects tab is served."""
+    """What the tab renders when nothing is running."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="theseus-proj-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="theseus-snap-"))
         self.store = ConfigStore(self.tmp / "config.json")
         self.root = self.tmp / "build"
         self.root.mkdir()
@@ -582,41 +1018,38 @@ class TestSnapshotState(unittest.TestCase):
         self.assertFalse(state["resumable"])
 
     def test_a_project_left_on_disk_is_found(self):
-        # The app was closed mid-build. Presenting an empty form over the top
-        # of a half-built codebase would be the wrong answer.
         ws = Workspace(self.root)
         ws.ensure()
-        ws.write_state({
-            "project_id": "abc", "status": IMPLEMENTING, "current_phase": 2,
-            "brief": "a half-built thing", "tasks": [],
-        })
+        project = Project(id="abc", goal="build it", workspace=str(self.root))
+        project.status = "IMPLEMENTING"
+        project.tasks = [card("t1", COL_BACKLOG)]
+        ws.write_board(project.board_document())
+
         state = self.engine.snapshot_state(str(self.root))
         self.assertTrue(state["found_on_disk"])
         self.assertTrue(state["resumable"])
-        self.assertEqual(state["project"]["brief"], "a half-built thing")
+        self.assertEqual(state["project"]["goal"], "build it")
+        self.assertEqual(state["project"]["counts"]["backlog"], 1)
 
     def test_a_finished_project_is_not_resumable(self):
         ws = Workspace(self.root)
         ws.ensure()
-        ws.write_state({"project_id": "abc", "status": COMPLETED, "tasks": []})
+        ws.write_board({"project_id": "abc", "goal": "g", "status": COMPLETED})
         state = self.engine.snapshot_state(str(self.root))
         self.assertFalse(state["resumable"])
 
     def test_a_finished_project_does_not_follow_you_to_another_folder(self):
-        # The tab reports on the folder it is asked about. A project left in
-        # memory from the last build would otherwise be shown over the top of
-        # a folder that has nothing to do with it.
+        # A completed run stays in memory, but asked about a different folder
+        # this must report *that* folder rather than the last thing it built.
         other = self.tmp / "elsewhere"
         other.mkdir()
-        self.engine._project = Project(
-            id="abc", brief="an earlier build", workspace=str(self.root),
-            status=COMPLETED,
-        )
-        here = self.engine.snapshot_state(str(self.root))
-        self.assertEqual(here["project"]["id"], "abc")
-        there = self.engine.snapshot_state(str(other))
-        self.assertIsNone(there["project"])
+        finished = Project(id="abc", goal="g", workspace=str(self.root))
+        finished.status = COMPLETED
+        self.engine._project = finished
+
+        state = self.engine.snapshot_state(str(other))
+        self.assertIsNone(state["project"])
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)

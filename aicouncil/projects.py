@@ -1,66 +1,74 @@
-"""The Projects engine: three agents, five phases, nobody watching.
+"""The Projects engine: three agents around one board, nobody watching.
 
 Council is one task, two stages and a human at the gate. Projects is the other
-end of that: a brief goes in, and an architect, a developer and a QA agent
-take turns against the same directory until the thing builds, passes its own
-tests and has a README - across more turns than any one of them can hold in a
-context window.
+end of that: a goal goes in, and an architect, a developer and a QA agent work
+a shared Kanban board against the same directory until the thing builds,
+passes its own tests, and nobody has anything left to add.
 
-The phase cycle
----------------
+Not a pipeline
+--------------
 
-::
+There is no step 1, step 2, step 3. Every turn the engine reads the board and
+asks one question - *what does this project need next?* - and the answer picks
+the agent::
 
-    [1 Architecture] --> [2 Implementation] --> [3 QA & build]
-           ^                     ^                     |
-           |                     | build failing       |
-           |                     +---------------------+
-           |                                           | build passing
-    [5 Finalisation] <-- [4 Feature expansion] <--------+
-           |
-           v
-       COMPLETED
+    build FAILING ......... developer fixes it
+    build UNKNOWN ......... QA builds and tests it
+    tasks in review ....... architect reviews the diff
+    tasks in backlog ...... developer claims the top one
+    board empty, green .... architect proposes what is missing
+    nothing left .......... done
 
-Phase 4 does not implement anything itself: it decides what v1.1 should be,
-adds those tasks, and drops the run back into phase 2 so the same developer
-and the same QA agent build and verify them the way they did the base. When
-the expansion budget is spent, a passing build goes to phase 5 instead -
-a final integrity check, then a README - and the project is done.
+That ordering is the whole design. A failing build outranks new features; an
+unverified build outranks a code review, because reviewing code that does not
+compile is wasted; and *only* a QA turn can move the build to PASSING. The
+engine sets it back to UNKNOWN the moment anyone writes code, so a green board
+always means somebody ran the tests after the last edit.
 
 Who owns what
 -------------
 
-The engine owns ``.theseus/STATE.json``. Agents are told to read it and never
-to write it, and the engine rewrites it after every step, so a run always has
-one authoritative record of where it is. What agents *do* own is
-``.theseus/ROADMAP.md`` (the living checklist, prose) and
-``.theseus/CRITIQUE.log`` (append-only findings), plus the project's own
-files. Structured changes - a task finished, a build failed - come back
-through the JSON block each agent ends its turn with, which the engine parses
-and applies. That split is deliberate: prose files tolerate three agents
-editing them, a state machine does not.
+The engine owns ``.theseus/BOARD.json`` and is the only writer. Agents read it
+and report *deltas* - this task moved, the build failed, here are three ideas -
+in a fenced JSON block the engine parses and applies. Agents own the prose:
+``.theseus/CRITIQUE.log`` (append-only findings) and ``.theseus/SPEC.md``
+(design notes), plus the project's own source. That split is deliberate: prose
+files tolerate three writers, a state machine does not.
+
+Everything the engine creates lives in ``.theseus/`` and that directory is
+added to ``.gitignore`` on the way in, so pointing this at a real repository
+does not litter its diff.
+
+Working on somebody else's code
+-------------------------------
+
+Most projects are not empty folders. The first turn of every run is a
+*read-only* audit: the QA agent gets no write grant at all and is asked what
+is already here - the layout, the configs, the build tooling. The engine reads
+the tooling too (``go.mod``, ``package.json``, ``Cargo.toml``, ...) and puts
+the real commands on the board, so QA runs ``go test ./...`` because that is
+what this project uses, not because an agent invented a script. Everything
+after that turn is asked for targeted edits against named files, never
+whole-file rewrites.
 
 Surviving a context limit
 -------------------------
 
-No turn depends on the previous turn's conversation. Every prompt is built
-from files on disk - the state, the roadmap, the spec, the last failure
-verbatim - so an agent that dies mid-phase costs one step, not the run. When a
-step fails in a way that looks like exhaustion (a token or quota limit, a
-timeout, a non-zero exit), the engine marks ``continuation_token_needed`` and
-re-runs that same step on a *different* agent, which is why the roles are
-configured as three independent providers rather than one CLI with three
-prompts.
+No turn depends on the previous turn's conversation. Every prompt is rebuilt
+from the board and the diff on disk, never from a transcript, so an agent that
+dies mid-turn costs one turn, not the run. When a turn fails in a way that
+reads as exhaustion - a token or quota limit, a timeout - the engine marks
+``continuation_needed`` and re-runs that same turn on a *different* agent,
+which is why the three chairs are three independent providers.
 
 Permission to write
 -------------------
 
-A project writes. It cannot do anything else: phase 1 creates SPEC.md, phase 2
-writes the codebase, phase 3 appends to CRITIQUE.log. So every project step is
-invoked with its agent's auto-approve flags, and there is no configuration
-that changes that. Starting a project *is* the grant - which is why it takes a
-deliberate press of a button, names the folder it will write to, and takes a
-git snapshot first where there is one to take.
+A project writes. Every turn after the audit is invoked with its agent's
+auto-approve flags, and there is no setting that changes that. Starting a
+project *is* the grant - which is why it takes a deliberate press of a button,
+names the folder it will write to, and takes a git snapshot first where there
+is one to take.
 
 Only one project runs at a time, and never alongside a council or chat run:
 they would be two agents editing the same tree with no idea the other existed.
@@ -69,6 +77,7 @@ they would be two agents editing the same tree with no idea the other existed.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
 import threading
@@ -83,41 +92,47 @@ from . import gitutil, prompts
 from .events import EventBus
 from .providers import ProviderResult, ProviderRunner, probe
 
-# -- The state machine -----------------------------------------------------
+# -- The board -------------------------------------------------------------
 
-# Status values. These are the schema's enum and the whole of it: nothing else
-# is ever written to `status`, because the file is read by agents that were
-# told what the six values mean.
+# The four columns, in the order they are read and rendered. These strings are
+# the ones agents see in BOARD.json and report back, so they are lower-case
+# and boring on purpose.
+COL_BACKLOG = "backlog"
+COL_IN_PROGRESS = "in_progress"
+COL_IN_REVIEW = "in_review"
+COL_DONE = "done"
+
+COLUMNS = (COL_BACKLOG, COL_IN_PROGRESS, COL_IN_REVIEW, COL_DONE)
+COLUMN_LABELS = {
+    COL_BACKLOG: "Backlog",
+    COL_IN_PROGRESS: "In progress",
+    COL_IN_REVIEW: "Review",
+    COL_DONE: "Done",
+}
+
+# Build health. Only a QA turn may report PASSING; the engine writes UNKNOWN
+# itself whenever code changes, so "green" cannot survive an edit.
+HEALTH_PASSING = "PASSING"
+HEALTH_FAILING = "FAILING"
+HEALTH_UNKNOWN = "UNKNOWN"
+HEALTH_VALUES = (HEALTH_PASSING, HEALTH_FAILING, HEALTH_UNKNOWN)
+
+# Project status. Derived from whichever decision the loop just took - it is
+# what the banner says, never what the engine dispatches on.
+AUDITING = "AUDITING"
 PLANNING = "PLANNING"
 IMPLEMENTING = "IMPLEMENTING"
 TESTING = "TESTING"
-EXPANDING = "EXPANDING"
+REVIEWING = "REVIEWING"
+INNOVATING = "INNOVATING"
 COMPLETED = "COMPLETED"
 FAILED = "FAILED"
 
 TERMINAL_STATUSES = {COMPLETED, FAILED}
 
-# Phases are what the engine actually dispatches on. `status` is derived from
-# the phase below, and cannot carry the machine on its own: phase 5 has two
-# steps, a verification and a write-up, and the schema has no word for either
-# that is not already spoken for.
-PHASE_ARCHITECTURE = 1
-PHASE_IMPLEMENTATION = 2
-PHASE_QA = 3
-PHASE_EXPANSION = 4
-PHASE_FINALISATION = 5
-
-PHASE_NAMES = {
-    PHASE_ARCHITECTURE: "Architecture",
-    PHASE_IMPLEMENTATION: "Implementation",
-    PHASE_QA: "QA & build",
-    PHASE_EXPANSION: "Feature expansion",
-    PHASE_FINALISATION: "Finalisation",
-}
-
-# The three jobs, and the provider each is configured under. The ids are the
+# The three chairs, and the provider each is configured under. The ids are the
 # provider keys in config, so every picker the council already has - agent,
-# model, effort, availability - works on these unchanged.
+# model, effort, availability, quota - works on these unchanged.
 ROLES = ("architect", "coder", "qa")
 ROLE_LABELS = {
     "architect": "Architect",
@@ -125,36 +140,43 @@ ROLE_LABELS = {
     "qa": "QA",
 }
 
-# What a task looks like. `assigned_to` is a role id, not an agent id: which
-# CLI holds the developer's chair is a setting, and a task written in round
-# one must not name a binary the operator reassigned in round three.
-TASK_STATUSES = ("pending", "in_progress", "completed")
+# Task kinds. A bug is a task that jumps the queue: QA raises them off a build
+# failure, and the developer claims them before anything in the backlog.
+KIND_TASK = "task"
+KIND_BUG = "bug"
+KINDS = (KIND_TASK, KIND_BUG)
 
-# Files the engine manages, relative to the project root.
+# Where a task came from. Only used to tell the operator which items the
+# council invented on its own once the brief was satisfied.
+ORIGIN_GOAL = "goal"
+ORIGIN_INNOVATION = "innovation"
+ORIGIN_BUG = "bug"
+
+# Files the engine manages, all relative to the project root.
 THESEUS_DIR = ".theseus"
-STATE_FILE = "STATE.json"
-ROADMAP_FILE = "ROADMAP.md"
+BOARD_FILE = "BOARD.json"
 CRITIQUE_FILE = "CRITIQUE.log"
+SPEC_FILE = "SPEC.md"
 
-# How much of the roadmap and the state file the browser is sent. The tracker
-# renders both live, and a project that has run for an hour has a critique log
-# far larger than anything worth pushing down an SSE stream on every step.
+# How much of the board and the log the browser is sent. A project that has
+# run for an hour has a critique log far larger than anything worth pushing
+# down an SSE stream on every turn.
 MAX_UI_TEXT = 24_000
-# Step records held for the UI. A long project produces hundreds; the whole
-# history is in CRITIQUE.log and the transcript, and the tracker only ever
-# shows the recent ones.
+# Turn records held for the UI. The whole history is in CRITIQUE.log.
 MAX_STEP_RECORDS = 200
+# How much of a build failure is kept on the board and replayed to the agent
+# that has to fix it. Enough for a stack trace, not a whole test run.
+MAX_BUILD_LOG = 6_000
 
 # A reply that ends in a fenced JSON block, which is the contract in
-# `prompts.REPORT_CONTRACT`. Matched non-greedily from the *last* fence, since
-# an agent explaining the contract back to us would otherwise win.
+# ``prompts.REPORT_CONTRACT``. Matched from the *last* fence backwards, since
+# an agent explaining the contract back to us puts an example block earlier.
 FENCED_JSON_RE = re.compile(r"```(?:json)?\s*\n(.*?)\n?```", re.DOTALL)
 
 # What exhaustion looks like from outside the process. None of the three CLIs
-# has a distinct exit code for it, so this reads their prose - which means it
-# is a heuristic and is treated as one: a false positive costs one hand-off to
-# another agent, which is survivable, and a false negative just looks like an
-# ordinary failed step.
+# has a distinct exit code for it, so this reads their prose - which makes it a
+# heuristic, and it is treated as one: a false positive costs one hand-off to
+# another agent, and a false negative just looks like an ordinary failed turn.
 EXHAUSTION_RE = re.compile(
     r"(context (?:window |length |limit )?(?:exceeded|too long|full)"
     r"|maximum context"
@@ -170,9 +192,129 @@ EXHAUSTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# How many consecutive turns may leave the board completely unchanged before
+# the run is called stalled. Three agents that all decline to move a card are
+# not making progress, and the step limit is too blunt an instrument to notice
+# that an hour early.
+STALL_LIMIT = 3
+
 
 class ProjectBusy(RuntimeError):
     """A project is already running."""
+
+
+# --------------------------------------------------------------------------
+# Native build tooling
+# --------------------------------------------------------------------------
+
+# Marker file -> (stack name, the commands that stack actually uses). Ordered:
+# the first marker found names the stack, and every marker found contributes
+# its commands, because a Go service with a Makefile has both.
+#
+# The point of this table is that QA is *told* the project's own commands
+# rather than inventing a build script. Adopting `go test ./...` because
+# go.mod is present is the difference between verifying this project and
+# verifying a scaffold an agent wrote to make itself pass.
+TOOLING_MARKERS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("go.mod", "Go", ("gofmt -l .", "go vet ./...", "go build ./...", "go test ./...")),
+    ("Cargo.toml", "Rust", ("cargo fmt --check", "cargo clippy", "cargo test")),
+    ("pyproject.toml", "Python", ("python3 -m pytest",)),
+    ("pytest.ini", "Python", ("python3 -m pytest",)),
+    ("tox.ini", "Python", ("python3 -m pytest",)),
+    ("setup.py", "Python", ("python3 -m pytest",)),
+    ("Gemfile", "Ruby", ("bundle exec rake test",)),
+    ("pom.xml", "Java (Maven)", ("mvn -q verify",)),
+    ("build.gradle", "Java (Gradle)", ("./gradlew build",)),
+    ("CMakeLists.txt", "CMake", ("cmake -B build", "cmake --build build")),
+    ("Makefile", "Make", ("make",)),
+)
+
+# package.json scripts worth running, in the order they should run.
+NPM_SCRIPTS = ("lint", "build", "test")
+
+
+def detect_tooling(root: str | Path) -> Dict[str, Any]:
+    """Read the project's own build tooling off disk. Never raises, never writes.
+
+    Returns ``{"stack": [...], "commands": [...], "markers": [...]}``. An empty
+    result is normal and honest - an empty folder has no tooling yet, and the
+    agents are told to say so rather than to guess.
+    """
+    path = Path(root)
+    stack: List[str] = []
+    commands: List[str] = []
+    markers: List[str] = []
+
+    for marker, name, cmds in TOOLING_MARKERS:
+        if not (path / marker).is_file():
+            continue
+        markers.append(marker)
+        if name not in stack:
+            stack.append(name)
+        for cmd in cmds:
+            if cmd not in commands:
+                commands.append(cmd)
+
+    # package.json is handled separately: its commands are whatever the
+    # project declared, not a guess. `npm test` on a package with no test
+    # script fails in a way that looks like a broken build.
+    pkg = path / "package.json"
+    if pkg.is_file():
+        markers.append("package.json")
+        if "Node" not in stack:
+            stack.append("Node")
+        scripts: Dict[str, Any] = {}
+        try:
+            data = json.loads(pkg.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(data, dict) and isinstance(data.get("scripts"), dict):
+                scripts = data["scripts"]
+        except (OSError, json.JSONDecodeError, ValueError):
+            scripts = {}
+        for name in NPM_SCRIPTS:
+            if scripts.get(name):
+                cmd = f"npm run {name}" if name != "test" else "npm test"
+                if cmd not in commands:
+                    commands.append(cmd)
+
+    return {"stack": stack, "commands": commands, "markers": markers}
+
+
+def ensure_gitignored(root: str | Path) -> str:
+    """Add ``.theseus/`` to the project's .gitignore. Returns what it did.
+
+    Only inside a git repository, and only ever by appending: an existing
+    .gitignore is somebody's file, and a project engine that rewrites it has
+    already broken the promise that it edits surgically.
+    """
+    path = Path(root)
+    try:
+        if not gitutil.repo_root(path):
+            return ""
+    except (gitutil.GitError, OSError):
+        return ""
+
+    ignore = path / ".gitignore"
+    try:
+        current = ignore.read_text(encoding="utf-8", errors="replace") if ignore.is_file() else ""
+    except OSError:
+        return ""
+
+    for line in current.splitlines():
+        if line.strip().strip("/") == THESEUS_DIR:
+            return ""
+
+    block = (
+        f"\n# Working state for the Theseus AI project engine (not part of the app):\n"
+        f"/{THESEUS_DIR}/\n"
+    )
+    try:
+        with ignore.open("a", encoding="utf-8") as fh:
+            if current and not current.endswith("\n"):
+                fh.write("\n")
+            fh.write(block)
+    except OSError:
+        return ""
+    return f"Added /{THESEUS_DIR}/ to .gitignore."
 
 
 # --------------------------------------------------------------------------
@@ -185,13 +327,9 @@ def parse_report(text: str) -> Dict[str, Any]:
 
     Returns ``{}`` when there is nothing parseable, which the caller treats as
     "it did the work but did not tell me about it" rather than as a failure.
-    That distinction matters: a phase failed on a missing report would burn a
-    retry on an agent whose only mistake was formatting, and the files it
-    wrote are on disk either way for QA to find.
-
-    Fences are searched from the last one backwards. An agent that quotes the
-    contract while explaining itself puts an example block earlier in the
-    reply, and the real report is always the thing it ends with.
+    That distinction matters: a turn failed on a missing report would burn a
+    retry on an agent whose only mistake was formatting, and whatever it wrote
+    is on disk either way for QA to find.
     """
     if not text:
         return {}
@@ -204,50 +342,60 @@ def parse_report(text: str) -> Dict[str, Any]:
         if start != -1:
             candidates.append(tail[start + 1 :])
 
+    keys = {"status", "files_modified", "reasoning", "tasks", "build", "reviews", "ideas"}
     for raw in reversed(candidates):
         try:
             data = json.loads(raw)
         except (json.JSONDecodeError, ValueError):
             continue
-        if isinstance(data, dict) and (
-            "status" in data or "files_modified" in data or "reasoning" in data
-        ):
+        if isinstance(data, dict) and keys & set(data):
             return data
     return {}
 
 
 def _as_task(entry: Any, fallback_role: str = "coder") -> Optional[Dict[str, Any]]:
-    """Normalise one reported task, or None if it is not one."""
+    """Normalise one reported card, or None if it is not one."""
     if not isinstance(entry, dict):
         return None
     task_id = str(entry.get("id") or "").strip()
     if not task_id:
         return None
-    status = str(entry.get("status") or "pending").strip().lower()
-    if status not in TASK_STATUSES:
-        status = "pending"
+
+    column = str(entry.get("column") or COL_BACKLOG).strip().lower()
+    if column not in COLUMNS:
+        column = COL_BACKLOG
+    kind = str(entry.get("kind") or KIND_TASK).strip().lower()
+    if kind not in KINDS:
+        kind = KIND_TASK
     assigned = str(entry.get("assigned_to") or "").strip().lower()
+    origin = str(entry.get("origin") or "").strip().lower()
+
     return {
         "id": task_id,
-        "description": str(entry.get("description") or "").strip(),
-        "status": status,
+        "title": str(entry.get("title") or entry.get("description") or "").strip(),
+        "detail": str(entry.get("detail") or "").strip(),
+        "column": column,
+        "kind": kind,
         "assigned_to": assigned if assigned in ROLES else fallback_role,
+        "origin": origin if origin in (ORIGIN_GOAL, ORIGIN_INNOVATION, ORIGIN_BUG)
+        else (ORIGIN_BUG if kind == KIND_BUG else ORIGIN_GOAL),
+        "note": str(entry.get("note") or "").strip(),
     }
 
 
 def merge_tasks(
     existing: List[Dict[str, Any]], reported: Any, fallback_role: str = "coder"
 ) -> List[Dict[str, Any]]:
-    """Apply an agent's reported tasks onto the list the engine is holding.
+    """Apply an agent's reported cards onto the board the engine is holding.
 
-    A reported task with an id already present updates that entry; a new id is
-    appended. Nothing is ever removed - an agent that omits a task from its
-    report has said nothing about it, and reading silence as deletion would let
-    one forgetful reply erase the roadmap.
+    A reported id already on the board moves that card; a new id is appended.
+    Nothing is ever removed - an agent that omits a card has said nothing about
+    it, and reading silence as deletion would let one forgetful reply wipe the
+    board.
 
-    A status-only report (``{"id": "task_3", "status": "completed"}``) keeps
-    the description it already had, which is what the contract asks agents to
-    send once the list exists.
+    A move-only report (``{"id": "t3", "column": "done"}``) keeps the title and
+    detail the card already had, which is what the contract asks for once the
+    board exists.
     """
     out = [dict(t) for t in existing]
     index = {t["id"]: i for i, t in enumerate(out)}
@@ -257,15 +405,33 @@ def merge_tasks(
             continue
         if task["id"] in index:
             current = out[index[task["id"]]]
-            current["status"] = task["status"]
-            if task["description"]:
-                current["description"] = task["description"]
-            if isinstance(entry, dict) and entry.get("assigned_to"):
-                current["assigned_to"] = task["assigned_to"]
+            current["column"] = task["column"]
+            for key in ("title", "detail", "note"):
+                if task[key]:
+                    current[key] = task[key]
+            if isinstance(entry, dict):
+                if entry.get("assigned_to"):
+                    current["assigned_to"] = task["assigned_to"]
+                if entry.get("kind"):
+                    current["kind"] = task["kind"]
         else:
             index[task["id"]] = len(out)
             out.append(task)
     return out
+
+
+def _as_health(value: Any) -> str:
+    """One of the three health values, or UNKNOWN. Never guesses PASSING."""
+    text = str(value or "").strip().upper()
+    if text in HEALTH_VALUES:
+        return text
+    # Accept the obvious synonyms an agent might reach for, but only for the
+    # two that are safe to infer. Anything unrecognised stays UNKNOWN.
+    if text in ("PASS", "PASSED", "GREEN", "OK", "SUCCESS"):
+        return HEALTH_PASSING
+    if text in ("FAIL", "FAILED", "RED", "BROKEN", "ERROR"):
+        return HEALTH_FAILING
+    return HEALTH_UNKNOWN
 
 
 # --------------------------------------------------------------------------
@@ -278,7 +444,7 @@ class Workspace:
 
     Every read here is forgiving and every write is atomic. The files sit in a
     folder three coding agents have write access to, so a truncated or
-    hand-mangled STATE.json has to degrade to "the engine keeps what it had"
+    hand-mangled BOARD.json has to degrade to "the engine keeps what it had"
     rather than take the run down.
     """
 
@@ -290,12 +456,8 @@ class Workspace:
         return self.root / THESEUS_DIR
 
     @property
-    def state_path(self) -> Path:
-        return self.dir / STATE_FILE
-
-    @property
-    def roadmap_path(self) -> Path:
-        return self.dir / ROADMAP_FILE
+    def board_path(self) -> Path:
+        return self.dir / BOARD_FILE
 
     @property
     def critique_path(self) -> Path:
@@ -303,30 +465,22 @@ class Workspace:
 
     @property
     def spec_path(self) -> Path:
-        return self.root / "SPEC.md"
+        return self.dir / SPEC_FILE
 
     def ensure(self) -> None:
-        """Create the directory and seed the two agent-owned files.
+        """Create the directory and seed the log.
 
-        Seeded rather than left absent so phase 1 has something to append to
-        and the tracker has something to render, and so a `.theseus` directory
-        in a repository is self-explanatory to whoever finds it in a diff.
+        Seeded rather than left absent so the first turn has something to
+        append to, and so a ``.theseus`` directory somebody finds in a checkout
+        explains itself.
         """
         self.dir.mkdir(parents=True, exist_ok=True)
-        if not self.roadmap_path.exists():
-            self.roadmap_path.write_text(
-                "# Roadmap\n\n"
-                "Maintained by the Theseus AI project engine and the agents it "
-                "runs. The authoritative task list is in `STATE.json`; this is "
-                "the readable one.\n\n"
-                "_Waiting for the architect._\n",
-                encoding="utf-8",
-            )
         if not self.critique_path.exists():
             self.critique_path.write_text(
                 "# Critique log\n\n"
                 "Append-only. Every build failure, review finding and "
-                "verification result, oldest first.\n",
+                "verification result, oldest first. The board itself is in "
+                "BOARD.json.\n",
                 encoding="utf-8",
             )
 
@@ -339,15 +493,12 @@ class Workspace:
             return ""
         return prompts.clip(text, limit) if limit and len(text) > limit else text
 
-    def read_state(self) -> Dict[str, Any]:
+    def read_board(self) -> Dict[str, Any]:
         try:
-            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            data = json.loads(self.board_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, ValueError):
             return {}
         return data if isinstance(data, dict) else {}
-
-    def roadmap(self, limit: int = 0) -> str:
-        return self.read_text(self.roadmap_path, limit)
 
     def critique(self, limit: int = 0) -> str:
         return self.read_text(self.critique_path, limit)
@@ -357,12 +508,12 @@ class Workspace:
 
     # -- writes ------------------------------------------------------------
 
-    def write_state(self, state: Dict[str, Any]) -> None:
-        """Persist STATE.json atomically. Failure is reported, not fatal."""
+    def write_board(self, board: Dict[str, Any]) -> None:
+        """Persist BOARD.json atomically. Failure is reported, not fatal."""
         self.dir.mkdir(parents=True, exist_ok=True)
-        tmp = self.state_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(state, indent=2, default=str) + "\n", encoding="utf-8")
-        tmp.replace(self.state_path)
+        tmp = self.board_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(board, indent=2, default=str) + "\n", encoding="utf-8")
+        tmp.replace(self.board_path)
 
     def append_critique(self, text: str) -> None:
         """Add one entry to the log. Append-only, always."""
@@ -386,11 +537,12 @@ class StepRecord:
     """One agent invocation, as the tracker shows it."""
 
     index: int
-    phase: int
     role: str
     label: str  # which CLI ran it, e.g. "Claude"
-    heading: str  # what it was asked to do, e.g. "Fix the build"
+    heading: str  # what it was asked to do, e.g. "Fix the failing build"
+    trigger: str  # why the loop chose it, e.g. "build FAILING"
     state: str = "running"  # running | done | failed | skipped
+    read_only: bool = False
     started_at: float = field(default_factory=time.time)
     ended_at: float = 0.0
     ok: bool = False
@@ -404,13 +556,13 @@ class StepRecord:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "index": self.index,
-            "phase": self.phase,
-            "phase_name": PHASE_NAMES.get(self.phase, str(self.phase)),
             "role": self.role,
             "role_label": ROLE_LABELS.get(self.role, self.role),
             "label": self.label,
             "heading": self.heading,
+            "trigger": self.trigger,
             "state": self.state,
+            "read_only": self.read_only,
             "started_at": self.started_at,
             "ended_at": self.ended_at,
             "duration": round(self.ended_at - self.started_at, 2)
@@ -427,25 +579,52 @@ class StepRecord:
 
 
 @dataclass
+class Decision:
+    """What the board says should happen next, and who does it."""
+
+    role: str
+    kind: str  # audit | plan | implement | fix | verify | review | innovate
+    heading: str
+    trigger: str
+    status: str
+    build: Callable[[str], str]
+    read_only: bool = False
+    tasks: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
 class Project:
-    """One autonomous build, from brief to hand-off."""
+    """One autonomous build, from goal to hand-off."""
 
     id: str
-    brief: str
+    goal: str
     workspace: str
-    status: str = PLANNING
-    phase: int = PHASE_ARCHITECTURE
-    active_role: str = "architect"
+    status: str = AUDITING
+    active_role: str = "qa"
     tasks: List[Dict[str, Any]] = field(default_factory=list)
-    build_status: str = "untested"
-    last_execution_error: str = ""
-    continuation_token_needed: bool = False
+    build_health: str = HEALTH_UNKNOWN
+    # Whether there is anything worth building right now. Distinct from
+    # ``build_health == UNKNOWN``, which is also true of a project nobody has
+    # written a line of code for yet: verifying an empty folder produces a
+    # failing build ("no tests ran") and sends the developer off to fix a
+    # project that does not exist. Set when an agent writes code, and at start
+    # for a workspace that arrived with build tooling already in it - there,
+    # "was this repository already broken before we touched it?" is worth one
+    # turn to find out.
+    needs_verification: bool = False
+    last_build_log: str = ""
+    ideas: List[Dict[str, Any]] = field(default_factory=list)
+    tooling: Dict[str, Any] = field(default_factory=dict)
+    audited: bool = False
+    continuation_needed: bool = False
     last_run_timestamp: str = ""
     created_at: float = field(default_factory=time.time)
     ended_at: float = 0.0
     steps_used: int = 0
     fix_attempts: int = 0
-    expansions_remaining: int = 0
+    innovation_rounds: int = 0
+    stall_count: int = 0
+    last_fingerprint: str = ""
     error: str = ""
     # How it ended, when it ended well. Kept apart from `error` rather than
     # reusing it: a summary in the error field reads as a failure everywhere
@@ -456,49 +635,103 @@ class Project:
     steps: List[StepRecord] = field(default_factory=list)
     # Frozen at start, exactly as a council run freezes its own: a project runs
     # for an hour and the operator will reasonably change settings during it.
-    # Which CLI holds which chair must not change under a running phase.
+    # Which CLI holds which chair must not change under a running turn.
     config: Dict[str, Any] = field(default_factory=dict, repr=False)
 
-    # -- the state file ----------------------------------------------------
+    # -- the board ---------------------------------------------------------
 
-    def state_document(self) -> Dict[str, Any]:
-        """``.theseus/STATE.json`` as the engine writes it.
+    def column(self, name: str) -> List[Dict[str, Any]]:
+        """Every card currently in one column, in board order."""
+        return [t for t in self.tasks if t.get("column") == name]
 
-        The first nine keys are the schema agents are told to expect; the rest
-        is the engine's own bookkeeping, kept in the same file so that a run
-        resumed after a restart - or picked up by a human reading the folder -
-        needs to open exactly one thing.
+    def open_tasks(self) -> List[Dict[str, Any]]:
+        """Everything not yet done."""
+        return [t for t in self.tasks if t.get("column") != COL_DONE]
+
+    def next_card(self) -> Optional[Dict[str, Any]]:
+        """The card the developer should claim: bugs first, then board order.
+
+        Anything already in progress outranks the backlog - a card left in
+        progress by a turn that died is the thing to finish, not to duplicate.
+        """
+        for column in (COL_IN_PROGRESS, COL_BACKLOG):
+            cards = self.column(column)
+            bugs = [c for c in cards if c.get("kind") == KIND_BUG]
+            if bugs:
+                return bugs[0]
+            if cards:
+                return cards[0]
+        return None
+
+    def fingerprint(self) -> str:
+        """A hash of everything a turn is supposed to be able to change.
+
+        Used only to notice a stalled swarm. Deliberately excludes step counts
+        and timestamps, which move whether or not any work happened.
+        """
+        payload = json.dumps(
+            {
+                "tasks": [
+                    [t.get("id"), t.get("column"), t.get("kind")] for t in self.tasks
+                ],
+                "health": self.build_health,
+                "ideas": len(self.ideas),
+                "audited": self.audited,
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+    def board_document(self) -> Dict[str, Any]:
+        """``.theseus/BOARD.json`` as the engine writes it.
+
+        Cards are grouped into columns here rather than carrying a ``column``
+        field, because this file is read by agents and a Kanban board with
+        columns in it is the thing they were told to expect. The engine holds
+        them flat internally, where moving one is an assignment rather than
+        two list operations.
         """
         return {
             "project_id": self.id,
+            "goal": self.goal,
             "status": self.status,
-            "current_phase": self.phase,
+            "build_health": self.build_health,
+            "needs_verification": self.needs_verification,
+            "last_build_log": prompts.clip(self.last_build_log, MAX_BUILD_LOG),
             "active_agent": self.active_role,
             "last_run_timestamp": self.last_run_timestamp,
-            "continuation_token_needed": self.continuation_token_needed,
-            "tasks": copy.deepcopy(self.tasks),
-            "last_execution_error": self.last_execution_error,
-            "build_status": self.build_status,
+            "continuation_needed": self.continuation_needed,
+            "columns": {
+                name: [
+                    {k: v for k, v in card.items() if k != "column"}
+                    for card in self.column(name)
+                ]
+                for name in COLUMNS
+            },
+            "ideas": copy.deepcopy(self.ideas),
+            "tooling": copy.deepcopy(self.tooling),
             # -- engine bookkeeping --------------------------------------
-            "brief": self.brief,
-            "phase_name": PHASE_NAMES.get(self.phase, ""),
+            "audited": self.audited,
             "created_at": self.created_at,
             "steps_used": self.steps_used,
             "fix_attempts": self.fix_attempts,
-            "expansions_remaining": self.expansions_remaining,
+            "innovation_rounds": self.innovation_rounds,
             "error": self.error,
             "note": self.note,
             "snapshot": self.snapshot.to_dict() if self.snapshot else None,
         }
 
-    def to_dict(self, roadmap: str = "", state_json: str = "") -> Dict[str, Any]:
-        doc = self.state_document()
+    def to_dict(self, critique: str = "", board_json: str = "") -> Dict[str, Any]:
+        doc = self.board_document()
+        counts = {name: len(self.column(name)) for name in COLUMNS}
         return {
             **doc,
             "id": self.id,
             "workspace": self.workspace,
-            "phase_names": PHASE_NAMES,
+            "columns_order": list(COLUMNS),
+            "column_labels": COLUMN_LABELS,
             "role_labels": ROLE_LABELS,
+            "counts": counts,
             "paused": self.paused,
             "ended_at": self.ended_at,
             "done": self.status in TERMINAL_STATUSES,
@@ -510,52 +743,60 @@ class Project:
                 )
                 for role in ROLES
             },
-            "roadmap": roadmap,
-            "state_json": state_json,
+            "critique": critique,
+            "board_json": board_json,
         }
 
     # -- restoring from disk ----------------------------------------------
 
     @classmethod
-    def from_state(cls, workspace: str, data: Dict[str, Any]) -> "Project":
-        """Rebuild a project from a STATE.json written by an earlier session.
+    def from_board(cls, workspace: str, data: Dict[str, Any]) -> "Project":
+        """Rebuild a project from a BOARD.json written by an earlier session.
 
-        Only the schema fields are trusted: a hand-edited or half-written file
-        should resume the run, not decide how many steps it has left. Anything
-        missing falls back to a value that makes the run finishable rather than
-        one that makes it look finished.
+        Anything missing or mangled falls back to a value that makes the run
+        finishable rather than one that makes it look finished - which is why
+        an unreadable ``build_health`` lands on UNKNOWN, not PASSING.
         """
-        tasks = [
-            t
-            for t in (_as_task(e) for e in (data.get("tasks") or []))
-            if t is not None
-        ]
+        tasks: List[Dict[str, Any]] = []
+        columns = data.get("columns")
+        if isinstance(columns, dict):
+            for name in COLUMNS:
+                for entry in columns.get(name) or []:
+                    card = _as_task(entry)
+                    if card is not None:
+                        card["column"] = name
+                        tasks.append(card)
+
         status = str(data.get("status") or PLANNING).upper()
-        if status not in {PLANNING, IMPLEMENTING, TESTING, EXPANDING, COMPLETED, FAILED}:
+        if status not in {
+            AUDITING, PLANNING, IMPLEMENTING, TESTING, REVIEWING,
+            INNOVATING, COMPLETED, FAILED,
+        }:
             status = PLANNING
-        try:
-            phase = int(data.get("current_phase") or PHASE_ARCHITECTURE)
-        except (TypeError, ValueError):
-            phase = PHASE_ARCHITECTURE
-        if phase not in PHASE_NAMES:
-            phase = PHASE_ARCHITECTURE
-        role = str(data.get("active_agent") or "architect")
+        role = str(data.get("active_agent") or "qa")
+
+        ideas = [i for i in (data.get("ideas") or []) if isinstance(i, dict)]
+        tooling = data.get("tooling")
+
         return cls(
             id=str(data.get("project_id") or uuid.uuid4().hex[:12]),
-            brief=str(data.get("brief") or ""),
+            goal=str(data.get("goal") or ""),
             workspace=workspace,
             status=status,
-            phase=phase,
-            active_role=role if role in ROLES else "architect",
+            active_role=role if role in ROLES else "qa",
             tasks=tasks,
-            build_status=str(data.get("build_status") or "untested"),
-            last_execution_error=str(data.get("last_execution_error") or ""),
-            continuation_token_needed=bool(data.get("continuation_token_needed")),
+            build_health=_as_health(data.get("build_health")),
+            needs_verification=bool(data.get("needs_verification")),
+            last_build_log=str(data.get("last_build_log") or ""),
+            ideas=ideas,
+            tooling=tooling if isinstance(tooling, dict) else {},
+            audited=bool(data.get("audited")),
+            continuation_needed=bool(data.get("continuation_needed")),
             last_run_timestamp=str(data.get("last_run_timestamp") or ""),
-            created_at=float(data.get("created_at") or time.time()),
-            steps_used=int(data.get("steps_used") or 0),
-            fix_attempts=int(data.get("fix_attempts") or 0),
-            expansions_remaining=int(data.get("expansions_remaining") or 0),
+            created_at=_as_float(data.get("created_at"), time.time()),
+            steps_used=int(_as_float(data.get("steps_used"), 0)),
+            fix_attempts=int(_as_float(data.get("fix_attempts"), 0)),
+            innovation_rounds=int(_as_float(data.get("innovation_rounds"), 0)),
             error=str(data.get("error") or ""),
             note=str(data.get("note") or ""),
         )
@@ -567,7 +808,7 @@ class Project:
 
 
 class ProjectEngine:
-    """Drives one project through the phase cycle on a worker thread.
+    """Drives one project by reading the board and picking an agent.
 
     ``busy_check`` is called before a project starts and must raise if
     something else - a council run, a chat - is already working the tree. The
@@ -590,7 +831,7 @@ class ProjectEngine:
         self._runner: Optional[ProviderRunner] = None
         self._stop = threading.Event()
         # Cleared while paused, set while running: the loop waits on it between
-        # steps, which is the only place a pause can take effect without
+        # turns, which is the only place a pause can take effect without
         # killing an agent in the middle of writing a file.
         self._resume = threading.Event()
         self._resume.set()
@@ -615,8 +856,8 @@ class ProjectEngine:
     def snapshot_state(self, workspace: str = "") -> Dict[str, Any]:
         """What the Projects tab renders.
 
-        With no project in memory it looks on disk: a `.theseus/STATE.json` in
-        the chosen folder is a project this app was running before it was
+        With no project in memory it looks on disk: a ``.theseus/BOARD.json``
+        in the chosen folder is a project this app was running before it was
         closed, and offering to resume it beats presenting an empty form over
         the top of a half-built codebase.
 
@@ -635,45 +876,47 @@ class ProjectEngine:
             project = None
 
         if project is not None:
-            ws = Workspace(project.workspace)
             return {
                 "running": running,
                 "resumable": not running and project.status not in TERMINAL_STATUSES,
-                "project": project.to_dict(
-                    roadmap=ws.roadmap(MAX_UI_TEXT),
-                    state_json=json.dumps(project.state_document(), indent=2),
-                ),
+                "project": self._payload(project),
             }
 
         folder = folder or (self.store.get("workspace") or "").strip()
         if folder:
             ws = Workspace(folder)
-            data = ws.read_state()
+            data = ws.read_board()
             if data.get("project_id"):
-                found = Project.from_state(folder, data)
+                found = Project.from_board(folder, data)
                 found.config = self.store.all()
                 return {
                     "running": False,
                     "resumable": found.status not in TERMINAL_STATUSES,
                     "found_on_disk": True,
                     "project": found.to_dict(
-                        roadmap=ws.roadmap(MAX_UI_TEXT),
-                        state_json=json.dumps(data, indent=2),
+                        critique=ws.critique(MAX_UI_TEXT),
+                        board_json=json.dumps(data, indent=2),
                     ),
                 }
         return {"running": False, "resumable": False, "project": None}
 
     # -- control -----------------------------------------------------------
 
-    def start(self, brief: str, workspace: str = "", resume: bool = False) -> Project:
+    def start(
+        self,
+        goal: str,
+        workspace: str = "",
+        resume: bool = False,
+        innovation: Optional[int] = None,
+    ) -> Project:
         """Begin, or pick up, an autonomous build. Returns once the loop is up.
 
         Everything that can refuse the run is checked here, before a single
-        agent is launched: the brief, the folder, the three CLIs. A project
-        that discovers in phase 3 that its QA binary was never installed has
-        already spent two rounds of quota finding out.
+        agent is launched: the goal, the folder, the three CLIs. A project that
+        discovers on its fourth turn that its QA binary was never installed has
+        already spent three rounds of quota finding out.
         """
-        brief = (brief or "").strip()
+        goal = (goal or "").strip()
         chosen = (workspace or "").strip()
         root = self._resolve_root(chosen)
 
@@ -688,30 +931,30 @@ class ProjectEngine:
         ws = Workspace(root)
 
         if resume:
-            data = ws.read_state()
+            data = ws.read_board()
             if not data.get("project_id"):
                 raise ValueError(
                     f"There is no project to resume in {root} - no "
-                    f"{THESEUS_DIR}/{STATE_FILE} was found there."
+                    f"{THESEUS_DIR}/{BOARD_FILE} was found there."
                 )
-            project = Project.from_state(root, data)
+            project = Project.from_board(root, data)
             if project.status in TERMINAL_STATUSES:
                 raise ValueError(
                     f"That project already finished ({project.status.title()}). "
                     f"Start a new one, or move {THESEUS_DIR}/ aside to build "
                     f"here again."
                 )
-            if brief:
-                project.brief = brief
-            if not project.brief:
+            if goal:
+                project.goal = goal
+            if not project.goal:
                 raise ValueError(
-                    "That project's state file carries no brief, so there is "
-                    "nothing to continue from. Type one to resume it."
+                    "That project's board carries no goal, so there is nothing "
+                    "to continue from. Type one to resume it."
                 )
         else:
-            if not brief:
+            if not goal:
                 raise ValueError("Describe what you want built.")
-            existing = ws.read_state()
+            existing = ws.read_board()
             if existing.get("project_id") and str(
                 existing.get("status")
             ) not in TERMINAL_STATUSES:
@@ -720,10 +963,12 @@ class ProjectEngine:
                     f"({existing.get('status')}). Resume it, or move "
                     f"{THESEUS_DIR}/ aside to start over."
                 )
-            project = Project(
-                id=uuid.uuid4().hex[:12], brief=brief, workspace=root
-            )
-            project.expansions_remaining = _int_setting(settings, "expansion_rounds", 1)
+            project = Project(id=uuid.uuid4().hex[:12], goal=goal, workspace=root)
+
+        if innovation is None:
+            project.innovation_rounds = _int_setting(settings, "innovation_rounds", 2, floor=0)
+        else:
+            project.innovation_rounds = max(0, min(int(innovation), 10))
 
         project.config = conf
         project.paused = False
@@ -733,8 +978,19 @@ class ProjectEngine:
         if missing:
             raise ValueError(self._missing_message(missing))
 
+        # Read-only, and before anything is written: what this project already
+        # builds with is a fact about the folder, not something to ask an agent
+        # to guess at.
+        project.tooling = detect_tooling(root)
+        # A workspace that arrived with real build tooling gets one baseline
+        # verification, so a repository that was already red when we were
+        # pointed at it is known to be our starting position rather than
+        # discovered three cards later and blamed on the developer.
+        if not resume and project.tooling.get("commands"):
+            project.needs_verification = True
+
         ws.ensure()
-        self._write_state(project)
+        self._write_board(project)
 
         with self._lock:
             self._project = project
@@ -744,10 +1000,21 @@ class ProjectEngine:
 
         self.store.remember_workspace(root)
         self.bus.publish("project_started", project=self._payload(project))
+
+        ignored = ensure_gitignored(root)
+        if ignored:
+            self._log("info", ignored)
+        if project.tooling.get("commands"):
+            self._log(
+                "info",
+                f"Adopting this project's own tooling: "
+                f"{', '.join(project.tooling['commands'][:4])}.",
+            )
         self._log(
             "info",
-            f"Project {project.id} started in {root}. Every step runs with its "
-            f"agent's auto-approve flags - files will change without asking.",
+            f"Project {project.id} started in {root}. The first turn is a "
+            f"read-only audit; every turn after it runs with its agent's "
+            f"auto-approve flags, so files will change without asking.",
         )
 
         thread = threading.Thread(
@@ -760,13 +1027,13 @@ class ProjectEngine:
         return project
 
     def pause(self) -> None:
-        """Halt after the running agent finishes its step.
+        """Halt after the running agent finishes its turn.
 
-        Deliberately not mid-step. A CLI killed between two `write` calls
-        leaves a half-written file that nothing in the run knows is
-        half-written, and the next agent builds on it. Waiting for the step
-        costs a few minutes and leaves the tree consistent - and **Stop** is
-        there for the operator who wants it to end now.
+        Deliberately not mid-turn. A CLI killed between two writes leaves a
+        half-written file that nothing in the run knows is half-written, and
+        the next agent builds on it. Waiting costs a few minutes and leaves the
+        tree consistent - and **Stop** is there for the operator who wants it
+        to end now.
         """
         with self._lock:
             project = self._project
@@ -774,11 +1041,11 @@ class ProjectEngine:
                 raise ValueError("No project is running.")
             project.paused = True
         self._resume.clear()
-        self._log("warn", "Pausing after the current agent finishes its step.")
+        self._log("warn", "Pausing after the current agent finishes its turn.")
         self._publish_state()
 
     def resume(self) -> None:
-        """Release a pause. The loop re-reads its state and carries on."""
+        """Release a pause. The loop re-reads the board and carries on."""
         with self._lock:
             project = self._project
             if project is None:
@@ -789,9 +1056,9 @@ class ProjectEngine:
         self._publish_state()
 
     def handoff(self, role: str) -> None:
-        """Force the next step onto a different agent.
+        """Force the next turn onto a different agent.
 
-        For the case the phase cycle cannot detect: an agent that is answering,
+        For the case the board cannot detect: an agent that is answering,
         exiting cleanly, and going in circles. The engine cannot tell that from
         progress, so the operator can.
         """
@@ -804,7 +1071,7 @@ class ProjectEngine:
             self._handoff_role = role
         self._log(
             "warn",
-            f"Hand-off requested: the next step runs on the "
+            f"Hand-off requested: the next turn runs on the "
             f"{ROLE_LABELS[role]} agent.",
         )
         self._publish_state()
@@ -836,9 +1103,9 @@ class ProjectEngine:
         """The absolute directory a project builds in.
 
         Unlike a council run this does *not* collapse to the repository root. A
-        project is asked to lay out its own tree, and silently redirecting it
-        from `~/code/repo/subdir` to `~/code/repo` would have it build over a
-        codebase the operator never pointed at.
+        project may be pointed at one service inside a monorepo, and silently
+        redirecting it from ``~/code/repo/subdir`` to ``~/code/repo`` would have
+        it build over a codebase the operator never pointed at.
         """
         folder = (folder or "").strip()
         if not folder:
@@ -877,15 +1144,15 @@ class ProjectEngine:
     # -- the loop ----------------------------------------------------------
 
     def _execute(self, project: Project) -> None:
-        """Worker-thread body: run phases until the project settles."""
+        """Worker-thread body: read the board, pick an agent, repeat."""
         try:
             self._take_snapshot(project)
-            max_steps = _int_setting(
-                project.config.get("project") or {}, "max_steps", 40
-            )
+            settings = project.config.get("project") or {}
+            max_steps = _int_setting(settings, "max_steps", 40)
+            project.last_fingerprint = project.fingerprint()
 
             while True:
-                # Terminal first, and before the stop check: a phase that has
+                # Terminal first, and before the stop check: a turn that has
                 # just finished the project and a stop that arrives in the same
                 # moment would otherwise rewrite a COMPLETED run as "stopped by
                 # the operator", which is both wrong and unrecoverable.
@@ -896,7 +1163,7 @@ class ProjectEngine:
                     self._finish(project, FAILED, "Stopped by the operator.")
                     return
 
-                # The pause gate. Between steps only - see `pause`.
+                # The pause gate. Between turns only - see `pause`.
                 if not self._resume.is_set():
                     self._publish_state()
                     self._resume.wait()
@@ -908,268 +1175,472 @@ class ProjectEngine:
                     self._finish(
                         project,
                         FAILED,
-                        f"Reached the step limit ({max_steps} agent turns) "
+                        f"Reached the turn limit ({max_steps} agent turns) "
                         f"without finishing. Raise it in Settings, or resume "
                         f"the project - everything built so far is on disk and "
-                        f"the roadmap says where it got to.",
+                        f"the board says where it got to.",
                     )
                     return
 
-                handler = {
-                    PHASE_ARCHITECTURE: self._phase_architecture,
-                    PHASE_IMPLEMENTATION: self._phase_implementation,
-                    PHASE_QA: self._phase_qa,
-                    PHASE_EXPANSION: self._phase_expansion,
-                    PHASE_FINALISATION: self._phase_finalisation,
-                }[project.phase]
-                handler(project)
+                decision = self._decide(project)
+                if decision is None:
+                    self._complete(project)
+                    return
+
+                self._run_decision(project, decision)
         except Exception as exc:  # a crash here must not wedge the engine
             self._finish(project, FAILED, f"{type(exc).__name__}: {exc}")
 
-    # -- phases ------------------------------------------------------------
+    # -- the decision engine -----------------------------------------------
 
-    def _phase_architecture(self, project: Project) -> None:
-        self._enter(project, PHASE_ARCHITECTURE, PLANNING, "architect")
-        step, report = self._run_role(
-            project, "architect", "Design the system",
-            lambda ctx: prompts.build_architecture_prompt(project.brief, ctx),
-        )
-        if step is None:
-            return
+    def _decide(self, project: Project) -> Optional[Decision]:
+        """What this project needs next. ``None`` means it is finished.
 
-        project.tasks = merge_tasks(project.tasks, report.get("tasks"), "coder")
-        spec_written = Workspace(project.workspace).spec_path.exists()
+        The order is the policy, and it is the part of this engine worth
+        arguing about:
 
-        # Judged on what is on disk, not on the exit status. An architect that
-        # wrote the spec and the roadmap and *then* fell over has done phase 1;
-        # failing the project on the exit code would throw that away and make
-        # the operator start again from a folder that already has the answer.
-        if not project.tasks and not spec_written:
-            self._fail_step(
-                project, step,
-                "The architect produced neither a task list nor a SPEC.md, so "
-                "there is nothing for the developer to build.",
+        1. Nothing has looked at the folder yet - audit it, read-only.
+        2. The board is empty - the goal has not been decomposed.
+        3. The build is failing - nothing else matters until it is not.
+        4. The build is unverified - somebody wrote code and nobody ran it.
+        5. Cards are waiting on review - close the loop before opening another.
+        6. Cards are waiting to be built - do the work.
+        7. Everything is done and green - propose what is missing.
+        """
+        settings = project.config.get("project") or {}
+        goal = project.goal
+
+        # 1. Startup: a read-only look at what is already here.
+        if not project.audited:
+            return Decision(
+                role="qa",
+                kind="audit",
+                heading="Audit the workspace",
+                trigger="project start",
+                status=AUDITING,
+                read_only=True,
+                build=lambda ctx: prompts.build_audit_prompt(goal, ctx),
             )
-            return
 
-        if not step.ok:
-            self._log(
-                "warn",
-                f"The architect's step failed ({step.error}), but it left a "
-                f"plan behind. Continuing from what is on disk.",
-            )
+        # 2. A goal nobody has broken down yet.
         if not project.tasks:
-            self._log(
-                "warn",
-                "The architect returned no task list. The developer will work "
-                "from SPEC.md and the roadmap instead.",
+            return Decision(
+                role="architect",
+                kind="plan",
+                heading="Break the goal into tasks",
+                trigger="board empty",
+                status=PLANNING,
+                build=lambda ctx: prompts.build_plan_prompt(goal, ctx),
             )
-        if not spec_written:
-            self._log(
-                "warn",
-                "No SPEC.md was written. The developer and QA will work from "
-                "the roadmap and the brief alone, which is thinner than "
-                "intended - and QA has no build command to run.",
-            )
-        self._advance(project, PHASE_IMPLEMENTATION)
 
-    def _phase_implementation(self, project: Project) -> None:
-        fixing = project.build_status == "failing"
-        self._enter(project, PHASE_IMPLEMENTATION, IMPLEMENTING, "coder")
-        pending = [t for t in project.tasks if t["status"] != "completed"]
-        step, report = self._run_role(
-            project,
-            "coder",
-            "Fix the build" if fixing else "Implement the pending tasks",
-            lambda ctx: prompts.build_implementation_prompt(
-                project.brief, ctx, _render_tasks(pending), fixing=fixing
-            ),
-        )
-        if step is None:
-            return
-        project.tasks = merge_tasks(project.tasks, report.get("tasks"), "coder")
-        if not step.ok:
-            # Not fatal on its own: QA runs next either way, and what is on
-            # disk is what matters. A developer that keeps failing is caught by
-            # the fix-attempt budget instead.
-            self._log(
-                "warn",
-                f"The developer's step failed ({step.error}). Handing to QA "
-                f"anyway - what is on disk is what gets verified.",
-            )
-        self._advance(project, PHASE_QA)
-
-    def _phase_qa(self, project: Project) -> None:
-        self._enter(project, PHASE_QA, TESTING, "qa")
-        step, report = self._run_role(
-            project, "qa", "Build and verify",
-            lambda ctx: prompts.build_qa_prompt(project.brief, ctx),
-        )
-        if step is None:
-            return
-
-        build = str(report.get("build_status") or "").strip().lower()
-        error = str(report.get("last_execution_error") or "").strip()
-        if build not in ("passing", "failing"):
-            # No usable verdict. Treated as failing, never as passing: the one
-            # thing that must not happen is a silent QA turning into a green
-            # build the loop then builds on top of.
-            build = "failing"
-            error = error or (
-                step.error
-                or "QA did not report a build status, so the build is "
-                "unverified. Run the build and the tests, and report "
-                "`build_status` explicitly."
-            )
-            self._log("warn", "QA reported no build status. Treating it as failing.")
-
-        project.build_status = build
-        project.last_execution_error = error if build == "failing" else ""
-        Workspace(project.workspace).append_critique(
-            f"## {_stamp()} - QA, phase {project.phase}, build {build}\n\n"
-            f"{step.reasoning or '(no summary reported)'}\n"
-            + (f"\n```\n{prompts.clip(error, 4000)}\n```\n" if error else "")
-        )
-
-        if build == "failing":
-            budget = _int_setting(
-                project.config.get("project") or {}, "max_fix_attempts", 3
-            )
-            project.fix_attempts += 1
-            if project.fix_attempts > budget:
+        # 3. A failing build outranks everything. Bounded, because an agent
+        #    that cannot fix a build in three tries will not fix it in thirty.
+        if project.build_health == HEALTH_FAILING:
+            max_fix = _int_setting(settings, "max_fix_attempts", 3)
+            if project.fix_attempts >= max_fix:
                 self._finish(
                     project,
                     FAILED,
-                    f"The build still fails after {budget} fix attempts. The "
-                    f"last failure is in {THESEUS_DIR}/{CRITIQUE_FILE}; the "
-                    f"work so far is on disk and the project can be resumed "
-                    f"once you have unstuck it.",
+                    f"The build has failed {project.fix_attempts} times in a "
+                    f"row and the developer could not clear it. The last "
+                    f"failure is on the board and in "
+                    f"{THESEUS_DIR}/{CRITIQUE_FILE}; everything written so far "
+                    f"is still on disk.",
                 )
-                return
+                return None
+            log = project.last_build_log
+            return Decision(
+                role="coder",
+                kind="fix",
+                heading="Fix the failing build",
+                trigger="build FAILING",
+                status=IMPLEMENTING,
+                build=lambda ctx: prompts.build_fix_prompt(goal, ctx, log),
+            )
+
+        # 4. Somebody wrote code and nobody has run it since.
+        if project.needs_verification:
+            return Decision(
+                role="qa",
+                kind="verify",
+                heading="Build and test",
+                trigger="unverified changes",
+                status=TESTING,
+                build=lambda ctx: prompts.build_verify_prompt(goal, ctx),
+            )
+
+        # 5. Review before starting more work, so the queue cannot run away.
+        in_review = project.column(COL_IN_REVIEW)
+        if in_review:
+            return Decision(
+                role="architect",
+                kind="review",
+                heading=f"Review {len(in_review)} change(s)",
+                trigger=f"{len(in_review)} in review",
+                status=REVIEWING,
+                tasks=in_review,
+                build=lambda ctx: prompts.build_review_prompt(goal, ctx, in_review),
+            )
+
+        # 6. Work waiting to be done.
+        card = project.next_card()
+        if card is not None:
+            label = card.get("title") or card["id"]
+            return Decision(
+                role="coder",
+                kind="implement",
+                heading=prompts.clip(label, 80),
+                trigger=(
+                    "bug on the board" if card.get("kind") == KIND_BUG else "backlog"
+                ),
+                status=IMPLEMENTING,
+                tasks=[card],
+                build=lambda ctx: prompts.build_implement_prompt(goal, ctx, card),
+            )
+
+        # 7. Everything green, nothing left - what did we miss?
+        if project.innovation_rounds > 0:
+            rounds = project.innovation_rounds
+            return Decision(
+                role="architect",
+                kind="innovate",
+                heading="Propose enhancements",
+                trigger="board clear, build green",
+                status=INNOVATING,
+                build=lambda ctx: prompts.build_innovate_prompt(goal, ctx, rounds),
+            )
+
+        return None
+
+    # -- applying one turn's report ----------------------------------------
+
+    def _run_decision(self, project: Project, decision: Decision) -> None:
+        """Run the chosen agent and fold its report back into the board."""
+        project.status = decision.status
+        project.active_role = decision.role
+        project.last_run_timestamp = _stamp()
+
+        # A claimed card is in progress before the agent starts, not after: if
+        # this turn dies, the board must already say who was holding it.
+        if decision.kind == "implement" and decision.tasks:
+            self._move(project, decision.tasks[0]["id"], COL_IN_PROGRESS)
+
+        self._write_board(project)
+        self._publish_state()
+
+        step, report = self._run_role(project, decision)
+        if step is None:
+            return  # stopped mid-turn; _run_role has already finished the run
+
+        applier = {
+            "audit": self._apply_audit,
+            "plan": self._apply_plan,
+            "implement": self._apply_implement,
+            "fix": self._apply_fix,
+            "verify": self._apply_verify,
+            "review": self._apply_review,
+            "innovate": self._apply_innovate,
+        }[decision.kind]
+        applier(project, decision, step, report)
+
+        self._note_progress(project)
+        self._write_board(project)
+        self._publish_state()
+
+    def _apply_audit(
+        self, project: Project, decision: Decision, step: StepRecord, report: Dict[str, Any]
+    ) -> None:
+        """The read-only look at the folder. Cannot fail the run.
+
+        A failed audit is worth a warning and nothing more: the engine already
+        read the tooling off disk itself, so the run has what it needs even if
+        the agent said nothing useful.
+        """
+        project.audited = True
+        if not step.ok:
             self._log(
                 "warn",
-                f"Build failing (attempt {project.fix_attempts} of {budget}). "
-                f"Back to the developer with the trace.",
+                f"The workspace audit failed ({step.error}). Continuing from "
+                f"what the engine could read off disk itself.",
             )
-            self._advance(project, PHASE_IMPLEMENTATION)
-            return
+        notes = str(report.get("reasoning") or "").strip()
+        if notes:
+            Workspace(project.workspace).append_critique(
+                f"## {_stamp()} - Workspace audit ({ROLE_LABELS[step.role]})\n\n{notes}\n"
+            )
+        # An audit reads; it does not verify. Whatever it says about the build,
+        # the board's health stays unknown until QA has actually run one - a
+        # green CI badge in somebody's README is not a build.
+        project.build_health = HEALTH_UNKNOWN
 
-        project.fix_attempts = 0
-        self._log("info", "Build passing.")
-        if project.expansions_remaining > 0:
-            self._advance(project, PHASE_EXPANSION)
-        else:
-            self._advance(project, PHASE_FINALISATION)
-
-    def _phase_expansion(self, project: Project) -> None:
-        self._enter(project, PHASE_EXPANSION, EXPANDING, "architect")
-        project.expansions_remaining = max(0, project.expansions_remaining - 1)
-        before = {t["id"] for t in project.tasks}
-        step, report = self._run_role(
-            project, "architect", "Propose the next version",
-            lambda ctx: prompts.build_expansion_prompt(project.brief, ctx),
-        )
-        if step is None:
-            return
-
+    def _apply_plan(
+        self, project: Project, decision: Decision, step: StepRecord, report: Dict[str, Any]
+    ) -> None:
         project.tasks = merge_tasks(project.tasks, report.get("tasks"), "coder")
-        added = [t for t in project.tasks if t["id"] not in before]
-        if not added:
-            # A real answer, and the architect is told so: nothing worth adding
-            # means the project is done, not that the phase failed.
-            self._log(
-                "info",
-                "The architect proposed nothing further. Going straight to "
-                "finalisation.",
+        # Judged on what landed on the board, not on the exit status: an
+        # architect that wrote a plan and *then* fell over has done the job.
+        if not project.tasks:
+            self._finish(
+                project,
+                FAILED,
+                f"The architect produced no tasks, so there is nothing for the "
+                f"developer to build. {step.error}".strip(),
             )
-            self._advance(project, PHASE_FINALISATION)
             return
-
         self._log(
             "info",
-            f"Expansion: {len(added)} new task(s) - "
-            + "; ".join(t["description"][:70] or t["id"] for t in added),
-        )
-        Workspace(project.workspace).append_critique(
-            f"## {_stamp()} - Expansion round\n\n"
-            + "\n".join(f"- {t['id']}: {t['description']}" for t in added)
-            + "\n"
-        )
-        self._advance(project, PHASE_IMPLEMENTATION)
-
-    def _phase_finalisation(self, project: Project) -> None:
-        """Verify the whole thing, then write the README, then stop."""
-        self._enter(project, PHASE_FINALISATION, TESTING, "qa")
-        step, report = self._run_role(
-            project, "qa", "Final integrity check",
-            lambda ctx: prompts.build_integrity_prompt(project.brief, ctx),
-        )
-        if step is None:
-            return
-
-        build = str(report.get("build_status") or "").strip().lower()
-        error = str(report.get("last_execution_error") or "").strip()
-        Workspace(project.workspace).append_critique(
-            f"## {_stamp()} - Final integrity check, build {build or 'unreported'}\n\n"
-            f"{step.reasoning or '(no summary reported)'}\n"
-            + (f"\n```\n{prompts.clip(error, 4000)}\n```\n" if error else "")
+            f"{len(project.tasks)} task(s) on the board.",
         )
 
-        if build == "failing":
-            budget = _int_setting(
-                project.config.get("project") or {}, "max_fix_attempts", 3
+    def _apply_implement(
+        self, project: Project, decision: Decision, step: StepRecord, report: Dict[str, Any]
+    ) -> None:
+        card_id = decision.tasks[0]["id"] if decision.tasks else ""
+        project.tasks = merge_tasks(project.tasks, report.get("tasks"), "coder")
+
+        # If the developer did not say where the card went, the engine decides
+        # from the outcome. A turn that ran cleanly puts its work up for
+        # review; one that failed leaves the card in progress for the next
+        # attempt rather than quietly parking it.
+        if card_id and not self._reported(report, card_id):
+            self._move(project, card_id, COL_IN_REVIEW if step.ok else COL_IN_PROGRESS)
+
+        if step.files_modified or step.ok:
+            self._mark_dirty(project, f"the {ROLE_LABELS[step.role]} agent wrote code")
+
+    def _apply_fix(
+        self, project: Project, decision: Decision, step: StepRecord, report: Dict[str, Any]
+    ) -> None:
+        project.tasks = merge_tasks(project.tasks, report.get("tasks"), "coder")
+        project.fix_attempts += 1
+        self._mark_dirty(project, "the developer attempted a fix")
+
+    def _apply_verify(
+        self, project: Project, decision: Decision, step: StepRecord, report: Dict[str, Any]
+    ) -> None:
+        """Fold a QA verdict into the board.
+
+        Fail-closed on purpose. QA that returns nothing usable is recorded as
+        FAILING, never as passing: a silent verification turning the board
+        green is the one outcome the rest of the loop must not build on, since
+        every downstream decision - review, innovation, completion - reads
+        PASSING as "somebody ran the tests".
+        """
+        build = report.get("build")
+        health = HEALTH_UNKNOWN
+        log = ""
+        if isinstance(build, dict):
+            health = _as_health(build.get("health") or build.get("status"))
+            log = str(build.get("log") or build.get("error") or "").strip()
+        elif build is not None:
+            health = _as_health(build)
+
+        if health == HEALTH_UNKNOWN:
+            health = HEALTH_FAILING
+            log = log or (
+                f"QA ({ROLE_LABELS[step.role]}) finished without reporting a "
+                f"build status, so the build is treated as failing. "
+                + (f"The turn itself failed: {step.error}" if not step.ok else
+                   "Run the project's build and tests and report `build.health` "
+                   "explicitly.")
             )
-            project.build_status = "failing"
-            project.last_execution_error = error
-            project.fix_attempts += 1
-            if project.fix_attempts <= budget:
-                self._log(
-                    "warn",
-                    "The final check failed. Back to the developer rather than "
-                    "handing over something that does not build.",
-                )
-                self._advance(project, PHASE_IMPLEMENTATION)
-                return
-            # Out of budget, but the code is real and the log says what is
-            # wrong. Finish the hand-off and say plainly that it is broken -
-            # that is more use than stopping with no README at all.
+
+        project.build_health = health
+        project.needs_verification = False
+        project.last_build_log = prompts.clip(log, MAX_BUILD_LOG)
+
+        # QA may raise bugs off a failure. They are cards like any other, and
+        # they jump the developer's queue.
+        project.tasks = merge_tasks(project.tasks, report.get("tasks"), "coder")
+
+        if health == HEALTH_PASSING:
+            project.fix_attempts = 0
+            self._log("info", "Build passing.")
+        else:
+            self._log("warn", f"Build failing. {prompts.clip(log, 300)}")
+
+        Workspace(project.workspace).append_critique(
+            f"## {_stamp()} - Verification by {ROLE_LABELS[step.role]}: {health}\n\n"
+            f"{prompts.clip(log, MAX_BUILD_LOG) or '(no detail reported)'}\n"
+        )
+
+    def _apply_review(
+        self, project: Project, decision: Decision, step: StepRecord, report: Dict[str, Any]
+    ) -> None:
+        """Approve or bounce the cards that were in review.
+
+        A card the reviewer said nothing about stays in review. That looks like
+        a stall, and it is meant to: the stall guard will end the run and say
+        so, which is more honest than approving unreviewed work by default.
+        """
+        reviews = report.get("reviews")
+        approved, bounced = 0, 0
+        seen: set[str] = set()
+
+        for entry in reviews if isinstance(reviews, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            card_id = str(entry.get("id") or "").strip()
+            if not card_id:
+                continue
+            verdict = str(entry.get("verdict") or "").strip().lower()
+            note = str(entry.get("note") or "").strip()
+            seen.add(card_id)
+            if verdict in ("approve", "approved", "accept", "pass", "ok"):
+                self._move(project, card_id, COL_DONE, note=note)
+                approved += 1
+            else:
+                self._move(project, card_id, COL_BACKLOG, note=note)
+                bounced += 1
+                if note:
+                    Workspace(project.workspace).append_critique(
+                        f"## {_stamp()} - Review of {card_id}: changes requested\n\n{note}\n"
+                    )
+
+        # The contract also allows a plain task move, for a reviewer that
+        # reports through `tasks` instead of `reviews`.
+        project.tasks = merge_tasks(project.tasks, report.get("tasks"), "coder")
+
+        if approved or bounced:
             self._log(
-                "warn",
-                "The final check still fails and the fix budget is spent. "
-                "Writing the hand-off anyway, with the failure recorded.",
+                "info",
+                f"Review: {approved} approved, {bounced} sent back.",
             )
         else:
-            project.build_status = "passing" if build == "passing" else project.build_status
-            project.last_execution_error = ""
+            self._log(
+                "warn",
+                f"The {ROLE_LABELS[step.role]} agent returned no review verdict, "
+                f"so nothing moved out of review.",
+            )
+        if bounced:
+            self._mark_dirty(project, "review sent work back")
 
-        # -- the write-up ---------------------------------------------------
-        self._enter(project, PHASE_FINALISATION, IMPLEMENTING, "architect")
-        step, _ = self._run_role(
-            project, "architect", "Write the hand-off",
-            lambda ctx: prompts.build_handoff_prompt(project.brief, ctx),
-        )
-        if step is None:
-            return
+    def _apply_innovate(
+        self, project: Project, decision: Decision, step: StepRecord, report: Dict[str, Any]
+    ) -> None:
+        """Turn proposed ideas into backlog cards, spending one round."""
+        project.innovation_rounds = max(0, project.innovation_rounds - 1)
 
-        done = sum(1 for t in project.tasks if t["status"] == "completed")
-        # Completed, and honest about what it is: the build is what the project
-        # is, and the write-up is the last thing on top of it. Saying "finished"
-        # while quietly omitting that the README step failed, or that the final
-        # check never went green, is exactly the reassurance that stops the
-        # operator opening CRITIQUE.log.
+        ideas = [i for i in (report.get("ideas") or []) if isinstance(i, dict)]
+        before = len(project.tasks)
+        project.tasks = merge_tasks(project.tasks, report.get("tasks"), "coder")
+
+        # Ideas reported as ideas rather than as cards still become cards -
+        # otherwise a well-behaved architect that filled in the documented
+        # `ideas` field would have its proposals silently dropped.
+        for n, idea in enumerate(ideas, start=1):
+            title = str(idea.get("title") or idea.get("description") or "").strip()
+            if not title:
+                continue
+            card_id = str(idea.get("id") or "").strip() or f"idea_{len(project.tasks) + n}"
+            if any(t["id"] == card_id for t in project.tasks):
+                continue
+            project.tasks.append(
+                {
+                    "id": card_id,
+                    "title": title,
+                    "detail": str(idea.get("detail") or idea.get("why") or "").strip(),
+                    "column": COL_BACKLOG,
+                    "kind": KIND_TASK,
+                    "assigned_to": "coder",
+                    "origin": ORIGIN_INNOVATION,
+                    "note": "",
+                }
+            )
+
+        project.ideas = (project.ideas + ideas)[-20:]
+        added = len(project.tasks) - before
+        if added > 0:
+            self._log("info", f"{added} proposed enhancement(s) added to the backlog.")
+        else:
+            # Nothing proposed means the architect is out of ideas, which is a
+            # finished project - not a reason to ask it again next turn.
+            project.innovation_rounds = 0
+            self._log("info", "No further enhancements proposed.")
+
+    # -- board mutations ---------------------------------------------------
+
+    def _move(
+        self, project: Project, card_id: str, column: str, note: str = ""
+    ) -> None:
+        for card in project.tasks:
+            if card["id"] == card_id:
+                card["column"] = column
+                if note:
+                    card["note"] = prompts.clip(note, 600)
+                return
+
+    def _reported(self, report: Dict[str, Any], card_id: str) -> bool:
+        """Whether the agent's report says anything about one card."""
+        for entry in report.get("tasks") or []:
+            if isinstance(entry, dict) and str(entry.get("id") or "").strip() == card_id:
+                return True
+        return False
+
+    def _mark_dirty(self, project: Project, why: str) -> None:
+        """Code changed, so the build is unverified until QA says otherwise.
+
+        This is the invariant that makes PASSING mean something. Only a QA turn
+        can set it, and any write clears it - so the board can never claim a
+        green build for a tree nobody has tested in its current state.
+        """
+        if project.build_health == HEALTH_PASSING:
+            self._log("info", f"Build health back to UNKNOWN: {why}.")
+        project.build_health = HEALTH_UNKNOWN
+        project.needs_verification = True
+
+    def _note_progress(self, project: Project) -> None:
+        """Count consecutive turns that changed nothing on the board.
+
+        Three agents can all run cleanly, report nothing actionable, and leave
+        the board exactly as they found it - a reviewer with no verdict, a
+        developer that claimed a card and wrote nothing. The turn limit would
+        eventually catch that, thirty turns and an hour of quota later.
+        """
+        current = project.fingerprint()
+        if current == project.last_fingerprint:
+            project.stall_count += 1
+        else:
+            project.stall_count = 0
+            project.last_fingerprint = current
+
+        if project.stall_count >= STALL_LIMIT:
+            self._finish(
+                project,
+                FAILED,
+                f"The board has not moved in {project.stall_count} turns - the "
+                f"agents are answering but nothing is changing. Everything "
+                f"built so far is on disk; {THESEUS_DIR}/{CRITIQUE_FILE} and "
+                f"the turn list say what they were doing. Try a hand-off to a "
+                f"different agent, or a sharper goal.",
+            )
+
+    def _complete(self, project: Project) -> None:
+        """Nothing left to do. Say how it went, honestly."""
+        done = len(project.column(COL_DONE))
+        total = len(project.tasks)
         caveats = []
-        if not step.ok:
-            caveats.append(f"the README step failed ({step.error})")
-        if project.build_status != "passing":
-            caveats.append(f"the build is {project.build_status}")
+        if project.build_health != HEALTH_PASSING:
+            caveats.append(f"the build is {project.build_health}")
+        stuck = [t for t in project.open_tasks()]
+        if stuck:
+            caveats.append(f"{len(stuck)} card(s) never reached Done")
+        invented = len(
+            [t for t in project.tasks if t.get("origin") == ORIGIN_INNOVATION]
+        )
         self._finish(
             project,
             COMPLETED,
             "",
             note=(
-                f"Finished: {done} of {len(project.tasks)} task(s) completed, "
-                f"build {project.build_status}, in {project.steps_used} agent "
+                f"Finished: {done} of {total} card{_s(total)} done, build "
+                f"{project.build_health.lower()}, in {project.steps_used} agent "
                 f"turns."
+                + (
+                    f" {invented} of those {'was' if invented == 1 else 'were'} "
+                    f"proposed by the council itself, not by you."
+                    if invented else ""
+                )
                 + (f" Note: {'; '.join(caveats)}." if caveats else "")
             ),
         )
@@ -1177,21 +1648,18 @@ class ProjectEngine:
     # -- running one agent -------------------------------------------------
 
     def _run_role(
-        self,
-        project: Project,
-        role: str,
-        heading: str,
-        build_prompt: Callable[[str], str],
+        self, project: Project, decision: Decision
     ) -> tuple[Optional[StepRecord], Dict[str, Any]]:
-        """Run one step, handing off to another agent if this one is exhausted.
+        """Run one turn, handing off to another agent if this one is exhausted.
 
-        Returns ``(None, {})`` when the run was stopped mid-step, which is the
-        caller's signal to return without advancing anything.
+        Returns ``(None, {})`` when the run was stopped mid-turn, which is the
+        caller's signal to return without applying anything.
 
         The hand-off is the whole reason a project survives a context limit.
         The prompt is rebuilt for the replacement rather than replayed, because
-        every project prompt is built from files on disk - so the second agent
-        starts from the same state, not from the first one's transcript.
+        every project prompt is built from the board and the diff on disk - so
+        the second agent starts from the same state, not from the first one's
+        transcript.
         """
         forced = ""
         with self._lock:
@@ -1199,32 +1667,33 @@ class ProjectEngine:
                 forced, self._handoff_role = self._handoff_role, ""
 
         attempted: List[str] = []
-        runner_role = forced or role
-        handoff_from = role if forced and forced != role else ""
+        runner_role = forced or decision.role
+        handoff_from = decision.role if forced and forced != decision.role else ""
 
         while True:
             attempted.append(runner_role)
             provider = self._provider(project, runner_role)
             step = StepRecord(
                 index=project.steps_used + 1,
-                phase=project.phase,
                 role=runner_role,
                 label=str(provider.get("label") or runner_role),
-                heading=heading,
+                heading=decision.heading,
+                trigger=decision.trigger,
+                read_only=decision.read_only,
                 handoff_from=handoff_from,
             )
             project.steps_used += 1
             project.steps.append(step)
             del project.steps[:-MAX_STEP_RECORDS]
 
-            prompt = build_prompt(self._context(project, runner_role))
+            prompt = decision.build(self._context(project, runner_role))
             self.bus.publish(
                 "project_step",
                 project=self._payload(project),
                 step=step.to_dict(),
             )
 
-            result = self._invoke(project, runner_role, provider, prompt)
+            result = self._invoke(project, provider, prompt, decision.read_only)
             report = parse_report(result.stdout)
 
             step.ended_at = time.time()
@@ -1242,7 +1711,7 @@ class ProjectEngine:
 
             if result.cancelled or self._stop.is_set():
                 step.state = "skipped"
-                self._write_state(project)
+                self._write_board(project)
                 self.bus.publish(
                     "project_step_done",
                     project=self._payload(project),
@@ -1260,34 +1729,47 @@ class ProjectEngine:
             # Did this agent run out of room rather than run out of ideas?
             spare = [r for r in ROLES if r not in attempted]
             if result.ok or not self._looks_exhausted(result) or not spare:
-                project.continuation_token_needed = False
-                self._write_state(project)
+                project.continuation_needed = False
+                self._write_board(project)
                 return step, report
 
-            project.continuation_token_needed = True
-            self._write_state(project)
+            project.continuation_needed = True
+            self._write_board(project)
             handoff_from = runner_role
             runner_role = spare[0]
             self._log(
                 "warn",
                 f"The {ROLE_LABELS[handoff_from]} agent ran out of room "
                 f"({result.error or 'context or quota limit'}). Handing this "
-                f"step to the {ROLE_LABELS[runner_role]} agent with the state "
-                f"file as its context.",
+                f"turn to the {ROLE_LABELS[runner_role]} agent with the board "
+                f"as its context.",
             )
 
     def _invoke(
-        self, project: Project, role: str, provider: Dict[str, Any], prompt: str
+        self,
+        project: Project,
+        provider: Dict[str, Any],
+        prompt: str,
+        read_only: bool,
     ) -> ProviderResult:
-        """Launch one CLI. Always with write permission - see the module docs."""
-        runner = ProviderRunner(provider, self._output_cb(role))
+        """Launch one CLI.
+
+        ``read_only`` is the audit turn and only the audit turn: the two grants
+        are opposites and never both sent, so an audit gets the CLI's read-only
+        flags and no auto-approve at all. Everything else writes - see the
+        module docs.
+        """
+        runner = ProviderRunner(provider, self._output_cb(str(provider.get("id") or "")))
         with self._lock:
             self._runner = runner
             if self._stop.is_set():
                 runner.cancel()
         try:
             return runner.run(
-                prompt, cwd=project.workspace, auto_approve=True, read_only=False
+                prompt,
+                cwd=project.workspace,
+                auto_approve=not read_only,
+                read_only=read_only,
             )
         finally:
             with self._lock:
@@ -1318,8 +1800,13 @@ class ProjectEngine:
         return provider
 
     def _context(self, project: Project, role: str) -> str:
-        """Build the shared preamble for one turn, from the files on disk."""
-        ws = Workspace(project.workspace)
+        """Build the shared preamble for one turn, from the board and the tree.
+
+        Deliberately not the transcript. What an agent gets is the board, the
+        working diff, the last build failure and the house rules - never the
+        previous turns' terminal output, which is the single largest thing that
+        could be sent and the least useful per token.
+        """
         diff = ""
         try:
             if gitutil.repo_root(project.workspace):
@@ -1329,38 +1816,15 @@ class ProjectEngine:
         return prompts.project_context_block(
             project_id=project.id,
             root=project.workspace,
-            state_json=json.dumps(project.state_document(), indent=2),
-            roadmap=ws.roadmap(),
-            spec=ws.spec(),
-            last_error=project.last_execution_error,
+            board_json=json.dumps(project.board_document(), indent=2),
+            tooling=project.tooling,
+            build_health=project.build_health,
+            build_log=project.last_build_log,
             diff=diff,
             house_rules=str(project.config.get("house_rules") or ""),
         )
 
     # -- state transitions -------------------------------------------------
-
-    def _enter(self, project: Project, phase: int, status: str, role: str) -> None:
-        project.phase = phase
-        project.status = status
-        project.active_role = role
-        project.last_run_timestamp = _stamp()
-        self._write_state(project)
-        self._publish_state()
-
-    def _advance(self, project: Project, phase: int) -> None:
-        project.phase = phase
-        project.status = {
-            PHASE_ARCHITECTURE: PLANNING,
-            PHASE_IMPLEMENTATION: IMPLEMENTING,
-            PHASE_QA: TESTING,
-            PHASE_EXPANSION: EXPANDING,
-            PHASE_FINALISATION: TESTING,
-        }[phase]
-        self._write_state(project)
-        self._publish_state()
-
-    def _fail_step(self, project: Project, step: StepRecord, why: str) -> None:
-        self._finish(project, FAILED, f"{why} {step.error}".strip())
 
     def _finish(
         self, project: Project, status: str, error: str, note: str = ""
@@ -1370,7 +1834,7 @@ class ProjectEngine:
         project.note = note
         project.ended_at = time.time()
         project.last_run_timestamp = _stamp()
-        self._write_state(project)
+        self._write_board(project)
         Workspace(project.workspace).append_critique(
             f"## {_stamp()} - Project {status.lower()}\n\n{note or error or '(no note)'}\n"
         )
@@ -1405,18 +1869,18 @@ class ProjectEngine:
 
     # -- plumbing ----------------------------------------------------------
 
-    def _write_state(self, project: Project) -> None:
+    def _write_board(self, project: Project) -> None:
         try:
-            Workspace(project.workspace).write_state(project.state_document())
+            Workspace(project.workspace).write_board(project.board_document())
         except OSError as exc:
-            # Losing the state file costs resumability, not the run in flight.
-            self._log("warn", f"Could not write {THESEUS_DIR}/{STATE_FILE}: {exc}")
+            # Losing the board costs resumability, not the run in flight.
+            self._log("warn", f"Could not write {THESEUS_DIR}/{BOARD_FILE}: {exc}")
 
     def _payload(self, project: Project) -> Dict[str, Any]:
         ws = Workspace(project.workspace)
         return project.to_dict(
-            roadmap=ws.roadmap(MAX_UI_TEXT),
-            state_json=json.dumps(project.state_document(), indent=2),
+            critique=ws.critique(MAX_UI_TEXT),
+            board_json=json.dumps(project.board_document(), indent=2),
         )
 
     def _publish_state(self) -> None:
@@ -1435,24 +1899,34 @@ class ProjectEngine:
 
 
 def _stamp() -> str:
-    """An ISO-8601 timestamp, which is what the schema asks for."""
+    """An ISO-8601 timestamp, which is what the board asks for."""
     return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
 
 
-def _int_setting(settings: Dict[str, Any], key: str, fallback: int) -> int:
-    """One positive integer out of the project settings, however mangled."""
+def _s(n: int) -> str:
+    """Plural suffix. These strings end up in the banner the operator reads."""
+    return "" if n == 1 else "s"
+
+
+def _as_float(value: Any, fallback: float) -> float:
+    """One number out of a board field, however mangled."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _int_setting(
+    settings: Dict[str, Any], key: str, fallback: int, floor: int = 1
+) -> int:
+    """One integer out of the project settings, however mangled.
+
+    ``floor`` is 1 for the bounds that make no sense at zero (a run with no
+    turns) and 0 for the innovation budget, where zero is a real choice: ship
+    what I asked for and stop.
+    """
     try:
         value = int(settings.get(key, fallback))
     except (TypeError, ValueError):
         return fallback
-    return value if value > 0 else fallback
-
-
-def _render_tasks(tasks: List[Dict[str, Any]]) -> str:
-    """The task list as the developer reads it."""
-    if not tasks:
-        return ""
-    return "\n".join(
-        f"- `{t['id']}` [{t['status']}] {t['description'] or '(no description)'}"
-        for t in tasks
-    )
+    return value if value >= floor else fallback

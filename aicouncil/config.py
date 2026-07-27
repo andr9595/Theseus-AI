@@ -411,16 +411,17 @@ DEFAULTS: Dict[str, Any] = {
     # no human in it: without them a project that cannot make progress will
     # keep spending quota on the same failure until someone notices.
     "project": {
-        # Total agent turns before the run stops and says so. Roughly: one for
-        # architecture, one or two per task, one QA round per implementation
-        # round, two to finish.
+        # Total agent turns before the run stops and says so. Roughly: one to
+        # audit the folder, one to plan, one or two per card, and one QA round
+        # per batch of cards.
         "max_steps": 40,
         # Consecutive failing builds before the project gives up rather than
         # handing the same trace back to the developer again.
         "max_fix_attempts": 3,
-        # How many rounds of "what should v1.1 be?" happen after the base build
-        # passes. Zero ships the brief and nothing more.
-        "expansion_rounds": 1,
+        # How many rounds of "what did we miss?" the architect gets once the
+        # board is clear and the build is green. Zero builds what was asked for
+        # and stops; this is what the Innovation slider sets.
+        "innovation_rounds": 2,
     },
     # --- Prompting ----------------------------------------------------------
     # Extra standing instructions appended to both council stages. Solo does

@@ -35,11 +35,13 @@ drives the CLIs you have already authenticated, so the marginal cost of a run
 is zero.
 
 There is also a third tab. **[Projects](#projects)** points three agents — an
-architect, a developer and a QA specialist — at one folder and loops them
-through five phases with nobody approving anything, until the thing builds,
-passes its own tests and has a README. It is the same machinery with the human
-taken out, which is exactly why it takes a deliberate press of a button and
-names the folder before it starts.
+architect, a developer and a QA specialist — at one folder and lets them work a
+shared Kanban board with nobody approving anything, until the board is clear and
+the build is green. Each turn the board decides who goes next: a failing build
+outranks new features, an unverified build outranks a code review, and only a QA
+turn can call anything green. It is the same machinery with the human taken out,
+which is exactly why it takes a deliberate press of a button and names the
+folder before it starts.
 
 ---
 
@@ -194,16 +196,16 @@ drafter                       ← use "polisher" for Stage 2
 |---|---|
 | **Council** | The two-stage pipeline: draft, approve, apply. Each member's CLI, model, effort and role are set by clicking it on the strip. |
 | **Chat** | One agent, one conversation, no gate and no writes. Its CLI, model and effort are the pickers under the composer. |
-| **Project** | An autonomous build. Three agents take turns against one folder until it works, passes its own tests and has a README. Nobody approves anything. See [Projects](#projects). |
+| **Project** | An autonomous build. Three agents work a shared Kanban board against one folder until it is clear and the build is green. Nobody approves anything. See [Projects](#projects). |
 
 Everything a run does lands in the conversation itself — the gate, the console
 and the diff are blocks in the thread rather than tabs beside it, so each one
 sits next to the exchange that produced it.
 
 Council and Chat are two ways of running *one task*. Project is a different
-thing on the same machinery: it runs for as long as the work takes, and only
-one of the three can be working the folder at a time — the app refuses to
-start a run while a project is going, and the reverse.
+thing on the same machinery: it runs for as long as the work takes, and only one
+of the three can be working the folder at a time — the app refuses to start a
+run while a project is going, and the reverse.
 
 ---
 
@@ -442,65 +444,106 @@ and reasoning level but not its council role. The mode is still stored as
 
 ## Projects
 
-The other two tabs run one task. Projects runs a *build*: you write a brief,
-pick a folder, and three agents take turns against it until it works, passes
-its own tests and has a README — across far more turns than any one of them
+The other two tabs run one task. Projects runs a *build*: you write a goal, pick
+a folder, and three agents work a shared Kanban board against it until the board
+is clear and the build is green — across far more turns than any one of them
 could hold in a single context window.
 
+### It is a board, not a pipeline
+
+There is no step 1, step 2, step 3. Every turn the engine reads
+`.theseus/BOARD.json` and asks one question — *what does this project need
+next?* — and the answer picks the agent:
+
 ```text
-   Your brief
-       |
-       v
-  [1 Architecture] ──> [2 Implementation] ──> [3 QA & build]
-         ^                     ^                     │
-         │                     │  build failing      │
-         │                     └─────────────────────┤
-         │                                           │ build passing
-  [5 Finalisation] <── [4 Feature expansion] <───────┘
-         │
-         v
-     COMPLETED
+  build FAILING ........ the developer fixes it
+  build UNKNOWN ........ QA builds and tests it
+  cards in review ...... the architect reviews the diff
+  cards in backlog ..... the developer claims the top one
+  board clear, green ... the architect proposes what is missing
+  nothing left ......... COMPLETED
 ```
 
-Phase 4 does not implement anything itself: it decides what v1.1 should be,
-adds those tasks and drops back into phase 2, so the enhancements are built and
-verified exactly the way the base was. When the expansion budget is spent, a
-passing build goes to phase 5 instead — a final integrity check, then the
-README — and the project is done.
+That ordering *is* the design, and it is the part worth arguing about:
+
+- **A failing build outranks everything.** No new features while it is red.
+- **An unverified build outranks a code review.** Reviewing code nobody has
+  compiled wastes the reviewer's turn, and half the time reviews something that
+  does not build.
+- **A review outranks starting more work**, so the queue cannot run away from
+  the person who has to read it.
+- **Only a QA turn can set the build to PASSING**, and the engine sets it back
+  to UNKNOWN the moment anyone writes code. A green board therefore always
+  means somebody ran the tests *after* the last edit.
+
+Bugs are cards too. QA raises them off a build failure, and they jump the
+developer's queue ahead of the backlog.
 
 ### The three chairs
 
-| Chair | Default CLI | What it does |
-|---|---|---|
-| **Architect** | `claude` | System design, directory layout, the task list, reviewing what came back, deciding what the project needs next, and the final README. |
-| **Developer** | `codex` | Writes the code and its tests. Receives build failures and fixes the cause. |
-| **QA** | `agy` | Inspects the tree, runs the real build and the real test suite, captures the stack trace verbatim, and decides whether it passes. |
+| Chair | Default CLI | Fires when | What it does |
+|---|---|---|---|
+| **Architect** | `claude` | a goal needs decomposing, cards are in review, or the board is clear | Turns the goal into cards, reviews diffs and approves or bounces them, and proposes enhancements once the goal is met. |
+| **Developer** | `codex` | there are cards in the backlog, or the build is failing | Claims the top card, writes the code and its tests, fixes build failures. One card per turn. |
+| **QA** | `agy` | at startup, and whenever code has changed | Audits the workspace read-only, then runs the project's real build and test commands and captures the output verbatim. |
 
 That pairing follows the work rather than the vendor — judgement to the best
 reasoner, bulk implementation to the most generous quota, build-and-verify to
-the one happiest running commands — and none of it is a rule. Click any chair
-in the matrix to reassign it, exactly as you would a council member. The three
-are ordinary providers under the hood, so the model picker, the reasoning-depth
+the one happiest running commands — and none of it is a rule. Click any chair in
+the matrix to reassign it, exactly as you would a council member. The three are
+ordinary providers under the hood, so the model picker, the reasoning-depth
 picker and the quota chip all work on them unchanged.
 
 If a chair's CLI is not installed, the project **will not start**, and says
-which one. A build that runs unattended for an hour should not discover in
-phase 3 that its QA binary was never there. `agy` in particular is opt-in —
-install it with `scripts/install-deps.sh --antigravity`, or move QA to a CLI
-you already have.
+which one. A build that runs unattended for an hour should not discover on its
+fourth turn that its QA binary was never there. `agy` in particular is opt-in —
+install it with `scripts/install-deps.sh --antigravity`, or move QA to a CLI you
+already have.
+
+### Pointing it at code that already exists
+
+Most projects are not empty folders, and this one is built for that case.
+
+**The first turn is read-only.** Before anything is written, the QA chair is
+invoked with its read-only flags and *no auto-approve grant at all*, and asked
+what is already here: the layout, the configs, what of the goal exists, and
+anything that would break if an agent touched it. Nothing can change during that
+turn, by construction rather than by instruction.
+
+**It adopts your build, it does not invent one.** The engine reads the tooling
+off disk itself — `go.mod`, `package.json`, `Cargo.toml`, `pyproject.toml`,
+`Makefile` and friends — and puts the real commands on the board. QA runs
+`go test ./...` because that is what this project uses. `package.json` scripts
+are read rather than guessed, because `npm test` against a package with no test
+script fails in a way that looks exactly like a broken build.
+
+**A repository that arrives red is known to be red.** A workspace with existing
+build tooling gets one baseline verification before any card is worked, so a
+build that was already failing when you pointed at it is your starting position
+rather than something discovered three cards later and blamed on the developer.
+An empty folder skips that, because verifying an empty directory reports a
+failing build and sends the developer off to fix a project that does not exist.
+
+**Edits are surgical.** The developer is told to change the lines that need
+changing in the files that need changing — not to rewrite a file it was only
+meant to edit, not to reformat code it did not touch. A whole-file rewrite
+destroys the diff the reviewer reads.
+
+**`.theseus/` is added to `.gitignore`** on the way in, if the folder is a git
+repository, by appending — never by rewriting a file that is already yours. The
+engine's working state stays out of your pull request.
 
 ### Permission: there is no gate
 
-A project writes. It cannot do anything else — phase 1 creates `SPEC.md`,
-phase 2 writes the codebase, phase 3 appends to the critique log — so **every
-step is invoked with its agent's auto-approve flags**, and no setting changes
-that. Zero-Touch is not involved; pressing **Start project** *is* the grant.
-That is why the confirmation names the folder: it is the one thing that turns a
-misclick into a question.
+A project writes. Apart from that first audit it cannot do anything else — so
+**every turn after the audit is invoked with its agent's auto-approve flags**,
+and no setting changes that. Zero-Touch is not involved; pressing **Start
+project** *is* the grant. That is why the confirmation names the folder: it is
+the one thing that turns a misclick into a question.
 
-A git snapshot is taken before the first write where there is one to take, so
-an entire build can be undone. In a folder that is not a repository there is
-nothing to snapshot and the app says so before you start.
+A git snapshot is taken before the first write where there is one to take, so an
+entire build can be undone. In a folder that is not a repository there is nothing
+to snapshot and the app says so before you start.
 
 ### What it writes
 
@@ -508,31 +551,35 @@ Inside the project root:
 
 | Path | Owner | What it is |
 |---|---|---|
-| `.theseus/STATE.json` | the engine | Execution state, phase, active chair, task list, build status, last failure. |
-| `.theseus/ROADMAP.md` | the agents | The living checklist, in prose. |
+| `.theseus/BOARD.json` | the engine | The board: goal, build health, the four columns, the last build output, the detected tooling. |
 | `.theseus/CRITIQUE.log` | the agents | Append-only: every build failure, review finding and verification result. |
-| `SPEC.md` | the architect | The specification, including the exact build and test commands QA will run. |
-| `README.md` | the architect | Written last, for whoever was not here while it was built. |
+| `.theseus/SPEC.md` | the architect | Design notes, when the design needs explaining. |
 
-The split matters. The engine owns `STATE.json` and rewrites it after every
-step, so there is always one authoritative record of where the run is; the
-agents own the two prose files, because prose tolerates three writers and a
-state machine does not. Structured changes — a task finished, a build failed —
-come back through a fenced JSON block each agent ends its turn with, which the
-engine parses and applies.
+Everything else it writes is your project's own source.
+
+The split matters. The engine owns `BOARD.json` and is its only writer, so there
+is always one authoritative record of where the run is; the agents own the prose
+files, because prose tolerates three writers and a state machine does not. Cards
+move by an agent *reporting* the move in a fenced JSON block at the end of its
+turn, which the engine parses and applies.
+
+Omission is never deletion: a card an agent forgets to mention is left exactly
+where it was. One careless reply cannot wipe the board.
 
 ### Surviving a context limit
 
 No turn depends on the previous turn's conversation. Every prompt is rebuilt
-from the files on disk — the state, the roadmap, the spec, the last failure
-verbatim — so an agent that dies mid-phase costs one step, not the run.
+from the board and the working diff on disk — never from a transcript — so an
+agent that dies mid-turn costs one turn, not the run. Terminal output from
+earlier turns is never replayed to anyone: it is the largest thing that could be
+sent and the least useful per token.
 
-When a step fails in a way that reads as exhaustion (a token or quota limit, a
+When a turn fails in a way that reads as exhaustion (a token or quota limit, a
 timeout, a non-zero exit with the right words in it), the engine sets
-`continuation_token_needed`, hands that *same step* to a different chair, and
-carries on. The replacement starts from the state file, not from a transcript
-it never saw. That is the reason the roles are three independent providers
-rather than one CLI asked three different things.
+`continuation_needed`, hands that *same turn* to a different chair, and carries
+on. The replacement starts from the board, not from a conversation it never saw.
+That is the reason the roles are three independent providers rather than one CLI
+asked three different things.
 
 This is a heuristic on the CLIs' own prose — none of them has a distinct exit
 code for "out of context" — and it is treated as one: a false positive costs a
@@ -540,46 +587,67 @@ single hand-off, which is survivable.
 
 ### The controls
 
-- **Pause** stops the loop *after* the running agent finishes its step. It does
+- **Pause** stops the loop *after* the running agent finishes its turn. It does
   not interrupt: a CLI killed between two file writes leaves a tree nothing in
   the run knows is half-written. It costs a few minutes and leaves the folder
   consistent.
-- **Resume** picks up from the state file.
-- **Hand off** forces the next step onto a chair you choose. For the failure
-  the engine cannot see — an agent answering, exiting zero, and going in
-  circles.
-- **Stop** ends it now, killing whatever is executing. Use Pause unless you
-  mean that.
+- **Resume** picks up from the board.
+- **Hand off** forces the next turn onto a chair you choose. For the failure the
+  board cannot see — an agent answering, exiting zero, and going in circles.
+- **Stop** ends it now, killing whatever is executing. Use Pause unless you mean
+  that.
 
 Close the window mid-build and the project is still on disk; reopening the app
-finds it and offers to resume. A project that is still running when you open
-the app pulls you to the tab, because an idle-looking window while three agents
+finds it and offers to resume. A project that is still running when you open the
+app pulls you to the tab, because an idle-looking window while three agents
 rewrite a folder is the wrong thing to show.
+
+### Proactive innovation
+
+The slider on the initializer decides how much the council may invent once your
+goal is met and the build is green. At **zero** it builds what you asked for and
+stops — the right setting for a repository you care about. Above zero, the
+architect proposes two or three enhancements, they become ordinary backlog
+cards, and the developer builds and QA verifies them exactly as it did the rest.
+Cards the council invented are tagged **idea** on the board and counted
+separately in the completion note, so "what did it do that I did not ask for?"
+is answerable at a glance.
+
+An architect that honestly has nothing worth adding returns no cards, and the
+run ends there rather than inventing work to fill the budget.
 
 ### Bounds
 
 Under **Settings → Run → Projects**, because the loop has no human in it and
-without them a project that cannot make progress will keep spending quota on
-the same failure until somebody notices:
+without them a project that cannot make progress will keep spending quota on the
+same failure until somebody notices:
 
 | Setting | Default | What it stops |
 |---|---|---|
 | Step limit | 40 | Total agent turns before it stops and says so. |
 | Fix attempts | 3 | Failing builds in a row before it gives up rather than handing back the same trace again. |
-| Expansion rounds | 1 | Rounds of "what should v1.1 be?". Zero ships the brief and nothing more. |
+| Innovation rounds | 2 | Where the initializer's slider starts. |
 
-Hitting a limit is not data loss: everything built is on disk, the roadmap says
+There is also an unconfigurable one: if three consecutive turns leave the board
+completely unchanged — a reviewer giving no verdict, a developer claiming a card
+and writing nothing — the run stops and says the board is not moving. Three
+agents can all run cleanly and make no progress, and the step limit is too blunt
+an instrument to notice that an hour early.
+
+Hitting a limit is not data loss: everything built is on disk, the board says
 where it got to, and the project can be resumed once you have unstuck it.
 
 ### Trying it without spending quota
 
 `scripts/mock-agent.py` speaks the project protocol. Point all three chairs at
-it and the whole five-phase loop runs for real against a real directory: it
-writes a spec, implements a two-file Python module with a genuine bug in it,
-fails its own test suite, is handed the trace, fixes it, proposes an
-enhancement and writes a README. Nothing in that sequence is faked — the tests
-really run and really fail — which is the only way to know the loop works
-rather than to believe it.
+it and the whole decision loop runs for real against a real directory: it audits
+the folder read-only, plans two cards, implements a Python module **with a
+genuine bug in it**, fails its own test suite, is handed the real trace, fixes
+it, gets the cards reviewed and proposes one enhancement before declaring itself
+finished. Nothing in that sequence is faked — the tests really run and really
+fail — which is the only way to know the loop works rather than to believe it.
+
+---
 
 ---
 
@@ -926,7 +994,7 @@ aicouncil/
 ├── __main__.py     Entry point, browser launcher, --doctor
 ├── server.py       http.server + SSE, token auth, Origin/Host validation
 ├── pipeline.py     The state machine: drafting → gate → polishing → complete
-├── projects.py     The five-phase autonomous loop and its .theseus/ state file
+├── projects.py     The board-driven autonomous loop and its .theseus/ board
 ├── providers.py    CLI adapters: argv construction, streaming, cancellation
 ├── prompts.py      Role catalogue, stage prompts and the project phase prompts
 ├── gitutil.py      Repo status, diffs, snapshot/rollback & pull-request plumbing
@@ -996,16 +1064,27 @@ Coverage focuses on the properties that matter if they're wrong:
   those runs lose is the diff, the snapshot and pull-request delivery, and a
   config written when the folder was a mandatory repository still migrates.
 - Cross-origin and bad-token requests are rejected; path traversal is blocked.
-- A project runs **all five phases against a real directory** with the mock
-  agents: it writes real files, its test suite really fails, the trace really
-  reaches the developer, and the fix really passes. Every unit test around that
-  one would still pass if the phases had quietly stopped connecting.
-- A corrupt or hand-mangled `STATE.json` resumes at the start rather than
-  crashing a worker thread or dispatching on a phase that does not exist, and
-  an agent's silence about a task is never read as deleting it.
+- A project runs **the whole decision loop against a real directory** with the
+  mock agents: it writes real files, its test suite really fails, the trace
+  really reaches the developer, and the fix really passes. Every unit test
+  around that one would still pass if the turns had quietly stopped connecting.
+- The **ordering policy** is pinned directly by handing the engine a board and
+  asking what it would do next — a failing build outranks a review, a review
+  outranks new work, a bug jumps the queue — so a reordering cannot pass as a
+  refactor.
+- A corrupt or hand-mangled `BOARD.json` resumes rather than crashing a worker
+  thread, an unreadable `build_health` resumes as **unknown and never passing**,
+  and an agent's silence about a card is never read as deleting it.
 - QA reporting no build status is treated as **failing, never passing** — a
   silent verification turning into a green build is the one outcome the loop
-  must not build on top of.
+  must not build on top of. Writing code sets the build back to unknown, so a
+  green board cannot survive an edit.
+- The first turn of a run is verified to be **read-only against a real
+  invocation**: no write grant, and no files modified.
+- `.theseus/` is appended to an existing `.gitignore` rather than replacing it,
+  and never added twice.
+- Build tooling is **read off disk, not guessed** — `package.json` scripts that
+  do not exist are never run.
 - A project and a run refuse each other, in both directions.
 
 ---
