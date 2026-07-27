@@ -614,6 +614,17 @@ function visibleMode() {
   return selectedMode();
 }
 
+/** A completed run does not own the screen after its mode is left. The server
+ *  retains the latest run globally, so filter it here or switching from Chat
+ *  to Council would keep rendering the Chat conversation under the Council
+ *  selector (and vice versa). */
+function runOnScreen() {
+  const run = (state.openChat && state.openChat.run) || state.run;
+  if (!run) return null;
+  const mode = run.mode || (run.solo ? 'solo' : 'council');
+  return mode === uiMode() ? run : null;
+}
+
 /** The folder the operator chose, or '' for the scratch workspace. */
 function workspacePath() {
   return ((state.config || {}).workspace) || '';
@@ -632,7 +643,7 @@ function runWorkspace(run) {
 }
 
 function renderStatus() {
-  const run = state.run;
+  const run = runOnScreen();
   const s = run ? run.state : 'idle';
 
   // No status pill any more: what a stage is doing reads off the member that
@@ -822,7 +833,7 @@ function seatTag(role) {
  *  redrawing the strip from a preview mid-run would show a council that is not
  *  the one working. */
 function activeSeating() {
-  const run = (state.openChat && state.openChat.run) || state.run;
+  const run = runOnScreen();
   if (run && !run.solo && run.seating) return run.seating;
   return state.seating;
 }
@@ -843,7 +854,7 @@ function renderStrip() {
   strip.classList.toggle('hidden', !show);
   if (!show) { strip.innerHTML = ''; return; }
 
-  const run = (state.openChat && state.openChat.run) || state.run;
+  const run = runOnScreen();
   const providers = (state.config || {}).providers || {};
   const seats = [...(seating.members || []), seating.chair].filter(Boolean);
 
@@ -943,7 +954,7 @@ const COUNCIL_STEPS = [
 
 function renderCouncilSteps() {
   const host = $('#council-steps');
-  const run = (state.openChat && state.openChat.run) || state.run;
+  const run = runOnScreen();
   const show = uiMode() === 'council' && run && !run.solo && run.seating;
   host.classList.toggle('hidden', !show);
   if (!show) { $('.project-strip', host).innerHTML = ''; return; }
@@ -1595,7 +1606,7 @@ function renderThread() {
 
   // Whichever conversation is on screen: the one opened from history, or the
   // live run. They are the same shape, so one path renders both.
-  const run = (state.openChat && state.openChat.run) || state.run;
+  const run = runOnScreen();
   const live = !state.openChat;
 
   $('#hero').classList.toggle('hidden', !!run);

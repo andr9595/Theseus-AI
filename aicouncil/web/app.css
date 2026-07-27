@@ -1637,6 +1637,28 @@ html, body {
 
 .project-setup { display: flex; flex-direction: column; gap: 20px; }
 
+/* Project's prompt is its composer. Keep the per-run cogwheel attached to the
+   box just as it is in Council and Chat, instead of floating in the heading. */
+.project-goal-box {
+  padding: 10px 11px 8px;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  transition: border-color .13s;
+}
+.project-goal-box:focus-within { border-color: var(--accent); }
+.field .project-goal-box textarea {
+  display: block;
+  width: 100%;
+  padding: 0 1px 7px;
+  background: none;
+  border: 0;
+  border-radius: 0;
+  resize: vertical;
+}
+.field .project-goal-box textarea:focus { border-color: transparent; }
+.project-goal-foot { display: flex; justify-content: flex-end; }
+
 .project-folder {
   display: inline-flex; align-items: center; gap: 8px;
   padding: 9px 12px;

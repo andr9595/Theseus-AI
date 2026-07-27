@@ -155,6 +155,11 @@ class TestStaticFiles(ServerTestBase):
             body = res.read().decode()
         self.assertEqual(body.count('class="project-gear-btn icon-round"'), 2)
         self.assertIn('aria-label="Project options"', body)
+        goal_box = body.split('class="project-goal-box"', 1)[1].split(
+            'class="field-hint"', 1
+        )[0]
+        self.assertIn('id="project-goal"', goal_box)
+        self.assertIn('class="project-gear-btn icon-round"', goal_box)
 
         with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
             script = res.read().decode()
@@ -162,6 +167,18 @@ class TestStaticFiles(ServerTestBase):
         self.assertIn("project ? 'project' : (chat ? 'chat' : 'council')", script)
         self.assertIn("$$('.project-gear-btn').forEach", script)
         self.assertIn("openSettings(project ? 'project' : 'stages')", script)
+
+    def test_completed_run_is_only_rendered_in_its_own_mode(self):
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        helper = script.split("function runOnScreen()", 1)[1].split(
+            "/** The folder", 1
+        )[0]
+        self.assertIn("mode === uiMode() ? run : null", helper)
+        thread = script.split("function renderThread()", 1)[1].split(
+            "/* ---- Projects", 1
+        )[0]
+        self.assertIn("const run = runOnScreen();", thread)
 
     def test_accepted_chat_submit_clears_only_the_submitted_message(self):
         with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
