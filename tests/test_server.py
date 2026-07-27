@@ -116,12 +116,18 @@ class TestStaticFiles(ServerTestBase):
             body = res.read().decode()
         self.assertIn("Theseus AI", body)
 
-    def test_each_mode_has_a_caveman_setting(self):
+    def test_caveman_settings_live_with_the_modes_that_use_them(self):
         with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
             body = res.read().decode()
-        for mode in ("council", "chat", "project"):
-            self.assertIn(f'data-settings-tab="{mode}"', body)
-            self.assertIn(f'id="caveman-{mode}"', body)
+        self.assertNotIn('id="caveman-council"', body)
+        self.assertNotIn('id="caveman-chat"', body)
+        self.assertIn('id="caveman-project"', body)
+
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn("const cavemanMode = chat ? 'chat' : 'council';", script)
+        self.assertIn("row('caveman', 'Caveman mode'", script)
+        self.assertIn("patchConfig({ caveman: { [cavemanMode]:", script)
 
     def test_security_headers_are_present(self):
         with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:

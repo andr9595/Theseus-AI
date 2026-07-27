@@ -2645,7 +2645,7 @@ function openPersonaMenu(anchor, seatId) {
 // against the CLI - the same CLI can sit in two seats with two lenses. The
 // wording is still edited in one place: Settings -> Roles.
 
-/** The gear beside the composer: the two options that get changed per run.
+/** The gear beside the composer: the options that get changed per run.
  *  The rest are a click further on, in Settings, because they are decisions
  *  about the project rather than about the message being sent. */
 function openGearMenu(anchor) {
@@ -2655,6 +2655,7 @@ function openGearMenu(anchor) {
   // the CLI gets its auto-approve flags — it is just that Council can also be
   // granted that at the gate, and Chat, having no gate, cannot.
   const chat = uiMode() === 'solo';
+  const cavemanMode = chat ? 'chat' : 'council';
 
   const row = (key, label, on, danger) =>
     `<button class="menu-toggle${on ? ' on' : ''}${danger ? ' danger' : ''}" ` +
@@ -2665,6 +2666,7 @@ function openGearMenu(anchor) {
   menu.className = 'model-menu gear-menu';
   menu.innerHTML =
     row('zero_touch', 'Zero-Touch mode', !!c.zero_touch, true) +
+    row('caveman', 'Caveman mode', cavemanOn(cavemanMode), false) +
     row('pull_request_mode', 'Pull request mode', !!c.pull_request_mode, false) +
     // Council only: Chat has one agent and no bench to show. It is a display
     // choice rather than a permission, so unlike the two above it is applied
@@ -2695,6 +2697,10 @@ function openGearMenu(anchor) {
     const btn = e.target.closest('[data-toggle]');
     if (!btn || btn.disabled) return;
     closeModelMenu();
+    if (btn.dataset.toggle === 'caveman') {
+      patchConfig({ caveman: { [cavemanMode]: !cavemanOn(cavemanMode) } });
+      return;
+    }
     if (btn.dataset.toggle === 'show_seats') {
       const show = !seatsShown();
       // `patchConfig` re-renders, so the strip appears or goes on its own.
@@ -3118,8 +3124,6 @@ function renderSettings() {
   }).join('');
 
   $('#house-rules').value = conf.house_rules || '';
-  $('#caveman-council').checked = cavemanOn('council');
-  $('#caveman-chat').checked = cavemanOn('chat');
   $('#caveman-project').checked = cavemanOn('project');
   $('#display-name').value = conf.display_name || '';
   $('#port-input').value = conf.port || 8760;
@@ -3359,12 +3363,10 @@ async function saveSettings() {
         providers,
         council: readCouncilSettings(),
         house_rules: $('#house-rules').value,
-        // All three every time. The config store deep-merges, so sending only
-        // the mode that changed would be indistinguishable from sending
-        // nothing — and a switch that would not turn off is worse than absent.
+        // Council and Chat live in their own composer menus. This form owns
+        // only Project, and the config store deep-merges this leaf without
+        // disturbing either chat mode.
         caveman: {
-          council: $('#caveman-council').checked,
-          chat: $('#caveman-chat').checked,
           project: $('#caveman-project').checked,
         },
         display_name: $('#display-name').value.trim(),
