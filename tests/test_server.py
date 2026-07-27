@@ -125,7 +125,10 @@ class TestStaticFiles(ServerTestBase):
 
         with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
             script = res.read().decode()
-        self.assertIn("const cavemanMode = chat ? 'chat' : 'council';", script)
+        self.assertIn(
+            "const cavemanMode = project ? 'project' : (chat ? 'chat' : 'council');",
+            script,
+        )
         self.assertIn("row('caveman', 'Caveman mode'", script)
         self.assertIn("patchConfig({ caveman: { [cavemanMode]:", script)
 
@@ -139,12 +142,26 @@ class TestStaticFiles(ServerTestBase):
         with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
             script = res.read().decode()
         self.assertIn(
-            "const efficiencyMode = chat ? 'chat' : 'council';",
+            "const efficiencyMode = project ? 'project' : "
+            "(chat ? 'chat' : 'council');",
             script,
         )
         self.assertIn("row('efficiency', 'Efficiency mode'", script)
         self.assertIn("patchConfig({", script)
         self.assertIn("efficiency: {", script)
+
+    def test_project_has_its_own_run_options_cogwheel(self):
+        with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
+            body = res.read().decode()
+        self.assertEqual(body.count('class="project-gear-btn icon-round"'), 2)
+        self.assertIn('aria-label="Project options"', body)
+
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn("const project = mode === 'project';", script)
+        self.assertIn("project ? 'project' : (chat ? 'chat' : 'council')", script)
+        self.assertIn("$$('.project-gear-btn').forEach", script)
+        self.assertIn("openSettings(project ? 'project' : 'stages')", script)
 
     def test_accepted_chat_submit_clears_only_the_submitted_message(self):
         with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:

@@ -101,15 +101,26 @@
 
           <!-- The initializer. -->
           <section id="project-setup" class="project-setup">
-            <h2 class="project-title">Build something, unattended</h2>
-            <p class="project-sub">
-              Three agents work one folder around a shared board &mdash; an
-              architect plans and reviews, a developer builds, QA tests &mdash;
-              and the board decides who goes next. The first turn is a
-              read-only look at what is already there. Every turn after it
-              <b>runs with its CLI's auto-approve flags</b>, so files change
-              without asking. Pick the folder deliberately.
-            </p>
+            <header class="project-head">
+              <div class="project-head-main">
+                <h2 class="project-title">Build something, unattended</h2>
+                <p class="project-sub">
+                  Three agents work one folder around a shared board &mdash; an
+                  architect plans and reviews, a developer builds, QA tests &mdash;
+                  and the board decides who goes next. The first turn is a
+                  read-only look at what is already there. Every turn after it
+                  <b>runs with its CLI's auto-approve flags</b>, so files change
+                  without asking. Pick the folder deliberately.
+                </p>
+              </div>
+              <button class="project-gear-btn icon-round" type="button"
+                aria-label="Project options" aria-haspopup="true">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+                  <circle cx="12" cy="12" r="3"/>
+                  <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2v.2a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0-1.2-2.9H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 8a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V2a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V8a1.7 1.7 0 0 0 1.5 1H22a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>
+                </svg>
+              </button>
+            </header>
 
             <div class="field">
               <label for="project-goal">What should it build?</label>
@@ -176,6 +187,13 @@
                 <p id="project-where" class="project-sub"></p>
               </div>
               <div class="project-controls">
+                <button class="project-gear-btn icon-round" type="button"
+                  aria-label="Project options" aria-haspopup="true">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+                    <circle cx="12" cy="12" r="3"/>
+                    <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2v.2a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0-1.2-2.9H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 8a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V2a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V8a1.7 1.7 0 0 0 1.5 1H22a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>
+                  </svg>
+                </button>
                 <button id="project-pause" class="btn btn-quiet btn-sm" type="button">Pause</button>
                 <button id="project-resume" class="btn btn-quiet btn-sm hidden" type="button">Resume</button>
                 <button id="project-handoff" class="btn btn-quiet btn-sm" type="button" aria-haspopup="true">Hand off</button>

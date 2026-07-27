@@ -2645,7 +2645,8 @@ function openPersonaMenu(anchor, seatId) {
 // against the CLI - the same CLI can sit in two seats with two lenses. The
 // wording is still edited in one place: Settings -> Roles.
 
-/** The gear beside the composer: the options that get changed per run.
+/** The gear beside the composer, or at the head of Project: the options that
+ *  get changed per mode.
  *  The rest are a click further on, in Settings, because they are decisions
  *  about the project rather than about the message being sent. */
 function openGearMenu(anchor) {
@@ -2654,9 +2655,11 @@ function openGearMenu(anchor) {
   // Both apply in both modes. Zero-Touch means the same thing either way —
   // the CLI gets its auto-approve flags — it is just that Council can also be
   // granted that at the gate, and Chat, having no gate, cannot.
-  const chat = uiMode() === 'solo';
-  const cavemanMode = chat ? 'chat' : 'council';
-  const efficiencyMode = chat ? 'chat' : 'council';
+  const mode = uiMode();
+  const project = mode === 'project';
+  const chat = mode === 'solo';
+  const cavemanMode = project ? 'project' : (chat ? 'chat' : 'council');
+  const efficiencyMode = project ? 'project' : (chat ? 'chat' : 'council');
 
   const row = (key, label, on, danger) =>
     `<button class="menu-toggle${on ? ' on' : ''}${danger ? ' danger' : ''}" ` +
@@ -2666,21 +2669,25 @@ function openGearMenu(anchor) {
   const menu = document.createElement('div');
   menu.className = 'model-menu gear-menu';
   menu.innerHTML =
-    row('zero_touch', 'Zero-Touch mode', !!c.zero_touch, true) +
+    (project ? '' : row('zero_touch', 'Zero-Touch mode', !!c.zero_touch, true)) +
     row('caveman', 'Caveman mode', cavemanOn(cavemanMode), false) +
     row('efficiency', 'Efficiency mode', efficiencyOn(efficiencyMode), false) +
-    row('pull_request_mode', 'Pull request mode', !!c.pull_request_mode, false) +
+    (project ? '' :
+      row('pull_request_mode', 'Pull request mode', !!c.pull_request_mode, false)) +
     // Council only: Chat has one agent and no bench to show. It is a display
     // choice rather than a permission, so unlike the two above it is applied
     // here directly - there is no confirmation for it to bypass.
-    (chat ? '' : row('show_seats', 'Show the council seats', seatsShown(), false)) +
+    (chat || project ? '' :
+      row('show_seats', 'Show the council seats', seatsShown(), false)) +
     `<hr>` +
     `<button class="model-opt" data-open="settings">` +
       `<span class="model-opt-name">More…</span>` +
       `<span class="model-opt-note">Settings</span>` +
     `</button>` +
     `<div class="model-menu-source">` +
-      (chat
+      (project
+        ? 'Applies to the Architect, Developer and QA prompts in Projects.'
+        : chat
         ? (c.zero_touch
           ? 'Chat can change files in the working folder.'
           : 'Chat is read-only. Zero-Touch is the only way to let it write, ' +
@@ -2693,7 +2700,7 @@ function openGearMenu(anchor) {
   menu.addEventListener('click', (e) => {
     if (e.target.closest('[data-open="settings"]')) {
       closeModelMenu();
-      $('#settings-btn').click();
+      openSettings(project ? 'project' : 'stages');
       return;
     }
     const btn = e.target.closest('[data-toggle]');
@@ -2953,6 +2960,15 @@ function switchSettingsTab(name) {
     t.classList.toggle('active', t.dataset.settingsTab === name));
   $$('.settings-panel').forEach(p =>
     p.classList.toggle('active', p.dataset.settingsPanel === name));
+}
+
+async function openSettings(tab = 'stages') {
+  await refreshDoctor(true);
+  renderSettings();
+  renderRoleList();
+  renderHistoryCounts();
+  switchSettingsTab(tab);
+  openModal('settings');
 }
 
 /** Writing modes are scoped to 'council', 'chat' or 'project'. Each mode gets
@@ -4071,6 +4087,13 @@ function wire() {
     if ($('.model-menu')) { closeModelMenu(); return; }
     openGearMenu($('#gear-btn'));
   });
+  $$('.project-gear-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if ($('.model-menu')) { closeModelMenu(); return; }
+      openGearMenu(btn);
+    });
+  });
 
   // -- projects ---------------------------------------------------------
   // The agent matrix. A chair is the same provider object the council strip
@@ -4271,14 +4294,7 @@ function wire() {
   });
 
   // -- settings ---------------------------------------------------------
-  $('#settings-btn').addEventListener('click', async () => {
-    await refreshDoctor(true);
-    renderSettings();
-    renderRoleList();
-    renderHistoryCounts();
-    switchSettingsTab('stages');
-    openModal('settings');
-  });
+  $('#settings-btn').addEventListener('click', () => openSettings('stages'));
   $('#clear-council').addEventListener('click', () => clearHistory('council'));
   $('#clear-chat').addEventListener('click', () => clearHistory('solo'));
   $('.settings-tabs').addEventListener('click', (e) => {
