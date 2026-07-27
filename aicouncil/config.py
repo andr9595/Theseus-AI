@@ -136,6 +136,42 @@ AGENTS: Dict[str, Dict[str, Any]] = {
         # between a conversation and a run.
         "read_only_args": ["--permission-mode", "plan"],
     },
+    # Google's Antigravity CLI, which replaced Gemini CLI for personal accounts
+    # on 18 June 2026. Its binary is `agy`, and the key has to stay a substring
+    # of that: `agent_for` identifies an agent by looking for its name inside
+    # the executable's, so that a hand-edited absolute path still resolves.
+    "agy": {
+        "label": "Antigravity",
+        # The prompt is the *value* of `--print`, not a positional argument -
+        # the one structural difference from the other two. A bare `{prompt}`
+        # token would let `build_argv` splice the model and permission flags in
+        # ahead of it, directly between `--print` and its own value, and
+        # `--print` would take `--model` as the thing to answer. Attaching the
+        # placeholder to the flag removes the gap entirely.
+        #
+        # `--print-timeout` is pinned well past every timeout in this app
+        # because `agy` defaults to five minutes and gives up on its own: a
+        # council stage allowed thirty would be cut off at five with no
+        # explanation. Set high, the app's own timeout is always the one that
+        # decides.
+        "command": ["agy", "--print-timeout", "60m", "--prompt={prompt}"],
+        "auto_approve_args": ["--dangerously-skip-permissions"],
+        "model_args": ["--model", "{model}"],
+        # low | medium | high, per the CLI's own validation message. Narrower
+        # than Claude's five levels, and it refuses a value it does not know
+        # rather than warning and carrying on - so the picker asks rather than
+        # offering a list this file would have to keep in step.
+        "effort_args": ["--effort", "{effort}"],
+        # No streaming format to ask for: `agy` has no `--output-format`, so
+        # its print mode is read as the plain text it is. Present and empty for
+        # the same reason as Codex's - assigning this agent to a job must clear
+        # the other's streaming flags rather than leave them on a binary that
+        # would reject them.
+        "stream_args": [],
+        # `--mode plan` is Antigravity's read-only mode: it reads the
+        # repository and answers, and will not edit.
+        "read_only_args": ["--mode", "plan"],
+    },
 }
 
 # Reported for a command that matches no catalogued agent: a hand-written

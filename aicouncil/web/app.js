@@ -1936,6 +1936,14 @@ async function dropUnsupportedEffort(providerId, provider) {
   try {
     const data = await api(`/api/efforts?provider=${encodeURIComponent(providerId)}`);
     const levels = (data.levels || []).map(l => l.effort);
+    // Antigravity treats every model it lists as a complete selection and
+    // rejects `--effort` beside one rather than picking a winner. That is a
+    // definite "no", unlike the empty list below, so it clears on its own.
+    if (data.conflicts_with_model) {
+      await patchConfig({ providers: { [providerId]: { effort: '' } } });
+      toast(data.error || 'That model takes no separate effort.', 'warn', 6000);
+      return;
+    }
     // An empty list means discovery failed, not that nothing is supported —
     // clearing on that would silently undo a deliberate choice.
     if (!levels.length || levels.includes(effort)) return;

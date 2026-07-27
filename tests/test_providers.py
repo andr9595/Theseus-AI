@@ -4,6 +4,7 @@ The invariant under test: auto-approve flags reach the child process if and
 only if the pipeline explicitly granted permission.
 """
 
+import copy
 import json
 import os
 import shutil
@@ -15,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from aicouncil import providers  # noqa: E402
+from aicouncil.config import AGENTS, agent_for  # noqa: E402
 from aicouncil.providers import (  # noqa: E402
     ARGV_PROMPT_LIMIT,
     ClaudeStreamReader,
@@ -38,6 +40,10 @@ CODEX = {
     "command": ["codex", "exec", "{prompt}"],
     "auto_approve_args": ["--dangerously-bypass-approvals-and-sandbox"],
 }
+# The real catalogue entry, not a hand-written stand-in: what these tests are
+# protecting is the template itself, and a local copy would keep passing after
+# someone edited the one the app actually ships.
+AGY = dict(copy.deepcopy(AGENTS["agy"]), id="solo")
 
 
 class TestBuildArgv(unittest.TestCase):
@@ -775,6 +781,158 @@ class TestClaudeAliasResolution(unittest.TestCase):
         self.assertNotIn("fable", first["resolved"])
         second = discover_models(provider)
         self.assertIn("fable", second["resolved"])
+
+
+class TestAntigravityAgent(unittest.TestCase):
+    """Antigravity's prompt is a flag's value, not a positional argument.
+
+    Every other agent here takes the prompt as its own argument, so the app
+    splices model and permission flags in immediately ahead of it. Do that to
+    `agy --print <prompt>` and `--print` takes `--model` as the thing to
+    answer: the run succeeds, silently, on the wrong prompt and with no model
+    set. Attaching the placeholder to the flag is what prevents it, so these
+    tests hold the prompt and its flag together as one token.
+    """
+
+    def test_the_binary_is_recognised_as_a_catalogued_agent(self):
+        self.assertEqual(agent_for(AGY), "agy")
+        # And by absolute path, which is how a hand-edited command arrives.
+        self.assertEqual(agent_for(dict(AGY, command=["/opt/bin/agy", "-p"])), "agy")
+
+    def test_the_prompt_stays_welded_to_its_flag(self):
+        provider = dict(AGY, model="gemini-3.6-flash", effort="high")
+        argv, stdin = build_argv(provider, "fix the bug", auto_approve=True)
+        self.assertIsNone(stdin)
+        self.assertIn("--prompt=fix the bug", argv)
+        # Nothing may sit between the flag and its value, because there is no
+        # "between" - they are one argv entry. The prompt is also last, so no
+        # later flag can be read as a continuation of it.
+        self.assertEqual(argv[-1], "--prompt=fix the bug")
+        self.assertNotIn("fix the bug", argv[:-1])
+
+    def test_flags_land_ahead_of_the_prompt_in_every_combination(self):
+        provider = dict(AGY, model="gemini-3.6-flash", effort="low")
+        for approve, readonly in ((False, False), (True, False), (False, True)):
+            with self.subTest(auto_approve=approve, read_only=readonly):
+                argv, _ = build_argv(
+                    provider, "task", auto_approve=approve, read_only=readonly
+                )
+                self.assertEqual(argv[0], "agy")
+                self.assertEqual(argv[-1], "--prompt=task")
+                self.assertEqual(argv.count("--prompt=task"), 1)
+
+    def test_permission_flags_are_opposites_never_both(self):
+        granted, _ = build_argv(AGY, "task", auto_approve=True)
+        self.assertIn("--dangerously-skip-permissions", granted)
+        self.assertNotIn("plan", granted)
+
+        withheld, _ = build_argv(AGY, "task", auto_approve=False, read_only=True)
+        self.assertEqual(withheld[-3:-1], ["--mode", "plan"])
+        self.assertNotIn("--dangerously-skip-permissions", withheld)
+
+    def test_nothing_is_granted_by_default(self):
+        argv, _ = build_argv(AGY, "task", auto_approve=False)
+        self.assertNotIn("--dangerously-skip-permissions", argv)
+
+    def test_its_own_print_timeout_outlives_the_apps(self):
+        # `agy` gives up after five minutes by default and says nothing useful
+        # about why. Every stage timeout in this app is longer than that, so
+        # the CLI's own limit has to be raised past all of them or it, not the
+        # app, is what ends a long run.
+        self.assertIn("--print-timeout", AGY["command"])
+        value = AGY["command"][AGY["command"].index("--print-timeout") + 1]
+        self.assertEqual(value, "60m")
+
+    def test_output_is_read_as_plain_text(self):
+        # There is no `--output-format` on this CLI, so asking for one would
+        # fail the run outright, and parsing its prose as JSON would mangle it.
+        self.assertEqual(AGY["stream_args"], [])
+        argv, _ = build_argv(AGY, "task", auto_approve=False)
+        self.assertIsNone(stream_reader_for(argv))
+
+
+class TestAntigravityDiscovery(unittest.TestCase):
+    """What `agy` can run, asked of `agy`."""
+
+    MODELS_STUB = (
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "if sys.argv[1:2] == ['models']:\n"
+        "    print('Available models:')\n"
+        "    print('gemini-3.6-flash-high')\n"
+        "    print('claude-sonnet-4-6')\n"
+        "    print('Gemini 3.6 Flash (High)')\n"
+        "    print('')\n"
+        "else:\n"
+        "    sys.stderr.write('Error: invalid model selection "
+        "(--model \"\" --effort \"?ask\"): invalid --effort \"?ask\" "
+        "(valid: low, medium, high)\\n')\n"
+    )
+
+    SIGNED_OUT_STUB = (
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "sys.stderr.write('Error: Please sign in to view available models.\\n')\n"
+        "sys.exit(1)\n"
+    )
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-agy-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _stub(self, body, **extra):
+        path = self.tmp / "agy"
+        path.write_text(body)
+        path.chmod(0o755)
+        return dict(AGY, command=[str(path), "--prompt={prompt}"], **extra)
+
+    def test_model_ids_are_taken_and_prose_is_left(self):
+        r = discover_models(self._stub(self.MODELS_STUB))
+        # The heading and the human-readable form of a model name are both
+        # dropped without this code having to know either was coming.
+        self.assertEqual(r["models"], ["gemini-3.6-flash-high", "claude-sonnet-4-6"])
+        self.assertFalse(r["error"])
+
+    def test_being_signed_out_is_reported_in_the_clis_own_words(self):
+        r = discover_models(self._stub(self.SIGNED_OUT_STUB))
+        self.assertEqual(r["models"], [])
+        self.assertIn("sign in", r["error"])
+
+    def test_effort_levels_are_read_from_the_clis_refusal(self):
+        r = discover_efforts(self._stub(self.MODELS_STUB))
+        self.assertEqual([lv["effort"] for lv in r["levels"]], ["low", "medium", "high"])
+        self.assertFalse(r["error"])
+
+    def test_a_listed_model_refuses_a_separate_effort(self):
+        # `agy` rejects --effort beside anything on its own list, before the
+        # run starts. Offering a level here would produce a config that cannot
+        # run and a failure that names no cause.
+        r = discover_efforts(self._stub(self.MODELS_STUB, model="gemini-3.6-flash-high"))
+        self.assertEqual(r["levels"], [])
+        self.assertTrue(r["conflicts_with_model"])
+        self.assertIn("gemini-3.6-flash-high", r["error"])
+
+    def test_the_list_decides_and_not_the_shape_of_the_name(self):
+        # The regression this replaced: `claude-sonnet-4-6` carries no `-high`
+        # suffix and still refuses `--effort`. Reading the name would have
+        # offered a level that fails the run; reading the list does not.
+        r = discover_efforts(self._stub(self.MODELS_STUB, model="claude-sonnet-4-6"))
+        self.assertEqual(r["levels"], [])
+        self.assertTrue(r["conflicts_with_model"])
+
+    def test_an_unlisted_base_model_is_where_effort_belongs(self):
+        # `gemini-3.6-flash` is not on the list precisely because it is the
+        # half of a selection that `--effort` completes.
+        r = discover_efforts(self._stub(self.MODELS_STUB, model="gemini-3.6-flash"))
+        self.assertEqual([lv["effort"] for lv in r["levels"]], ["low", "medium", "high"])
+        self.assertFalse(r.get("conflicts_with_model"))
+
+    def test_a_missing_binary_says_so_instead_of_guessing(self):
+        r = discover_models(dict(AGY, command=["agy-not-installed"]))
+        self.assertEqual(r["models"], [])
+        self.assertIn("PATH", r["error"])
 
 
 class TestEffortDiscovery(unittest.TestCase):

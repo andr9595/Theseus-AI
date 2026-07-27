@@ -704,7 +704,48 @@ def discover_models(provider: Dict) -> Dict:
         return _discover_codex_models()
     if "claude" in base:
         return _discover_claude_models(provider)
+    if "agy" in base:
+        return _discover_agy_models(provider)
     return {"models": [], "source": "", "error": "No discovery available for this CLI."}
+
+
+def _discover_agy_models(provider: Dict) -> Dict:
+    """Ask `agy models`, which prints one model per line and nothing else.
+
+    Antigravity has a subcommand for this, so there is no guessing to do at
+    all. It needs the CLI to be signed in; when it is not, the CLI says so in
+    a sentence worth passing straight through rather than paraphrasing.
+    """
+    path = resolve_binary(list(provider.get("command") or []))
+    if not path:
+        return {
+            "models": [], "source": "",
+            "error": f"`{(provider.get('command') or ['agy'])[0]}` is not on PATH.",
+        }
+    try:
+        proc = subprocess.run(
+            [path, "models"], capture_output=True, text=True, timeout=60, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        return {"models": [], "source": "", "error": f"Could not run `agy models`: {exc}"}
+
+    # A model id never contains a space, so this drops the "Available models:"
+    # style heading and the human-readable "Gemini 3.6 Flash (High)" form the
+    # CLI uses in error messages, without needing to know either is coming.
+    models = [
+        word for word in (line.strip() for line in (proc.stdout or "").splitlines())
+        if word and not word.endswith(":") and len(word.split()) == 1
+    ]
+    error = ""
+    if not models:
+        error = _one_line((proc.stderr or proc.stdout or "").strip()) or (
+            "`agy models` returned nothing."
+        )
+    return {
+        "models": models,
+        "source": "agy models (asked just now)" if models else "",
+        "error": error,
+    }
 
 
 # The families `claude --model` documents as aliases. Pinned IDs are
@@ -866,6 +907,10 @@ def _discover_codex_models() -> Dict:
 # than invented, and ordered shallowest-first as the CLI lists them.
 CLAUDE_EFFORT_FALLBACK = ["low", "medium", "high", "xhigh", "max"]
 
+# The same, for `agy --effort`. Transcribed from its validation message
+# ("valid: low, medium, high") on Antigravity CLI 1.1.7, not invented.
+AGY_EFFORT_FALLBACK = ["low", "medium", "high"]
+
 # What each level means. Codex publishes its own wording per model and that is
 # preferred where it exists; this covers Claude, which publishes none.
 EFFORT_NOTES = {
@@ -904,9 +949,77 @@ def discover_efforts(provider: Dict) -> Dict:
         return _discover_codex_efforts(str(provider.get("model") or "").strip())
     if "claude" in base:
         return _discover_claude_efforts(provider)
+    if "agy" in base:
+        return _discover_agy_efforts(provider)
     return {
         "levels": [], "default": "", "source": "",
         "error": "No effort discovery available for this CLI.",
+    }
+
+
+def _discover_agy_efforts(provider: Dict) -> Dict:
+    """Ask `agy` which levels it takes, and whether this model allows one.
+
+    Two different "no" answers, deliberately kept apart. Antigravity refuses
+    `--effort` beside any model `agy models` lists, because every name on that
+    list is already a complete selection - `gemini-3.6-flash-high` has the
+    level in it, and `claude-sonnet-4-6` has no such knob at all. The levels
+    are for the base names it does *not* list, like `gemini-3.6-flash`.
+
+    The list is what decides, never the shape of the name: reading the `-high`
+    suffix looks right, and gets `claude-sonnet-4-6` wrong. Reporting this as
+    an ordinary empty list would leave a stale level set and a run that dies at
+    launch, so it is flagged as the definite refusal it is.
+    """
+    model = str(provider.get("model") or "").strip()
+    if model and model in set(_discover_agy_models(provider).get("models") or []):
+        return {
+            "levels": [], "default": "", "source": "",
+            "conflicts_with_model": True,
+            "error": (
+                f"{model} is one of the complete selections `agy models` lists, "
+                f"so it takes no separate effort. To choose one, use a base "
+                f"model name it does not list - gemini-3.6-flash rather than "
+                f"gemini-3.6-flash-high."
+            ),
+        }
+
+    path = resolve_binary(list(provider.get("command") or []))
+    levels: List[str] = []
+    source = ""
+    if path:
+        try:
+            proc = subprocess.run(
+                # Same trick as the Claude probe: a value no real level will
+                # ever be makes the CLI print the legal set and exit. It is
+                # rejected during argument validation, so no request is made
+                # and no quota is spent - and no model is named, because
+                # naming one here would risk the conflict above.
+                [path, "--effort", "?ask", "--prompt=?"],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            text = (proc.stdout or "") + (proc.stderr or "")
+            match = re.search(r"valid:\s*([a-zA-Z0-9_, -]+?)\)", text)
+            if match:
+                levels = [v.strip() for v in match.group(1).split(",") if v.strip()]
+                source = "agy --effort validation (asked just now)"
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            pass
+
+    if not levels:
+        levels = list(AGY_EFFORT_FALLBACK)
+        source = "known values for agy --effort (the CLI could not be asked)"
+
+    return {
+        "levels": [
+            {"effort": name, "description": EFFORT_NOTES.get(name, "")}
+            for name in levels
+        ],
+        # Antigravity does not say which level it defaults to, and it varies by
+        # model. Saying nothing beats naming one and being wrong.
+        "default": "",
+        "source": source,
+        "error": "",
     }
 
 

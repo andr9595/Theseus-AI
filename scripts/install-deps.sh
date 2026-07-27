@@ -8,13 +8,17 @@
 # each vendor's first-party installer. Those drop a standalone binary into
 # ~/.local/bin, so no Node, no npm and no sudo are involved.
 #
+# Google's Antigravity CLI (`agy`) is a third option the app can drive, behind
+# --antigravity: it is a ~190 MB binary and not one of the defaults.
+#
 # Everything else (gh, python3-pip/venv, VS Code) is optional, needs root, and
 # is skipped unless you pass --extras or --vscode.
 #
-# Both installers pipe a remote script to bash. They are the official sources,
+# These installers pipe a remote script to bash. They are the official sources,
 # but read them first if you would rather not:
-#   curl -fsSL https://claude.ai/install.sh          | less
-#   curl -fsSL https://chatgpt.com/codex/install.sh  | less
+#   curl -fsSL https://claude.ai/install.sh              | less
+#   curl -fsSL https://chatgpt.com/codex/install.sh      | less
+#   curl -fsSL https://antigravity.google/cli/install.sh | less
 
 set -euo pipefail
 
@@ -31,21 +35,24 @@ have() { command -v "$1" >/dev/null 2>&1; }
 WANT_ALL=1
 WANT_VSCODE=0
 WANT_EXTRAS=0
+WANT_AGY=0
 for arg in "$@"; do
   case "$arg" in
     --vscode)   WANT_VSCODE=1; WANT_EXTRAS=1 ;;
     --extras)   WANT_EXTRAS=1 ;;
+    --antigravity) WANT_AGY=1 ;;
     --check)    WANT_ALL=0 ;;
     -h|--help)
       # Print the header comment block, stopping at the first non-comment line
       # so the help text cannot drift out of sync with the file again.
       awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"
       echo
-      echo "Usage: $0 [--check] [--extras] [--vscode]"
+      echo "Usage: $0 [--check] [--extras] [--vscode] [--antigravity]"
       echo "  (default) install the codex and claude CLIs only - no sudo needed"
       echo "  --check   report what is present, install nothing"
       echo "  --extras  also install gh and the missing system python packages (needs sudo)"
       echo "  --vscode  also install Visual Studio Code (implies --extras)"
+      echo "  --antigravity  also install Google's agy CLI (~190 MB, opt-in)"
       exit 0 ;;
     *) warn "unknown option: $arg" ;;
   esac
@@ -54,7 +61,7 @@ done
 # --------------------------------------------------------------------------
 say "Current state"
 # --------------------------------------------------------------------------
-for tool in python3 git node npm gh code claude codex; do
+for tool in python3 git node npm gh code claude codex agy; do
   if have "$tool"; then
     ok "$(printf '%-8s' "$tool") $(command -v "$tool")"
   else
@@ -91,6 +98,18 @@ if have codex; then
   ok "codex already installed: $(command -v codex)"
 else
   curl -fsSL https://chatgpt.com/codex/install.sh | bash || warn "codex CLI install failed"
+fi
+
+# Google's Antigravity CLI, which replaced Gemini CLI for personal accounts in
+# June 2026. Opt-in rather than default: the two above are what the pipeline
+# ships configured for, and this one is a ~190 MB binary nobody should get by
+# accident. Its installer verifies a SHA-512 against the release manifest.
+if [[ $WANT_AGY -eq 1 ]]; then
+  if have agy; then
+    ok "agy already installed: $(command -v agy)"
+  else
+    curl -fsSL https://antigravity.google/cli/install.sh | bash || warn "Antigravity CLI install failed"
+  fi
 fi
 
 SHELL_RC="$HOME/.bashrc"

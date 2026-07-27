@@ -45,10 +45,11 @@ is zero.
 | A browser | Chromium-family gets a frameless app window; Firefox gets a plain window |
 | `codex` CLI | Optional — Stage 1. See [Installing the agent CLIs](#installing-the-agent-clis) |
 | `claude` CLI | Optional — Stage 2 |
+| `agy` CLI | Optional — Google's Antigravity, assignable to either stage or to Chat |
 | `gh` CLI | Optional — only for [Pull-request mode](#pull-request-mode). `./scripts/install-deps.sh --extras` installs it |
 
-The app itself has **no dependencies at all**. If the two CLIs are not
-installed yet, everything still runs — point the providers at the bundled mock
+The app itself has **no dependencies at all**. If no agent CLI is installed
+yet, everything still runs — point the providers at the bundled mock
 agent (below) and the full pipeline is exercisable end to end.
 
 ---
@@ -98,26 +99,29 @@ Providers:
 
 ## Installing the agent CLIs
 
-The pipeline needs `codex` and `claude` on your `PATH`. Both vendors ship a
+The pipeline needs at least one agent CLI on your `PATH` — `codex` and `claude`
+by default, with Google's `agy` a third option. All three vendors ship a
 first-party installer that drops a standalone binary into `~/.local/bin` — **no
 Node, no npm, no sudo**:
 
 ```bash
 curl -fsSL https://chatgpt.com/codex/install.sh | bash
 curl -fsSL https://claude.ai/install.sh | bash
+curl -fsSL https://antigravity.google/cli/install.sh | bash   # optional
 source ~/.bashrc
 ```
 
 Or let the bundled script do it, which is the same thing plus a PATH check:
 
 ```bash
-./scripts/install-deps.sh              # CLIs only, no sudo
-./scripts/install-deps.sh --check      # report what's present, install nothing
-./scripts/install-deps.sh --extras     # also gh + python3-pip/venv (needs sudo)
-./scripts/install-deps.sh --vscode     # also VS Code (implies --extras)
+./scripts/install-deps.sh                # codex + claude, no sudo
+./scripts/install-deps.sh --check        # report what's present, install nothing
+./scripts/install-deps.sh --antigravity  # also agy (~190 MB, opt-in)
+./scripts/install-deps.sh --extras       # also gh + python3-pip/venv (needs sudo)
+./scripts/install-deps.sh --vscode       # also VS Code (implies --extras)
 ```
 
-> Both installers pipe a remote script to `bash`. They are the official
+> Each installer pipes a remote script to `bash`. They are the official
 > sources, but you can read them first:
 > `curl -fsSL https://chatgpt.com/codex/install.sh | less`
 
@@ -126,6 +130,7 @@ Then authenticate each CLI once, interactively:
 ```bash
 codex login     # browser login for ChatGPT Plus/Pro
 claude          # browser login for Claude Pro
+agy             # browser login with a Google account
 ```
 
 These are **subscription logins, not API keys** — that is what keeps runs at
@@ -405,10 +410,10 @@ ChatGPT is. It has:
   and the reply.
 - **Read-only until you say otherwise.** By default Chat is invoked with its
   agent's read-only arguments (`--sandbox read-only` for `codex`,
-  `--permission-mode plan` for `claude`) and never receives an auto-approve
-  flag. Turn Zero-Touch on and it can change files, takes a snapshot first and
-  shows the diff afterwards, exactly as the council's writing stage does. See
-  [Zero-Touch mode](#zero-touch-mode).
+  `--permission-mode plan` for `claude`, `--mode plan` for `agy`) and never
+  receives an auto-approve flag. Turn Zero-Touch on and it can change files,
+  takes a snapshot first and shows the diff afterwards, exactly as the
+  council's writing stage does. See [Zero-Touch mode](#zero-touch-mode).
 
 Conversations from the two modes are kept apart, in the sidebar and on the
 wire: each mode lists only its own, continuing one switches the selector to the
@@ -556,8 +561,23 @@ tab, where a conversation can be read in full or
 
 The *agent* (which CLI) and the *job* (Junior Draft / Senior Polish) are
 separate settings. Settings → each stage has an **Agent** dropdown: Codex,
-Claude, or Custom command. Claude can draft and Codex can be the senior; the
-same agent can hold both jobs.
+Claude, Antigravity, or Custom command. Claude can draft and Codex can be the
+senior; the same agent can hold both jobs.
+
+**Antigravity** is Google's `agy`, which replaced Gemini CLI for personal
+accounts on 18 June 2026. Install it with
+`curl -fsSL https://antigravity.google/cli/install.sh | bash` and run `agy`
+once to sign in with a Google account; the binary lands in `~/.local/bin`. It
+differs from the other two in three ways worth knowing:
+
+- **The prompt is a flag's value**, not an argument of its own — hence the
+  `--prompt={prompt}` template. Do not rewrite it as `--print {prompt}`: the
+  model and permission flags are inserted immediately ahead of the prompt, and
+  `--print` would take `--model` as the thing to answer.
+- **No streaming format.** `agy` has no `--output-format`, so its answer is
+  read as the plain text it is.
+- **No quota reading.** It publishes no equivalent of `claude /usage`, so its
+  member shows *no quota data* rather than a number this app made up.
 
 Picking one swaps that stage's command, display name, auto-approve argument,
 streaming arguments and model flag **as a single unit**, because those only
@@ -644,6 +664,7 @@ two different ways because the CLIs differ:
 |---|---|---|
 | Claude | `claude -p "/usage"` — the slash command, answered locally with no model call | Live; polled at launch and every 5 min |
 | Codex | the `rate_limits` headers it writes to `$CODEX_HOME/sessions/*.jsonl` | As of the last Codex run; marked `*` when older than 30 min |
+| Antigravity | — it publishes no quota anywhere this app can read | Shows *no quota data*, never an invented number |
 
 The chip leads with the **shortest window**, because that is the one that
 bites first: Claude's 5-hour session, Codex's weekly. Hover for every window —
@@ -668,10 +689,12 @@ it to the list for next time.
 
 The picker asks each CLI what it can actually run. Codex publishes an
 account-scoped list in `$CODEX_HOME/models_cache.json` — read live, so it
-reflects your login's entitlements. Claude ships no such file, so the picker
-offers its documented `--model` aliases. Nothing is hardcoded, deliberately: a
-shipped list is wrong the moment a model is renamed, and wrong *per account*
-regardless.
+reflects your login's entitlements. Antigravity has a subcommand for it, so the
+picker runs `agy models` and shows exactly what it prints (which includes
+Anthropic and open-weight models served through Antigravity, not just Gemini
+ones). Claude ships neither, so the picker offers its documented `--model`
+aliases. Nothing is hardcoded, deliberately: a shipped list is wrong the moment
+a model is renamed, and wrong *per account* regardless.
 
 Aliases (`opus`, `sonnet`, `haiku`, `fable`) always resolve to the newest model
 in that family; a pinned ID stays where you put it. On its own, though, an
@@ -710,18 +733,32 @@ quota.
 With no model pinned the CLI chooses one, so Codex's menu offers only the levels
 *every* selectable model accepts. Pin a model to unlock the rest.
 
+Antigravity takes `low`, `medium` or `high`, and will name them the same way
+Claude does when handed a value it does not know. It also does something
+neither of the others do: **every model `agy models` lists is already a
+complete selection**, and it refuses `--effort` beside one. Sometimes that is
+because the level is in the name (`gemini-3.6-flash-high`) and sometimes
+because the model has no such knob at all (`claude-sonnet-4-6`) — the list is
+what decides, not the shape of the name. Pick a listed model and the effort
+menu says so instead of offering a level; pick one while a level is set and the
+level is cleared for you.
+
+To choose the effort yourself, type a **base** name the list does not show —
+`gemini-3.6-flash` rather than `gemini-3.6-flash-high` — into the model box.
+The CLI accepts those with `--effort`; it just does not enumerate them.
+
 Changing the model re-checks the level you had set, and clears it if the new
-model does not offer it. That check exists because the two CLIs fail
-differently: Claude warns and falls back to its default, which is survivable,
-while Codex rejects the run outright — minutes after launch, for a reason
-nothing on screen would explain.
+model does not offer it. That check exists because the CLIs fail differently:
+Claude warns and falls back to its default, which is survivable, while Codex
+and Antigravity reject the run outright — for Codex minutes after launch, for
+a reason nothing on screen would explain.
 
 Blank — the default — passes no effort flag at all and lets each CLI use the
 depth its vendor tuned for that model.
 
 The flag itself lives in `effort_args` under **Command line** in Settings, next
-to `model_args`, because there is no common spelling: Claude takes
-`--effort high` and Codex takes `-c model_reasoning_effort=high`. A configured
+to `model_args`, because there is no common spelling: Claude and Antigravity
+take `--effort high`, Codex takes `-c model_reasoning_effort=high`. A configured
 command with no `effort_args` has no effort knob, and gets no chip — nothing is
 guessed at, since a wrong guess would be read as the prompt or rejected.
 

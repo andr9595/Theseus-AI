@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from aicouncil.config import ConfigStore, agent_for  # noqa: E402
+from aicouncil.config import ConfigStore, agent_catalog, agent_for  # noqa: E402
 from aicouncil.server import make_server, serve_forever_in_thread  # noqa: E402
 
 
@@ -401,7 +401,13 @@ class TestApi(ServerTestBase):
         # its own copy of a command or a permission flag.
         _, data = self.request("/api/state")
         ids = {a["id"] for a in data["agents"]}
-        self.assertEqual(ids, {"codex", "claude", "custom"})
+        # Against the catalogue itself, not a list spelled out here: the point
+        # is that the endpoint serves all of it, and a literal set turns every
+        # new agent into a test failure that says nothing about the change.
+        self.assertEqual(ids, {a["id"] for a in agent_catalog()})
+        # The ones that must not quietly disappear. Removing an agent should
+        # take a deliberate edit here, unlike adding one.
+        self.assertLessEqual({"codex", "claude", "agy", "custom"}, ids)
 
     def test_doctor_reports_provider_availability(self):
         status, data = self.request("/api/doctor")
