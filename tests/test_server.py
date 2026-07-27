@@ -116,6 +116,13 @@ class TestStaticFiles(ServerTestBase):
             body = res.read().decode()
         self.assertIn("Theseus AI", body)
 
+    def test_each_mode_has_a_caveman_setting(self):
+        with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
+            body = res.read().decode()
+        for mode in ("council", "chat", "project"):
+            self.assertIn(f'data-settings-tab="{mode}"', body)
+            self.assertIn(f'id="caveman-{mode}"', body)
+
     def test_security_headers_are_present(self):
         with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
             csp = res.headers.get("Content-Security-Policy")
@@ -404,6 +411,22 @@ class TestApi(ServerTestBase):
 
         status, data = self.request("/api/config")
         self.assertEqual(data["config"]["house_rules"], "use tabs")
+
+    def test_caveman_modes_round_trip_independently(self):
+        modes = {"council": True, "chat": False, "project": True}
+        status, data = self.request(
+            "/api/config", method="POST", body={"caveman": modes}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["config"]["caveman"], modes)
+
+        _, data = self.request("/api/config")
+        self.assertEqual(data["config"]["caveman"], modes)
+        self.request(
+            "/api/config",
+            method="POST",
+            body={"caveman": {mode: False for mode in modes}},
+        )
 
     def test_zero_touch_toggle_persists(self):
         self.request("/api/config", method="POST", body={"zero_touch": True})

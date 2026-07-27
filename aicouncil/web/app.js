@@ -2939,6 +2939,13 @@ function switchSettingsTab(name) {
     p.classList.toggle('active', p.dataset.settingsPanel === name));
 }
 
+/** Caveman mode, per app mode: 'council', 'chat' or 'project'. One switch each
+ *  rather than one global, because what it costs differs — a Chat answer is
+ *  read and discarded, a council deliberation is the record of a change. */
+function cavemanOn(mode) {
+  return !!((state.config || {}).caveman || {})[mode];
+}
+
 function renderSettings() {
   const conf = state.config || {};
   const providers = conf.providers || {};
@@ -3111,6 +3118,9 @@ function renderSettings() {
   }).join('');
 
   $('#house-rules').value = conf.house_rules || '';
+  $('#caveman-council').checked = cavemanOn('council');
+  $('#caveman-chat').checked = cavemanOn('chat');
+  $('#caveman-project').checked = cavemanOn('project');
   $('#display-name').value = conf.display_name || '';
   $('#port-input').value = conf.port || 8760;
   $('#open-browser').checked = conf.open_browser !== false;
@@ -3349,6 +3359,14 @@ async function saveSettings() {
         providers,
         council: readCouncilSettings(),
         house_rules: $('#house-rules').value,
+        // All three every time. The config store deep-merges, so sending only
+        // the mode that changed would be indistinguishable from sending
+        // nothing — and a switch that would not turn off is worse than absent.
+        caveman: {
+          council: $('#caveman-council').checked,
+          chat: $('#caveman-chat').checked,
+          project: $('#caveman-project').checked,
+        },
         display_name: $('#display-name').value.trim(),
         port: parseInt($('#port-input').value, 10) || 8760,
         open_browser: $('#open-browser').checked,

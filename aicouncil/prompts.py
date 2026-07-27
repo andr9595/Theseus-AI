@@ -601,6 +601,43 @@ def _rules_block(house_rules: str) -> str:
     )
 
 
+# Caveman Mode. A style instruction, switched on per mode in Settings, and the
+# reason it is worded as strictly as it is: every one of these CLIs answers in
+# prose, and prose is most of what a run spends. Rule 5 is the one that makes
+# it safe to send - what the operator actually has to *use* out of an answer is
+# the code, the paths and the commands, so those are carved out of the
+# compression entirely. Nothing here touches the confidence trailer or the
+# project report contract; both are fenced or fixed-format and covered by 5.
+CAVEMAN_SYSTEM = """\
+[SYSTEM INSTRUCTION: ULTRA-LOW TOKEN EFFICIENCY MODE] Goal: Save maximum \
+tokens on every response while maintaining 100% technical accuracy. Rules:
+
+1. Dialect: Speak telegraphic / caveman style. Omit filler words, articles (a, \
+an, the), pleasantries, preambles, and postambles.
+2. Tone: Direct, concise, blunt. State facts and actions immediately.
+3. Grammar: Use simple noun-verb structures. Skip transitions (e.g., \
+"Furthermore", "In order to").
+4. Formatting: Use minimal bullet points. Avoid long narrative paragraphs.
+5. Preservation Exception: ALL code blocks, shell commands, file paths, \
+variables, configuration files, and error messages MUST remain untouched, \
+complete, and byte-exact. Do not compress code or syntax.
+
+Example Output: User: How do I restart Nginx on Ubuntu? Assistant: Run \
+sudo systemctl restart nginx. Check status with sudo systemctl status nginx."""
+
+
+def _caveman_block(caveman: bool) -> str:
+    """Caveman Mode, as its own section rather than folded into house rules.
+
+    The rules the operator typed and a style switch this app owns are different
+    kinds of instruction, and a run that answered strangely should show which
+    of the two asked for it.
+    """
+    if not caveman:
+        return ""
+    return f"\n# How to write your answer\n{CAVEMAN_SYSTEM}\n"
+
+
 @dataclass(frozen=True)
 class ConversationContext:
     """What replaying a thread costs, and the turns that fit inside the budget.
@@ -1016,6 +1053,7 @@ def build_member_prompt(
     conversation: Optional[List[Dict[str, Any]]] = None,
     persona_system: str = "",
     system: str = "",
+    caveman: bool = False,
 ) -> str:
     """Stage 1: one member answering the task with no sight of its peers.
 
@@ -1027,6 +1065,7 @@ def build_member_prompt(
     return (
         f"{system}\n"
         f"{_persona_block(persona_system)}"
+        f"{_caveman_block(caveman)}"
         f"{_rules_block(house_rules)}\n"
         f"# Context\n{_workspace_block(workspace, workspace_status)}\n"
         f"{_history_block(conversation)}\n"
@@ -1044,6 +1083,7 @@ def build_critique_prompt(
     persona_system: str = "",
     strictness_level: Any = DEFAULT_STRICTNESS,
     system: str = "",
+    caveman: bool = False,
 ) -> str:
     """Stage 2: one member critiquing its peers, who are anonymous to it.
 
@@ -1072,6 +1112,7 @@ def build_critique_prompt(
         f"{system}\n"
         f"{_persona_block(persona_system)}"
         f"\n# How hard to push ({band['name']})\n{band['critique']}\n"
+        f"{_caveman_block(caveman)}"
         f"{_rules_block(house_rules)}\n"
         f"# Context\n{_workspace_block(workspace, workspace_status)}\n"
         f"# The task every member was given\n{task.strip()}\n"
@@ -1094,6 +1135,7 @@ def build_chairman_prompt(
     conversation: Optional[List[Dict[str, Any]]] = None,
     strictness_level: Any = DEFAULT_STRICTNESS,
     system: str = "",
+    caveman: bool = False,
 ) -> str:
     """Stage 3: the chairman synthesises the council and applies the outcome.
 
@@ -1130,6 +1172,7 @@ def build_chairman_prompt(
     head = (
         f"{system}\n"
         f"\n# How much agreement to require ({band['name']})\n{band['chair']}\n"
+        f"{_caveman_block(caveman)}"
         f"{_rules_block(house_rules)}\n"
         f"# Context\n{_workspace_block(workspace, workspace_status)}\n"
         f"{_history_block(conversation)}\n"
@@ -1200,6 +1243,7 @@ def build_chat_prompt(
     task: str,
     conversation: Optional[List[Dict[str, Any]]] = None,
     behavior: str = "",
+    caveman: bool = False,
 ) -> str:
     """The whole prompt for one Solo Mode turn.
 
@@ -1208,14 +1252,19 @@ def build_chat_prompt(
     is the point of Solo Mode, and the one thing the council-shaped version it
     replaces could not do: that one always injected a persona, the house rules
     and a repository preamble, so a plain question never arrived as one.
+
+    Caveman Mode is the one exception, and only because the operator switched
+    it on for Chat specifically. It is still their instruction; it simply lives
+    in Settings rather than in the message.
     """
     message = task.strip()
     behavior = behavior.strip()
+    style = _caveman_block(caveman).strip()
     history = _chat_history_block(conversation)
-    if not behavior and not history:
+    if not behavior and not history and not style:
         return message
 
-    parts = [p for p in (behavior, history) if p]
+    parts = [p for p in (style, behavior, history) if p]
     parts.append(f"# Message\n{message}")
     return "\n\n".join(parts) + "\n"
 
@@ -1432,6 +1481,7 @@ def project_context_block(
     build_log: str = "",
     diff: str = "",
     house_rules: str = "",
+    caveman: bool = False,
 ) -> str:
     """The shared preamble every project turn starts from.
 
@@ -1502,6 +1552,11 @@ def project_context_block(
             "",
             house_rules.strip(),
         ]
+    if caveman:
+        # Last, so it is the nearest instruction to the turn itself. The report
+        # contract is a fenced JSON block and rule 5 leaves fences alone, so
+        # the engine still gets something it can parse.
+        parts += ["", _caveman_block(True).strip()]
     return "\n".join(parts)
 
 

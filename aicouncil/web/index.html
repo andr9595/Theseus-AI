@@ -373,6 +373,7 @@
     <div class="settings-tabs" role="tablist">
       <button class="settings-tab active" data-settings-tab="stages" role="tab">Agents</button>
       <button class="settings-tab" data-settings-tab="council" role="tab">Council</button>
+      <button class="settings-tab" data-settings-tab="chat" role="tab">Chat</button>
       <button class="settings-tab" data-settings-tab="roles" role="tab">Roles</button>
       <button class="settings-tab" data-settings-tab="run" role="tab">Run</button>
       <button class="settings-tab" data-settings-tab="project" role="tab">Project</button>
@@ -446,6 +447,20 @@
           <span class="field-hint" id="council-strictness-hint"></span>
         </div>
 
+        <label class="toggle" for="caveman-council">
+          <input type="checkbox" id="caveman-council">
+          <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+          <span class="toggle-text">
+            <strong>Caveman mode</strong>
+            <em>
+              Every seat answers telegraphically &mdash; no articles, no
+              preamble. Code, paths, commands and error text stay byte-exact.
+              Saves the most here, where three seats each write a full answer
+              and then critique each other.
+            </em>
+          </span>
+        </label>
+
         <h4 class="settings-head">Seating</h4>
         <p class="settings-note">
           Which CLI holds each seat, and what it is told to be. Pin either and
@@ -465,6 +480,25 @@
           on their own, within bounds.
         </p>
         <div id="council-capabilities" class="council-caps"></div>
+      </section>
+
+      <section class="settings-panel" data-settings-panel="chat">
+        <p class="settings-note">
+          Controls how the Chat assistant writes its replies. This does not
+          change Council or Project responses.
+        </p>
+
+        <label class="toggle" for="caveman-chat">
+          <input type="checkbox" id="caveman-chat">
+          <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+          <span class="toggle-text">
+            <strong>Caveman mode</strong>
+            <em>
+              Telegraphic answers &mdash; no articles, no preamble. Code,
+              paths, commands and error text stay byte-exact.
+            </em>
+          </span>
+        </label>
       </section>
 
       <section class="settings-panel" data-settings-panel="roles">
@@ -571,6 +605,20 @@
           <textarea id="house-rules" rows="10" spellcheck="false"
             placeholder="e.g. Use tabs. Never add dependencies without asking. All new code needs tests."></textarea>
         </div>
+
+        <h4 class="settings-head">Projects mode</h4>
+        <label class="toggle" for="caveman-project">
+          <input type="checkbox" id="caveman-project">
+          <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+          <span class="toggle-text">
+            <strong>Caveman mode</strong>
+            <em>
+              Architect, Developer and QA answer telegraphically. Code, paths,
+              commands and error text stay byte-exact, and so does the fenced
+              JSON each turn ends with &mdash; the orchestrator still parses it
+            </em>
+          </span>
+        </label>
       </section>
 
       <section class="settings-panel" data-settings-panel="app">

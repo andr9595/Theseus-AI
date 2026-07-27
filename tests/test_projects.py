@@ -474,6 +474,40 @@ class TestDecisionEngine(unittest.TestCase):
         self.assertIn("failed 3 times", self.project.error)
 
 
+class TestCavemanModeInProjects(unittest.TestCase):
+    """Projects has its own switch, read from the config frozen at start."""
+
+    MARK = "ULTRA-LOW TOKEN EFFICIENCY MODE"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="theseus-caveman-"))
+        self.store = ConfigStore(self.tmp / "config.json")
+        self.root = self.tmp / "build"
+        self.root.mkdir()
+        Workspace(self.root).ensure()
+        self.engine = ProjectEngine(self.store, EventBus())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def context(self):
+        project = Project(id="p1", goal="build it", workspace=str(self.root))
+        project.config = self.store.all()
+        return self.engine._context(project, "coder")
+
+    def test_a_turn_says_nothing_about_style_by_default(self):
+        self.assertNotIn(self.MARK, self.context())
+
+    def test_switching_it_on_reaches_every_project_turn(self):
+        self.store.update({"caveman": {"project": True}})
+        self.assertIn(self.MARK, self.context())
+
+    def test_the_councils_switch_does_not_move_projects(self):
+        # Three switches, not one with three labels.
+        self.store.update({"caveman": {"council": True, "project": False}})
+        self.assertNotIn(self.MARK, self.context())
+
+
 class TestApplyingReports(unittest.TestCase):
     """Folding one agent's answer back onto the board."""
 

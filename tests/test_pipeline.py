@@ -1819,6 +1819,144 @@ class TestSoloPrompt(unittest.TestCase):
         self.assertLess(prompt.index("add a login route"), prompt.index("and now?"))
 
 
+class TestCavemanPrompt(unittest.TestCase):
+    """The style switch: telegraphic prose, byte-exact code.
+
+    Each mode owns its own switch, so every test here is also a test that the
+    other two modes were left alone.
+    """
+
+    MARK = "ULTRA-LOW TOKEN EFFICIENCY MODE"
+
+    def test_nothing_is_added_when_it_is_off(self):
+        from aicouncil import prompts
+
+        self.assertEqual(prompts.build_chat_prompt("what is this?"),
+                         "what is this?")
+        self.assertNotIn(self.MARK, prompts.build_member_prompt("t", "/tmp"))
+
+    def test_chat_gets_it_before_the_message(self):
+        from aicouncil import prompts
+
+        prompt = prompts.build_chat_prompt("what is this?", caveman=True)
+        self.assertIn(self.MARK, prompt)
+        self.assertLess(prompt.index(self.MARK), prompt.index("what is this?"))
+
+    def test_a_typed_behaviour_still_arrives_alongside_it(self):
+        # The switch is a style, not a replacement for what the operator wrote.
+        from aicouncil import prompts
+
+        prompt = prompts.build_chat_prompt(
+            "hello", behavior="Always show the code.", caveman=True
+        )
+        self.assertIn(self.MARK, prompt)
+        self.assertIn("Always show the code.", prompt)
+
+    def test_every_council_stage_gets_the_same_instruction(self):
+        # A chairman writing tersely over members who wrote at length would
+        # read as three different voices in one transcript.
+        from aicouncil import prompts
+
+        member = prompts.build_member_prompt("t", "/tmp", caveman=True)
+        critique = prompts.build_critique_prompt(
+            "t", [{"alias": "Agent B", "output": "x"}], "/tmp", caveman=True
+        )
+        chair = prompts.build_chairman_prompt(
+            "t", [{"alias": "Agent A", "output": "x"}], [], "/tmp", caveman=True
+        )
+        for prompt in (member, critique, chair):
+            self.assertIn(self.MARK, prompt)
+
+    def test_code_and_paths_are_carved_out_of_the_compression(self):
+        # The whole reason this is safe to send: what the operator has to use
+        # out of an answer is exempt from being shortened.
+        from aicouncil import prompts
+
+        prompt = prompts.build_member_prompt("t", "/tmp", caveman=True)
+        self.assertIn("byte-exact", prompt)
+        self.assertIn("Preservation Exception", prompt)
+
+    def test_a_project_turn_carries_it_only_when_it_is_on(self):
+        from aicouncil import prompts
+
+        off = prompts.project_context_block("p1", "/tmp", "{}")
+        on = prompts.project_context_block("p1", "/tmp", "{}", caveman=True)
+        self.assertNotIn(self.MARK, off)
+        self.assertIn(self.MARK, on)
+
+
+class TestCavemanReachesTheRun(PipelineTestBase):
+    """End to end: the switch a mode owns is the one that reaches its CLI."""
+
+    # The mock echoes this when the instruction reached it. Asserting on the
+    # recorded command would prove nothing: it redacts the prompt to a length.
+    MARK = "caveman mode requested"
+
+    def setUp(self):
+        super().setUp()
+        assistant = mock_provider("solo", "Assistant")
+        # The shipped solo provider's streaming flags survive the deep merge,
+        # and `--output-format stream-json` leaves the mock's own parser
+        # reading "stream-json" as the prompt. Cleared so the assertion below
+        # is about what the pipeline sent and not about argparse.
+        assistant["stream_args"] = []
+        assistant["read_only_args"] = []
+        self.store.update({"mode": "solo", "providers": {"solo": assistant}})
+
+    def _sent(self, run):
+        return run.stages["solo"].output
+
+    def test_chat_answers_telegraphically_once_it_is_switched_on(self):
+        self.store.update({"caveman": {"chat": True}})
+        run = self.pipeline.start("what does this repo do?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertIn(self.MARK, self._sent(run))
+
+    def test_switching_it_on_for_the_council_leaves_chat_alone(self):
+        # Three switches, not one with three labels. Turning the council terse
+        # must not quietly change how a conversation answers.
+        self.store.update({"caveman": {"council": True, "chat": False}})
+        run = self.pipeline.start("what does this repo do?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertNotIn(self.MARK, self._sent(run))
+
+    def test_it_can_be_switched_off_again(self):
+        # `ConfigStore.update` deep-merges, so a switch is only really a switch
+        # if writing False over True survives the merge.
+        self.store.update({"caveman": {"chat": True}})
+        self.store.update({"caveman": {"chat": False}})
+        run = self.pipeline.start("what does this repo do?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertNotIn(self.MARK, self._sent(run))
+
+
+class TestCavemanReachesCouncilRun(PipelineTestBase):
+    """The Council setting reaches members, critiques, and the chair."""
+
+    MARK = "caveman mode requested"
+
+    def test_every_council_invocation_gets_the_instruction(self):
+        self.store.update({
+            "mode": "council",
+            "zero_touch": True,
+            "caveman": {"council": True},
+        })
+        run = self.pipeline.start("do a thing", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        stages = self.member_stages(run) + self.critique_stages(run)
+        stages.append(run.stages["chair"])
+        for stage in stages:
+            self.assertIn(self.MARK, stage.output, stage.id)
+
+
 class TestRoleReachesTheRun(PipelineTestBase):
     def test_a_configured_persona_is_used_by_a_real_run(self):
         # End to end: pin a seat's lens, run, and confirm the agent answered

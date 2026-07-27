@@ -1822,6 +1822,7 @@ class ProjectEngine:
             build_log=project.last_build_log,
             diff=diff,
             house_rules=str(project.config.get("house_rules") or ""),
+            caveman=bool((project.config.get("caveman") or {}).get("project")),
         )
 
     # -- state transitions -------------------------------------------------

@@ -1037,11 +1037,14 @@ class Pipeline:
             # Still bare, even when it may write. Nothing is added that the
             # operator did not put there: permission to change files is not a
             # reason to start injecting a persona, the house rules or a
-            # repository preamble into a message they typed themselves.
+            # repository preamble into a message they typed themselves. The
+            # style switch below is the operator's own, set for Chat in
+            # Settings, and adds nothing when it is off.
             prompts.build_chat_prompt(
                 run.task,
                 run.conversation,
                 behavior=str(provider.get("behavior") or ""),
+                caveman=bool((run.config.get("caveman") or {}).get("chat")),
             ),
             auto_approve=writes,
             read_only=not writes,
@@ -1155,6 +1158,10 @@ class Pipeline:
         conf = run.config
         roles = conf.get("roles", {})
         house_rules = conf.get("house_rules", "")
+        # One reading for the whole run: a mid-run edit in Settings would
+        # otherwise leave the chairman writing in a different voice to the
+        # members it is synthesising.
+        caveman = bool((conf.get("caveman") or {}).get("council"))
         workspace_status = gitutil.status(run.workspace).to_dict()
         seating = run.seating
         if seating is None:  # start() always seats a council run
@@ -1192,6 +1199,7 @@ class Pipeline:
                         house_rules,
                         run.conversation,
                         persona_system=self._persona_system(seat, roles),
+                        caveman=caveman,
                     ),
                     False,  # never auto-approved
                     True,   # and explicitly read-only
@@ -1266,6 +1274,7 @@ class Pipeline:
                             house_rules,
                             persona_system=self._persona_system(p["seat"], roles),
                             strictness_level=run.strictness,
+                            caveman=caveman,
                         ),
                         False,
                         True,
@@ -1364,6 +1373,7 @@ class Pipeline:
                 run.conversation,
                 strictness_level=run.strictness,
                 system=str(chair_role.get("system") or ""),
+                caveman=caveman,
             ),
             auto_approve=execute_approved,
         )

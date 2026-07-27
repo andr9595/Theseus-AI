@@ -674,6 +674,11 @@ def main() -> int:
     emit(f"[mock-agent] role={args.role} zero-touch={'yes' if zero_touch else 'no'} "
          f"cwd={Path.cwd()}")
     emit(f"[mock-agent] received a {len(prompt)} character prompt")
+    # Echoed so a test can see which instructions actually reached the CLI: the
+    # recorded command redacts the prompt to a character count, so the agent's
+    # own output is the only honest evidence of what it was told.
+    if "ULTRA-LOW TOKEN EFFICIENCY MODE" in prompt:
+        emit("[mock-agent] caveman mode requested")
     emit()
 
     if args.fail:

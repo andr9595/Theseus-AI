@@ -533,6 +533,17 @@ DEFAULTS: Dict[str, Any] = {
     # Extra standing instructions appended to both council stages. Solo does
     # not get them: it is a conversation, not a run against this project.
     "house_rules": "",
+    # Caveman Mode: telegraphic answers, with code, paths, commands and error
+    # text left byte-exact. Per mode rather than global, because the three want
+    # different things from it - a Chat answer is read off the screen and
+    # shortening it costs nothing, while a council deliberation is also the
+    # record of *why* a change was made. Off everywhere by default: it changes
+    # how every answer reads, which is not something to inherit unasked.
+    "caveman": {
+        "council": False,
+        "chat": False,
+        "project": False,
+    },
     # What the context meter's percentage is measured against. A figure to edit
     # rather than one to trust: no CLI reports the window its model was given,
     # and the aliases in Settings resolve to whatever the vendor ships today.
