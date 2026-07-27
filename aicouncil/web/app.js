@@ -802,6 +802,14 @@ function roleTag(role) {
   return String(role || '').trim().toUpperCase();
 }
 
+/** The same label, trimmed for a seat on the bench. "Council Member" is the
+ *  neutral persona's full name and reads fine in a menu, but on a row of
+ *  council seats the first word is true of every one of them and costs the
+ *  width the CLI's name needs. */
+function seatTag(role) {
+  return roleTag(String(role || '').replace(/^council\s+/i, ''));
+}
+
 /** The council strip: one compact button per stage, in a single row above the
  *  thread. Clicking a member opens everything about it — CLI, model, effort
  *  and role — rather than spreading those across chips that widen the strip
@@ -839,13 +847,26 @@ function renderStrip() {
   const providers = (state.config || {}).providers || {};
   const seats = [...(seating.members || []), seating.chair].filter(Boolean);
 
+  // Inside a `.column`, so the bench lines up with the composer it seats
+  // rather than being centred on its own and drifting out of step with it.
+  //
+  // The notes go *under* the bench, not beside it. They were siblings of the
+  // row inside a flex container, which laid them out as another column of it -
+  // a paragraph of small print alongside the seats, growing the strip
+  // sideways until the seats themselves had no room left to spell their names.
   strip.innerHTML =
-    '<div class="strip-inner">' +
-    seats.map(seat => seatHtml(seat, run, providers)).join('') +
-    '</div>' +
-    (seating.notes || []).map(n =>
-      `<div class="strip-note-line">${esc(n)}</div>`
-    ).join('');
+    '<div class="column">' +
+      '<div class="strip-inner">' +
+      seats.map(seat => seatHtml(seat, run, providers)).join('') +
+      '</div>' +
+      ((seating.notes || []).length
+        ? `<div class="strip-notes">` +
+            (seating.notes || []).map(n =>
+              `<p class="strip-note-line">${esc(n)}</p>`
+            ).join('') +
+          `</div>`
+        : '') +
+    '</div>';
 }
 
 /** One seat on the strip. Coloured by which CLI is in it rather than by which
@@ -862,19 +883,31 @@ function seatHtml(seat, run, providers) {
   if (run && run.state === 'awaiting_approval' && seat.chairman) st = 'waiting';
 
   const who = p.label || seat.agent;
-  const model = p.model || 'default model';
+  // Spelled out in the tooltip, where there is room; abbreviated on the seat,
+  // where it is the line under a name that already fills the cell.
+  const model = p.model || 'default';
   const role = seat.chairman ? 'Chair' : (seat.persona_name || 'Member');
   const reasons = (seat.reasons || []).join(' · ');
 
   const title =
     `${who} — ${role}` +
     (seat.alias ? ` · appears to its peers as ${seat.alias}` : '') +
-    ` · ${modelDetail(model)}` +
+    ` · ${modelDetail(p.model || 'default model')}` +
     (p.effort ? ` · ${p.effort}` : '') +
     (available ? '' : ` · ${(p.command || [])[0] || 'CLI'} not found`) +
     (reasons ? `\n\nSeated because: ${reasons}` : '') +
     (seat.pinned ? '\nPinned to this seat, so the routing works around it.' : '') +
     '\n\nClick to seat a CLI here, or to change its model, effort or behaviour.';
+
+  // Stacked in the same order as a project chair's tile - what the seat is,
+  // then who is in it, then the detail - because they are the same question
+  // asked twice and reading them the same way costs nothing. Laid out across
+  // instead, the three competed for one line and the CLI's name was the part
+  // that lost: a bench reading "Cla…, Antigr…, Co…" cannot be checked at a
+  // glance, which is the only thing it is there for.
+  const detail = seat.alias
+    ? `${seat.alias}${p.model ? ` · ${p.model}` : ''}`
+    : model;
 
   return (
     `<button class="member ${st}${available ? '' : ' unavailable'}` +
@@ -884,13 +917,13 @@ function seatHtml(seat, run, providers) {
       `title="${esc(title)}">` +
       `<span class="member-mark">${esc(String(who).slice(0, 2).toUpperCase())}</span>` +
       `<span class="member-body">` +
+        `<span class="member-role">${esc(seatTag(role))}</span>` +
         `<span class="member-name">${esc(who)}` +
-          (seat.pinned ? '<span class="member-pin" aria-label="pinned">·</span>' : '') +
+          (seat.pinned ? '<span class="member-pin" title="pinned">·</span>' : '') +
         `</span>` +
-        `<span class="member-model">${esc(seat.alias || model)}</span>` +
+        `<span class="member-model">${esc(detail)}</span>` +
       `</span>` +
       `<span class="member-tail">` +
-        `<span class="member-role">${esc(roleTag(role))}</span>` +
         memberQuotaHtml(seat.provider_id) +
         `<span class="member-dot"></span>` +
       `</span>` +

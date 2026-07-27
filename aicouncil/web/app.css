@@ -274,24 +274,27 @@ html, body {
    run, so it must not scroll away while the run it configures is going. */
 .council-strip {
   flex: 0 0 auto;
-  display: flex; justify-content: center;
-  padding: 2px 20px 6px;
+  padding: 2px 0 6px;
 }
 
+/* A grid, not a scrolling row. The bench has as many seats as the operator
+   asked for, and a flex row fitted them by squeezing each one until the CLI
+   names ellipsised away - the single fact the bench exists to show. Seats keep
+   a floor width and wrap onto a second line instead. */
 .strip-inner {
-  display: flex; align-items: stretch; gap: 3px;
-  max-width: 100%;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(158px, 1fr));
+  gap: 3px;
   padding: 5px;
   background: var(--bg-2);
   border: 1px solid var(--line);
   border-radius: 13px;
-  overflow-x: auto;
 }
 
 .member {
   --agent-color: var(--accent-2);
   display: flex; align-items: center; gap: 9px;
-  min-width: 0; padding: 6px 11px 6px 7px;
+  min-width: 0; padding: 6px 9px 6px 7px;
   font: inherit; text-align: left;
   color: var(--text);
   background: transparent;
@@ -319,11 +322,17 @@ html, body {
 
 /* Anything the router had to settle for: one CLI installed, a pin it could
    not honour, a chair that is also a member. Never silent - a bench that is
-   not the one asked for has to say so. */
+   not the one asked for has to say so - but underneath the bench it is about,
+   reading as a footnote to it. Beside it, this was a wall of small print
+   competing with the seats for the same horizontal space. */
+.strip-notes {
+  display: flex; flex-direction: column; gap: 3px;
+  margin: 5px 2px 0;
+}
 .strip-note-line {
-  max-width: 640px; margin: 5px auto 0;
+  margin: 0; padding-left: 9px;
   font-size: 10.5px; line-height: 1.45; color: var(--text-3);
-  text-align: center;
+  border-left: 2px solid var(--line);
 }
 
 /* The three-stage stepper. Reuses the project tracker's cells verbatim so a
@@ -342,7 +351,10 @@ html, body {
 }
 .member.unavailable .member-mark { color: var(--text-3); border-style: dashed; }
 
-.member-body { display: flex; flex-direction: column; min-width: 0; line-height: 1.3; }
+.member-body {
+  display: flex; flex-direction: column; min-width: 0;
+  flex: 1 1 auto; line-height: 1.3;
+}
 .member-name {
   font-size: 12.5px; font-weight: 600;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -352,12 +364,30 @@ html, body {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
-.member-tail { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; margin-left: 3px; }
+.member-tail {
+  display: flex; align-items: center; gap: 5px;
+  flex: 0 0 auto; align-self: flex-start; margin-top: 2px;
+}
+/* What the seat is, above who is holding it. Muted on a member and coloured on
+   the chair, because "which of these writes" is the one distinction on the
+   bench worth spending a colour on. */
+/* Wraps rather than truncating. Personas are operator-named and some are two
+   words wide - "SECURITY REVIEWER" does not fit a quarter of the bench on one
+   line, and clipped to "SECURITY REVIEW…" it stops being the thing that says
+   what this seat is for. The row stretches every seat to match, so a long tag
+   on one costs alignment nowhere. */
 .member-role {
   font-family: var(--mono); font-size: 8.5px; font-weight: 700;
-  letter-spacing: .08em; text-transform: uppercase;
-  color: var(--agent-color);
+  letter-spacing: .06em; text-transform: uppercase;
+  color: var(--text-3);
+  white-space: normal; overflow-wrap: anywhere;
 }
+.member.is-chair .member-role { color: var(--agent-color); }
+/* The quota reading is a warning here, not a dashboard: it appears only once
+   it is worth interrupting for, and the bar it carries elsewhere would cost a
+   seat a third of its width to say what the number already says. */
+.member .usage-chip { padding: 1px 5px; }
+.member .usage-bar { display: none; }
 .member-dot {
   width: 6px; height: 6px; border-radius: 50%;
   background: var(--text-3);
@@ -1885,9 +1915,9 @@ pre.project-file {
   .mode-switch button { padding: 7px 15px; }
   .hero { padding: 8vh 0 0; }
   .hero h2 { font-size: 21px; }
-  /* The strip is the one thing here that cannot wrap without losing its
-     shape, so it scrolls sideways instead. */
-  .council-strip { justify-content: flex-start; }
+  /* The bench wraps now rather than scrolling sideways, so a phone gets two
+     seats a row instead of a row it has to drag to read the end of. */
+  .strip-inner { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   /* Four board columns across a phone is four characters each. Two by two
      keeps every card readable and the flow still reads left to right. */
   .project-board { grid-template-columns: repeat(2, minmax(0, 1fr)); }
