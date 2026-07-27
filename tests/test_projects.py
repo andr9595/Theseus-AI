@@ -508,6 +508,41 @@ class TestCavemanModeInProjects(unittest.TestCase):
         self.assertNotIn(self.MARK, self.context())
 
 
+class TestEfficiencyModeInProjects(unittest.TestCase):
+    """Projects reads its independent Efficiency switch at run start."""
+
+    MARK = "[SYSTEM INSTRUCTION: EFFICIENCY MODE]"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="theseus-efficiency-"))
+        self.store = ConfigStore(self.tmp / "config.json")
+        self.root = self.tmp / "build"
+        self.root.mkdir()
+        Workspace(self.root).ensure()
+        self.engine = ProjectEngine(self.store, EventBus())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def context(self):
+        project = Project(id="p1", goal="build it", workspace=str(self.root))
+        project.config = self.store.all()
+        return self.engine._context(project, "coder")
+
+    def test_a_turn_says_nothing_about_efficiency_by_default(self):
+        self.assertNotIn(self.MARK, self.context())
+
+    def test_switching_it_on_reaches_every_project_turn(self):
+        self.store.update({"efficiency": {"project": True}})
+        self.assertIn(self.MARK, self.context())
+
+    def test_chat_switch_does_not_change_projects(self):
+        self.store.update({
+            "efficiency": {"chat": True, "project": False},
+        })
+        self.assertNotIn(self.MARK, self.context())
+
+
 class TestApplyingReports(unittest.TestCase):
     """Folding one agent's answer back onto the board."""
 

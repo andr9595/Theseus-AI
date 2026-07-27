@@ -679,6 +679,8 @@ def main() -> int:
     # own output is the only honest evidence of what it was told.
     if "ULTRA-LOW TOKEN EFFICIENCY MODE" in prompt:
         emit("[mock-agent] caveman mode requested")
+    if "[SYSTEM INSTRUCTION: EFFICIENCY MODE]" in prompt:
+        emit("[mock-agent] efficiency mode requested")
     emit()
 
     if args.fail:

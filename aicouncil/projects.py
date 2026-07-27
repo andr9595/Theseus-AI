@@ -1823,6 +1823,9 @@ class ProjectEngine:
             diff=diff,
             house_rules=str(project.config.get("house_rules") or ""),
             caveman=bool((project.config.get("caveman") or {}).get("project")),
+            efficiency=bool(
+                (project.config.get("efficiency") or {}).get("project")
+            ),
         )
 
     # -- state transitions -------------------------------------------------

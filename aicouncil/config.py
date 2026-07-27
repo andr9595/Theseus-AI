@@ -544,6 +544,14 @@ DEFAULTS: Dict[str, Any] = {
         "chat": False,
         "project": False,
     },
+    # Efficiency Mode: concise normal prose without Caveman Mode's deliberately
+    # telegraphic grammar. It is independent so either style, both, or neither
+    # can be selected for each kind of run.
+    "efficiency": {
+        "council": False,
+        "chat": False,
+        "project": False,
+    },
     # What the context meter's percentage is measured against. A figure to edit
     # rather than one to trust: no CLI reports the window its model was given,
     # and the aliases in Settings resolve to whatever the vendor ships today.

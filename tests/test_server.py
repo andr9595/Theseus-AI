@@ -129,6 +129,23 @@ class TestStaticFiles(ServerTestBase):
         self.assertIn("row('caveman', 'Caveman mode'", script)
         self.assertIn("patchConfig({ caveman: { [cavemanMode]:", script)
 
+    def test_efficiency_settings_live_with_the_modes_that_use_them(self):
+        with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
+            body = res.read().decode()
+        self.assertNotIn('id="efficiency-council"', body)
+        self.assertNotIn('id="efficiency-chat"', body)
+        self.assertIn('id="efficiency-project"', body)
+
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn(
+            "const efficiencyMode = chat ? 'chat' : 'council';",
+            script,
+        )
+        self.assertIn("row('efficiency', 'Efficiency mode'", script)
+        self.assertIn("patchConfig({", script)
+        self.assertIn("efficiency: {", script)
+
     def test_accepted_chat_submit_clears_only_the_submitted_message(self):
         with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
             script = res.read().decode()
@@ -448,6 +465,24 @@ class TestApi(ServerTestBase):
             "/api/config",
             method="POST",
             body={"caveman": {mode: False for mode in modes}},
+        )
+
+    def test_efficiency_modes_round_trip_independently(self):
+        modes = {"council": False, "chat": True, "project": True}
+        status, data = self.request(
+            "/api/config",
+            method="POST",
+            body={"efficiency": modes},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["config"]["efficiency"], modes)
+
+        _, data = self.request("/api/config")
+        self.assertEqual(data["config"]["efficiency"], modes)
+        self.request(
+            "/api/config",
+            method="POST",
+            body={"efficiency": {mode: False for mode in modes}},
         )
 
     def test_zero_touch_toggle_persists(self):

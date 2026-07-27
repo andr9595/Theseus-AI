@@ -1885,6 +1885,79 @@ class TestCavemanPrompt(unittest.TestCase):
         self.assertIn(self.MARK, on)
 
 
+class TestEfficiencyPrompt(unittest.TestCase):
+    """Concise normal prose remains independent from Caveman Mode."""
+
+    MARK = "[SYSTEM INSTRUCTION: EFFICIENCY MODE]"
+
+    def test_nothing_is_added_when_it_is_off(self):
+        from aicouncil import prompts
+
+        self.assertEqual(
+            prompts.build_chat_prompt("what is this?"),
+            "what is this?",
+        )
+        self.assertNotIn(self.MARK, prompts.build_member_prompt("t", "/tmp"))
+
+    def test_chat_gets_it_before_the_message(self):
+        from aicouncil import prompts
+
+        prompt = prompts.build_chat_prompt("what is this?", efficiency=True)
+        self.assertIn(self.MARK, prompt)
+        self.assertLess(prompt.index(self.MARK), prompt.index("what is this?"))
+
+    def test_every_council_stage_gets_the_same_instruction(self):
+        from aicouncil import prompts
+
+        member = prompts.build_member_prompt("t", "/tmp", efficiency=True)
+        critique = prompts.build_critique_prompt(
+            "t",
+            [{"alias": "Agent B", "output": "x"}],
+            "/tmp",
+            efficiency=True,
+        )
+        chair = prompts.build_chairman_prompt(
+            "t",
+            [{"alias": "Agent A", "output": "x"}],
+            [],
+            "/tmp",
+            efficiency=True,
+        )
+        for prompt in (member, critique, chair):
+            self.assertIn(self.MARK, prompt)
+
+    def test_it_preserves_technical_content_and_necessary_reasoning(self):
+        from aicouncil import prompts
+
+        prompt = prompts.build_member_prompt("t", "/tmp", efficiency=True)
+        self.assertIn("Keep code blocks, shell commands, file paths", prompt)
+        self.assertIn("Preserve essential reasoning", prompt)
+
+    def test_it_can_coexist_with_caveman_mode(self):
+        from aicouncil import prompts
+
+        prompt = prompts.build_chat_prompt(
+            "hello",
+            caveman=True,
+            efficiency=True,
+        )
+        self.assertIn(self.MARK, prompt)
+        self.assertIn("ULTRA-LOW TOKEN EFFICIENCY MODE", prompt)
+
+    def test_a_project_turn_carries_it_only_when_it_is_on(self):
+        from aicouncil import prompts
+
+        off = prompts.project_context_block("p1", "/tmp", "{}")
+        on = prompts.project_context_block(
+            "p1",
+            "/tmp",
+            "{}",
+            efficiency=True,
+        )
+        self.assertNotIn(self.MARK, off)
+        self.assertIn(self.MARK, on)
+
+
 class TestCavemanReachesTheRun(PipelineTestBase):
     """End to end: the switch a mode owns is the one that reaches its CLI."""
 
@@ -1946,6 +2019,56 @@ class TestCavemanReachesCouncilRun(PipelineTestBase):
             "mode": "council",
             "zero_touch": True,
             "caveman": {"council": True},
+        })
+        run = self.pipeline.start("do a thing", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        stages = self.member_stages(run) + self.critique_stages(run)
+        stages.append(run.stages["chair"])
+        for stage in stages:
+            self.assertIn(self.MARK, stage.output, stage.id)
+
+
+class TestEfficiencyReachesTheRun(PipelineTestBase):
+    MARK = "efficiency mode requested"
+
+    def setUp(self):
+        super().setUp()
+        assistant = mock_provider("solo", "Assistant")
+        assistant["stream_args"] = []
+        assistant["read_only_args"] = []
+        self.store.update({"mode": "solo", "providers": {"solo": assistant}})
+
+    def test_chat_receives_only_its_own_efficiency_switch(self):
+        self.store.update({
+            "efficiency": {"chat": True, "council": False},
+        })
+        run = self.pipeline.start("what does this repo do?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertIn(self.MARK, run.stages["solo"].output)
+
+    def test_council_switch_does_not_change_chat(self):
+        self.store.update({
+            "efficiency": {"council": True, "chat": False},
+        })
+        run = self.pipeline.start("what does this repo do?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertNotIn(self.MARK, run.stages["solo"].output)
+
+
+class TestEfficiencyReachesCouncilRun(PipelineTestBase):
+    MARK = "efficiency mode requested"
+
+    def test_every_council_invocation_gets_the_instruction(self):
+        self.store.update({
+            "mode": "council",
+            "zero_touch": True,
+            "efficiency": {"council": True},
         })
         run = self.pipeline.start("do a thing", str(self.repo))
         self.wait_terminal()

@@ -625,6 +625,22 @@ complete, and byte-exact. Do not compress code or syntax.
 Example Output: User: How do I restart Nginx on Ubuntu? Assistant: Run \
 sudo systemctl restart nginx. Check status with sudo systemctl status nginx."""
 
+EFFICIENCY_SYSTEM = """\
+[SYSTEM INSTRUCTION: EFFICIENCY MODE] Write concise, professional responses \
+that minimize tokens without sacrificing correctness, necessary context, or \
+usability. Rules:
+
+1. Lead with the answer, result, or required action.
+2. Include only information needed to understand, verify, or use the answer.
+3. Remove filler, repetition, restatements, unnecessary headings, and \
+unrequested examples.
+4. Prefer compact paragraphs or short lists, whichever is easier to scan.
+5. Preserve essential reasoning, safety warnings, assumptions, and uncertainty.
+6. Keep code blocks, shell commands, file paths, variables, configuration, and \
+error messages complete and exact.
+7. If another requested writing style is active, preserve its voice while \
+applying these efficiency rules."""
+
 
 def _caveman_block(caveman: bool) -> str:
     """Caveman Mode, as its own section rather than folded into house rules.
@@ -636,6 +652,13 @@ def _caveman_block(caveman: bool) -> str:
     if not caveman:
         return ""
     return f"\n# How to write your answer\n{CAVEMAN_SYSTEM}\n"
+
+
+def _efficiency_block(efficiency: bool) -> str:
+    """Efficiency Mode's concise normal-prose instruction."""
+    if not efficiency:
+        return ""
+    return f"\n# How to write your answer\n{EFFICIENCY_SYSTEM}\n"
 
 
 @dataclass(frozen=True)
@@ -1054,6 +1077,7 @@ def build_member_prompt(
     persona_system: str = "",
     system: str = "",
     caveman: bool = False,
+    efficiency: bool = False,
 ) -> str:
     """Stage 1: one member answering the task with no sight of its peers.
 
@@ -1066,6 +1090,7 @@ def build_member_prompt(
         f"{system}\n"
         f"{_persona_block(persona_system)}"
         f"{_caveman_block(caveman)}"
+        f"{_efficiency_block(efficiency)}"
         f"{_rules_block(house_rules)}\n"
         f"# Context\n{_workspace_block(workspace, workspace_status)}\n"
         f"{_history_block(conversation)}\n"
@@ -1084,6 +1109,7 @@ def build_critique_prompt(
     strictness_level: Any = DEFAULT_STRICTNESS,
     system: str = "",
     caveman: bool = False,
+    efficiency: bool = False,
 ) -> str:
     """Stage 2: one member critiquing its peers, who are anonymous to it.
 
@@ -1113,6 +1139,7 @@ def build_critique_prompt(
         f"{_persona_block(persona_system)}"
         f"\n# How hard to push ({band['name']})\n{band['critique']}\n"
         f"{_caveman_block(caveman)}"
+        f"{_efficiency_block(efficiency)}"
         f"{_rules_block(house_rules)}\n"
         f"# Context\n{_workspace_block(workspace, workspace_status)}\n"
         f"# The task every member was given\n{task.strip()}\n"
@@ -1136,6 +1163,7 @@ def build_chairman_prompt(
     strictness_level: Any = DEFAULT_STRICTNESS,
     system: str = "",
     caveman: bool = False,
+    efficiency: bool = False,
 ) -> str:
     """Stage 3: the chairman synthesises the council and applies the outcome.
 
@@ -1173,6 +1201,7 @@ def build_chairman_prompt(
         f"{system}\n"
         f"\n# How much agreement to require ({band['name']})\n{band['chair']}\n"
         f"{_caveman_block(caveman)}"
+        f"{_efficiency_block(efficiency)}"
         f"{_rules_block(house_rules)}\n"
         f"# Context\n{_workspace_block(workspace, workspace_status)}\n"
         f"{_history_block(conversation)}\n"
@@ -1244,6 +1273,7 @@ def build_chat_prompt(
     conversation: Optional[List[Dict[str, Any]]] = None,
     behavior: str = "",
     caveman: bool = False,
+    efficiency: bool = False,
 ) -> str:
     """The whole prompt for one Solo Mode turn.
 
@@ -1253,13 +1283,16 @@ def build_chat_prompt(
     replaces could not do: that one always injected a persona, the house rules
     and a repository preamble, so a plain question never arrived as one.
 
-    Caveman Mode is the one exception, and only because the operator switched
-    it on for Chat specifically. It is still their instruction; it simply lives
-    in Settings rather than in the message.
+    The two writing-mode switches are the exceptions, and only because the
+    operator switched them on for Chat specifically. They are still the
+    operator's instructions; they simply live in Settings rather than in the
+    message.
     """
     message = task.strip()
     behavior = behavior.strip()
-    style = _caveman_block(caveman).strip()
+    style = (
+        _caveman_block(caveman) + _efficiency_block(efficiency)
+    ).strip()
     history = _chat_history_block(conversation)
     if not behavior and not history and not style:
         return message
@@ -1482,6 +1515,7 @@ def project_context_block(
     diff: str = "",
     house_rules: str = "",
     caveman: bool = False,
+    efficiency: bool = False,
 ) -> str:
     """The shared preamble every project turn starts from.
 
@@ -1557,6 +1591,10 @@ def project_context_block(
         # contract is a fenced JSON block and rule 5 leaves fences alone, so
         # the engine still gets something it can parse.
         parts += ["", _caveman_block(True).strip()]
+    if efficiency:
+        # Like Caveman Mode, keep the selected writing instruction next to the
+        # turn contract and outside all fenced machine-readable content.
+        parts += ["", _efficiency_block(True).strip()]
     return "\n".join(parts)
 
 

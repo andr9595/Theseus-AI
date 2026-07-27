@@ -2656,6 +2656,7 @@ function openGearMenu(anchor) {
   // granted that at the gate, and Chat, having no gate, cannot.
   const chat = uiMode() === 'solo';
   const cavemanMode = chat ? 'chat' : 'council';
+  const efficiencyMode = chat ? 'chat' : 'council';
 
   const row = (key, label, on, danger) =>
     `<button class="menu-toggle${on ? ' on' : ''}${danger ? ' danger' : ''}" ` +
@@ -2667,6 +2668,7 @@ function openGearMenu(anchor) {
   menu.innerHTML =
     row('zero_touch', 'Zero-Touch mode', !!c.zero_touch, true) +
     row('caveman', 'Caveman mode', cavemanOn(cavemanMode), false) +
+    row('efficiency', 'Efficiency mode', efficiencyOn(efficiencyMode), false) +
     row('pull_request_mode', 'Pull request mode', !!c.pull_request_mode, false) +
     // Council only: Chat has one agent and no bench to show. It is a display
     // choice rather than a permission, so unlike the two above it is applied
@@ -2699,6 +2701,14 @@ function openGearMenu(anchor) {
     closeModelMenu();
     if (btn.dataset.toggle === 'caveman') {
       patchConfig({ caveman: { [cavemanMode]: !cavemanOn(cavemanMode) } });
+      return;
+    }
+    if (btn.dataset.toggle === 'efficiency') {
+      patchConfig({
+        efficiency: {
+          [efficiencyMode]: !efficiencyOn(efficiencyMode),
+        },
+      });
       return;
     }
     if (btn.dataset.toggle === 'show_seats') {
@@ -2945,11 +2955,16 @@ function switchSettingsTab(name) {
     p.classList.toggle('active', p.dataset.settingsPanel === name));
 }
 
-/** Caveman mode, per app mode: 'council', 'chat' or 'project'. One switch each
- *  rather than one global, because what it costs differs — a Chat answer is
- *  read and discarded, a council deliberation is the record of a change. */
+/** Writing modes are scoped to 'council', 'chat' or 'project'. Each mode gets
+ *  its own switches because what brevity costs differs — a Chat answer is read
+ *  and discarded, a council deliberation is the record of a change. */
 function cavemanOn(mode) {
   return !!((state.config || {}).caveman || {})[mode];
+}
+
+/** Concise normal prose, independently selectable for every app mode. */
+function efficiencyOn(mode) {
+  return !!((state.config || {}).efficiency || {})[mode];
 }
 
 function renderSettings() {
@@ -3125,6 +3140,7 @@ function renderSettings() {
 
   $('#house-rules').value = conf.house_rules || '';
   $('#caveman-project').checked = cavemanOn('project');
+  $('#efficiency-project').checked = efficiencyOn('project');
   $('#display-name').value = conf.display_name || '';
   $('#port-input').value = conf.port || 8760;
   $('#open-browser').checked = conf.open_browser !== false;
@@ -3368,6 +3384,9 @@ async function saveSettings() {
         // disturbing either chat mode.
         caveman: {
           project: $('#caveman-project').checked,
+        },
+        efficiency: {
+          project: $('#efficiency-project').checked,
         },
         display_name: $('#display-name').value.trim(),
         port: parseInt($('#port-input').value, 10) || 8760,

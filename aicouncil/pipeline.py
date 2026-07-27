@@ -1038,13 +1038,16 @@ class Pipeline:
             # operator did not put there: permission to change files is not a
             # reason to start injecting a persona, the house rules or a
             # repository preamble into a message they typed themselves. The
-            # style switch below is the operator's own, set for Chat in
-            # Settings, and adds nothing when it is off.
+            # style switches below are the operator's own, set for Chat in
+            # Settings, and add nothing when they are off.
             prompts.build_chat_prompt(
                 run.task,
                 run.conversation,
                 behavior=str(provider.get("behavior") or ""),
                 caveman=bool((run.config.get("caveman") or {}).get("chat")),
+                efficiency=bool(
+                    (run.config.get("efficiency") or {}).get("chat")
+                ),
             ),
             auto_approve=writes,
             read_only=not writes,
@@ -1162,6 +1165,7 @@ class Pipeline:
         # otherwise leave the chairman writing in a different voice to the
         # members it is synthesising.
         caveman = bool((conf.get("caveman") or {}).get("council"))
+        efficiency = bool((conf.get("efficiency") or {}).get("council"))
         workspace_status = gitutil.status(run.workspace).to_dict()
         seating = run.seating
         if seating is None:  # start() always seats a council run
@@ -1200,6 +1204,7 @@ class Pipeline:
                         run.conversation,
                         persona_system=self._persona_system(seat, roles),
                         caveman=caveman,
+                        efficiency=efficiency,
                     ),
                     False,  # never auto-approved
                     True,   # and explicitly read-only
@@ -1275,6 +1280,7 @@ class Pipeline:
                             persona_system=self._persona_system(p["seat"], roles),
                             strictness_level=run.strictness,
                             caveman=caveman,
+                            efficiency=efficiency,
                         ),
                         False,
                         True,
@@ -1374,6 +1380,7 @@ class Pipeline:
                 strictness_level=run.strictness,
                 system=str(chair_role.get("system") or ""),
                 caveman=caveman,
+                efficiency=efficiency,
             ),
             auto_approve=execute_approved,
         )
