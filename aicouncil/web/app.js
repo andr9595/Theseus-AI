@@ -3727,12 +3727,9 @@ function connect() {
 
   on('stage_output', (d) => {
     if (state.run && state.run.solo) {
-      // Progressive, and provisional: `stage_finished` replaces this with the
-      // CLI's own final answer, which is prose rather than a transcript of it.
-      // Written straight into the live message, which no render between here
-      // and `stage_finished` rebuilds.
-      const live = $('#thread .assistant-message .markdown[data-live]');
-      if (live) live.textContent += `${d.line}\n`;
+      // Chat shows the answer, not the agent's working transcript. The stage
+      // header already says "working"; `stage_finished` renders the CLI's
+      // final answer when it is ready.
       return;
     }
     // Tag with the stage's own label: either agent can hold either job, so a
@@ -3896,7 +3893,9 @@ async function loadState() {
 }
 
 async function startRun() {
-  const task = $('#task-input').value.trim();
+  const input = $('#task-input');
+  const submittedValue = input.value;
+  const task = submittedValue.trim();
   if (!task) return;
   const conf = state.config || {};
 
@@ -3940,7 +3939,12 @@ async function startRun() {
       },
     });
     // Only once the server has accepted it: a rejected start leaves the
-    // attachment in place so the operator can fix the task and try again.
+    // message and attachment in place so the operator can fix them and retry.
+    // Preserve anything typed while the request was in flight.
+    if (input.value === submittedValue) {
+      input.value = '';
+      input.dispatchEvent(new Event('input'));
+    }
     clearContinuation();
   } catch (err) {
     toast(err.message, 'error', 9000);

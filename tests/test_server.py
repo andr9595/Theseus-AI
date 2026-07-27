@@ -129,6 +129,22 @@ class TestStaticFiles(ServerTestBase):
         self.assertIn("row('caveman', 'Caveman mode'", script)
         self.assertIn("patchConfig({ caveman: { [cavemanMode]:", script)
 
+    def test_accepted_chat_submit_clears_only_the_submitted_message(self):
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn("const submittedValue = input.value;", script)
+        self.assertIn("if (input.value === submittedValue) {", script)
+        self.assertIn("input.value = '';", script)
+
+    def test_chat_hides_intermediate_agent_output(self):
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        handler = script.split("on('stage_output', (d) => {", 1)[1].split(
+            "on('stage_finished'", 1
+        )[0]
+        self.assertIn("if (state.run && state.run.solo)", handler)
+        self.assertNotIn("live.textContent", handler)
+
     def test_security_headers_are_present(self):
         with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
             csp = res.headers.get("Content-Security-Policy")
