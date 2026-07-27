@@ -556,6 +556,10 @@ const state = {
   // operator has switched away can be discarded rather than shown.
   chatMode: '',
   openChat: null,
+  // Which concrete model each alias stands for right now — `opus` is only a
+  // pointer, and the version it points at is the thing worth knowing. Filled
+  // in from /api/models; empty until the CLI has been asked once.
+  resolvedModels: {},
 };
 
 const STATE_LABELS = {
@@ -807,7 +811,7 @@ function renderStrip() {
     const initial = (p.label || id).slice(0, 2).toUpperCase();
     const model = p.model || 'default model';
     const title =
-      `${p.label || id} — ${p.role || 'no role'} · ${model}` +
+      `${p.label || id} — ${p.role || 'no role'} · ${modelDetail(model)}` +
       (p.effort ? ` · ${p.effort}` : '') +
       (available ? '' : ` · ${(p.command || [])[0] || 'CLI'} not found`) +
       '\nClick to change CLI, model, effort or role.';
@@ -863,7 +867,7 @@ function renderComposerChips() {
       `title="Which CLI answers — ${esc(agentLabel)}">` +
       `<span class="chip-label">${esc(agentLabel)}</span>${caret}</button>` +
     `<button class="model-chip${p.model ? ' set' : ''}" type="button" data-model-for="solo" ` +
-      `title="Model — ${esc(modelLabel)}">` +
+      `title="Model — ${esc(modelDetail(modelLabel))}">` +
       `<span class="chip-label">${esc(modelLabel)}</span>${caret}</button>` +
     (hasEffort
       ? `<button class="model-chip effort-chip${p.effort ? ' set' : ''}" type="button" ` +
@@ -1464,6 +1468,38 @@ function closeModelMenu() {
   if (open) open.remove();
 }
 
+/** Keep what the CLI said an alias resolves to, so the chips and the council
+ *  strip can name the generation too — not just the menu that asked. */
+function rememberResolved(map) {
+  Object.assign(state.resolvedModels, map || {});
+}
+
+/** "opus (claude-opus-5)" once the resolution is known, "opus" until then.
+ *  Never a guess: an alias with no answer yet is left to speak for itself. */
+function modelDetail(model) {
+  const points = state.resolvedModels[model];
+  return points && points !== model ? `${model} (${points})` : model;
+}
+
+/** Ask once, in the background, so the very first tooltip is already specific.
+ *  Costs nothing per alias — the server kills each probe at the handshake —
+ *  and the answer is cached there for the life of the process. */
+function prefetchResolvedModels() {
+  const providers = (state.config || {}).providers || {};
+  const wanted = Object.keys(providers).filter(id =>
+    /^[a-z]+$/.test(providers[id].model || '')
+  );
+  if (!wanted.length) return;
+  // Every one of them, not just the first: the two council seats can be on
+  // different CLIs, and only one of them may be the one with aliases. The
+  // server caches per binary, so asking twice about the same CLI is free.
+  Promise.all(wanted.map(id =>
+    api(`/api/models?provider=${encodeURIComponent(id)}`)
+      .then(data => rememberResolved(data.resolved))
+      .catch(() => { /* A tooltip is not worth surfacing a failure for. */ })
+  )).then(() => { renderComposerChips(); renderStrip(); });
+}
+
 /** Anchor below the chip, then nudge back inside the viewport. Called twice:
  *  once for the loading state and again once the real list has resized it. */
 function positionModelMenu(menu, anchor) {
@@ -1494,12 +1530,15 @@ async function openModelMenu(anchor, providerId) {
   let models = provider.models || [];
   let source = 'configured in Settings';
   let error = '';
+  let resolved = {};
   try {
     const data = await api(`/api/models?provider=${encodeURIComponent(providerId)}`);
     if (data.models && data.models.length) {
       models = data.models;
       source = data.source || '';
     }
+    resolved = data.resolved || {};
+    rememberResolved(resolved);
     error = data.error || '';
   } catch (err) {
     error = err.message;
@@ -1511,13 +1550,23 @@ async function openModelMenu(anchor, providerId) {
       `<span class="model-opt-name">CLI default</span>` +
       `<span class="model-opt-note">whatever the CLI is set to</span>` +
     `</button>` +
-    models.map(m =>
-      `<button class="model-opt${m === current ? ' active' : ''}" data-value="${esc(m)}">` +
-        `<span class="model-opt-name">${esc(m)}</span>` +
-        // Bare aliases track the newest model in a family; pinned IDs don't.
-        `<span class="model-opt-note">${/^[a-z]+$/.test(m) ? 'alias · always latest' : ''}</span>` +
-      `</button>`
-    ).join('') +
+    models.map(m => {
+      // An alias tracks the newest model in its family, so on its own it does
+      // not say which generation you are about to run. Name the model it
+      // points at right now; a pinned id already names itself.
+      const points = resolved[m] || '';
+      const note = points ? `→ ${points}` : (/^[a-z]+$/.test(m) ? 'alias · always latest' : '');
+      const why = points
+        ? `${m} is an alias — it currently runs ${points}, and will follow that family as it is updated.`
+        : '';
+      return (
+        `<button class="model-opt${m === current ? ' active' : ''}" data-value="${esc(m)}"` +
+          `${why ? ` title="${esc(why)}"` : ''}>` +
+          `<span class="model-opt-name">${esc(m)}</span>` +
+          `<span class="model-opt-note">${esc(note)}</span>` +
+        `</button>`
+      );
+    }).join('') +
     (error ? `<div class="model-menu-error">${esc(error)}</div>` : '') +
     `<div class="model-menu-custom">` +
       `<input class="model-custom-input" placeholder="Other model…" spellcheck="false" ` +
@@ -1655,7 +1704,7 @@ function openMemberMenu(anchor, providerId) {
 
   const rows = [
     ['agent', 'CLI', agentLabel],
-    ['model', 'Model', provider.model || 'the CLI’s default'],
+    ['model', 'Model', provider.model ? modelDetail(provider.model) : 'the CLI’s default'],
     ...(hasEffort ? [['effort', 'Effort', provider.effort || 'the CLI’s default']] : []),
     ['role', 'Role', provider.role || 'none'],
   ];
@@ -1866,7 +1915,9 @@ async function setModel(providerId, value) {
   }
   await patchConfig(patch);
   toast(
-    value ? `${provider.label || providerId} → ${value}`
+    // Named in full at the moment of choosing, which is when it matters most:
+    // picking "opus" should confirm which generation that is today.
+    value ? `${provider.label || providerId} → ${modelDetail(value)}`
           : `${provider.label || providerId} → CLI default`,
     'ok', 2600
   );
@@ -3125,6 +3176,7 @@ async function boot() {
   await refreshDoctor();
   await loadChats();
   connect();
+  prefetchResolvedModels();
   $('#task-input').focus();
 }
 

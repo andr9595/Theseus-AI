@@ -14,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from aicouncil import providers  # noqa: E402
 from aicouncil.providers import (  # noqa: E402
     ARGV_PROMPT_LIMIT,
     ClaudeStreamReader,
@@ -663,7 +664,10 @@ class TestModelDiscovery(unittest.TestCase):
         self.assertTrue(r["error"])
 
     def test_claude_offers_aliases_not_pinned_ids(self):
-        r = discover_models({"command": ["claude", "-p", "{prompt}"]})
+        # A claude-named binary that is not installed, deliberately: this
+        # asserts what is *offered*, and launching the real CLI from a unit
+        # test would tie the answer to whoever is logged in on the machine.
+        r = discover_models({"command": ["claude-not-installed", "-p", "{prompt}"]})
         self.assertIn("opus", r["models"])
         # A pinned ID would go stale and silently keep running an old model.
         self.assertFalse([m for m in r["models"] if m.startswith("claude-")])
@@ -672,6 +676,105 @@ class TestModelDiscovery(unittest.TestCase):
         r = discover_models({"command": ["some-other-agent", "{prompt}"]})
         self.assertEqual(r["models"], [])
         self.assertTrue(r["error"])
+
+
+class TestClaudeAliasResolution(unittest.TestCase):
+    """An alias hides the thing the operator most wants to know.
+
+    `opus` is a pointer, not a model. Offering it unlabelled means the menu
+    cannot answer "am I about to run the current generation or last year's" —
+    which is the entire reason someone opens that menu. The CLI expands the
+    alias itself, before it opens a connection, so it can be asked for free.
+    """
+
+    # Prints the handshake the real CLI prints, then hangs like a session that
+    # is waiting on a model. Hanging is the point: the probe must take its one
+    # line and leave, not wait for an answer it never wanted.
+    STUB = (
+        "#!/usr/bin/env python3\n"
+        "import json, sys, time\n"
+        "a = sys.argv[1:]\n"
+        "open(sys.argv[0] + '.calls', 'a').write('x')\n"
+        "model = a[a.index('--model') + 1]\n"
+        "print(json.dumps({'type': 'system', 'subtype': 'init',\n"
+        "                  'model': 'resolved-' + model}), flush=True)\n"
+        "time.sleep(60)\n"
+    )
+
+    SILENT_STUB = (
+        "#!/usr/bin/env python3\n"
+        "import time\n"
+        "time.sleep(60)\n"
+    )
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-alias-"))
+        providers._ALIAS_CACHE.clear()
+        self._timeout = providers.ALIAS_PROBE_TIMEOUT
+
+    def tearDown(self):
+        providers.ALIAS_PROBE_TIMEOUT = self._timeout
+        providers._ALIAS_CACHE.clear()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _stub(self, body, name="claude"):
+        path = self.tmp / name
+        path.write_text(body)
+        path.chmod(0o755)
+        return {"command": [str(path), "-p", "{prompt}"]}
+
+    def _calls(self, provider):
+        marker = Path(provider["command"][0] + ".calls")
+        return len(marker.read_text()) if marker.exists() else 0
+
+    def test_each_alias_is_named_by_the_model_it_resolves_to(self):
+        r = discover_models(self._stub(self.STUB))
+        self.assertEqual(r["resolved"], {
+            "opus": "resolved-opus",
+            "sonnet": "resolved-sonnet",
+            "haiku": "resolved-haiku",
+            "fable": "resolved-fable",
+        })
+        # The aliases stay the value that gets saved. Resolving one is for
+        # reading, not for pinning the config to a model id that will age.
+        self.assertEqual(r["models"], ["opus", "sonnet", "haiku", "fable"])
+
+    def test_the_probe_is_killed_at_the_handshake(self):
+        provider = self._stub(self.STUB)
+        discover_models(provider)
+        # The stub sleeps for a minute after its first line. Returning at all
+        # means nothing waited for it, and nothing was left running.
+        self.assertEqual(self._calls(provider), 4)
+
+    def test_a_second_ask_does_not_launch_the_cli_again(self):
+        provider = self._stub(self.STUB)
+        discover_models(provider)
+        discover_models(provider)
+        self.assertEqual(self._calls(provider), 4)
+
+    def test_a_silent_cli_gives_up_rather_than_hanging(self):
+        providers.ALIAS_PROBE_TIMEOUT = 0.5
+        r = discover_models(self._stub(self.SILENT_STUB))
+        self.assertEqual(r["resolved"], {})
+        # The list still works, so this is not an error banner's business.
+        self.assertIn("opus", r["models"])
+        self.assertFalse(r["error"])
+
+    def test_an_incomplete_answer_is_not_cached(self):
+        # A machine too busy to answer for one alias would otherwise freeze a
+        # blank entry into the menu until the app is restarted.
+        provider = self._stub(self.STUB)
+        original = providers._resolve_claude_alias
+        try:
+            providers._resolve_claude_alias = (
+                lambda path, alias: "" if alias == "fable" else original(path, alias)
+            )
+            first = discover_models(provider)
+        finally:
+            providers._resolve_claude_alias = original
+        self.assertNotIn("fable", first["resolved"])
+        second = discover_models(provider)
+        self.assertIn("fable", second["resolved"])
 
 
 class TestEffortDiscovery(unittest.TestCase):

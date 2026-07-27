@@ -661,9 +661,10 @@ is worth.
 
 ### Choosing a model per stage
 
-Click the model chip on either agent card to switch that stage's model. The
-picker offers the configured list, the CLI's own default, and a free-text box
-for anything else — typing a model adds it to the list for next time.
+In Chat, click the model chip under the composer. In Council, click a member on
+the strip and choose **Model**. The picker offers the configured list, the
+CLI's own default, and a free-text box for anything else — typing a model adds
+it to the list for next time.
 
 The picker asks each CLI what it can actually run. Codex publishes an
 account-scoped list in `$CODEX_HOME/models_cache.json` — read live, so it
@@ -673,9 +674,15 @@ shipped list is wrong the moment a model is renamed, and wrong *per account*
 regardless.
 
 Aliases (`opus`, `sonnet`, `haiku`, `fable`) always resolve to the newest model
-in that family; a pinned ID stays where you put it. The picker labels which is
-which, because the difference only shows up months later when a pinned stage is
-quietly running a superseded model.
+in that family; a pinned ID stays where you put it. On its own, though, an
+alias does not say *which* generation you are about to run, so the picker shows
+what each one points at right now — `opus → claude-opus-5` — and the toast
+confirms it when you choose. That reading comes from `claude` itself: the CLI
+expands the alias locally, before it opens a connection, and names the result
+in the first line of its `--output-format stream-json` handshake. The app reads
+that line and kills the process, so the prompt is never sent and the check
+costs nothing. If the CLI cannot be reached the aliases are still offered,
+unlabelled — the list is not wrong, it is just less specific.
 
 Blank — the default — passes no `--model` flag at all, so each CLI uses
 whatever it is configured for. That is the setting most likely to still be

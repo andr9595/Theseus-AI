@@ -13,8 +13,9 @@ Three behaviours are worth calling out:
   ``--dangerously-bypass-approvals-and-sandbox``) live in a separate config
   field and are appended only when ``auto_approve`` is set. The pipeline sets
   it in exactly two cases: Zero-Touch Mode is on, or a human clicked "Approve
-  & execute" at the gate. Stage 1 never receives them - it is read-only, and
-  neither does Solo Mode, which is invoked with ``read_only_args`` instead.
+  & execute" at the gate. Stage 1 never receives them - it is read-only - and
+  neither does Chat until Zero-Touch is switched on, being invoked with
+  ``read_only_args`` instead.
 
 * **No shell.** Commands are executed as argv lists with ``shell=False``, so a
   prompt containing backticks, ``$(...)`` or a semicolon is inert data rather
@@ -36,6 +37,8 @@ import signal
 import subprocess
 import threading
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -685,10 +688,14 @@ def discover_models(provider: Dict) -> Dict:
 
     Claude Code ships no equivalent cache; its ``--model`` help documents the
     alias form instead, and an alias always resolves to the current model in
-    that family, so aliases are what we offer.
+    that family, so aliases are what we offer - each one asked what it points
+    at right now, so the menu can say `opus -> claude-opus-5` instead of
+    leaving the reader to guess which generation they just picked.
 
-    Returns ``{"models": [...], "source": "...", "error": "..."}``. Callers
-    fall back to the configured list when ``models`` is empty.
+    Returns ``{"models": [...], "resolved": {alias: id}, "source": "...",
+    "error": "..."}``. Callers fall back to the configured list when ``models``
+    is empty, and must treat ``resolved`` as optional - it is empty whenever
+    the CLI could not be asked.
     """
     exe = (provider.get("command") or [""])[0]
     base = os.path.basename(str(exe))
@@ -696,15 +703,127 @@ def discover_models(provider: Dict) -> Dict:
     if "codex" in base:
         return _discover_codex_models()
     if "claude" in base:
-        # Aliases only. Pinned IDs are deliberately not enumerated here: this
-        # app has no way to know which ones the account may use, and a stale
-        # pinned ID is the failure mode we are trying to avoid.
-        return {
-            "models": ["opus", "sonnet", "haiku", "fable"],
-            "source": "claude --model aliases (always resolve to the latest)",
-            "error": "",
-        }
+        return _discover_claude_models(provider)
     return {"models": [], "source": "", "error": "No discovery available for this CLI."}
+
+
+# The families `claude --model` documents as aliases. Pinned IDs are
+# deliberately not enumerated alongside them: this app has no way to know which
+# ones the account may use, and a stale pinned ID is the failure mode the
+# aliases exist to avoid.
+CLAUDE_ALIASES = ["opus", "sonnet", "haiku", "fable"]
+
+# Resolutions live for the process, keyed by binary path. They only change when
+# the CLI is upgraded, and a menu that reopens often should not pay four
+# process launches every time.
+_ALIAS_CACHE: Dict[str, Dict[str, str]] = {}
+_ALIAS_LOCK = threading.Lock()
+
+# Long enough for a cold CLI start on a loaded machine, short enough that a
+# hung binary cannot hold a dropdown open indefinitely.
+ALIAS_PROBE_TIMEOUT = 20.0
+
+
+def _discover_claude_models(provider: Dict) -> Dict:
+    """Offer the aliases, and name the model each one currently points at."""
+    path = resolve_binary(list(provider.get("command") or []))
+    resolved = _resolve_claude_aliases(path) if path else {}
+    return {
+        "models": list(CLAUDE_ALIASES),
+        "resolved": resolved,
+        "source": (
+            "claude --model aliases, resolved by asking the CLI just now"
+            if resolved else
+            # Not an error: the aliases are still the right thing to offer, and
+            # a red banner over a list that works would be a lie about it.
+            "claude --model aliases (the CLI could not be asked which model "
+            "each one points at)"
+        ),
+        "error": "",
+    }
+
+
+def _resolve_claude_aliases(path: str) -> Dict[str, str]:
+    """Map every alias to the concrete model id it stands for, in parallel.
+
+    Four sequential probes would put four seconds in front of a dropdown. Run
+    together they finish in about one, and the answer is then cached for the
+    life of the process.
+    """
+    with _ALIAS_LOCK:
+        cached = _ALIAS_CACHE.get(path)
+    if cached is not None:
+        return dict(cached)
+
+    with ThreadPoolExecutor(max_workers=len(CLAUDE_ALIASES)) as pool:
+        pairs = pool.map(lambda a: (a, _resolve_claude_alias(path, a)), CLAUDE_ALIASES)
+        resolved = {alias: model for alias, model in pairs if model}
+
+    # Only a complete answer is cached. A partial one usually means the machine
+    # was busy or offline for a moment, and caching it would freeze a blank
+    # entry in the menu until the app restarts.
+    if len(resolved) == len(CLAUDE_ALIASES):
+        with _ALIAS_LOCK:
+            _ALIAS_CACHE[path] = dict(resolved)
+    return resolved
+
+
+def _resolve_claude_alias(path: str, alias: str) -> str:
+    """Ask `claude` what one alias resolves to, without spending anything.
+
+    The CLI expands the alias itself, before it opens a connection: its `init`
+    event names the resolved model, and that event still arrives when the API
+    endpoint is pointed at a dead port. So this starts a session, reads the
+    first line, and kills it - the prompt is never sent and no tokens are used.
+
+    ``--session-id`` is fixed per alias so that repeated probing reuses the
+    same slot instead of filling the user's `/resume` list with one dead
+    session per dropdown they open.
+    """
+    session = str(uuid.uuid5(uuid.NAMESPACE_URL, f"theseus-ai/model-probe/{alias}"))
+    proc = None
+    watchdog = None
+    try:
+        proc = subprocess.Popen(
+            [
+                path, "-p", "--model", alias, "--session-id", session,
+                "--output-format", "stream-json", "--verbose",
+                # A prompt is required to get past argument validation. It is
+                # never delivered - see above.
+                "hi",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        # Reading a pipe blocks, so the time limit has to come from outside it:
+        # the kill closes stdout, the loop below ends, and the probe gives up.
+        watchdog = threading.Timer(ALIAS_PROBE_TIMEOUT, proc.kill)
+        watchdog.start()
+        for line in proc.stdout:
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("type") == "system" and event.get("subtype") == "init":
+                return str(event.get("model") or "")
+    except (OSError, ValueError):
+        pass
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
+        if proc is not None:
+            proc.kill()
+            # The pipe is still open on the return path, and this runs inside a
+            # long-lived server: leaking one descriptor per probe would add up.
+            if proc.stdout is not None:
+                proc.stdout.close()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+    return ""
 
 
 def _discover_codex_models() -> Dict:
