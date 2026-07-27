@@ -1318,6 +1318,32 @@ class TestConversationList(PipelineTestBase):
         # every time the operator sends another message.
         self.assertEqual(listed[0]["title"], "the original request")
 
+    def test_many_chat_follow_ups_remain_one_conversation(self):
+        self.store.update({
+            "mode": "solo",
+            "providers": {"solo": mock_provider("solo", "Assistant")},
+        })
+        previous = ""
+        runs = []
+        for number in range(1, 9):
+            run = self.run_once(
+                f"chat message {number}",
+                continue_from=previous,
+            )
+            runs.append(run)
+            previous = run.transcript_name
+
+        listed = self.pipeline.history(mode="solo")
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0]["file"], runs[-1].transcript_name)
+        self.assertEqual(listed[0]["messages"], 8)
+        self.assertEqual(listed[0]["title"], "chat message 1")
+        self.assertEqual(runs[-1].parent_run_id, runs[-2].id)
+        self.assertEqual(
+            [turn["task"] for turn in runs[-1].conversation],
+            [f"chat message {number}" for number in range(1, 8)],
+        )
+
     def test_continuing_the_same_run_twice_lists_both_branches(self):
         first = self.run_once("the original request")
         left = self.run_once("down one path", continue_from=first.transcript_name)

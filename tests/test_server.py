@@ -188,16 +188,45 @@ class TestStaticFiles(ServerTestBase):
         self.assertIn("input.value = '';", script)
 
     def test_completed_chat_stays_attached_for_the_next_message(self):
+        with urllib.request.urlopen(f"{self.base}/continuation.js", timeout=15) as res:
+            continuation = res.read().decode()
         with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
             script = res.read().decode()
+
+        # The pure decision covers every terminal transcript, and refuses all
+        # states in which silently attaching would be surprising or invalid.
+        for terminal in ("complete", "failed", "cancelled"):
+            self.assertIn(f"'{terminal}'", continuation)
+        for guard in (
+            "options.busy",
+            "options.fresh",
+            "options.openChat",
+            "mode !== options.mode",
+            "runWorkspace !== options.workspace",
+        ):
+            self.assertIn(guard, continuation)
+
         handler = script.split("on('state', (d) => {", 1)[1].split(
             "on('stage_started'", 1
         )[0]
         terminal = handler.split("if (!state.busy) {", 1)[1]
-        self.assertIn("if (d.run && d.run.file)", terminal)
-        self.assertIn("continueRun(", terminal)
-        self.assertIn("d.run.file,", terminal)
+        self.assertIn("restoreContinuation();", terminal)
+        load_state = script.split("async function loadState()", 1)[1].split(
+            "async function startRun()", 1
+        )[0]
+        # This is the missed-event/reload/commit-refresh case that produced
+        # two newest root chats in the operator's actual history.
+        self.assertIn("restoreContinuation();", load_state)
+        self.assertIn("state.freshChat = false;", script)
+        self.assertIn("function startFreshChat()", script)
         self.assertIn("if (!alreadyAttachedLatest) clearContinuation();", script)
+
+        with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
+            html = res.read().decode()
+        self.assertLess(
+            html.index('<script src="/continuation.js"></script>'),
+            html.index('<script src="/app.js"></script>'),
+        )
 
     def test_chat_hides_intermediate_agent_output(self):
         with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:

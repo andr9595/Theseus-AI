@@ -562,6 +562,9 @@ const state = {
   // operator asked to compact it before the next run.
   continueContext: null,
   compactContext: false,
+  // Explicitly blank composers must survive state refreshes. False at boot so
+  // the latest completed run can be restored and continued after a reload.
+  freshChat: false,
   // The conversation list in the sidebar, and the one open in the main pane.
   chats: [],
   // Which mode `state.chats` was fetched for, so a list that arrives after the
@@ -621,6 +624,9 @@ function visibleMode() {
 function runOnScreen() {
   const run = (state.openChat && state.openChat.run) || state.run;
   if (!run) return null;
+  // A live run owns the screen, but once it ends an explicit "New chat" must
+  // stay blank even when /api/state returns that latest completed run again.
+  if (!state.openChat && state.freshChat && !state.busy) return null;
   const mode = run.mode || (run.solo ? 'solo' : 'council');
   return mode === uiMode() ? run : null;
 }
@@ -767,6 +773,7 @@ async function continueRun(file, task, mode = '', quiet = false) {
   if (mode && mode !== selectedMode()) {
     await patchConfig({ mode });
   }
+  state.freshChat = false;
   state.continueFrom = file;
   state.continueTask = (task || '').slice(0, 90);
   state.continueContext = null;
@@ -796,6 +803,41 @@ function clearContinuation() {
   state.continueContext = null;
   state.compactContext = false;
   renderContinuation();
+}
+
+/** Reattach the completed conversation returned by /api/state or an event.
+ *
+ * A state refresh used to restore only the visible transcript. The composer
+ * therefore looked connected while `continue_from` was empty, and its next
+ * message became a new history row. Keep display and submission attached by
+ * deriving both from the same run.
+ */
+function restoreContinuation() {
+  const target = Continuation.target(state.run, {
+    busy: state.busy,
+    fresh: state.freshChat,
+    openChat: !!state.openChat,
+    mode: selectedMode(),
+    workspace: workspacePath() || state.scratchWorkspace,
+  });
+  if (!target) return;
+
+  // Commit events can refresh state twice. Preserve the context preview and
+  // compaction choice when this conversation is already attached.
+  if (state.continueFrom === target.file) {
+    state.continueTask = target.task;
+    renderContinuation();
+    return;
+  }
+  continueRun(target.file, target.task, target.mode, true);
+}
+
+/** Blank the composer intentionally. Unlike a transient attachment clear,
+ * this survives /api/state refreshes until a run starts or history is opened. */
+function startFreshChat() {
+  state.openChat = null;
+  state.freshChat = true;
+  clearContinuation();
 }
 
 /** Which catalogued agent a provider runs, judged by its executable — the
@@ -2923,6 +2965,9 @@ async function selectWorkspace(path) {
       method: 'POST',
       body: { workspace: status.path },
     });
+    if ((workspacePath() || state.scratchWorkspace) !== status.path) {
+      startFreshChat();
+    }
     state.config = config;
     state.workspaceStatus = status;
     renderAll();
@@ -2950,6 +2995,9 @@ async function clearWorkspace() {
       method: 'POST',
       body: { workspace: '' },
     });
+    if ((workspacePath() || state.scratchWorkspace) !== state.scratchWorkspace) {
+      startFreshChat();
+    }
     state.config = config;
     state.workspaceStatus = null;
     renderAll();
@@ -3561,6 +3609,7 @@ async function openChat(file) {
   // screen from this, and an event arriving mid-load would otherwise drop the
   // live run on top of the conversation being opened.
   state.openChat = { file, run: null };
+  state.freshChat = false;
   state.tab = '';
   renderChats();
 
@@ -3620,7 +3669,7 @@ async function deleteChat(file) {
     await api('/api/history/delete', { method: 'POST', body: { file } });
     // It may be the one on screen, or the one the composer is attached to.
     if (state.openChat && state.openChat.file === file) closeChat();
-    if (state.continueFrom === file) clearContinuation();
+    if (state.continueFrom === file) startFreshChat();
     await loadChats();
     toast('Conversation deleted.', 'ok', 2600);
   } catch (err) {
@@ -3642,8 +3691,7 @@ async function clearHistory(mode) {
   try {
     const { deleted } = await api('/api/history/delete',
       { method: 'POST', body: { all: true, mode } });
-    closeChat();
-    clearContinuation();
+    startFreshChat();
     await loadChats();
     renderHistoryCounts();
     toast(`${deleted} conversation${deleted === 1 ? '' : 's'} deleted.`, 'ok');
@@ -3657,8 +3705,7 @@ async function clearHistory(mode) {
  *  necessary in the first place. */
 function closeChat() {
   if (!state.openChat) return;
-  state.openChat = null;
-  clearContinuation();
+  startFreshChat();
   renderAll();
   renderChats();
 }
@@ -3707,6 +3754,7 @@ function connect() {
   on('run_started', (d) => {
     state.run = d.run;
     state.busy = true;
+    state.freshChat = false;
     // A conversation opened from history is on screen where the answer is
     // about to render, and a run starting is where attention belongs.
     state.openChat = null;
@@ -3754,16 +3802,7 @@ function connect() {
       // this, `startRun` cleared the attachment accepted for the previous
       // message and every ordinary next message became a new sidebar row.
       // "New chat" remains the explicit way to detach.
-      const earlier = (d.run && d.run.conversation) || [];
-      const title = (earlier.length ? earlier[0].task : d.run && d.run.task) || '';
-      if (d.run && d.run.file) {
-        continueRun(
-          d.run.file,
-          title,
-          d.run.mode || (d.run.solo ? 'solo' : 'council'),
-          true,
-        );
-      }
+      restoreContinuation();
       loadChats();
       // The run has just written to the working tree, so the git status the
       // status bar and the commit bar are drawn from is now a run out of date.
@@ -3946,6 +3985,7 @@ async function loadState() {
     state.scratchWorkspace = data.scratch_workspace || '';
     state.usage = data.usage || {};
     state.user = data.user || '';
+    restoreContinuation();
     renderAll();
   } catch (err) {
     toast(err.message, 'error', 12000);
@@ -3998,6 +4038,7 @@ async function startRun() {
         compact_context: state.compactContext,
       },
     });
+    state.freshChat = false;
     // Only once the server has accepted it: a rejected start leaves the
     // message and attachment in place so the operator can fix them and retry.
     // Preserve anything typed while the request was in flight.
@@ -4039,8 +4080,7 @@ function wire() {
     // A conversation belongs to the mode it was started in, so switching
     // detaches whatever is attached rather than continuing it in the other.
     if (want !== selectedMode()) {
-      if (state.continueFrom) clearContinuation();
-      closeChat();
+      startFreshChat();
       // Awaited: the sidebar lists one mode's conversations, and `loadChats`
       // reads the mode back out of the config it is about to be given. Fired
       // without waiting, it asks for the list of the mode being left.
@@ -4357,9 +4397,7 @@ function wire() {
   });
   $('#new-chat').addEventListener('click', () => {
     state.tab = '';
-    state.run = null;
-    clearContinuation();
-    closeChat();
+    startFreshChat();
     renderAll();
     renderChats();
     $('#task-input').focus();
@@ -4367,8 +4405,9 @@ function wire() {
 
   // -- continuation -----------------------------------------------------
   $('#continue-clear').addEventListener('click', () => {
-    clearContinuation();
-    closeChat();
+    startFreshChat();
+    renderAll();
+    renderChats();
   });
   // Compaction applies to the run about to start; the transcript on disk is
   // never rewritten, so the full text of every turn stays readable in its own
