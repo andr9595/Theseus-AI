@@ -34,6 +34,13 @@ either job** from Settings, including the same agent twice. See
 drives the CLIs you have already authenticated, so the marginal cost of a run
 is zero.
 
+There is also a third tab. **[Projects](#projects)** points three agents — an
+architect, a developer and a QA specialist — at one folder and loops them
+through five phases with nobody approving anything, until the thing builds,
+passes its own tests and has a README. It is the same machinery with the human
+taken out, which is exactly why it takes a deliberate press of a button and
+names the folder before it starts.
+
 ---
 
 ## Requirements
@@ -187,11 +194,16 @@ drafter                       ← use "polisher" for Stage 2
 |---|---|
 | **Council** | The two-stage pipeline: draft, approve, apply. Each member's CLI, model, effort and role are set by clicking it on the strip. |
 | **Chat** | One agent, one conversation, no gate and no writes. Its CLI, model and effort are the pickers under the composer. |
-| **Project** | A placeholder. Nothing is configurable there yet. |
+| **Project** | An autonomous build. Three agents take turns against one folder until it works, passes its own tests and has a README. Nobody approves anything. See [Projects](#projects). |
 
 Everything a run does lands in the conversation itself — the gate, the console
 and the diff are blocks in the thread rather than tabs beside it, so each one
 sits next to the exchange that produced it.
+
+Council and Chat are two ways of running *one task*. Project is a different
+thing on the same machinery: it runs for as long as the work takes, and only
+one of the three can be working the folder at a time — the app refuses to
+start a run while a project is going, and the reverse.
 
 ---
 
@@ -425,6 +437,149 @@ Configurations written before this existed are migrated on load. The old
 selector pointed at becomes the initial Chat assistant, keeping its CLI, model
 and reasoning level but not its council role. The mode is still stored as
 `solo` on disk — only what the tab is called has changed.
+
+---
+
+## Projects
+
+The other two tabs run one task. Projects runs a *build*: you write a brief,
+pick a folder, and three agents take turns against it until it works, passes
+its own tests and has a README — across far more turns than any one of them
+could hold in a single context window.
+
+```text
+   Your brief
+       |
+       v
+  [1 Architecture] ──> [2 Implementation] ──> [3 QA & build]
+         ^                     ^                     │
+         │                     │  build failing      │
+         │                     └─────────────────────┤
+         │                                           │ build passing
+  [5 Finalisation] <── [4 Feature expansion] <───────┘
+         │
+         v
+     COMPLETED
+```
+
+Phase 4 does not implement anything itself: it decides what v1.1 should be,
+adds those tasks and drops back into phase 2, so the enhancements are built and
+verified exactly the way the base was. When the expansion budget is spent, a
+passing build goes to phase 5 instead — a final integrity check, then the
+README — and the project is done.
+
+### The three chairs
+
+| Chair | Default CLI | What it does |
+|---|---|---|
+| **Architect** | `claude` | System design, directory layout, the task list, reviewing what came back, deciding what the project needs next, and the final README. |
+| **Developer** | `codex` | Writes the code and its tests. Receives build failures and fixes the cause. |
+| **QA** | `agy` | Inspects the tree, runs the real build and the real test suite, captures the stack trace verbatim, and decides whether it passes. |
+
+That pairing follows the work rather than the vendor — judgement to the best
+reasoner, bulk implementation to the most generous quota, build-and-verify to
+the one happiest running commands — and none of it is a rule. Click any chair
+in the matrix to reassign it, exactly as you would a council member. The three
+are ordinary providers under the hood, so the model picker, the reasoning-depth
+picker and the quota chip all work on them unchanged.
+
+If a chair's CLI is not installed, the project **will not start**, and says
+which one. A build that runs unattended for an hour should not discover in
+phase 3 that its QA binary was never there. `agy` in particular is opt-in —
+install it with `scripts/install-deps.sh --antigravity`, or move QA to a CLI
+you already have.
+
+### Permission: there is no gate
+
+A project writes. It cannot do anything else — phase 1 creates `SPEC.md`,
+phase 2 writes the codebase, phase 3 appends to the critique log — so **every
+step is invoked with its agent's auto-approve flags**, and no setting changes
+that. Zero-Touch is not involved; pressing **Start project** *is* the grant.
+That is why the confirmation names the folder: it is the one thing that turns a
+misclick into a question.
+
+A git snapshot is taken before the first write where there is one to take, so
+an entire build can be undone. In a folder that is not a repository there is
+nothing to snapshot and the app says so before you start.
+
+### What it writes
+
+Inside the project root:
+
+| Path | Owner | What it is |
+|---|---|---|
+| `.theseus/STATE.json` | the engine | Execution state, phase, active chair, task list, build status, last failure. |
+| `.theseus/ROADMAP.md` | the agents | The living checklist, in prose. |
+| `.theseus/CRITIQUE.log` | the agents | Append-only: every build failure, review finding and verification result. |
+| `SPEC.md` | the architect | The specification, including the exact build and test commands QA will run. |
+| `README.md` | the architect | Written last, for whoever was not here while it was built. |
+
+The split matters. The engine owns `STATE.json` and rewrites it after every
+step, so there is always one authoritative record of where the run is; the
+agents own the two prose files, because prose tolerates three writers and a
+state machine does not. Structured changes — a task finished, a build failed —
+come back through a fenced JSON block each agent ends its turn with, which the
+engine parses and applies.
+
+### Surviving a context limit
+
+No turn depends on the previous turn's conversation. Every prompt is rebuilt
+from the files on disk — the state, the roadmap, the spec, the last failure
+verbatim — so an agent that dies mid-phase costs one step, not the run.
+
+When a step fails in a way that reads as exhaustion (a token or quota limit, a
+timeout, a non-zero exit with the right words in it), the engine sets
+`continuation_token_needed`, hands that *same step* to a different chair, and
+carries on. The replacement starts from the state file, not from a transcript
+it never saw. That is the reason the roles are three independent providers
+rather than one CLI asked three different things.
+
+This is a heuristic on the CLIs' own prose — none of them has a distinct exit
+code for "out of context" — and it is treated as one: a false positive costs a
+single hand-off, which is survivable.
+
+### The controls
+
+- **Pause** stops the loop *after* the running agent finishes its step. It does
+  not interrupt: a CLI killed between two file writes leaves a tree nothing in
+  the run knows is half-written. It costs a few minutes and leaves the folder
+  consistent.
+- **Resume** picks up from the state file.
+- **Hand off** forces the next step onto a chair you choose. For the failure
+  the engine cannot see — an agent answering, exiting zero, and going in
+  circles.
+- **Stop** ends it now, killing whatever is executing. Use Pause unless you
+  mean that.
+
+Close the window mid-build and the project is still on disk; reopening the app
+finds it and offers to resume. A project that is still running when you open
+the app pulls you to the tab, because an idle-looking window while three agents
+rewrite a folder is the wrong thing to show.
+
+### Bounds
+
+Under **Settings → Run → Projects**, because the loop has no human in it and
+without them a project that cannot make progress will keep spending quota on
+the same failure until somebody notices:
+
+| Setting | Default | What it stops |
+|---|---|---|
+| Step limit | 40 | Total agent turns before it stops and says so. |
+| Fix attempts | 3 | Failing builds in a row before it gives up rather than handing back the same trace again. |
+| Expansion rounds | 1 | Rounds of "what should v1.1 be?". Zero ships the brief and nothing more. |
+
+Hitting a limit is not data loss: everything built is on disk, the roadmap says
+where it got to, and the project can be resumed once you have unstuck it.
+
+### Trying it without spending quota
+
+`scripts/mock-agent.py` speaks the project protocol. Point all three chairs at
+it and the whole five-phase loop runs for real against a real directory: it
+writes a spec, implements a two-file Python module with a genuine bug in it,
+fails its own test suite, is handed the trace, fixes it, proposes an
+enhancement and writes a README. Nothing in that sequence is faked — the tests
+really run and really fail — which is the only way to know the loop works
+rather than to believe it.
 
 ---
 
@@ -771,8 +926,9 @@ aicouncil/
 ├── __main__.py     Entry point, browser launcher, --doctor
 ├── server.py       http.server + SSE, token auth, Origin/Host validation
 ├── pipeline.py     The state machine: drafting → gate → polishing → complete
+├── projects.py     The five-phase autonomous loop and its .theseus/ state file
 ├── providers.py    CLI adapters: argv construction, streaming, cancellation
-├── prompts.py      Role catalogue and stage prompt construction
+├── prompts.py      Role catalogue, stage prompts and the project phase prompts
 ├── gitutil.py      Repo status, diffs, snapshot/rollback & pull-request plumbing
 ├── config.py       Atomic JSON config with deep-merged defaults
 ├── events.py       Pub/sub bus with replay and per-subscriber backpressure
@@ -840,6 +996,17 @@ Coverage focuses on the properties that matter if they're wrong:
   those runs lose is the diff, the snapshot and pull-request delivery, and a
   config written when the folder was a mandatory repository still migrates.
 - Cross-origin and bad-token requests are rejected; path traversal is blocked.
+- A project runs **all five phases against a real directory** with the mock
+  agents: it writes real files, its test suite really fails, the trace really
+  reaches the developer, and the fix really passes. Every unit test around that
+  one would still pass if the phases had quietly stopped connecting.
+- A corrupt or hand-mangled `STATE.json` resumes at the start rather than
+  crashing a worker thread or dispatching on a phase that does not exist, and
+  an agent's silence about a task is never read as deleting it.
+- QA reporting no build status is treated as **failing, never passing** — a
+  silent verification turning into a green build is the one outcome the loop
+  must not build on top of.
+- A project and a run refuse each other, in both directions.
 
 ---
 

@@ -18,6 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from aicouncil import config as cfg  # noqa: E402
 from aicouncil.config import ConfigStore, agent_catalog, agent_for  # noqa: E402
 from aicouncil.server import make_server, serve_forever_in_thread  # noqa: E402
 
@@ -413,7 +414,13 @@ class TestApi(ServerTestBase):
         status, data = self.request("/api/doctor")
         self.assertEqual(status, 200)
         ids = {p["id"] for p in data["providers"]}
-        self.assertEqual(ids, {"drafter", "polisher", "solo"})
+        # Against the configured chairs rather than a literal, for the same
+        # reason as the agent catalogue above. What must not silently vanish is
+        # named separately: the two council stages, chat, and the three
+        # Projects roles.
+        self.assertEqual(ids, set(cfg.DEFAULTS["providers"]))
+        self.assertLessEqual({"drafter", "polisher", "solo"}, ids)
+        self.assertLessEqual({"architect", "coder", "qa"}, ids)
         for p in data["providers"]:
             self.assertIn("available", p)
 
@@ -501,6 +508,108 @@ class TestApi(ServerTestBase):
         status, data = self.request("/api/context?file=1700000000-nosuchrun.json")
         self.assertEqual(status, 400)
         self.assertIn("No such run transcript", data["error"])
+
+
+class TestProjectRoutes(ServerTestBase):
+    """The Projects tab's endpoints, over the same real socket."""
+
+    def setUp(self):
+        self.folder = Path(tempfile.mkdtemp(prefix="aicouncil-proj-"))
+        self.addCleanup(shutil.rmtree, self.folder, ignore_errors=True)
+
+    def test_an_empty_folder_reports_no_project(self):
+        status, data = self.request(
+            f"/api/project?workspace={urllib.parse.quote(str(self.folder))}"
+        )
+        self.assertEqual(status, 200)
+        self.assertIsNone(data["project"])
+        self.assertFalse(data["running"])
+        # The matrix draws its availability dots from this.
+        self.assertEqual({r["id"] for r in data["roles"]}, {"architect", "coder", "qa"})
+        self.assertIn("max_steps", data["settings"])
+
+    def test_a_project_on_disk_is_reported(self):
+        theseus = self.folder / ".theseus"
+        theseus.mkdir()
+        (theseus / "STATE.json").write_text(
+            json.dumps({
+                "project_id": "abc123", "status": "IMPLEMENTING",
+                "current_phase": 2, "brief": "half a thing", "tasks": [],
+            }),
+            encoding="utf-8",
+        )
+        status, data = self.request(
+            f"/api/project?workspace={urllib.parse.quote(str(self.folder))}"
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(data["resumable"])
+        self.assertEqual(data["project"]["brief"], "half a thing")
+
+    def test_starting_without_a_brief_is_refused(self):
+        status, data = self.request(
+            "/api/project/start", method="POST",
+            body={"brief": "", "workspace": str(self.folder)},
+        )
+        self.assertEqual(status, 400)
+        self.assertFalse(data["ok"])
+
+    def test_controls_refuse_when_nothing_is_running(self):
+        for path in ("/api/project/pause", "/api/project/resume"):
+            status, data = self.request(path, method="POST")
+            self.assertEqual(status, 400, path)
+            self.assertFalse(data["ok"])
+
+    def test_an_unknown_handoff_role_is_refused(self):
+        status, data = self.request(
+            "/api/project/handoff", method="POST", body={"role": "janitor"}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("role", data["error"])
+
+    def test_the_file_reader_takes_a_name_not_a_path(self):
+        # This endpoint reads a folder the operator chose, over a port any
+        # local process can reach. Taking a filename would turn "show me the
+        # roadmap" into an arbitrary-file read.
+        for name in ("../../etc/passwd", "/etc/passwd", "id_rsa"):
+            status, data = self.request(
+                f"/api/project/file?name={urllib.parse.quote(name)}"
+                f"&workspace={urllib.parse.quote(str(self.folder))}"
+            )
+            self.assertEqual(status, 400, name)
+            self.assertIn("Not a project file", data["error"])
+
+    def test_the_file_reader_serves_the_four_it_knows(self):
+        theseus = self.folder / ".theseus"
+        theseus.mkdir()
+        (theseus / "ROADMAP.md").write_text("# Roadmap\n\n- [ ] one\n", encoding="utf-8")
+        status, data = self.request(
+            f"/api/project/file?name=roadmap"
+            f"&workspace={urllib.parse.quote(str(self.folder))}"
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("- [ ] one", data["text"])
+
+    def test_a_project_and_a_run_refuse_each_other(self):
+        # Both drive coding agents against the same folder. Two of them editing
+        # one tree with no idea the other exists is how a build ends up with
+        # half of each.
+        engine = self.state.projects
+
+        class Pretend:
+            def is_running(self_inner):
+                return True
+
+        real = self.state.projects
+        try:
+            self.state.projects = Pretend()
+            status, data = self.request(
+                "/api/start", method="POST", body={"task": "do something"}
+            )
+            self.assertEqual(status, 409)
+            self.assertIn("project is running", data["error"])
+        finally:
+            self.state.projects = real
+        self.assertIs(self.state.projects, engine)
 
 
 if __name__ == "__main__":

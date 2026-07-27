@@ -13,6 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from aicouncil import usage as usage_module  # noqa: E402
 from aicouncil.config import ConfigStore  # noqa: E402
 from aicouncil.usage import (  # noqa: E402
     UsagePoller,
@@ -128,7 +129,34 @@ class TestPoller(unittest.TestCase):
     def test_poll_records_a_reading_per_provider(self):
         poller = UsagePoller(self.store)
         snap = poller.poll_once()
-        self.assertEqual(set(snap), {"drafter", "polisher", "solo"})
+        # One entry per configured chair, whichever chairs exist - including
+        # Projects Mode's three, which share their binaries with the council's
+        # and are therefore answered from one probe apiece.
+        self.assertEqual(set(snap), set(self.store.get("providers", {})))
+        self.assertLessEqual({"drafter", "polisher", "solo"}, set(snap))
+        self.assertLessEqual({"architect", "coder", "qa"}, set(snap))
+
+    def test_chairs_sharing_a_binary_are_probed_once(self):
+        # Six providers are two or three CLIs. `claude -p /usage` costs a
+        # process launch and up to 45 seconds, so asking per chair would have
+        # the poller spend three of those to learn one number.
+        calls = []
+        real = usage_module.read_usage
+
+        def counting(provider, cwd=None):
+            calls.append(str((provider.get("command") or [""])[0]))
+            return real(provider, cwd=cwd)
+
+        usage_module.read_usage = counting
+        try:
+            snap = UsagePoller(self.store).poll_once()
+        finally:
+            usage_module.read_usage = real
+
+        self.assertEqual(len(calls), len(set(calls)))
+        # Every chair still gets an answer, and it is filed under its own id.
+        for pid, reading in snap.items():
+            self.assertEqual(reading["provider_id"], pid)
 
     def test_interval_has_a_floor(self):
         # A mistyped 1 would spawn a process every second forever.

@@ -9,7 +9,9 @@
 # ~/.local/bin, so no Node, no npm and no sudo are involved.
 #
 # Google's Antigravity CLI (`agy`) is a third option the app can drive, behind
-# --antigravity: it is a ~190 MB binary and not one of the defaults.
+# --antigravity: it is a ~190 MB binary and not one of the defaults. Projects
+# Mode does assign it the QA chair out of the box, so install it if you intend
+# to use that tab - or reassign QA to codex or claude in the agent matrix.
 #
 # Everything else (gh, python3-pip/venv, VS Code) is optional, needs root, and
 # is skipped unless you pass --extras or --vscode.
@@ -52,7 +54,7 @@ for arg in "$@"; do
       echo "  --check   report what is present, install nothing"
       echo "  --extras  also install gh and the missing system python packages (needs sudo)"
       echo "  --vscode  also install Visual Studio Code (implies --extras)"
-      echo "  --antigravity  also install Google's agy CLI (~190 MB, opt-in)"
+      echo "  --antigravity  also install Google's agy CLI (~190 MB, opt-in; Projects' QA chair)"
       exit 0 ;;
     *) warn "unknown option: $arg" ;;
   esac

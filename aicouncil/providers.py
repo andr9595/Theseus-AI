@@ -1144,6 +1144,35 @@ def _discover_codex_efforts(model: str) -> Dict:
     }
 
 
+def probe_all(providers: Dict[str, Dict], order: tuple) -> List[Dict]:
+    """Probe several chairs, launching each distinct binary once.
+
+    Six providers are usually two or three binaries: the council's two stages,
+    the chat assistant and the three project roles all draw from the same small
+    set of installed CLIs. `probe` spawns `<exe> --version` and waits up to
+    fifteen seconds for it, and this runs on every `/api/state`, so probing per
+    provider would have the dashboard launch six processes to learn three
+    things - and would stall the first paint behind all of them.
+    """
+    cache: Dict[str, Dict] = {}
+    out: List[Dict] = []
+    for pid in order:
+        provider = providers.get(pid)
+        if not provider:
+            continue
+        command = list(provider.get("command") or [])
+        # Keyed on the whole command word, not the resolved path: an
+        # unresolvable command has no path, and every one of those would
+        # otherwise share a single "" entry and report the first one's name.
+        key = str(command[0]) if command else ""
+        found = cache.get(key)
+        if found is None:
+            found = probe(provider)
+            cache[key] = found
+        out.append({**found, "id": pid, "label": provider.get("label")})
+    return out
+
+
 def probe(provider: Dict) -> Dict:
     """Check whether a provider's executable exists, for the UI status dots."""
     command = list(provider.get("command") or [])

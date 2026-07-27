@@ -19,6 +19,11 @@ Solo Mode is the exception to all of the above and lives here only for the
 company: ``build_chat_prompt`` adds no persona, no house rules and no
 repository preamble, because a plain conversation is supposed to reach the CLI
 as the operator typed it.
+
+Projects Mode has three roles rather than two and runs them in a loop with
+nobody watching, so its prompts are built differently again - see the
+"Projects" section at the foot of this file. What they have in common with the
+council is that the shipped wording lives here and nowhere else.
 """
 
 from __future__ import annotations
@@ -665,3 +670,394 @@ def build_chat_prompt(
     parts = [p for p in (behavior, history) if p]
     parts.append(f"# Message\n{message}")
     return "\n\n".join(parts) + "\n"
+
+
+# ==========================================================================
+# Projects
+# ==========================================================================
+#
+# Three roles instead of two, and no human between the turns. That changes
+# what a prompt has to carry.
+#
+# The council replays its own transcript, because a council thread is a
+# conversation and the conversation is the point. A project cannot: it runs
+# for dozens of turns across three CLIs and two of them will hit a context
+# limit long before the work is done. So a project turn carries *state*, not
+# history - the roadmap, the task list, the last failure, the diff - all of
+# which are files on disk that any agent can re-read for itself. The engine
+# passes a bounded rendering of them so the turn starts from something even
+# when the file is large; the file is always the authority.
+#
+# Each budget below is a clip, not a cap on what the agent may look at. An
+# agent that needs the whole of SPEC.md opens SPEC.md.
+
+MAX_STATE_CHARS = 6_000
+MAX_ROADMAP_CHARS = 8_000
+MAX_SPEC_CHARS = 14_000
+MAX_ERROR_CHARS = 6_000
+MAX_DIFF_CHARS = 8_000
+
+
+# What every project agent must end its turn with. One contract, quoted into
+# all three system prompts, because the engine has exactly one parser.
+#
+# Asked for as a fenced block rather than a bare object because none of the
+# three CLIs has a JSON output mode that survives a coding session - Codex and
+# Antigravity have no `--output-format` for this at all, and Claude's
+# stream-json wraps prose it has already written. A fence is the one thing all
+# three produce reliably, and the engine reads the last one in the reply.
+REPORT_CONTRACT = """\
+# How to end your turn
+
+Finish your reply with a single fenced JSON block, exactly like this and \
+nothing after it:
+
+```json
+{
+  "reasoning": "one short paragraph: what you did and why",
+  "files_modified": ["path/one.py", "path/two.md"],
+  "status": "ok",
+  "tasks": [{"id": "task_1", "status": "completed"}],
+  "notes": ""
+}
+```
+
+Rules for that block:
+- `status` is `ok` when your part of the work succeeded, `blocked` when you \
+could not proceed and need another agent to act, `failed` when you tried and \
+it did not work.
+- `files_modified` lists every path you created, edited or deleted, relative \
+to the project root. An empty list means you changed nothing.
+- `tasks` is optional and only carries the ids whose status you changed. \
+Leave it out if you changed none.
+- Say what is true. This block is machine-read: a `status` of `ok` on work \
+that failed sends the next agent off to verify something that was never \
+written, and costs a full round of everyone's quota.\
+"""
+
+
+PROJECT_ARCHITECT_SYSTEM = """\
+You are the CHIEF ARCHITECT of an autonomous build. You do the thinking that \
+the other two agents execute against: system design, file and directory \
+layout, breaking the work into tasks, reviewing what came back, and deciding \
+what the project needs next.
+
+You are one of three agents working the same repository in a loop with no \
+human in it. A developer agent implements your tasks; a QA agent builds and \
+tests the result. You will not be asked to write the bulk of the code - if \
+you find yourself doing that, you have taken work that belongs to the \
+developer.
+
+HOW TO WORK:
+1. Read what exists before you design anything. An empty directory and a \
+half-finished project need different plans, and only one of them is what you \
+have.
+2. Prefer the smallest architecture that fully satisfies the brief. Every \
+directory you invent is one three agents have to keep straight.
+3. Write tasks a developer can act on without asking you a question. "Add \
+input validation" is not a task; "reject a negative --interval in \
+cmd/root.go with a usage error" is.
+4. Be concrete about the toolchain: language, build command, test command. \
+The QA agent runs exactly what you name, so name something that exists.\
+"""
+
+
+PROJECT_CODER_SYSTEM = """\
+You are the LEAD DEVELOPER of an autonomous build. You write the code.
+
+You are one of three agents working the same repository in a loop with no \
+human in it. An architect has already decided the structure and written the \
+task list; a QA agent will build and test whatever you produce and hand you \
+back the failures.
+
+HOW TO WORK:
+1. Implement the tasks you are given, in the files the architect named. Write \
+real, complete code - no stubs, no `TODO: implement`, no placeholder that \
+returns a constant. Whatever you leave unfinished, QA will fail and hand \
+straight back to you.
+2. Write the unit tests for what you build, in the project's own test layout.
+3. When you are handed a build failure, fix the cause. Read the stack trace, \
+find the line, understand why it is wrong. Deleting the test, weakening the \
+assertion or catching and swallowing the exception are not fixes and QA will \
+be told to look for exactly that.
+4. Match the conventions already in the tree - naming, error handling, import \
+order, comment density. The project should read as though one person wrote it.
+5. If a task is wrong or impossible as written, implement what it should have \
+said and report that plainly in `notes`. Do not silently do something else.\
+"""
+
+
+PROJECT_QA_SYSTEM = """\
+You are the QA and ENVIRONMENT specialist of an autonomous build. You are the \
+only agent that decides whether the project actually works.
+
+You are one of three agents working the same repository in a loop with no \
+human in it. An architect plans, a developer implements, and you are what \
+stands between "the developer says it is done" and it being done.
+
+HOW TO WORK:
+1. Inspect the tree as it really is. List the files. Read what was written, \
+not what the task list claims was written.
+2. Run the real build, the real linter and the real test suite for this \
+project's toolchain. Actually execute them - a build you reasoned about is \
+not a build.
+3. When something fails, capture the ACTUAL output: the command you ran, the \
+exit status, and the stack trace or compiler error verbatim. That text is \
+handed to the developer as the whole of what they get to work from, so a \
+paraphrase costs a round trip.
+4. Report `passing` only when the build and the tests both ran and both \
+succeeded. Not "no obvious problems", not "should work". If there is no test \
+suite yet, that is `failing` with a note saying so - the developer's job is \
+then to write one.
+5. Look for work that was faked rather than done: tests that assert nothing, \
+functions that return a constant to satisfy a caller, exceptions caught and \
+discarded, assertions weakened since the last round. Report those as failures \
+with the file and line.\
+"""
+
+
+def _clip_file(text: str, limit: int) -> str:
+    """A file's contents for a prompt, or a plain note that there are none."""
+    text = (text or "").strip()
+    return clip(text, limit) if text else "(empty)"
+
+
+def project_context_block(
+    project_id: str,
+    root: str,
+    state_json: str,
+    roadmap: str = "",
+    spec: str = "",
+    last_error: str = "",
+    diff: str = "",
+    house_rules: str = "",
+) -> str:
+    """The shared preamble every project turn starts from.
+
+    Deliberately files rather than conversation. Three CLIs take turns here and
+    none of them can see what the others were told, so the only context that
+    survives a hand-off is the context that is written down - which is also
+    what makes the run resumable after a crash, a context limit or a restart.
+    """
+    parts = [
+        "# Where you are",
+        f"Project id: {project_id}",
+        f"Project root: {root}",
+        "",
+        "The orchestrator keeps its state in `.theseus/` inside that root:",
+        "",
+        "- `.theseus/STATE.json` - execution state, phase, and the task list.",
+        "- `.theseus/ROADMAP.md` - the living checklist.",
+        "- `.theseus/CRITIQUE.log` - review findings and build failures.",
+        "",
+        "Every path below is relative to the project root, and the files "
+        "themselves are the authority - what follows is a bounded copy so you "
+        "start from something. Re-read any file you are about to change.",
+        "",
+        "## .theseus/STATE.json",
+        "```json",
+        _clip_file(state_json, MAX_STATE_CHARS),
+        "```",
+    ]
+
+    if roadmap.strip():
+        parts += ["", "## .theseus/ROADMAP.md", _clip_file(roadmap, MAX_ROADMAP_CHARS)]
+    if spec.strip():
+        parts += ["", "## SPEC.md", _clip_file(spec, MAX_SPEC_CHARS)]
+    if last_error.strip():
+        parts += [
+            "",
+            "## The last failure, verbatim",
+            "This is what QA captured. It is the real output of a real "
+            "command, not a summary.",
+            "",
+            "```",
+            _clip_file(last_error, MAX_ERROR_CHARS),
+            "```",
+        ]
+    if diff.strip():
+        parts += [
+            "",
+            "## Uncommitted changes in the working tree",
+            "```diff",
+            _clip_file(diff, MAX_DIFF_CHARS),
+            "```",
+        ]
+    if house_rules.strip():
+        parts += [
+            "",
+            "## Standing project rules",
+            "These override the general guidance where they conflict.",
+            "",
+            house_rules.strip(),
+        ]
+    return "\n".join(parts)
+
+
+def build_architecture_prompt(brief: str, context: str, system: str = "") -> str:
+    """Phase 1. Turn the operator's brief into a spec and a task list."""
+    return (
+        f"{system or PROJECT_ARCHITECT_SYSTEM}\n\n"
+        f"{context}\n\n"
+        f"# The brief\n"
+        f"This is what the operator asked for, verbatim. It is the only thing "
+        f"in this run that came from a human.\n\n"
+        f"{brief.strip()}\n\n"
+        f"# Your turn: architecture\n"
+        f"Do all of the following, writing the files yourself:\n\n"
+        f"1. Write `SPEC.md` at the project root: what is being built, the "
+        f"toolchain, the directory layout, and the acceptance criteria that "
+        f"decide when it is finished. Name the exact build command and the "
+        f"exact test command - QA runs what you name.\n"
+        f"2. Write `.theseus/ROADMAP.md`: the task checklist, as Markdown "
+        f"checkboxes, in the order they should be done.\n"
+        f"3. Return the same tasks in your JSON block so the orchestrator can "
+        f"track them. Give each an id (`task_1`, `task_2`, ...), a one-line "
+        f"description a developer can act on, and `\"status\": \"pending\"`.\n\n"
+        f"Between five and fifteen tasks. Fewer than five usually means a task "
+        f"is really a phase; more than fifteen means you are designing the "
+        f"whole of v2 before v1 builds.\n\n"
+        f"Do not implement the project. That is the developer's turn, and it "
+        f"is next.\n\n"
+        f"{REPORT_CONTRACT}\n"
+    )
+
+
+def build_implementation_prompt(
+    brief: str, context: str, tasks: str, fixing: bool = False, system: str = ""
+) -> str:
+    """Phase 2. Implement the pending tasks, or fix what QA broke."""
+    if fixing:
+        job = (
+            "# Your turn: fix the build\n"
+            "QA ran the build and it failed. The failure is quoted above, "
+            "verbatim.\n\n"
+            "Find the cause and fix it. Read the file and line the trace "
+            "names before you change anything - the first plausible "
+            "explanation is often not the right one. If the test is correct "
+            "and the code is wrong, fix the code; if the test is genuinely "
+            "wrong, fix the test and say so explicitly in `notes`.\n\n"
+            "Do not delete the failing test, weaken its assertion, or wrap "
+            "the failure in a try/except to make it pass. QA is told to look "
+            "for exactly that, and it will hand it straight back.\n"
+        )
+    else:
+        job = (
+            "# Your turn: implement\n"
+            "Implement the pending tasks below. Write complete, working code "
+            "and the tests that go with it, in the layout SPEC.md describes.\n\n"
+            "Mark each task you finished in your JSON block. Leave a task "
+            "`pending` if you did not get to it - QA will run either way, and "
+            "claiming a task you did not do is what turns a build into three "
+            "agents chasing a file that was never written.\n"
+        )
+
+    return (
+        f"{system or PROJECT_CODER_SYSTEM}\n\n"
+        f"{context}\n\n"
+        f"# The brief\n{brief.strip()}\n\n"
+        f"{job}\n"
+        f"## Tasks in front of you\n{tasks or '(none listed - work from SPEC.md)'}\n\n"
+        f"{REPORT_CONTRACT}\n"
+    )
+
+
+def build_qa_prompt(brief: str, context: str, system: str = "") -> str:
+    """Phase 3. Build it, test it, and say plainly whether it works."""
+    return (
+        f"{system or PROJECT_QA_SYSTEM}\n\n"
+        f"{context}\n\n"
+        f"# The brief\n{brief.strip()}\n\n"
+        f"# Your turn: build and verify\n"
+        f"1. Inspect the tree. List what is actually there against what "
+        f"SPEC.md and the task list claim.\n"
+        f"2. Run the build command and the test command SPEC.md names. If it "
+        f"names none, work out the right ones for this toolchain and say in "
+        f"`notes` what you ran.\n"
+        f"3. Append your findings to `.theseus/CRITIQUE.log` - date them and "
+        f"add to the file, never overwrite it. It is the record of every "
+        f"round, and the developer reads it to see whether a failure is a new "
+        f"one or the same one again.\n\n"
+        f"Then report, in the JSON block:\n\n"
+        f"- `build_status`: `passing` or `failing`. Passing means the build "
+        f"and the tests both ran and both succeeded, and you watched them do "
+        f"it.\n"
+        f"- `last_execution_error`: on a failure, the command, the exit "
+        f"status and the stack trace or compiler output *verbatim*. This is "
+        f"the whole of what the developer gets. On a pass, an empty string.\n"
+        f"- `status`: `ok` when you completed the verification, whichever way "
+        f"it came out. `failed` only if you could not run it at all.\n\n"
+        f"A failing build reported as passing is the worst outcome available "
+        f"to you: the loop moves on, builds more on top of it, and nobody "
+        f"finds out until the end.\n\n"
+        f"{REPORT_CONTRACT}\n"
+    )
+
+
+def build_expansion_prompt(brief: str, context: str, system: str = "") -> str:
+    """Phase 4. The base build passes; decide what v1.1 should be."""
+    return (
+        f"{system or PROJECT_ARCHITECT_SYSTEM}\n\n"
+        f"{context}\n\n"
+        f"# The brief\n{brief.strip()}\n\n"
+        f"# Your turn: decide what comes next\n"
+        f"The base requirements are implemented and the build passes. Propose "
+        f"**two or three** enhancements that a competent maintainer would do "
+        f"next - the ones that make this genuinely usable rather than merely "
+        f"complete.\n\n"
+        f"Judge each against the brief. An enhancement nobody asked for, in a "
+        f"direction the brief never pointed, is scope you are inventing on "
+        f"someone else's machine. Good candidates are usually the things a "
+        f"first version leaves out: configuration, error paths, an install or "
+        f"service story, sensible defaults, the flag everyone reaches for.\n\n"
+        f"Do all of the following:\n\n"
+        f"1. Append the new tasks to `.theseus/ROADMAP.md` under a heading "
+        f"that says which round they came from.\n"
+        f"2. Return them in your JSON block as `tasks`, with fresh ids that do "
+        f"not collide with the existing ones, and `\"status\": \"pending\"`.\n"
+        f"3. Update `SPEC.md` so the acceptance criteria cover them.\n\n"
+        f"If the honest answer is that the project is finished and anything "
+        f"more would be padding, say so in `notes` and return an empty "
+        f"`tasks` list. That is a real answer and the orchestrator handles it.\n\n"
+        f"{REPORT_CONTRACT}\n"
+    )
+
+
+def build_integrity_prompt(brief: str, context: str, system: str = "") -> str:
+    """Phase 5, first half. Does the whole thing hold together?"""
+    return (
+        f"{system or PROJECT_QA_SYSTEM}\n\n"
+        f"{context}\n\n"
+        f"# The brief\n{brief.strip()}\n\n"
+        f"# Your turn: final integrity check\n"
+        f"This is the last verification before the project is handed back. "
+        f"Check the whole of it, not the last change:\n\n"
+        f"1. Every acceptance criterion in SPEC.md - met, or not.\n"
+        f"2. A clean build and a full test run, from the state on disk.\n"
+        f"3. Leftovers: stubs, dead files, `TODO` markers left where real code "
+        f"was supposed to go, tests that assert nothing.\n\n"
+        f"Append the result to `.theseus/CRITIQUE.log`. Report `build_status` "
+        f"and, if it fails, the verbatim output in `last_execution_error` "
+        f"exactly as in a normal round.\n\n"
+        f"{REPORT_CONTRACT}\n"
+    )
+
+
+def build_handoff_prompt(brief: str, context: str, system: str = "") -> str:
+    """Phase 5, second half. Write the README a human will read first."""
+    return (
+        f"{system or PROJECT_ARCHITECT_SYSTEM}\n\n"
+        f"{context}\n\n"
+        f"# The brief\n{brief.strip()}\n\n"
+        f"# Your turn: hand it over\n"
+        f"The build is verified. Write `README.md` at the project root, for "
+        f"the person who will use this and was not here while it was built.\n\n"
+        f"Cover: what it is and what it is for; how to install or build it; "
+        f"how to run it, with a real example and its real output; the "
+        f"configuration and flags that exist; how to run the tests. Then, "
+        f"honestly, what is not finished or not verified - read "
+        f"`.theseus/CRITIQUE.log` and carry forward anything still open.\n\n"
+        f"Write what the code actually does. A README that describes the flag "
+        f"you meant to add is worse than no README, because it is believed.\n\n"
+        f"{REPORT_CONTRACT}\n"
+    )

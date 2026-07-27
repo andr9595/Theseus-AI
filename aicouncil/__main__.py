@@ -103,7 +103,16 @@ def _print_doctor(store: cfg.ConfigStore) -> int:
         print("  pull request: off")
     print("\nProviders:")
     missing = []
-    for key in ("drafter", "polisher", "solo"):
+    # Named for what each chair does rather than for its config key: a project
+    # role has no council `role` to fall back on, and "coder" on its own says
+    # nothing about which of the three tabs it belongs to.
+    jobs = {
+        "solo": "Chat assistant",
+        "architect": "Project: arch",
+        "coder": "Project: dev",
+        "qa": "Project: QA",
+    }
+    for key in cfg.PROVIDER_ORDER:
         provider = store.get("providers", {}).get(key)
         if not provider:
             continue
@@ -112,9 +121,8 @@ def _print_doctor(store: cfg.ConfigStore) -> int:
         version = f"  [{info['version']}]" if info["version"] else ""
         location = info["path"] or "not found on PATH"
         # The job comes first: either agent can be assigned to either job, so
-        # which CLI is doing what is the part worth reading at a glance. Solo
-        # has no council role, so it is named for the mode it serves.
-        job = provider.get("role") or ("Solo assistant" if key == "solo" else key)
+        # which CLI is doing what is the part worth reading at a glance.
+        job = jobs.get(key) or provider.get("role") or key
         print(
             f"  [{mark}] {job:<14} {info['label']:<8} "
             f"{info['executable']:<10} -> {location}{version}"

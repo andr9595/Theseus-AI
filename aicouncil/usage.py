@@ -37,7 +37,7 @@ import re
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional
 
 from .providers import resolve_binary
@@ -447,12 +447,38 @@ class UsagePoller:
         return max(60.0, value)
 
     def poll_once(self) -> Dict[str, Any]:
+        """Refresh every provider's reading, asking each *agent* only once.
+
+        Six providers do not mean six probes. Quota is a property of the
+        subscription, not of the chair a CLI is sitting in, so two providers
+        pointed at the same binary have the same answer by definition - and
+        `claude -p /usage` costs a process launch and up to 45 seconds of
+        waiting. Since Projects Mode added three more chairs to the same two
+        or three CLIs, polling per provider would have tripled the launches to
+        re-read numbers that cannot differ.
+        """
         providers = self.store.get("providers", {}) or {}
         workspace = self.store.get("workspace") or None
+        # Keyed by what actually decides the answer: which quota source applies
+        # and which binary is asked. A hand-edited absolute path pointing at a
+        # second install is a different login and gets its own probe.
+        seen: Dict[tuple, UsageReading] = {}
         for pid, provider in providers.items():
             if self._stop.is_set():
                 break
-            reading = read_usage(provider, cwd=workspace)
+            key = (
+                agent_kind(provider),
+                resolve_binary(list(provider.get("command") or [])) or "",
+            )
+            shared = seen.get(key)
+            if shared is not None:
+                # Copied rather than shared: `provider_id` names the chair the
+                # UI looks it up under, and two chairs must not alias one
+                # object that then reports the wrong id for one of them.
+                reading = replace(shared, provider_id=pid)
+            else:
+                reading = read_usage(provider, cwd=workspace)
+                seen[key] = reading
             with self._lock:
                 # Keep the previous numbers when a poll fails, so a transient
                 # error blanks the chip's freshness rather than its content.

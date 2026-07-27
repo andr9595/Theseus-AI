@@ -76,7 +76,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import config as cfg
 from . import gitutil, prompts
 from .events import EventBus
-from .providers import ProviderResult, ProviderRunner, probe
+from .providers import ProviderResult, ProviderRunner, probe_all
 
 # Pipeline states
 IDLE = "idle"
@@ -446,11 +446,7 @@ class Pipeline:
             # The role behaviours a stage can be assigned. Served rather than
             # duplicated in the browser, so the shipped text has one home.
             "roles": prompts.role_catalog(self.store.get("roles", {})),
-            "providers_status": [
-                probe(providers[k])
-                for k in ("drafter", "polisher", "solo")
-                if k in providers
-            ],
+            "providers_status": probe_all(providers, cfg.PROVIDER_ORDER),
         }
 
     def is_busy(self) -> bool:

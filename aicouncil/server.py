@@ -40,7 +40,9 @@ from . import gitutil
 from .events import EventBus, drain, sse_comment, sse_format
 from .pipeline import Pipeline, PipelineBusy
 from . import prompts
-from .providers import discover_efforts, discover_models, probe
+from . import projects
+from .projects import ProjectBusy, ProjectEngine
+from .providers import discover_efforts, discover_models, probe_all
 from .usage import UsagePoller
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
@@ -57,6 +59,13 @@ class AppState:
         self.store = store
         self.bus = EventBus()
         self.pipeline = Pipeline(store, self.bus)
+        # Projects and the pipeline are peers, and they conflict: both drive
+        # coding agents against the same working folder, and two agents editing
+        # one tree with no idea the other exists is how a build ends up with
+        # half of each. Neither reaches into the other to find that out - this
+        # object owns both, so it is what knows, and each is handed a callable
+        # that refuses on the other's behalf.
+        self.projects = ProjectEngine(store, self.bus, busy_check=self._refuse_if_busy)
         self.token = secrets.token_urlsafe(24)
         self.started_at = time.time()
         # Publishing on the bus means every open tab updates together, and a
@@ -64,6 +73,22 @@ class AppState:
         self.usage = UsagePoller(
             store, on_update=lambda snap: self.bus.publish("usage", usage=snap)
         )
+
+    def _refuse_if_busy(self) -> None:
+        """Raise if a council or chat run is working the tree right now."""
+        if self.pipeline.is_busy():
+            raise PipelineBusy(
+                "A run is in progress. A project drives the same folder, so "
+                "wait for it to finish or cancel it first."
+            )
+
+    def refuse_if_project_running(self) -> None:
+        """The mirror image, for the paths that start a council or chat run."""
+        if self.projects.is_running():
+            raise PipelineBusy(
+                "A project is running in this folder. Pause or stop it before "
+                "starting a run - both drive agents against the same files."
+            )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -223,6 +248,13 @@ class Handler(BaseHTTPRequestHandler):
             ("POST", "/api/cancel"): self._api_cancel,
             ("POST", "/api/rollback"): self._api_rollback,
             ("POST", "/api/commit"): self._api_commit,
+            ("GET", "/api/project"): self._api_project,
+            ("POST", "/api/project/start"): self._api_project_start,
+            ("POST", "/api/project/pause"): self._api_project_pause,
+            ("POST", "/api/project/resume"): self._api_project_resume,
+            ("POST", "/api/project/stop"): self._api_project_stop,
+            ("POST", "/api/project/handoff"): self._api_project_handoff,
+            ("GET", "/api/project/file"): self._api_project_file,
             ("GET", "/api/roles"): lambda p: {
                 "ok": True,
                 "roles": prompts.role_catalog(self.app.store.get("roles", {})),
@@ -238,7 +270,7 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             result = handler(params)
-        except PipelineBusy as exc:
+        except (PipelineBusy, ProjectBusy) as exc:
             self._error(HTTPStatus.CONFLICT, str(exc))
         except ValueError as exc:
             self._error(HTTPStatus.BAD_REQUEST, str(exc))
@@ -427,11 +459,7 @@ class Handler(BaseHTTPRequestHandler):
             "config_path": str(self.app.store.path),
             "runs_path": str(self.app.pipeline.runs_dir),
             "uptime": round(time.time() - self.app.started_at, 1),
-            "providers": [
-                probe(providers[k])
-                for k in ("drafter", "polisher", "solo")
-                if k in providers
-            ],
+            "providers": probe_all(providers, cfg.PROVIDER_ORDER),
         }
 
     def _api_models(self, params: Dict[str, list]) -> Dict[str, Any]:
@@ -478,6 +506,10 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("`continue_from` must be a transcript filename.")
         if not isinstance(compact_context, bool):
             raise ValueError("`compact_context` must be true or false.")
+        # Checked here rather than inside the pipeline: the engine and the
+        # pipeline are peers that know nothing of each other, and this is the
+        # object that owns both.
+        self.app.refuse_if_project_running()
         run = self.app.pipeline.start(
             task,
             workspace,
@@ -506,14 +538,103 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError(
                 "No working folder is selected, so there is nothing to commit."
             )
-        if self.app.pipeline.is_busy():
+        if self.app.pipeline.is_busy() or self.app.projects.is_running():
             # Committing underneath a running agent would capture a tree it is
             # still editing, and the resulting commit would match neither the
-            # diff that was reviewed nor the one the run ends with.
-            raise ValueError("A run is in progress. Wait for it to finish.")
+            # diff that was reviewed nor the one the run ends with. A project
+            # is the same hazard for longer.
+            raise ValueError(
+                "A run or project is in progress. Wait for it to finish."
+            )
         result = gitutil.commit_all(workspace, str(body.get("message") or ""))
         self.app.bus.publish("committed", commit=result, workspace=workspace)
         return {"ok": True, "commit": result}
+
+    # -- Projects ----------------------------------------------------------
+
+    def _api_project(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """The Projects tab's whole view: the run, or what is on disk.
+
+        Takes the folder as a parameter rather than reading it from config so
+        that opening the tab while looking at a folder reports *that* folder's
+        project, even before the operator has committed to it.
+        """
+        workspace = (params.get("workspace") or [""])[0]
+        state = self.app.projects.snapshot_state(workspace)
+        state["ok"] = True
+        # Which chairs can actually be filled. The matrix draws its dots from
+        # this, so a missing CLI is visible before the start button is pressed
+        # rather than in the error that refuses it.
+        providers = self.app.store.get("providers", {})
+        state["roles"] = probe_all(providers, projects.ROLES)
+        state["settings"] = self.app.store.get("project", {})
+        return state
+
+    def _api_project_start(self, params: Dict[str, list]) -> Dict[str, Any]:
+        body = self._read_body()
+        project = self.app.projects.start(
+            str(body.get("brief") or ""),
+            str(body.get("workspace") or self.app.store.get("workspace") or ""),
+            resume=bool(body.get("resume")),
+        )
+        return {"ok": True, "project": project.to_dict()}
+
+    def _api_project_pause(self, params: Dict[str, list]) -> Dict[str, Any]:
+        self.app.projects.pause()
+        return {"ok": True}
+
+    def _api_project_resume(self, params: Dict[str, list]) -> Dict[str, Any]:
+        self.app.projects.resume()
+        return {"ok": True}
+
+    def _api_project_stop(self, params: Dict[str, list]) -> Dict[str, Any]:
+        self.app.projects.stop()
+        return {"ok": True}
+
+    def _api_project_handoff(self, params: Dict[str, list]) -> Dict[str, Any]:
+        self.app.projects.handoff(str(self._read_body().get("role") or ""))
+        return {"ok": True}
+
+    def _api_project_file(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Read one of the project's own files, for the tracker's viewer.
+
+        A fixed set of names, never a path from the client: this endpoint reads
+        a folder the operator chose, and taking a filename would turn "show me
+        the roadmap" into an arbitrary-file read over an authenticated but
+        drive-by-reachable local port.
+        """
+        name = (params.get("name") or ["roadmap"])[0]
+        workspace = (params.get("workspace") or [""])[0].strip()
+        if not workspace:
+            # Nothing asked for: the running project's folder, then the chosen
+            # one. A folder that *was* asked for is never overridden - the tab
+            # can be looking at a different one from the project in memory.
+            project = self.app.projects.project
+            workspace = (
+                project.workspace if project is not None
+                else (self.app.store.get("workspace") or "")
+            )
+        if not workspace:
+            raise ValueError("No project folder is selected.")
+
+        ws = projects.Workspace(workspace)
+        readable = {
+            "roadmap": ws.roadmap_path,
+            "critique": ws.critique_path,
+            "state": ws.state_path,
+            "spec": ws.spec_path,
+        }
+        if name not in readable:
+            raise ValueError(
+                f"Not a project file: {name!r}. "
+                f"Expected one of {', '.join(sorted(readable))}."
+            )
+        return {
+            "ok": True,
+            "name": name,
+            "path": str(readable[name]),
+            "text": ws.read_text(readable[name], projects.MAX_UI_TEXT),
+        }
 
     def _api_save_role(self, params: Dict[str, list]) -> Dict[str, Any]:
         """Create a role, or edit one - including a built-in."""

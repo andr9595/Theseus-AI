@@ -178,6 +178,11 @@ AGENTS: Dict[str, Dict[str, Any]] = {
 # template, or the bundled mock agent.
 CUSTOM_AGENT = "custom"
 
+# The order every list of chairs is presented in: the two council stages, the
+# chat assistant, then Projects Mode's three roles. Here rather than repeated
+# at each call site, so adding a seventh cannot leave one screen showing six.
+PROVIDER_ORDER = ("drafter", "polisher", "solo", "architect", "coder", "qa")
+
 
 def agent_for(provider: Dict[str, Any]) -> str:
     """Which catalogued agent a provider runs, judged by its executable.
@@ -308,6 +313,45 @@ DEFAULT_SOLO = {
     **copy.deepcopy(AGENTS["claude"]),
 }
 
+# --------------------------------------------------------------------------
+# Projects Mode's three chairs
+# --------------------------------------------------------------------------
+#
+# Configured as ordinary providers, under the role ids the engine dispatches
+# on, so every picker the council already has - agent, model, reasoning effort,
+# availability probe, quota chip - works on these with no new code. What they
+# do *not* carry is a `role_template`: a project's instructions come from the
+# phase it is in rather than from a role assigned once, so there is nothing
+# here for the Roles catalogue to override.
+#
+# The default pairing follows the work rather than the vendor: design and
+# review to the model with the best judgement, bulk implementation to the one
+# with the most generous quota, and build-and-verify to the one that is
+# happiest running commands and reading what came back.
+
+
+def _project_role(role: str, agent: str, timeout: int) -> Dict[str, Any]:
+    return {
+        "id": role,
+        "enabled": True,
+        "prompt_on_stdin": False,
+        # Longer than a council stage's by default. A project phase reads a
+        # tree, runs a build and writes several files in one turn, and a
+        # timeout mid-phase costs the whole step - which the engine then has to
+        # hand to another agent that starts from the same place.
+        "timeout_seconds": timeout,
+        "model": "",
+        "models": [],
+        "effort": "",
+        **copy.deepcopy(AGENTS[agent]),
+    }
+
+
+DEFAULT_ARCHITECT = _project_role("architect", "claude", 1800)
+DEFAULT_CODER = _project_role("coder", "codex", 2700)
+DEFAULT_QA = _project_role("qa", "agy", 1800)
+
+
 DEFAULTS: Dict[str, Any] = {
     "version": 1,
     # --- Mode ---------------------------------------------------------------
@@ -354,6 +398,29 @@ DEFAULTS: Dict[str, Any] = {
         "drafter": DEFAULT_DRAFTER,
         "polisher": DEFAULT_POLISHER,
         "solo": DEFAULT_SOLO,
+        # Projects Mode. Three more chairs in the same map rather than a
+        # namespace of their own, because everything that operates on a
+        # provider - the agent swap, the model picker, the availability probe -
+        # looks it up by id in exactly this dict.
+        "architect": DEFAULT_ARCHITECT,
+        "coder": DEFAULT_CODER,
+        "qa": DEFAULT_QA,
+    },
+    # --- Projects -----------------------------------------------------------
+    # The bounds on an autonomous build. All three exist because the loop has
+    # no human in it: without them a project that cannot make progress will
+    # keep spending quota on the same failure until someone notices.
+    "project": {
+        # Total agent turns before the run stops and says so. Roughly: one for
+        # architecture, one or two per task, one QA round per implementation
+        # round, two to finish.
+        "max_steps": 40,
+        # Consecutive failing builds before the project gives up rather than
+        # handing the same trace back to the developer again.
+        "max_fix_attempts": 3,
+        # How many rounds of "what should v1.1 be?" happen after the base build
+        # passes. Zero ships the brief and nothing more.
+        "expansion_rounds": 1,
     },
     # --- Prompting ----------------------------------------------------------
     # Extra standing instructions appended to both council stages. Solo does

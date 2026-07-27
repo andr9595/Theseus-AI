@@ -54,8 +54,10 @@
   <!-- ================= Main ================= -->
   <main class="main">
 
-    <!-- Centred mode selector. Council and Chat are real modes the server
-         stores; Project is a placeholder and deliberately never persisted. -->
+    <!-- Centred mode selector. Council and Chat are the two modes a *run* can
+         be started in and the server stores which; Project is a third surface
+         rather than a third mode - it starts a project, not a run - so it is
+         held in the browser and never written to `mode`. -->
     <div class="mode-bar">
       <div id="mode-switch" class="mode-switch" role="radiogroup" aria-label="Mode">
         <button type="button" role="radio" data-mode="council" aria-checked="true">Council</button>
@@ -82,11 +84,121 @@
           <p id="hero-sub" class="hero-sub"></p>
         </div>
 
-        <!-- Project is a placeholder: no config, no controls, nothing that
-             pretends to work. -->
-        <div id="project-empty" class="hero hidden">
-          <h2>Projects are coming soon</h2>
-          <p class="hero-sub">No configuration in this tab yet.</p>
+        <!-- ============== Projects ==============
+             Two faces, never both: the initializer until a project exists,
+             the tracker once one does. Rendered by `renderProject`. -->
+        <div id="project-pane" class="project-pane hidden">
+
+          <!-- The initializer. -->
+          <section id="project-setup" class="project-setup">
+            <h2 class="project-title">Build something, unattended</h2>
+            <p class="project-sub">
+              Three agents take turns against one folder &mdash; an architect
+              plans, a developer writes, QA builds and tests &mdash; looping
+              until it works and has a README. There is no approval gate:
+              <b>every step runs with its CLI's auto-approve flags</b>, so
+              files change without asking. Pick the folder deliberately.
+            </p>
+
+            <div class="field">
+              <label for="project-brief">What should it build?</label>
+              <textarea id="project-brief" rows="5" spellcheck="false"
+                placeholder="e.g. A cross-platform CLI that watches a directory and reports file-size changes as JSON, with tests and a systemd unit."></textarea>
+              <span class="field-hint">
+                The only thing in the whole run that comes from you. Say what
+                it is for and what &ldquo;finished&rdquo; means; the architect
+                turns that into a spec and a task list.
+              </span>
+            </div>
+
+            <div class="field">
+              <label>Where</label>
+              <button id="project-folder" class="project-folder" type="button">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+                </svg>
+                <span id="project-folder-label">Scratch workspace</span>
+              </button>
+              <span class="field-hint" id="project-folder-hint"></span>
+            </div>
+
+            <!-- The agent matrix. Which CLI sits in each chair, with its
+                 availability, because a project will not start with a seat it
+                 cannot fill and that is better known now than at the refusal. -->
+            <div class="field">
+              <label>Who</label>
+              <div id="project-matrix" class="project-matrix"></div>
+              <span class="field-hint">
+                Click a chair to reassign it. Model and reasoning depth are
+                set the same way as anywhere else.
+              </span>
+            </div>
+
+            <div class="project-start-row">
+              <button id="project-start" class="btn btn-primary" type="button">
+                Start project
+              </button>
+              <button id="project-resume-found" class="btn btn-quiet hidden" type="button">
+                Resume the project in this folder
+              </button>
+              <span id="project-start-hint" class="project-start-hint"></span>
+            </div>
+          </section>
+
+          <!-- The tracker. -->
+          <section id="project-live" class="project-live hidden">
+            <header class="project-head">
+              <div class="project-head-main">
+                <h2 id="project-brief-line" class="project-title"></h2>
+                <p id="project-where" class="project-sub"></p>
+              </div>
+              <div class="project-controls">
+                <button id="project-pause" class="btn btn-quiet btn-sm" type="button">Pause</button>
+                <button id="project-resume" class="btn btn-quiet btn-sm hidden" type="button">Resume</button>
+                <button id="project-handoff" class="btn btn-quiet btn-sm" type="button" aria-haspopup="true">Hand off</button>
+                <button id="project-stop" class="btn btn-quiet btn-sm" type="button">Stop</button>
+                <button id="project-new" class="btn btn-quiet btn-sm hidden" type="button">New project</button>
+              </div>
+            </header>
+
+            <!-- Phase 1 to 5, with the running agent on the active one. -->
+            <ol id="project-phases" class="project-phases"></ol>
+
+            <div id="project-banner" class="project-banner hidden"></div>
+
+            <div class="project-grid">
+              <div class="project-col">
+                <h4 class="project-head-sm">
+                  Tasks <span id="project-task-count" class="count"></span>
+                </h4>
+                <ul id="project-tasks" class="project-tasks"></ul>
+              </div>
+              <div class="project-col">
+                <h4 class="project-head-sm">Turns</h4>
+                <ol id="project-steps" class="project-steps"></ol>
+              </div>
+            </div>
+
+            <!-- The live console is moved in here, not duplicated: it is the
+                 same widget the council uses, and two of them would mean two
+                 scroll positions and two sets of lines to keep in step. -->
+            <div id="project-console-slot"></div>
+
+            <details id="project-roadmap-block" class="console-block">
+              <summary>Roadmap &mdash; <code>.theseus/ROADMAP.md</code></summary>
+              <div id="project-roadmap" class="project-file markdown"></div>
+            </details>
+
+            <details id="project-state-block" class="console-block">
+              <summary>State &mdash; <code>.theseus/STATE.json</code></summary>
+              <pre id="project-state-json" class="project-file mono"></pre>
+            </details>
+
+            <details id="project-critique-block" class="console-block">
+              <summary>Critique log &mdash; <code>.theseus/CRITIQUE.log</code></summary>
+              <pre id="project-critique" class="project-file mono"></pre>
+            </details>
+          </section>
         </div>
 
         <div id="thread" class="thread"></div>
@@ -324,6 +436,30 @@
             <em id="snapshot-note">Enable one-click rollback</em>
           </span>
         </label>
+
+        <h4 class="settings-head">Projects</h4>
+        <p class="settings-note">
+          The bounds on an autonomous build. All three exist because the loop
+          has no human in it: without them a project that cannot make progress
+          keeps spending quota on the same failure until somebody notices.
+        </p>
+        <div class="field-row">
+          <div class="field">
+            <label for="project-max-steps">Step limit</label>
+            <input id="project-max-steps" type="number" min="1" max="500">
+            <span class="field-hint">Agent turns before it stops and says so.</span>
+          </div>
+          <div class="field">
+            <label for="project-max-fixes">Fix attempts</label>
+            <input id="project-max-fixes" type="number" min="1" max="20">
+            <span class="field-hint">Failing builds in a row before giving up.</span>
+          </div>
+          <div class="field">
+            <label for="project-expansions">Expansion rounds</label>
+            <input id="project-expansions" type="number" min="0" max="10">
+            <span class="field-hint">Rounds of &ldquo;what should v1.1 be?&rdquo;. Zero ships the brief and nothing more.</span>
+          </div>
+        </div>
       </section>
 
       <section class="settings-panel" data-settings-panel="project">

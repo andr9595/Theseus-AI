@@ -537,10 +537,22 @@ const state = {
   // The OS user, for the sidebar footer and the greeting. There are no
   // accounts in this app; this is only who it is running as.
   user: '',
-  // Project is a placeholder tab, held here and never written to config: the
-  // server knows 'council' and 'solo' only, and a mode it cannot run is not one
-  // the app should still be sitting in after a restart.
+  // Which surface is on screen. 'project' is a third one rather than a third
+  // mode: it starts a project, not a run, and the server's `mode` knows only
+  // the two a run can be started in. Held here and never persisted.
   tab: '',
+  // The Projects tab, from /api/project. `project` is null when the chosen
+  // folder has no build in it; `running` says whether agents are moving right
+  // now, and `resumable` whether there is one on disk to pick up.
+  project: null,
+  projectRunning: false,
+  projectResumable: false,
+  // Availability of the three chairs, so a missing CLI is visible in the
+  // matrix before the start button is pressed rather than in the refusal.
+  projectRoles: [],
+  // The bounds on an autonomous build, from the server. Held so Settings can
+  // render them without a second request.
+  projectSettings: {},
   // The transcript the next run continues, if any. Held as a filename because
   // that is what the server accepts; the task text is kept alongside it purely
   // so the composer can name what is being continued.
@@ -1318,11 +1330,15 @@ function renderThread() {
   // Rescue the movable widgets before the innerHTML below would delete them.
   park();
 
-  $('#project-empty').classList.toggle('hidden', mode !== 'project');
-  if (mode === 'project') {
+  // Projects owns the whole pane when it is showing: there is no message to
+  // send, so the composer would be a text box wired to nothing.
+  const project = mode === 'project';
+  $('#project-pane').classList.toggle('hidden', !project);
+  $('.composer-dock').classList.toggle('hidden', project);
+  if (project) {
     $('#hero').classList.add('hidden');
     thread.innerHTML = '';
-    main.classList.add('empty');
+    main.classList.remove('empty');
     return;
   }
 
@@ -1384,6 +1400,360 @@ function renderThread() {
   renderCommitBar();
 }
 
+/* ---- Projects ----------------------------------------------------------
+   Two faces and never both. The initializer is a form; the tracker is a live
+   read of files on disk, which is also exactly what the agents are working
+   from — so what you are watching is the thing itself rather than a mirror of
+   it kept somewhere else.
+   ---------------------------------------------------------------------- */
+
+const PHASE_ORDER = [1, 2, 3, 4, 5];
+const PROJECT_ROLES = ['architect', 'coder', 'qa'];
+const ROLE_NAMES = { architect: 'Architect', coder: 'Developer', qa: 'QA' };
+
+/** Whether a project is on screen at all — running, paused or finished. */
+function hasProject() {
+  return !!(state.project && state.project.id);
+}
+
+function renderProject() {
+  if (uiMode() !== 'project') return;
+  const live = hasProject();
+  $('#project-setup').classList.toggle('hidden', live);
+  $('#project-live').classList.toggle('hidden', !live);
+  if (live) renderProjectLive();
+  else renderProjectSetup();
+}
+
+function renderProjectSetup() {
+  const folder = workspacePath();
+  $('#project-folder-label').textContent = folder ? shortPath(folder) : 'Scratch workspace';
+  $('#project-folder').title = folder || state.scratchWorkspace || '';
+  $('#project-folder-hint').textContent = folder
+    ? (workspaceIsRepo()
+      ? 'A git repository, so a snapshot is taken before the first write and ' +
+        'you can read the whole build as a diff afterwards.'
+      : 'Not a git repository, so nothing is snapshotted and there is nothing ' +
+        'to undo the build with. The agents will still work here.')
+    : 'No folder chosen, so it builds in the scratch workspace — a contained ' +
+      'directory of the app\'s own. Pick a folder to build somewhere you keep.';
+
+  $('#project-matrix').innerHTML = PROJECT_ROLES.map(chairHtml).join('');
+
+  // Resuming is offered only when the server found a build on disk. A project
+  // left half-finished by a closed window is the one case where the empty form
+  // is the wrong answer.
+  const resumable = state.projectResumable && !hasProject();
+  $('#project-resume-found').classList.toggle('hidden', !resumable);
+
+  const missing = (state.projectRoles || []).filter(r => !r.available);
+  $('#project-start').disabled = missing.length > 0;
+  $('#project-start-hint').textContent = missing.length
+    ? `${missing.map(r => ROLE_NAMES[r.id] || r.id).join(' and ')} ` +
+      `${missing.length === 1 ? 'has' : 'have'} no CLI installed. ` +
+      `A project runs unattended, so it will not start with a seat it cannot fill.`
+    : '';
+}
+
+/** One chair in the agent matrix. The same provider object the council strip
+ *  renders, so clicking it opens the same menu and a change here is a change
+ *  everywhere. */
+function chairHtml(role) {
+  const p = ((state.config || {}).providers || {})[role] || {};
+  const info = (state.projectRoles || []).find(r => r.id === role);
+  const available = !info || info.available;
+  const agent = state.agents.find(a => a.id === agentOf(p));
+  const agentLabel = agent && (agent.command || []).length ? agent.label : 'custom command';
+  const model = p.model || 'default model';
+  const running = hasProject() && state.projectRunning &&
+    state.project.active_agent === role;
+
+  const title =
+    `${ROLE_NAMES[role]} — ${agentLabel} · ${modelDetail(model)}` +
+    (p.effort ? ` · ${p.effort}` : '') +
+    (available ? '' : ` · ${(p.command || [])[0] || 'CLI'} not found`) +
+    '\nClick to change CLI, model or effort.';
+
+  return (
+    `<button class="chair${available ? '' : ' unavailable'}${running ? ' active' : ''}" ` +
+      `type="button" data-chair="${role}" data-role="${role}" title="${esc(title)}">` +
+      `<span class="chair-mark">${esc(ROLE_NAMES[role].slice(0, 2).toUpperCase())}</span>` +
+      `<span class="chair-body">` +
+        `<span class="chair-role">${esc(ROLE_NAMES[role])}</span>` +
+        `<span class="chair-agent">${esc(available ? agentLabel : agentLabel + ' — missing')}</span>` +
+        `<span class="chair-model">${esc(model)}</span>` +
+      `</span>` +
+    `</button>`
+  );
+}
+
+function renderProjectLive() {
+  const p = state.project;
+  const running = state.projectRunning;
+  const done = !!p.done;
+
+  $('#project-brief-line').textContent = p.brief || '(no brief recorded)';
+  $('#project-brief-line').title = p.brief || '';
+  $('#project-where').textContent =
+    `${shortPath(p.workspace)} · ${p.steps_used} turn${p.steps_used === 1 ? '' : 's'} · ` +
+    `build ${p.build_status}` +
+    (p.expansions_remaining ? ` · ${p.expansions_remaining} expansion round left` : '');
+  $('#project-where').title = p.workspace;
+
+  // Controls. Pause and Resume are the same button's two states rather than
+  // two live buttons, so there is never a pair where only one does anything.
+  $('#project-pause').classList.toggle('hidden', !running || p.paused);
+  $('#project-resume').classList.toggle('hidden', !(running && p.paused));
+  $('#project-handoff').classList.toggle('hidden', !running);
+  $('#project-stop').classList.toggle('hidden', !running);
+  $('#project-new').classList.toggle('hidden', running);
+
+  renderPhases(p, running, done);
+  renderProjectBanner(p, running, done);
+
+  const tasks = p.tasks || [];
+  const finished = tasks.filter(t => t.status === 'completed').length;
+  $('#project-task-count').textContent = tasks.length ? `${finished}/${tasks.length}` : '';
+  $('#project-tasks').innerHTML = tasks.length
+    ? tasks.map(t =>
+        `<li class="task ${esc(t.status)}">` +
+          `<span class="task-box">${t.status === 'completed' ? '&#10003;' : ''}</span>` +
+          `<span class="task-text">` +
+            `<span class="task-id">${esc(t.id)}</span>` +
+            `${esc(t.description || '(no description)')}` +
+          `</span>` +
+        `</li>`
+      ).join('')
+    : '<li class="task"><span class="task-text">Waiting for the architect.</span></li>';
+
+  // Newest first: a run of thirty turns is read from the end.
+  $('#project-steps').innerHTML = (p.steps || []).slice().reverse().map(stepHtml).join('')
+    || '<li class="step"><span class="step-why">Nothing has run yet.</span></li>';
+
+  $('#project-roadmap').innerHTML = renderMarkdown(p.roadmap || '_Not written yet._');
+  $('#project-state-json').textContent = p.state_json || '';
+
+  // Adopt the shared console. `renderThread` parks it on every render, so this
+  // has to claim it back each time rather than only once.
+  const slot = $('#project-console-slot');
+  const console_ = $('#console-block');
+  if (console_ && console_.parentNode !== slot) slot.appendChild(console_);
+
+  loadProjectCritique();
+}
+
+/** The critique log, which is the one project file the engine does not carry
+ *  on every event: it is append-only and grows all run, so it is fetched when
+ *  the tab is looked at instead of pushed down the stream. */
+async function loadProjectCritique() {
+  const block = $('#project-critique-block');
+  if (!block.open) return;
+  try {
+    const data = await api(
+      `/api/project/file?name=critique&workspace=${encodeURIComponent(
+        (state.project || {}).workspace || workspacePath())}`
+    );
+    $('#project-critique').textContent = data.text || '(nothing logged yet)';
+  } catch {
+    $('#project-critique').textContent = '(could not read the log)';
+  }
+}
+
+function renderPhases(p, running, done) {
+  const names = p.phase_names || {};
+  $('#project-phases').innerHTML = PHASE_ORDER.map(n => {
+    // "Done" is not simply "earlier than the current phase": the cycle goes
+    // backwards, so phase 3 sending the build back to phase 2 must not un-tick
+    // phases that really did happen. What decides it is whether a step for
+    // that phase has run and finished.
+    const steps = (p.steps || []).filter(s => s.phase === n);
+    const current = p.current_phase === n && !done;
+    let cls = '';
+    if (current) cls = running ? 'active' : (p.status === 'FAILED' ? 'failed' : 'active');
+    else if (steps.some(s => s.state === 'done')) cls = 'done';
+    if (done && p.status === 'FAILED' && p.current_phase === n) cls = 'failed';
+
+    const who = current
+      ? (p.paused ? 'paused' : `${ROLE_NAMES[p.active_agent] || p.active_agent} working`)
+      : (steps.length ? `${steps.length} turn${steps.length === 1 ? '' : 's'}` : '');
+
+    return (
+      `<li class="phase ${cls}">` +
+        `<div class="phase-n">PHASE ${n}</div>` +
+        `<div class="phase-name">${esc(names[n] || names[String(n)] || '')}</div>` +
+        `<div class="phase-who">${esc(who)}</div>` +
+      `</li>`
+    );
+  }).join('');
+}
+
+function renderProjectBanner(p, running, done) {
+  const banner = $('#project-banner');
+  let kind = '';
+  let text = '';
+
+  if (p.status === 'COMPLETED') {
+    kind = 'ok';
+    text = `${p.note || 'Finished.'} Everything is in ${p.workspace} — read ` +
+           `README.md first, then .theseus/CRITIQUE.log for what was left open.`;
+  } else if (p.status === 'FAILED') {
+    kind = 'error';
+    text = p.error || 'The project stopped.';
+  } else if (p.paused) {
+    kind = 'warn';
+    text = 'Paused. The agent that was running finished its step, so the tree ' +
+           'is consistent — nothing was interrupted mid-write.';
+  } else if (!running) {
+    kind = 'warn';
+    text = 'Not running. Everything so far is on disk; starting it again picks ' +
+           'up from the state file.';
+  } else if (p.continuation_token_needed) {
+    kind = 'warn';
+    text = 'An agent ran out of context or quota. The step was handed to ' +
+           'another one, which starts from the state file rather than from a ' +
+           'conversation it never saw.';
+  } else if (p.build_status === 'failing' && p.current_phase === 2) {
+    kind = 'warn';
+    text = `Build failing — the developer has the trace and is on attempt ` +
+           `${p.fix_attempts}.`;
+  } else {
+    kind = '';
+    text = 'Running unattended. Every step carries its CLI\'s auto-approve ' +
+           'flags, so files are changing without confirmation.';
+  }
+
+  banner.className = `project-banner${kind ? ' ' + kind : ''}`;
+  banner.classList.toggle('hidden', !text);
+  banner.textContent = text.trim();
+}
+
+function stepHtml(s) {
+  const files = (s.files_modified || []).slice(0, 6);
+  return (
+    `<li class="step ${esc(s.state)}">` +
+      `<div class="step-head">` +
+        `<span class="step-who">${esc(s.role_label || s.role)}</span>` +
+        `<span>${esc(s.heading)}</span>` +
+        `<span class="step-meta">` +
+          `${esc(s.label)}${s.duration ? ' · ' + esc(fmtDuration(s.duration)) : ''}` +
+        `</span>` +
+      `</div>` +
+      (s.handoff_from
+        ? `<div class="step-handoff">Handed over from the ` +
+          `${esc(ROLE_NAMES[s.handoff_from] || s.handoff_from)} chair.</div>`
+        : '') +
+      (s.reasoning ? `<div class="step-why">${esc(s.reasoning)}</div>` : '') +
+      (s.error ? `<div class="step-err">${esc(s.error)}</div>` : '') +
+      (files.length
+        ? `<div class="step-files" title="${esc((s.files_modified || []).join('\n'))}">` +
+          `${esc(files.join(', '))}` +
+          `${s.files_modified.length > files.length
+            ? ` +${s.files_modified.length - files.length} more` : ''}</div>`
+        : '') +
+    `</li>`
+  );
+}
+
+/** Start, or pick up, an autonomous build.
+ *
+ *  The confirmation is not ceremony. Every other surface in this app either
+ *  asks before it writes or has to be armed with Zero-Touch first; a project
+ *  cannot — it writes a codebase, so it carries the auto-approve flags by
+ *  construction — and pressing this button *is* the grant. Naming the folder
+ *  in the prompt is the part that matters: it is the one thing that turns a
+ *  misclick into a question. */
+async function startProject(resume) {
+  const brief = $('#project-brief').value.trim();
+  const folder = workspacePath();
+  const where = folder || `the scratch workspace (${state.scratchWorkspace || 'app folder'})`;
+
+  if (!resume && !brief) {
+    toast('Describe what you want built.', 'warn');
+    $('#project-brief').focus();
+    return;
+  }
+  if (!confirm(
+    `Start an autonomous build in:\n\n${where}\n\n` +
+    `Three agents will create, edit and delete files there without asking, ` +
+    `for as long as it takes — no approval gate.` +
+    (workspaceIsRepo()
+      ? '\n\nA git snapshot is taken first, so the whole build can be undone.'
+      : '\n\nThis is not a git repository, so nothing is snapshotted and ' +
+        'there is no way to undo it.')
+  )) return;
+
+  try {
+    await api('/api/project/start', {
+      method: 'POST',
+      body: { brief, workspace: folder, resume: !!resume },
+    });
+    $('#project-brief').value = '';
+    await loadProject(false);
+    toast(resume ? 'Project resumed.' : 'Project started.', 'ok');
+  } catch (err) {
+    toast(err.message, 'error', 9000);
+  }
+}
+
+/** Force the next step onto a chair the phase cycle would not have chosen.
+ *  For the failure the engine cannot see: an agent answering, exiting zero,
+ *  and going in circles. */
+function openHandoffMenu(anchor) {
+  closeModelMenu();
+  const active = (state.project || {}).active_agent;
+  const providers = (state.config || {}).providers || {};
+
+  const menu = document.createElement('div');
+  menu.className = 'model-menu';
+  menu.innerHTML =
+    `<div class="model-menu-head">Run the next step on</div>` +
+    PROJECT_ROLES.map(role =>
+      `<button class="model-opt${role === active ? ' active' : ''}" data-value="${role}">` +
+        `<span class="model-opt-name">${esc(ROLE_NAMES[role])}</span>` +
+        `<span class="model-opt-note">${esc((providers[role] || {}).label || role)}</span>` +
+      `</button>`
+    ).join('') +
+    `<div class="model-menu-source">` +
+      `Takes effect on the next step. The one running now finishes first.` +
+    `</div>`;
+  document.body.appendChild(menu);
+  positionModelMenu(menu, anchor);
+
+  menu.addEventListener('click', async (e) => {
+    const opt = e.target.closest('.model-opt');
+    if (!opt) return;
+    closeModelMenu();
+    try {
+      await api('/api/project/handoff', {
+        method: 'POST', body: { role: opt.dataset.value },
+      });
+      toast(`Next step goes to the ${ROLE_NAMES[opt.dataset.value]} chair.`, 'ok');
+    } catch (err) { toast(err.message, 'error'); }
+  });
+
+  setTimeout(() => {
+    document.addEventListener('click', onDocClickCloseModel, { once: true });
+  }, 0);
+}
+
+/** Re-read the tab from the server. Called on open, on a folder change, and
+ *  whenever a project event says the shape of it moved. */
+async function loadProject(quiet = true) {
+  try {
+    const data = await api(
+      `/api/project?workspace=${encodeURIComponent(workspacePath())}`
+    );
+    state.project = data.project;
+    state.projectRunning = !!data.running;
+    state.projectResumable = !!data.resumable;
+    state.projectRoles = data.roles || [];
+    if (data.settings) state.projectSettings = data.settings;
+    renderProject();
+  } catch (err) {
+    if (!quiet) toast(err.message, 'error');
+  }
+}
+
 /** The sidebar footer. There are no accounts here — the app is a local tool on
  *  loopback — so this is whatever name Settings was given, or failing that the
  *  OS user it was launched as. It signs you in to nothing. */
@@ -1408,6 +1778,7 @@ function renderAll() {
   renderWorkspace();
   renderToggles();
   renderThread();
+  renderProject();
 }
 
 /* ==========================================================================
@@ -1695,18 +2066,22 @@ async function setEffort(providerId, value) {
  *  the menu that already owns that setting rather than reimplementing it here:
  *  four settings, four existing menus, no fifth copy of the model list to drift
  *  out of step with the other one. */
-function openMemberMenu(anchor, providerId) {
+function openMemberMenu(anchor, providerId, { role = true, note = '' } = {}) {
   closeModelMenu();
   const provider = ((state.config || {}).providers || {})[providerId] || {};
   const agent = state.agents.find(a => a.id === agentOf(provider));
   const agentLabel = agent && (agent.command || []).length ? agent.label : 'custom command';
   const hasEffort = (provider.effort_args || []).length > 0;
 
+  // A project chair has no Role row. What it is told to do comes from the
+  // phase it is in — the architect designs in phase 1 and writes the README in
+  // phase 5 — so there is nothing for the Roles catalogue to override, and an
+  // entry that set one would be a setting the engine never reads.
   const rows = [
     ['agent', 'CLI', agentLabel],
     ['model', 'Model', provider.model ? modelDetail(provider.model) : 'the CLI’s default'],
     ...(hasEffort ? [['effort', 'Effort', provider.effort || 'the CLI’s default']] : []),
-    ['role', 'Role', provider.role || 'none'],
+    ...(role ? [['role', 'Role', provider.role || 'none']] : []),
   ];
 
   const menu = document.createElement('div');
@@ -1719,7 +2094,7 @@ function openMemberMenu(anchor, providerId) {
         `<span class="model-opt-note">${esc(value)}</span>` +
       `</button>`
     ).join('') +
-    `<div class="model-menu-source">Applies to this stage only.</div>`;
+    `<div class="model-menu-source">${esc(note || 'Applies to this stage only.')}</div>`;
   document.body.appendChild(menu);
   positionModelMenu(menu, anchor);
 
@@ -2020,6 +2395,9 @@ async function selectWorkspace(path) {
     state.config = config;
     state.workspaceStatus = status;
     renderAll();
+    // The Projects tab reports on the folder it is looking at, so a different
+    // folder is a different project - or none.
+    loadProject();
     closeModal('picker');
     toast(
       status.is_repo
@@ -2044,6 +2422,7 @@ async function clearWorkspace() {
     state.config = config;
     state.workspaceStatus = null;
     renderAll();
+    loadProject();
     closeModal('picker');
     const where = state.scratchWorkspace || 'the scratch workspace';
     toast(`No working folder. Runs now happen in ${where}.`, 'ok', 5200);
@@ -2068,18 +2447,27 @@ function renderSettings() {
   const providers = conf.providers || {};
   const host = $('#provider-forms');
 
-  // The council's two stages and Solo's one assistant, configured
-  // independently. `council` decides which half of the form each one gets:
-  // a stage is told what job to do and picks its agent here, the assistant is
-  // only ever given a behaviour the operator typed and picks its agent from
-  // its own card, where changing it is a gesture rather than a visit.
+  // Every chair in the app, configured independently. `kind` decides which
+  // half of the form each one gets, because what a chair is *told to do*
+  // arrives differently in each of the three:
+  //
+  //   stage    a council stage is assigned a role here;
+  //   chat     the assistant gets only a behaviour the operator typed, and
+  //            picks its agent from its own card rather than from this panel;
+  //   project  a project chair gets neither - its instruction comes from the
+  //            phase it is in, so a role box here would be a setting nothing
+  //            reads.
   const FORMS = [
-    { id: 'drafter', num: 'Stage 1', council: true },
-    { id: 'polisher', num: 'Stage 2', council: true },
-    { id: 'solo', num: 'Chat', council: false },
+    { id: 'drafter', num: 'Stage 1', kind: 'stage' },
+    { id: 'polisher', num: 'Stage 2', kind: 'stage' },
+    { id: 'solo', num: 'Chat', kind: 'chat' },
+    { id: 'architect', num: 'Project', kind: 'project', name: 'Architect' },
+    { id: 'coder', num: 'Project', kind: 'project', name: 'Developer' },
+    { id: 'qa', num: 'Project', kind: 'project', name: 'QA' },
   ];
 
-  host.innerHTML = FORMS.map(({ id, num, council }) => {
+  host.innerHTML = FORMS.map(({ id, num, kind, name }) => {
+    const council = kind === 'stage';
     const p = providers[id] || {};
     const info = state.providers.find(x => x.id === id);
     const probeHtml = info
@@ -2087,10 +2475,15 @@ function renderSettings() {
         `${info.available ? 'found' : 'not found'}</span>`
       : '';
     return (
-      `<div class="provider-form" data-provider="${id}" ` +
-        `data-council="${council ? '1' : ''}">` +
+      `<div class="provider-form" data-provider="${id}" data-kind="${kind}">` +
         `<h4><span class="stage-num">${esc(num)}</span> ` +
-          `${esc(p.role || (council ? id : 'Assistant'))} ${probeHtml}</h4>` +
+          `${esc(name || p.role || (council ? id : 'Assistant'))} ${probeHtml}</h4>` +
+        (kind === 'project'
+          ? `<p class="settings-note">` +
+              `Its agent, model and reasoning depth are set in the Projects ` +
+              `tab's matrix. There is no role to choose: what this chair is ` +
+              `told to do comes from the phase it is in.</p>`
+          : '') +
         (council
           ? `<div class="field-row">` +
               `<div class="field">` +
@@ -2108,12 +2501,14 @@ function renderSettings() {
                 `<input type="text" data-field="label" value="${esc(p.label || '')}">` +
               `</div>` +
             `</div>`
-          // Solo's agent is the chip on its card. Two places to pick it would
-          // be two apparent sources of truth, and the modal is the slower one.
+          // Chat's agent is the chip on its card, and a project chair's is its
+          // tile in the matrix. Two places to pick it would be two apparent
+          // sources of truth, and the modal is the slower one.
           : `<div class="field">` +
               `<label>Display name ` +
-                `<span class="field-hint">— the agent itself is the first chip ` +
-                `on the Assistant card</span></label>` +
+                `<span class="field-hint">— the agent itself is picked on ` +
+                `${kind === 'project' ? "the Projects tab" : 'the Assistant card'}` +
+                `</span></label>` +
               `<input type="text" data-field="label" value="${esc(p.label || '')}">` +
             `</div>`) +
         (council
@@ -2139,15 +2534,18 @@ function renderSettings() {
               `<span class="field-hint" data-role-warn="${id}"></span>` +
             `</div>`
           // No role, no template and no fallback: blank here means blank, so a
-          // new Solo conversation reaches the CLI as the message alone.
-          : `<div class="field">` +
+          // new Solo conversation reaches the CLI as the message alone. A
+          // project chair gets neither box - see FORMS.
+          : kind === 'chat'
+          ? `<div class="field">` +
               `<label>Behaviour ` +
                 `<span class="field-hint">— optional; blank sends your message ` +
                 `on its own</span></label>` +
               `<textarea rows="5" class="role-system" data-field="behavior" ` +
                 `placeholder="e.g. Answer briefly, and always show the code.">` +
                 `${esc(p.behavior || '')}</textarea>` +
-            `</div>`) +
+            `</div>`
+          : '') +
         // Everything below is the CLI plumbing the agent picker fills in for
         // you. Folded away because reading it is how you check a custom CLI,
         // not how you configure a stage.
@@ -2162,15 +2560,20 @@ function renderSettings() {
               `<label>Auto-approve arguments (added only when execution is approved)</label>` +
               `<textarea rows="2" data-field="auto_approve_args">${esc((p.auto_approve_args || []).join('\n'))}</textarea>` +
             `</div>` +
-            (council ? '' :
-              `<div class="field">` +
+            // Only Chat is ever invoked read-only. A council stage's
+            // permission is decided at the gate, and a project chair always
+            // writes - showing the field on either would offer a setting
+            // nothing sends.
+            (kind === 'chat'
+              ? `<div class="field">` +
                 `<label>Read-only arguments ` +
                   `<span class="field-hint">— added whenever Chat is ` +
                   `read-only, which is any run with Zero-Touch off. With it on, ` +
                   `the auto-approve arguments are sent instead</span></label>` +
                 `<textarea rows="2" data-field="read_only_args">` +
                   `${esc((p.read_only_args || []).join('\n'))}</textarea>` +
-              `</div>`) +
+              `</div>`
+              : '') +
             `<div class="field">` +
               `<label>Streaming arguments ` +
                 `<span class="field-hint">— always added; make the CLI report ` +
@@ -2228,15 +2631,21 @@ function renderSettings() {
   $('#display-name').value = conf.display_name || '';
   $('#port-input').value = conf.port || 8760;
   $('#open-browser').checked = conf.open_browser !== false;
+
+  const proj = conf.project || {};
+  $('#project-max-steps').value = proj.max_steps ?? 40;
+  $('#project-max-fixes').value = proj.max_fix_attempts ?? 3;
+  $('#project-expansions').value = proj.expansion_rounds ?? 1;
 }
 
 /** Flag a behaviour whose write expectation disagrees with the stage's actual
  *  permission. Not resolved automatically: guessing which of the two the
  *  operator meant is how a safety setting stops being trustworthy. */
 function updateRoleWarning(form) {
-  // Solo has no role and no per-stage permission, so there is no mismatch it
-  // could be in.
-  if (!form || !form.dataset.council) return;
+  // Only a council stage has both a role and a permission that can disagree
+  // with it. Chat has no role; a project chair has no role either, and always
+  // writes - there is no mismatch available to either of them.
+  if (!form || form.dataset.kind !== 'stage') return;
   const id = form.dataset.provider;
   const chosen = $('[data-field="role_template"]', form).value;
   const role = (state.roles || []).find(r => r.id === chosen);
@@ -2295,18 +2704,21 @@ async function saveSettings() {
       command,
       auto_approve_args: lines('auto_approve_args'),
       stream_args: lines('stream_args'),
-      // A council stage has a role; the Solo assistant has a behaviour and
-      // nothing else. Writing the other one's keys would leave a dead setting
-      // behind that still reads as though it decided something.
-      ...(form.dataset.council
-        ? {
-            role_template: field('role_template').value,
-            role_system: field('role_system').value.trim(),
-          }
-        : {
-            behavior: field('behavior').value.trim(),
-            read_only_args: lines('read_only_args'),
-          }),
+      // A council stage has a role; the Chat assistant has a behaviour; a
+      // project chair has neither, and is told what to do by the phase it is
+      // in. Writing another kind's keys would leave a dead setting behind that
+      // still reads as though it decided something.
+      ...({
+        stage: () => ({
+          role_template: field('role_template').value,
+          role_system: field('role_system').value.trim(),
+        }),
+        chat: () => ({
+          behavior: field('behavior').value.trim(),
+          read_only_args: lines('read_only_args'),
+        }),
+        project: () => ({}),
+      }[form.dataset.kind] || (() => ({})))(),
       model: field('model').value.trim(),
       // Space-separated on this form, since a model flag is always short.
       model_args: field('model_args').value.trim().split(/\s+/).filter(Boolean),
@@ -2332,6 +2744,15 @@ async function saveSettings() {
         display_name: $('#display-name').value.trim(),
         port: parseInt($('#port-input').value, 10) || 8760,
         open_browser: $('#open-browser').checked,
+        project: {
+          max_steps: Math.max(1, parseInt($('#project-max-steps').value, 10) || 40),
+          max_fix_attempts:
+            Math.max(1, parseInt($('#project-max-fixes').value, 10) || 3),
+          // The only one of the three that may legitimately be zero: no
+          // expansion rounds ships the brief and nothing more.
+          expansion_rounds:
+            Math.max(0, parseInt($('#project-expansions').value, 10) || 0),
+        },
       },
     });
     state.config = config;
@@ -2721,6 +3142,74 @@ function connect() {
     renderAll();
   });
 
+  // -- projects ---------------------------------------------------------
+  // A project runs for an hour and the operator is not expected to sit on the
+  // tab, so these keep the state current wherever they are — and pull them to
+  // the tab when a build starts, because that is where attention belongs.
+  on('project_started', (d) => {
+    state.project = d.project;
+    state.projectRunning = true;
+    state.projectResumable = false;
+    state.tab = 'project';
+    clearStream();
+    pushDivider('Project started');
+    pushLine('sys', 'project', `Brief: ${d.project.brief}`);
+    pushLine('sys', 'project', `Folder: ${d.project.workspace}`);
+    pushLine('warn', 'project',
+      'Every step runs with auto-approve. Files will change without asking.');
+    $('#console-block').open = true;
+    renderAll();
+    loadProject();
+  });
+
+  on('project_state', (d) => {
+    state.project = d.project;
+    // A paused project is still live — it is holding, not over — so what ends
+    // it is a terminal status and nothing else.
+    state.projectRunning = !d.project.done;
+    if (d.project.done) {
+      toast(
+        d.project.status === 'COMPLETED' ? 'Project complete.' : (d.project.error || 'Project stopped.'),
+        d.project.status === 'COMPLETED' ? 'ok' : 'error',
+        12000,
+      );
+      // The tree has changed under the status bar and the commit bar, and
+      // nothing else re-reads git.
+      loadState();
+    }
+    renderProject();
+  });
+
+  on('project_step', (d) => {
+    state.project = d.project;
+    state.projectRunning = !d.project.done;
+    pushDivider(`Phase ${d.step.phase} · ${d.step.role_label} · ${d.step.heading}`);
+    pushLine('sys', 'project',
+      `${d.step.role_label} · ${d.step.heading} (phase ${d.step.phase})`);
+    renderProject();
+  });
+
+  on('project_output', (d) => {
+    // Tagged with the chair rather than the CLI: which binary holds which
+    // chair is a setting, so a hardcoded name would mislabel a third of the
+    // stream the moment the matrix is changed.
+    pushLine(`${d.role}${d.stream === 'stderr' ? ' stderr' : ''}`,
+             ROLE_NAMES[d.role] || d.role, d.line);
+  });
+
+  on('project_step_done', (d) => {
+    state.project = d.project;
+    pushLine(d.step.ok ? 'sys' : 'err', 'exit',
+      `${d.step.role_label} finished in ${fmtDuration(d.step.duration)}` +
+      (d.step.ok ? '' : ` — ${d.step.error || 'failed'}`));
+    renderProject();
+  });
+
+  on('project_log', (d) => {
+    pushLine(d.level === 'warn' ? 'warn' : d.level === 'error' ? 'err' : 'sys',
+             'project', d.message);
+  });
+
   on('usage', (d) => {
     state.usage = d.usage || {};
     renderStrip();
@@ -2834,10 +3323,15 @@ function wire() {
     const want = btn.dataset.mode;
     if (want === uiMode()) return;
 
-    // Project is a placeholder, so it is remembered in the page and nowhere
-    // else. Leaving it puts the operator back in the real mode config still
-    // holds, which is why nothing is patched on the way out either.
-    if (want === 'project') { state.tab = 'project'; renderAll(); return; }
+    // Project is a surface rather than a mode, so it is remembered in the page
+    // and nowhere else. Leaving it puts the operator back in the real mode
+    // config still holds, which is why nothing is patched on the way out.
+    if (want === 'project') {
+      state.tab = 'project';
+      renderAll();
+      loadProject();
+      return;
+    }
     state.tab = '';
 
     // A conversation belongs to the mode it was started in, so switching
@@ -2879,6 +3373,68 @@ function wire() {
     e.stopPropagation();
     if ($('.model-menu')) { closeModelMenu(); return; }
     openGearMenu($('#gear-btn'));
+  });
+
+  // -- projects ---------------------------------------------------------
+  // The agent matrix. A chair is the same provider object the council strip
+  // renders, so this opens the same menu — minus Role, which a project chair
+  // does not have.
+  $('#project-matrix').addEventListener('click', (e) => {
+    const chair = e.target.closest('[data-chair]');
+    if (!chair) return;
+    e.stopPropagation();
+    if ($('.model-menu')) { closeModelMenu(); return; }
+    openMemberMenu(chair, chair.dataset.chair, {
+      role: false,
+      note: 'What this chair is told to do comes from the phase, not a role.',
+    });
+  });
+
+  // One folder picker for the whole app: a project builds where runs run.
+  $('#project-folder').addEventListener('click', () => {
+    loadPicker(workspacePath() || undefined);
+    openModal('picker');
+  });
+
+  $('#project-start').addEventListener('click', () => startProject(false));
+  $('#project-resume-found').addEventListener('click', () => startProject(true));
+
+  $('#project-pause').addEventListener('click', () =>
+    api('/api/project/pause', { method: 'POST' })
+      .then(loadProject).catch(e => toast(e.message, 'error')));
+
+  $('#project-resume').addEventListener('click', () =>
+    api('/api/project/resume', { method: 'POST' })
+      .then(loadProject).catch(e => toast(e.message, 'error')));
+
+  $('#project-stop').addEventListener('click', async () => {
+    if (!confirm(
+      'Stop the project?\n\n' +
+      'The agent that is running is killed where it stands, so a file it was ' +
+      'part-way through writing stays part-written. Pause instead if you only ' +
+      'want it to hold — that waits for the step to finish.'
+    )) return;
+    try {
+      await api('/api/project/stop', { method: 'POST' });
+    } catch (err) { toast(err.message, 'error'); }
+  });
+
+  // Fetched on open rather than pushed: it is append-only and grows all run.
+  $('#project-critique-block').addEventListener('toggle', loadProjectCritique);
+
+  $('#project-handoff').addEventListener('click', (e) => {
+    e.stopPropagation();
+    if ($('.model-menu')) { closeModelMenu(); return; }
+    openHandoffMenu($('#project-handoff'));
+  });
+
+  // Clearing the tab is what puts the initializer back. The project on disk is
+  // untouched — this is closing the report, not deleting the build.
+  $('#project-new').addEventListener('click', () => {
+    state.project = null;
+    state.projectResumable = false;
+    renderProject();
+    loadProject();
   });
 
   // -- run controls -----------------------------------------------------
@@ -3185,6 +3741,14 @@ async function boot() {
   await loadChats();
   connect();
   prefetchResolvedModels();
+  // A project outlives the window it was started from, so the tab is opened
+  // for you when one is still running - the alternative is an app that looks
+  // idle while three agents rewrite a folder.
+  await loadProject();
+  if (state.projectRunning) {
+    state.tab = 'project';
+    renderAll();
+  }
   $('#task-input').focus();
 }
 
