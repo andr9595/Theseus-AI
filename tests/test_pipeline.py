@@ -1355,6 +1355,20 @@ class TestConversationList(PipelineTestBase):
 
 
 class TestEventStream(PipelineTestBase):
+    def test_terminal_event_is_published_after_transcript_exists(self):
+        q = self.bus.subscribe()
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("persist before terminal event", str(self.repo))
+
+        while True:
+            event = q.get(timeout=5)
+            if event["kind"] == "state" and event["state"] in (
+                "complete", "failed", "cancelled"
+            ):
+                break
+
+        self.assertTrue((self.pipeline.runs_dir / run.transcript_name).is_file())
+
     def test_subscribers_observe_the_whole_run(self):
         q = self.bus.subscribe()
         self.store.update({"zero_touch": True})

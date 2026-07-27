@@ -3723,6 +3723,20 @@ function connect() {
     // when the conversation list can show it — and when a follow-up has folded
     // its parent into itself and must replace it there.
     if (!state.busy) {
+      // Keep the conversation in the composer as well as on screen. Without
+      // this, `startRun` cleared the attachment accepted for the previous
+      // message and every ordinary next message became a new sidebar row.
+      // "New chat" remains the explicit way to detach.
+      const earlier = (d.run && d.run.conversation) || [];
+      const title = (earlier.length ? earlier[0].task : d.run && d.run.task) || '';
+      if (d.run && d.run.file) {
+        continueRun(
+          d.run.file,
+          title,
+          d.run.mode || (d.run.solo ? 'solo' : 'council'),
+          true,
+        );
+      }
       loadChats();
       // The run has just written to the working tree, so the git status the
       // status bar and the commit bar are drawn from is now a run out of date.
@@ -3948,7 +3962,7 @@ async function startRun() {
     if (!ok) return;
   }
   try {
-    await api('/api/start', {
+    const { run: acceptedRun } = await api('/api/start', {
       method: 'POST',
       body: {
         task,
@@ -3964,7 +3978,13 @@ async function startRun() {
       input.value = '';
       input.dispatchEvent(new Event('input'));
     }
-    clearContinuation();
+    // A very fast agent can finish, publish its terminal event and attach its
+    // new transcript before this POST response arrives. Do not let the older
+    // request cleanup detach that freshly completed conversation.
+    const alreadyAttachedLatest = acceptedRun && state.run &&
+      state.run.id === acceptedRun.id &&
+      ['complete', 'failed', 'cancelled'].includes(state.run.state);
+    if (!alreadyAttachedLatest) clearContinuation();
   } catch (err) {
     toast(err.message, 'error', 9000);
   }

@@ -927,6 +927,11 @@ class Pipeline:
             run.state = state
             if state in TERMINAL_STATES:
                 run.ended_at = time.time()
+                # A terminal event tells the browser it can attach this run to
+                # the next message. Put the transcript on disk first so its
+                # context preview and the follow-up itself cannot race the
+                # worker thread's final persistence.
+                self._persist(run)
         self.bus.publish("state", state=state, run=run.to_dict(), **extra)
 
     def _stage_output_cb(self, stage_id: str):

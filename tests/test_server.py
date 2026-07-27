@@ -153,6 +153,18 @@ class TestStaticFiles(ServerTestBase):
         self.assertIn("if (input.value === submittedValue) {", script)
         self.assertIn("input.value = '';", script)
 
+    def test_completed_chat_stays_attached_for_the_next_message(self):
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        handler = script.split("on('state', (d) => {", 1)[1].split(
+            "on('stage_started'", 1
+        )[0]
+        terminal = handler.split("if (!state.busy) {", 1)[1]
+        self.assertIn("if (d.run && d.run.file)", terminal)
+        self.assertIn("continueRun(", terminal)
+        self.assertIn("d.run.file,", terminal)
+        self.assertIn("if (!alreadyAttachedLatest) clearContinuation();", script)
+
     def test_chat_hides_intermediate_agent_output(self):
         with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
             script = res.read().decode()
