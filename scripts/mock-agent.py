@@ -2,11 +2,21 @@
 """A stand-in coding agent, for demos and tests.
 
 Neither `codex` nor `claude` needs to be installed to exercise the pipeline:
-point a provider at this script and the full Draft -> Approve -> Polish ->
-Diff -> Rollback loop runs for real, including writing files to the target
-repository so the diff viewer has something to show.
+point a seat at this script and the full Deliberate -> Critique -> Approve ->
+Synthesize -> Diff -> Rollback loop runs for real, including writing files to
+the target repository so the diff viewer has something to show. A council turn
+is recognised by what its prompt asks for rather than by `--role` - see
+``COUNCIL_MARKERS`` below - so the same command works in every seat.
 
-Wire it up in Settings, one argument per line:
+Wire it up in Settings, one argument per line, in as many Agents cards as you
+want seated (`--role` is accepted but ignored for a council prompt, so its
+value does not matter here):
+
+    python3
+    /abs/path/scripts/mock-agent.py
+    {prompt}
+
+The legacy two-stage council still resolves its stages by `--role`:
 
     Stage 1 command                    Stage 2 command
     ---------------                    ---------------
@@ -15,9 +25,6 @@ Wire it up in Settings, one argument per line:
     --role                             --role
     drafter                            polisher
     {prompt}                           {prompt}
-
-Or run `./run.sh --doctor` after setting AI_COUNCIL_MOCK=1 to have the
-defaults point here automatically.
 
 It also speaks Projects Mode. Point the architect, coder and QA chairs at it
 and the whole decision loop runs for real against a real directory: it audits

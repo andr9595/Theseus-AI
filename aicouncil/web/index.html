@@ -381,6 +381,30 @@
   </div>
 </div>
 
+<!-- ================= Uncommitted changes =================
+     Opened from the status bar's "N uncommitted" chip, in every mode. The
+     diff block under a run shows what *that run* did; this shows what is in
+     the folder right now, whoever put it there. -->
+<div id="changes" class="modal hidden" role="dialog" aria-modal="true" aria-label="Uncommitted changes">
+  <div class="modal-card modal-card-tall">
+    <header class="modal-head">
+      <h3>Uncommitted changes</h3>
+      <button class="icon-btn" data-close="changes" type="button" aria-label="Close">&times;</button>
+    </header>
+    <div id="changes-where" class="changes-where"></div>
+    <div id="changes-files" class="changes-files"></div>
+    <div id="changes-diff" class="diff-view changes-diff"></div>
+    <footer class="modal-foot">
+      <input id="changes-message" class="commit-message" spellcheck="false"
+        placeholder="Commit message&hellip;" aria-label="Commit message">
+      <button id="changes-commit" class="btn btn-primary" type="button">
+        Commit everything
+      </button>
+    </footer>
+    <p id="changes-note" class="changes-note"></p>
+  </div>
+</div>
+
 <!-- ================= Settings ================= -->
 <div id="settings" class="modal hidden" role="dialog" aria-modal="true" aria-label="Settings">
   <div class="modal-card modal-card-tall">

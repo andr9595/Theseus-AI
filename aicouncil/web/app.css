@@ -703,6 +703,10 @@ html, body {
   font-family: var(--mono); font-size: 10.5px;
 }
 .chip.dirty { color: var(--yellow); border-color: rgba(234, 179, 8, .3); }
+/* The one chip that is a button. It reads as the others do until hovered,
+   because it is still first of all a piece of status. */
+.chip-btn { cursor: pointer; font: inherit; font-family: var(--mono); font-size: 10.5px; }
+.chip-btn:hover { background: var(--bg-4); border-color: rgba(234, 179, 8, .55); }
 .chip.clean { color: var(--green); border-color: rgba(52, 211, 153, .28); }
 .chip.warn  { color: var(--red);   border-color: rgba(244, 99, 99, .32); }
 
@@ -1556,6 +1560,42 @@ html, body {
 .commit-hint {
   font-family: var(--mono); font-size: 10.5px;
   color: var(--text-3); flex: 0 0 auto;
+}
+
+/* ---- Uncommitted changes, from the status bar ---- */
+
+.changes-where {
+  padding: 12px 18px 8px;
+  font-family: var(--mono); font-size: 11px; color: var(--text-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* The file list is the part that answers "what am I about to commit", so it
+   keeps its own height and its own scrollbar rather than sharing the diff's -
+   scrolling to the bottom of a long patch must not lose sight of the list. */
+.changes-files {
+  flex: 0 0 auto; max-height: 26vh; overflow-y: auto;
+  margin: 0 18px 10px; padding: 6px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.changes-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 3px 6px;
+  font-family: var(--mono); font-size: 11.5px; color: var(--text-2);
+}
+.changes-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.changes-tag {
+  flex: 0 0 auto; padding: 1px 6px; border-radius: 20px;
+  font-size: 9.5px; text-transform: lowercase;
+  background: var(--bg-3); border: 1px solid var(--line); color: var(--text-3);
+}
+.changes-tag.new { color: var(--green); border-color: rgba(52, 211, 153, .28); }
+.changes-tag.staged { color: var(--accent-2); }
+.changes-diff { flex: 1; min-height: 0; overflow-y: auto; margin: 0 18px; padding-bottom: 0; }
+.changes-note {
+  margin: 0; padding: 0 18px 14px;
+  font-size: 11px; color: var(--text-3);
 }
 
 /* ---- Role manager ---- */

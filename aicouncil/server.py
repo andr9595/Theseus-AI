@@ -425,7 +425,16 @@ class Handler(BaseHTTPRequestHandler):
         path = (params.get("path") or [""])[0]
         if not path:
             raise ValueError("A `path` query parameter is required.")
-        return {"ok": True, "status": gitutil.status(path).to_dict()}
+        out: Dict[str, Any] = {"ok": True, "status": gitutil.status(path).to_dict()}
+        # `?diff=1` is what the status bar's uncommitted chip asks for when it
+        # is opened. Status and patch are read in one request on purpose: two
+        # requests would be two different moments, and a file could be saved
+        # between them, leaving a list and a patch that disagree about what is
+        # in the tree the operator is about to commit.
+        if (params.get("diff") or [""])[0] not in ("", "0", "false"):
+            out["diff"] = gitutil.working_diff(path)
+            out["stat"] = gitutil.diff_stat(path)
+        return out
 
     def _api_history(self, params: Dict[str, list]) -> Dict[str, Any]:
         # Council and Chat conversations are not interchangeable - continuing

@@ -1194,26 +1194,110 @@ function renderCommitBar() {
   }
 }
 
-async function doCommit() {
-  const message = $('#commit-message').value.trim();
-  if (!message) { toast('A commit message is required.', 'warn'); return; }
-  const btn = $('#commit-btn');
-  btn.disabled = true;
+/** Commit the whole working tree. Shared by the bar under a run's diff and by
+ *  the status bar's chip so the two cannot drift: same refusal on an empty
+ *  message, same summary afterwards, same reload of what the folder now is. */
+async function commitWorkingTree(message, btn) {
+  if (!message) { toast('A commit message is required.', 'warn'); return false; }
+  if (btn) btn.disabled = true;
   try {
     const { commit } = await api('/api/commit', {
       method: 'POST',
       body: { message, workspace: workspacePath() },
     });
-    $('#commit-message').value = '';
     toast(
       `Committed ${commit.short} on ${commit.branch} — ${commit.files} file(s), ` +
       `+${commit.insertions}/-${commit.deletions}`, 'ok', 6000);
     await loadState();
+    return true;
   } catch (err) {
     toast(err.message, 'error', 9000);
+    return false;
   } finally {
-    btn.disabled = false;
+    if (btn) btn.disabled = false;
   }
+}
+
+async function doCommit() {
+  const box = $('#commit-message');
+  if (await commitWorkingTree(box.value.trim(), $('#commit-btn'))) box.value = '';
+}
+
+/* ==========================================================================
+   Uncommitted changes, from the status bar
+   ========================================================================== */
+
+/** One row per changed file, with what happened to it.
+ *  A file can be both staged and modified - staged an hour ago, edited since -
+ *  and that is worth seeing rather than collapsing, because `add -A` is about
+ *  to sweep up both halves. */
+function changedFiles(st) {
+  const rows = new Map();
+  const mark = (path, label) => {
+    const labels = rows.get(path) || [];
+    if (!labels.includes(label)) labels.push(label);
+    rows.set(path, labels);
+  };
+  (st.staged || []).forEach(p => mark(p, 'staged'));
+  (st.modified || []).forEach(p => mark(p, 'modified'));
+  (st.untracked || []).forEach(p => mark(p, 'new'));
+  return [...rows.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+}
+
+/** The chip, opened: what is in the folder right now and one button that
+ *  commits all of it. Deliberately not the run's diff block - that one is
+ *  scoped to what a run changed, and most dirty trees are dirty for other
+ *  reasons. */
+async function openChanges() {
+  const folder = workspacePath();
+  if (!folder) return;
+  $('#changes').classList.remove('hidden');
+  $('#changes-where').textContent = folder;
+  $('#changes-files').innerHTML = '';
+  $('#changes-diff').innerHTML =
+    '<div class="empty-state">Reading the working tree…</div>';
+  renderChangesFoot();
+  $('#changes-message').focus();
+
+  try {
+    const data = await api(
+      `/api/repo?path=${encodeURIComponent(folder)}&diff=1`);
+    const st = data.status || {};
+    const files = changedFiles(st);
+    $('#changes-where').textContent =
+      `${files.length} file${files.length === 1 ? '' : 's'} on ${st.branch || '?'} — ${folder}`;
+    $('#changes-files').innerHTML = files.map(([path, labels]) =>
+      `<div class="changes-row">` +
+        `<span class="changes-path" title="${esc(path)}">${esc(path)}</span>` +
+        labels.map(l => `<span class="changes-tag ${l}">${l}</span>`).join('') +
+      `</div>`
+    ).join('') || '<div class="empty-state">Nothing to commit.</div>';
+    $('#changes-diff').innerHTML = renderDiff(data.diff || '', data.stat);
+  } catch (err) {
+    $('#changes-diff').innerHTML =
+      `<div class="empty-state">${esc(err.message)}</div>`;
+  }
+}
+
+/** Whether committing is on offer, and if not, why not. The server refuses a
+ *  commit under a running agent anyway; saying so here means the refusal is
+ *  read before the button is pressed rather than after. */
+function renderChangesFoot() {
+  const busy = !!state.busy;
+  $('#changes-commit').disabled = busy;
+  $('#changes-note').textContent = busy
+    ? 'A run is in progress. Committing now would capture a tree it is still ' +
+      'editing, so wait for it to finish.'
+    : 'Commits everything the list shows, including new files. Nothing is ' +
+      'pushed.';
+}
+
+async function doChangesCommit() {
+  const box = $('#changes-message');
+  const ok = await commitWorkingTree(box.value.trim(), $('#changes-commit'));
+  if (!ok) return;
+  box.value = '';
+  closeModal('changes');
 }
 
 /* ==========================================================================
@@ -1362,9 +1446,13 @@ function renderWorkspace() {
     chips.push('<span class="chip">no git</span>');
   } else if (st && st.is_repo) {
     chips.push(`<span class="chip">${esc(st.branch || '?')}</span>`);
+    // Dirty is the only one of the three that leads anywhere: there is
+    // something to look at and something to do about it, so it is a button.
     chips.push(st.clean
       ? '<span class="chip clean">clean</span>'
-      : `<span class="chip dirty">${st.dirty_count} uncommitted</span>`);
+      : `<button class="chip dirty chip-btn" id="dirty-chip" type="button" ` +
+        `title="Review the changes and commit them">` +
+        `${st.dirty_count} uncommitted</button>`);
   } else if (st) {
     chips.push('<span class="chip">not a git repository</span>');
   }
@@ -2202,6 +2290,9 @@ function renderAll() {
   renderCouncilSteps();
   renderComposerChips();
   renderWorkspace();
+  // Only when it is open: a run that starts while the changes are on screen
+  // has to take the commit button away, since the server would refuse it.
+  if (!$('#changes').classList.contains('hidden')) renderChangesFoot();
   renderToggles();
   renderThread();
   renderProject();
@@ -4419,6 +4510,17 @@ function wire() {
         : 'Earlier turns will be sent in full again.',
       'ok', 5200
     );
+  });
+
+  // -- uncommitted changes ----------------------------------------------
+  // Delegated: the chip is rebuilt by `renderWorkspace` on every state poll,
+  // so a listener bound to the element itself would be thrown away with it.
+  $('#workspace-git').addEventListener('click', (e) => {
+    if (e.target.closest('#dirty-chip')) openChanges();
+  });
+  $('#changes-commit').addEventListener('click', doChangesCommit);
+  $('#changes-message').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doChangesCommit(); }
   });
 
   // -- modal dismissal --------------------------------------------------

@@ -1,34 +1,37 @@
 # Theseus AI
 
-A local, dark-themed desktop dashboard that runs a **two-stage coding pipeline**
+A local, dark-themed desktop dashboard that runs a **deliberating council**
 across your existing AI subscriptions — with **zero per-token API cost**.
 
 ```text
    Your task
        |
        v
-  ┌──────────────────┐   read-only     ┌──────────────────┐   writes to disk
-  │     Stage 1      │ ─── draft ───>  │     Stage 2      │ ──> your repo
-  │   Junior Draft   │                 │  Senior Polish   │
-  │  (Codex, or…)    │                 │  (Claude, or…)   │
-  └──────────────────┘                 └──────────────────┘
-                            ^
-                            └── approval gate (unless Zero-Touch is on)
+  ┌──────────────────┐   read-only    ┌──────────────────┐   read-only    ┌──────────────────┐   writes to disk
+  │     Members      │ ── answer ───> │     Critique      │ ── weigh ───> │     Chairman      │ ──> your repo
+  │ (one seat per     │                │ (each member      │                │ (decides, then    │
+  │  agent CLI)       │                │  reviews the      │                │  applies)         │
+  │                   │                │  others, blind)   │                │                   │
+  └──────────────────┘                └──────────────────┘                └──────────────────┘
+                                                                   ^
+                                                                   └── approval gate (unless Zero-Touch is on)
 ```
 
-Stage 1 shells out to the `codex` CLI (your ChatGPT Plus/Pro subscription) to
-survey the repository and write an implementation proposal. Stage 2 shells out
-to the `claude` CLI (your Claude Pro subscription) to verify that proposal
-against the real code, correct it, and apply the change.
+Every installed agent CLI gets its own seat. Each member shells out to its CLI
+(your ChatGPT Plus/Pro, Claude Pro, or other existing subscription) to answer
+the task independently and read-only. Each then critiques the others'
+anonymised answers. A chairman — one of the same agents, routed by the council
+— weighs every answer and every critique, decides, and, once permitted, is the
+only seat that writes to disk.
 
-Stage 2 is explicitly instructed to treat the draft as **untrusted input** — a
-colleague's suggestion, not a specification. That framing is deliberate: the
-main failure mode of a naive two-model chain is the second model politely
-rubber-stamping a confidently-wrong first draft.
+The chairman is explicitly instructed to treat every answer and critique as
+**untrusted input** — a colleague's opinion, not a specification. That framing
+is deliberate: the main failure mode of a naive multi-model chain is the
+deciding model politely rubber-stamping a confidently-wrong answer.
 
-That pairing is the default, not a rule: **either agent can be assigned to
-either job** from Settings, including the same agent twice. See
-[Assigning agents to jobs](#assigning-agents-to-jobs).
+Which agent sits in which seat, and which one chairs, is configurable from
+Settings, including the same agent in more than one seat. See
+[Assigning agents to seats](#assigning-agents-to-seats).
 
 **Nothing in this application reads, stores or transmits an API key.** It
 drives the CLIs you have already authenticated, so the marginal cost of a run
@@ -52,9 +55,9 @@ folder before it starts.
 | Python **3.9+** | Standard library only — no `pip install`, no virtualenv, no build step |
 | `git` | Optional — powers the diff viewer, safety snapshot and rollback when the working folder is a repository |
 | A browser | Chromium-family gets a frameless app window; Firefox gets a plain window |
-| `codex` CLI | Optional — Stage 1. See [Installing the agent CLIs](#installing-the-agent-clis) |
-| `claude` CLI | Optional — Stage 2 |
-| `agy` CLI | Optional — Google's Antigravity, assignable to either stage or to Chat |
+| `codex` CLI | Optional — a council seat. See [Installing the agent CLIs](#installing-the-agent-clis) |
+| `claude` CLI | Optional — a council seat |
+| `agy` CLI | Optional — Google's Antigravity, assignable to any seat or to Chat |
 | `gh` CLI | Optional — only for [Pull-request mode](#pull-request-mode). `./scripts/install-deps.sh --extras` installs it |
 
 The app itself has **no dependencies at all**. If no agent CLI is installed
@@ -85,13 +88,15 @@ Theseus AI v1.0.0
   python      : 3.12.3 (/usr/bin/python3)
   config      : /home/you/.config/ai-council/config.json
   runs        : /home/you/.config/ai-council/runs
+  mode        : council
   zero-touch  : off
   workspace   : /home/you/.config/ai-council/workspace (scratch)
   pull request: off
 
 Providers:
-  [MISS] Junior Draft   Codex    codex      -> not found on PATH
-  [MISS] Senior Polish  Claude   claude     -> not found on PATH
+  [MISS] council_codex  Codex    codex      -> not found on PATH
+  [MISS] council_claude Claude   claude     -> not found on PATH
+  [MISS] council_agy    Antigravity agy     -> not found on PATH
 ```
 
 ### Launcher flags
@@ -151,17 +156,19 @@ Confirm the app can see them with `./run.sh --doctor`.
 ### Trying it without the CLIs
 
 A mock agent ships in `scripts/`. It streams realistic Markdown and writes a
-real file, so the full Draft → Approve → Polish → Diff → Rollback loop works:
+real file, so the full Deliberate → Critique → Approve → Synthesize → Diff →
+Rollback loop works:
 
-Settings → for each stage, set the command to (one argument per line):
+Settings → Agents → each card, set the command to (one argument per line):
 
 ```text
 python3
 /absolute/path/to/ai-council/scripts/mock-agent.py
---role
-drafter                       ← use "polisher" for Stage 2
 {prompt}
 ```
+
+A council turn is recognised by what its prompt asks for, not by a flag, so
+the same command works whichever seat it lands in.
 
 ---
 
@@ -194,7 +201,7 @@ drafter                       ← use "polisher" for Stage 2
 
 | Tab | What it is |
 |---|---|
-| **Council** | The two-stage pipeline: draft, approve, apply. Each member's CLI, model, effort and role are set by clicking it on the strip. |
+| **Council** | Members answer independently, critique each other anonymised, then a chairman decides and applies. Each seat's CLI, model, effort and role are set by clicking it on the strip. |
 | **Chat** | One agent, one conversation, no gate and no writes. Its CLI, model and effort are the pickers under the composer. |
 | **Project** | An autonomous build. Three agents work a shared Kanban board against one folder until it is clear and the build is green. Nobody approves anything. See [Projects](#projects). |
 
@@ -352,8 +359,8 @@ one of them has a gate.
 
 | | Zero-Touch **off** (default) | Zero-Touch **on** |
 |---|---|---|
-| **Council** | Pauses at the gate. Nothing is on disk yet; **Approve & execute** is what grants Stage 2 permission. | No gate. Runs start to finish unattended, Stage 2 writing as it goes. |
-| **Chat** | Read-only. The assistant is invoked with its agent's read-only arguments (`--sandbox read-only`, `--permission-mode plan`) and can talk about the folder but not change it. | The assistant can create, modify and delete files, exactly as Stage 2 can. |
+| **Council** | Pauses at the gate. Nothing is on disk yet; **Approve & execute** is what grants the chairman permission. | No gate. Runs start to finish unattended, the chairman writing as it goes. |
+| **Chat** | Read-only. The assistant is invoked with its agent's read-only arguments (`--sandbox read-only`, `--permission-mode plan`) and can talk about the folder but not change it. | The assistant can create, modify and delete files, exactly as the chairman can. |
 
 Chat has no approval gate — nothing stands between the message and the reply
 for a human to review — so Zero-Touch is the *only* way to grant it write
@@ -363,8 +370,9 @@ which of the two you are in and turns amber when it is armed.
 
 Four properties hold throughout, and they are covered by tests:
 
-- **Stage 1 never receives an auto-approve flag.** It is read-only by contract
-  regardless of the toggle.
+- **A member or critique seat never receives an auto-approve flag.** They are
+  read-only by contract regardless of the toggle; only the chairman can be
+  granted one.
 - **Read-only and auto-approve are never both sent.** They are opposite grants;
   a provider gets one or the other.
 - **The flags are never baked into the command template.** They live in a
@@ -373,8 +381,8 @@ Four properties hold throughout, and they are covered by tests:
   passed.
 - **Whatever writes is protected the same way.** The safety snapshot is taken
   immediately before it and the diff collected immediately after, whether that
-  is Stage 2 or a Chat turn. A read-only run skips both, because reading a diff
-  after one would report your own uncommitted work as the agent's.
+  is the chairman or a Chat turn. A read-only run skips both, because reading a
+  diff after one would report your own uncommitted work as the agent's.
 
 > **Zero-Touch means what it says.** An agent will create, modify and delete
 > files in your working folder with no further confirmation. Use it on a
@@ -393,21 +401,20 @@ no gate and no branch for them to decide anything about.
 |---|---|---|
 | **Pull request** | Delivery | Deliver the run on a branch of its own and open a GitHub PR instead of writing to the checked-out branch. See below. |
 | **Require clean tree** | Delivery | Refuse to start if the repo has uncommitted changes. Pull-request mode enforces this itself, on or off. |
-| **Safety snapshot** | Delivery | Capture the worktree before Stage 2 so **Roll back** works. Leave on. |
+| **Safety snapshot** | Delivery | Capture the worktree before the chairman writes so **Roll back** works. Leave on. |
 
 ---
 
 ## Council or Chat
 
-The selector centred at the top decides which of two things your next message
-starts. It is the first choice, above everything it changes, because the two
-share almost nothing. (The third tab, Project, is a placeholder and starts
-nothing at all — it is deliberately not written to config, so the app never
-comes back up sitting in a mode it cannot run.)
+The selector centred at the top decides which of three things your next
+message (or, for Project, a goal) starts. It is the first choice, above
+everything it changes, because the three share almost nothing.
 
-**Council** is the pipeline this README is mostly about: Junior Draft →
-approval gate → Senior Polish, with the console, the diff, delivery controls,
-snapshots and rollback.
+**Council** is the pipeline this README is mostly about: independent member
+answers → anonymised critique → approval gate → chairman synthesis and
+application, with the console, the diff, delivery controls, snapshots and
+rollback. See [Projects](#projects) for the third tab.
 
 **Chat** is one assistant answering one message, the way opening `claude` or
 ChatGPT is. It has:
@@ -662,21 +669,21 @@ main (untouched)  ────────────────────�
                    \
                     ai-council/add-rate-limiting-9f2c1a  ──> pushed ──> PR
                      ^                      ^                            ^
-                     created after the      Stage 2 works here           you merge
+                     created after the      chairman works here         you merge
                      approval gate
 ```
 
 1. **Before anything starts**, every precondition is checked: a clean tree, a
    commit to branch from, a named branch (not a detached HEAD), a git identity
    to commit with, an `origin` remote, `gh` on `PATH`, and `gh auth status`
-   passing. Failing late — after the senior stage has spent its quota — would
+   passing. Failing late — after the chairman has spent its quota — would
    strand the work on a branch nobody asked for.
 2. **The branch is created after the approval gate**, so rejecting still leaves
    the repository completely untouched.
-3. Stage 2 works on that branch as it normally would.
+3. The chairman works on that branch as it normally would.
 4. On success the run commits everything it changed, pushes with
    `--set-upstream origin`, and runs `gh pr create --base <the branch you
-   started on> --head <the run's branch>`. The senior stage's own summary
+   started on> --head <the run's branch>`. The chairman's own summary
    becomes the PR body.
 5. **It then checks the base branch back out.** Left on the delivery branch,
    the next run would quietly take *it* as the base.
@@ -699,7 +706,7 @@ Two consequences worth knowing:
 
 This mode narrows what a safety snapshot is *for*, without replacing it. It
 still runs, and it is still the only recovery on offer between the moment
-Stage 2 starts writing and the moment the PR exists — the window a failed push
+the chairman starts writing and the moment the PR exists — the window a failed push
 or an unauthenticated `gh` leaves you in. What it no longer protects is your
 own uncommitted work, because there wasn't any: the run refused to start
 otherwise. In pull-request mode a rollback discards the run's work and returns
@@ -719,7 +726,7 @@ your base branch; enabling a ruleset is what stops everything else.
 
 ## How rollback works
 
-Before Stage 2 writes anything, the app records your worktree — tracked edits
+Before the chairman writes anything, the app records your worktree — tracked edits
 and untracked files alike — as a real commit object, anchored under its own ref
 in `refs/ai-council/snapshots/` so `git gc` can't reap it and a later run can't
 orphan an earlier one's snapshot (the twenty most recent are kept).
@@ -766,26 +773,29 @@ with an explanation rather than quietly sending an empty `--message=`.)
 
 The defaults:
 
-| Stage | Agent | Command | Auto-approve |
-|---|---|---|---|
-| 1 · Junior Draft | Codex | `codex exec {prompt}` | `--dangerously-bypass-approvals-and-sandbox` |
-| 2 · Senior Polish | Claude | `claude -p {prompt}` | `--dangerously-skip-permissions` |
+| Agent | Command | Auto-approve |
+|---|---|---|
+| Codex | `codex exec {prompt}` | `--dangerously-bypass-approvals-and-sandbox` |
+| Claude | `claude -p {prompt}` | `--dangerously-skip-permissions` |
 
-**Standing project rules** are appended to every prompt in both stages — a good
-place for "use tabs", "never add a dependency without asking", "all new code
-needs tests".
+**Standing project rules** are appended to every member's and the chairman's
+prompt — a good place for "use tabs", "never add a dependency without
+asking", "all new code needs tests".
 
 Config lives at `~/.config/ai-council/config.json`. Run transcripts are written
 to `~/.config/ai-council/runs/` and grouped into threads under the **Chats**
 tab, where a conversation can be read in full or
 [continued](#continuing-a-run).
 
-### Assigning agents to jobs
+### Assigning agents to seats
 
-The *agent* (which CLI) and the *job* (Junior Draft / Senior Polish) are
-separate settings. Settings → each stage has an **Agent** dropdown: Codex,
-Claude, Antigravity, or Custom command. Claude can draft and Codex can be the
-senior; the same agent can hold both jobs.
+The *agent* (which CLI) and the *seat* (member, or chairman) are separate
+settings. Settings → **Agents** has one card per installed CLI — Codex,
+Claude, Antigravity, or Custom command — with its command, auto-approve
+argument, model and streaming flags. Settings → **Council → Seating** is where
+each seat is pinned to one of those CLIs, or left on **Auto** for the router
+to pick per run from what the task looks like; the same pin-or-auto choice is
+one click away on any seat in the bench above the composer.
 
 **Antigravity** is Google's `agy`, which replaced Gemini CLI for personal
 accounts on 18 June 2026. Install it with
@@ -802,55 +812,50 @@ differs from the other two in three ways worth knowing:
 - **No quota reading.** It publishes no equivalent of `claude /usage`, so its
   member shows *no quota data* rather than a number this app made up.
 
-Picking one swaps that stage's command, display name, auto-approve argument,
-streaming arguments and model flag **as a single unit**, because those only
-make sense together —
-`--dangerously-skip-permissions` on `codex` is rejected outright, and the
-reverse is worse: the CLI starts, finds no permission grant, and blocks on a
-prompt nothing in this pipeline can answer. The swap also clears the stage's
-model, since a Codex slug handed to `claude --model` fails at launch.
+Editing a CLI's command by hand still works and simply reads back as
+**Custom command**; the command is the source of truth, and the card is
+derived from it, so the two can never disagree.
 
-Everything else about the stage — its job, prompt, timeout and approval
-behaviour — is untouched. Editing the command by hand still works and simply
-reads back as **Custom command**; the command is the source of truth, and the
-dropdown is derived from it, so the two can never disagree.
-
-The Chat assistant has its own entry in the same list, with its own display
+The Chat assistant has its own card in the same list, with its own display
 name, command and optional **Behaviour**. It has no Role, because it is not a
-stage in anything, and no Agent dropdown: the CLI Chat runs is the first chip
-under the composer, where the same swap happens on one click. Everything the dropdown
-would have written — command, permission flags, a cleared model and reasoning
-level — is written by the server either way.
+seat in the council, and no seat to pin it to: the CLI Chat runs is the first
+chip under the composer, where the same swap happens on one click.
 
 ### Roles
 
-What each stage is *told to do* is a setting, not a constant. Settings → per
-stage → **Role**:
+What a seat is *told to be* is a persona, pinned per seat the same way an
+agent is — Settings → **Council → Seating**, or left on **Auto** for the
+router to pick one the task calls for. The catalogue of personas is edited
+under Settings → **Roles**:
 
 | Template | Behaviour | Writes |
 |---|---|---|
-| Junior Draft | Surveys the repo, proposes a change | no |
-| Senior Polish | Verifies the draft, corrects it, applies it | yes |
+| Junior Draft *(legacy)* | Surveys the repo, proposes a change | no |
+| Senior Polish *(legacy)* | Verifies a draft, corrects it, applies it | yes |
 | Direct Implementer | Works the task directly, no draft to review | yes |
 | Adversarial Reviewer | Hunts for defects, fixes nothing | no |
 | Test Writer | Writes tests that would have caught real bugs | yes |
 | Security Reviewer | Findings with a real attacker and a real path | no |
 
-Pick one and it takes effect on the next run. The text box below it overrides
-the template entirely — edit it, or clear it to go back. Blank means "use the
-template", so clearing the box restores the default rather than sending an
-empty prompt.
+Junior Draft and Senior Polish are the two-stage council's personas, kept
+selectable but no longer wired to a stage that resolves them by name; every
+member seat today is read-only regardless of which persona it holds, and only
+the chairman can write. Pick a persona and it takes effect on the next run.
+The text box below it overrides the template entirely — edit it, or clear it
+to go back. Blank means "use the template", so clearing the box restores the
+default rather than sending an empty prompt.
 
-Combined with agent assignment, that already covers a lot: put Claude on the
-draft stage as an **Adversarial Reviewer** and Codex on the polish stage, and
+Combined with agent assignment, that already covers a lot: pin one seat to
+Claude as an **Adversarial Reviewer** and leave the rest on Auto, and
 Claude is no longer the final voice.
 
 **A caveat the UI states rather than hides.** Permission is still granted *per
-stage* — Stage 1 is read-only, Stage 2 writes once approved. So a writing role
-on Stage 1 produces an agent told to modify files that cannot, and a
-report-only role on Stage 2 gets told not to write while still permitted to.
-Settings flags the mismatch instead of silently resolving it; guessing which
-of the two you meant is how a safety setting stops being trustworthy.
+seat* — a member or critique seat is read-only, the chairman writes once
+approved. So a writing persona on a member seat produces an agent told to
+modify files that cannot, and a report-only persona on the chairman gets told
+not to write while still permitted to. Settings flags the mismatch instead of
+silently resolving it; guessing which of the two you meant is how a safety
+setting stops being trustworthy.
 
 ### Why the stream needs "streaming arguments"
 
@@ -933,15 +938,16 @@ unlabelled — the list is not wrong, it is just less specific.
 Blank — the default — passes no `--model` flag at all, so each CLI uses
 whatever it is configured for. That is the setting most likely to still be
 correct in six months. A practical split: put the cheap, generous-quota model
-on Stage 1 and spend the rationed one on Stage 2, which is where judgement
-actually matters.
+on the member seats and spend the rationed one on the chairman, which is where
+judgement actually matters.
 
-### Choosing a reasoning effort per stage
+### Choosing a reasoning effort per seat
 
 Beside the model chip is a second one for **reasoning effort** — the same knob
 `/effort` sets in Claude Code and the reasoning selector sets in Codex. Depth
-costs quota, and the two stages want different amounts of it: a junior sketching
-an approach rarely needs what a senior verifying it against the real code does.
+costs quota, and different seats want different amounts of it: a member
+sketching an independent answer rarely needs what a chairman weighing every
+answer and critique against the real code does.
 
 The levels are asked for, not shipped, for the same reason the model list is —
 and here it matters more, because the legal set is **per model**. Codex
@@ -993,7 +999,7 @@ guessed at, since a wrong guess would be read as the prompt or rejected.
 aicouncil/
 ├── __main__.py     Entry point, browser launcher, --doctor
 ├── server.py       http.server + SSE, token auth, Origin/Host validation
-├── pipeline.py     The state machine: drafting → gate → polishing → complete
+├── pipeline.py     The state machine: deliberate → critique → gate → synthesize → complete
 ├── projects.py     The board-driven autonomous loop and its .theseus/ board
 ├── providers.py    CLI adapters: argv construction, streaming, cancellation
 ├── prompts.py      Role catalogue, stage prompts and the project phase prompts
@@ -1047,7 +1053,7 @@ likely to break are exactly the ones a mock would paper over.
 Coverage focuses on the properties that matter if they're wrong:
 
 - Auto-approve flags reach the child process **if and only if** permission was
-  granted, and never reach Stage 1.
+  granted, and never reach a member or critique seat.
 - The approval gate is reached with a **pristine working tree**, and the
   configuration approved there is the one that runs — a settings change at the
   gate cannot swap the command about to be granted write permission.
@@ -1094,7 +1100,7 @@ Coverage focuses on the properties that matter if they're wrong:
 | Symptom | Cause / fix |
 |---|---|
 | `codex`/`claude` shows **not found** | Not on `PATH`. Run `./scripts/install-deps.sh`, or set an absolute path in Settings. |
-| Stage 2 finishes but the diff is empty | The CLI ran without write permission. With Zero-Touch off, you must click **Approve & execute** — that's what grants it. |
+| The chairman finishes but the diff is empty | The CLI ran without write permission. With Zero-Touch off, you must click **Approve & execute** — that's what grants it. |
 | "Missing session token" | The dashboard was opened without the launcher's URL. Restart with `./run.sh`. |
 | Pull-request mode refuses to start | It says which precondition failed — a dirty tree, no `origin`, no git identity, or `gh` missing or logged out. Fix that one thing. |
 | Run hangs, no output | The CLI is waiting on interactive input. Check its auto-approve arguments in Settings. |

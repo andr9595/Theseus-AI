@@ -1,26 +1,33 @@
-"""Prompt construction for the two council stages.
+"""Prompt construction for Council, Solo and Projects.
 
-The division of labour is the whole point of the quota optimisation:
+Council runs three stages, and ``build_member_prompt``, ``build_critique_prompt``
+and ``build_chairman_prompt`` build each in turn:
 
-* **Stage 1 (Codex, the junior)** does the expensive *exploratory* thinking -
-  reading the repo, weighing approaches, writing a first cut. It is explicitly
-  told **not** to modify files. Its output is a proposal document.
+* **Members** answer the task independently and in parallel, each through the
+  lens of the persona their seat was assigned. They are explicitly told **not**
+  to modify files - the deliberating and critiquing stages are read-only by
+  role regardless of what permission the run itself has been granted.
 
-* **Stage 2 (Claude, the senior)** receives that proposal as pre-digested
-  context. Because the survey work is already done, Claude spends its rationed
-  quota on judgement and application rather than on rediscovering the codebase.
+* **Critique** shows each member the others' answers, anonymised, and asks it
+  to weigh them against its own.
 
-Stage 2 is instructed to treat the draft as *untrusted input* - a suggestion
-from a colleague, not a specification. That framing matters: it keeps the
-senior stage from rubber-stamping a confidently-wrong draft, which is the main
-failure mode of a naive two-model chain.
+* **Chairman** receives every answer and every critique and is instructed to
+  treat them as *untrusted input* - colleagues' opinions, not a specification
+  - decide, and (if permitted) apply the outcome. That framing keeps the
+  chairman from rubber-stamping a confidently-wrong answer, which is the main
+  failure mode of a naive multi-model chain.
+
+``build_draft_prompt`` and ``build_polish_prompt`` remain for the two-stage
+Junior Draft / Senior Polish personas they were written for; those personas
+are still selectable in the role catalogue, but no stage resolves a prompt by
+name any more, so nothing in Council calls these builders today.
 
 Solo Mode is the exception to all of the above and lives here only for the
 company: ``build_chat_prompt`` adds no persona, no house rules and no
 repository preamble, because a plain conversation is supposed to reach the CLI
 as the operator typed it.
 
-Projects Mode has three roles rather than two and runs them in a loop with
+Projects Mode has three roles rather than one and runs them in a loop with
 nobody watching, so its prompts are built differently again - see the
 "Projects" section at the foot of this file. What they have in common with the
 council is that the shipped wording lives here and nowhere else.

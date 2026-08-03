@@ -144,7 +144,7 @@ def _print_doctor(store: cfg.ConfigStore) -> int:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="aicouncil",
-        description=f"{APP_NAME} - a local Junior Draft / Senior Polish coding pipeline.",
+        description=f"{APP_NAME} - a local, deliberating multi-agent coding council.",
     )
     parser.add_argument("--port", type=int, default=None, help="preferred port")
     parser.add_argument("--host", default="127.0.0.1", help="bind address (loopback only)")

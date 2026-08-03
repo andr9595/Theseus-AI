@@ -1,4 +1,4 @@
-"""The Junior Draft / Senior Polish orchestration engine.
+"""The deliberating council orchestration engine.
 
 Two modes, and they share only their start: Council is the pipeline below,
 Solo is one assistant answering one message.
@@ -9,16 +9,23 @@ State machine (Council)
     idle
       |  start()
       v
-    drafting
+    deliberating             (members answer independently, read-only)
+      |
+      v
+    critiquing                (members review each other, anonymised)
       |
       v
     awaiting_approval       (skipped in Zero-Touch Mode)
       |  approve()      \\  reject() / cancel()
       v                  v
-    polishing --------> cancelled
+    synthesizing ------> cancelled
       |
       +--> complete  (exit 0)
       +--> failed    (non-zero exit, timeout, or an unhandled error)
+
+A run that predates this three-stage rewrite may still report the two-stage
+``drafting`` / ``polishing`` states it was written in; those constants are
+kept only so an old transcript's status pill still resolves to a label.
 
 State machine (Solo)
 --------------------
@@ -42,8 +49,9 @@ permission has been granted, and is invoked with its ``read_only_args``
 everywhere else. The two modes differ only in who can grant it.
 
 * **Council** can always be granted it. Zero-Touch Mode grants it up front;
-  otherwise a human grants it at the gate. Stage 1 is read-only by role and
-  never receives it either way; Stage 2 carries it in ``execute_approved``.
+  otherwise a human grants it at the gate. The deliberating and critiquing
+  stages are read-only by role and never receive it either way; only the
+  chairman carries it, in ``execute_approved``.
 * **Solo** has no gate, so Zero-Touch is the only thing that can grant it.
   Without Zero-Touch the conversation is read-only, which is the default and
   what makes "what does this repo do?" safe to ask.
