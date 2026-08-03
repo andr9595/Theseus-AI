@@ -3214,8 +3214,6 @@ function renderSettings() {
   }).join('');
 
   $('#house-rules').value = conf.house_rules || '';
-  $('#caveman-project').checked = cavemanOn('project');
-  $('#efficiency-project').checked = efficiencyOn('project');
   $('#display-name').value = conf.display_name || '';
   $('#port-input').value = conf.port || 8760;
   $('#open-browser').checked = conf.open_browser !== false;
@@ -3454,15 +3452,10 @@ async function saveSettings() {
         providers,
         council: readCouncilSettings(),
         house_rules: $('#house-rules').value,
-        // Council and Chat live in their own composer menus. This form owns
-        // only Project, and the config store deep-merges this leaf without
-        // disturbing either chat mode.
-        caveman: {
-          project: $('#caveman-project').checked,
-        },
-        efficiency: {
-          project: $('#efficiency-project').checked,
-        },
+        // Caveman and Efficiency are absent on purpose: all three modes set
+        // them from their composer gear, which patches the one leaf it owns.
+        // Posting them from here too would let a stale form overwrite a
+        // toggle flipped after Settings was opened.
         display_name: $('#display-name').value.trim(),
         port: parseInt($('#port-input').value, 10) || 8760,
         open_browser: $('#open-browser').checked,

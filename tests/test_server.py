@@ -117,11 +117,14 @@ class TestStaticFiles(ServerTestBase):
         self.assertIn("Theseus AI", body)
 
     def test_caveman_settings_live_with_the_modes_that_use_them(self):
+        # All three modes toggle it from their composer gear, so Settings
+        # carries no checkbox for any of them - including Project, which used
+        # to own one and could overwrite the gear's value on save.
         with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
             body = res.read().decode()
         self.assertNotIn('id="caveman-council"', body)
         self.assertNotIn('id="caveman-chat"', body)
-        self.assertIn('id="caveman-project"', body)
+        self.assertNotIn('id="caveman-project"', body)
 
         with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
             script = res.read().decode()
@@ -137,7 +140,7 @@ class TestStaticFiles(ServerTestBase):
             body = res.read().decode()
         self.assertNotIn('id="efficiency-council"', body)
         self.assertNotIn('id="efficiency-chat"', body)
-        self.assertIn('id="efficiency-project"', body)
+        self.assertNotIn('id="efficiency-project"', body)
 
         with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
             script = res.read().decode()
