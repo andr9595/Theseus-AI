@@ -295,6 +295,21 @@ class TestConcurrentConfigWriters(unittest.TestCase):
         self.assertTrue(fresh["zero_touch"])
         self.assertEqual(fresh["house_rules"], "use tabs")
 
+    def test_remembering_a_workspace_does_not_revert_the_other_instance(self):
+        # This one runs at the start of every run with a chosen folder, which
+        # made it the likeliest write to be holding a stale copy - and it was
+        # the only writer that did not re-read first.
+        a = ConfigStore(self.path)
+        b = ConfigStore(self.path)
+
+        b.update({"zero_touch": True, "house_rules": "use tabs"})
+        a.remember_workspace("/tmp/some-project")
+
+        fresh = ConfigStore(self.path).all()
+        self.assertEqual(fresh["workspace"], "/tmp/some-project")
+        self.assertTrue(fresh["zero_touch"], "starting a run reverted zero_touch")
+        self.assertEqual(fresh["house_rules"], "use tabs")
+
     def test_same_key_written_twice_takes_the_later_value(self):
         a = ConfigStore(self.path)
         b = ConfigStore(self.path)

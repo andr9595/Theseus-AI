@@ -665,6 +665,13 @@ def main() -> int:
     # so that a test can assert a deliberating seat actually received it.
     parser.add_argument("--read-only", action="store_true")
     parser.add_argument("--fail", action="store_true", help="exit non-zero, to test error handling")
+    # What a CLI that hits its own quota wall, or dies inside its own harness,
+    # actually does: exits zero having printed nothing at all. It is the more
+    # dangerous half of "the agent failed", because everything downstream reads
+    # the exit code first.
+    parser.add_argument(
+        "--silent", action="store_true", help="exit zero with no output at all"
+    )
     args, unknown = parser.parse_known_args()
 
     if unknown:
@@ -673,6 +680,11 @@ def main() -> int:
 
     prompt = read_prompt(args.prompt)
     task = summarise_task(prompt)
+
+    # Before the banner: a silent CLI is silent on every stream, which is what
+    # makes it look like a success to anything reading the exit code.
+    if args.silent:
+        return 0
 
     zero_touch = (
         args.dangerously_skip_permissions

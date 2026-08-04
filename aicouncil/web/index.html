@@ -334,7 +334,7 @@
       </div>
     </div>
     <textarea id="approval-note" class="approval-note" rows="2" spellcheck="false"
-      placeholder="Optional: steer the senior stage. Takes precedence over the draft."></textarea>
+      placeholder="Optional: steer the chairman. Takes precedence over the council."></textarea>
     <div class="approval-actions">
       <button id="reject-btn" class="btn btn-quiet btn-sm" type="button">Reject</button>
       <button id="approve-btn" class="btn btn-primary btn-sm" type="button">Approve &amp; execute</button>
@@ -450,7 +450,9 @@
             <input id="council-seats" type="number" min="2" max="6">
             <span class="field-hint">
               How many answer the task independently. Two is the floor: one
-              member has no peer to review.
+              member has no peer to review. The ceiling is the number of agent
+              CLIs installed &mdash; asking for more seats than that seats
+              fewer, and the run says so.
             </span>
           </div>
           <div class="field">

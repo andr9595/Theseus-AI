@@ -645,7 +645,18 @@ def route(
                 f"would leave {len(without_chair)} member(s). It is holding a "
                 f"seat as well so the council has peers to review."
             )
-    wanted = min(wanted, max(2, len(pool)))
+    # The ceiling is the bench that exists. Asking for six seats on a machine
+    # with three CLIs installed buys three correlated answers at six times the
+    # quota, so the request is reduced - and said out loud, because a Members
+    # setting that quietly means something else is a setting nobody can trust.
+    seated = min(wanted, max(2, len(pool)))
+    if seated < wanted:
+        notes.append(
+            f"{wanted} members were asked for, but only {len(pool)} CLI(s) are "
+            f"available to seat. The council is {seated}; installing another "
+            f"agent is the only thing that widens it."
+        )
+    wanted = seated
 
     members: List[Seat] = []
     used: List[str] = []

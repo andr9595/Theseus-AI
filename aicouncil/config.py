@@ -502,6 +502,10 @@ DEFAULTS: Dict[str, Any] = {
         # The chair applies the patch, so it gets a longer ceiling than the
         # read-only members even though it is usually the same CLI.
         "chair_timeout_seconds": 1800,
+        # How long a Zero-Touch run waits at the gate its own failure forced
+        # on. Zero-Touch means nobody is watching, so an unanswerable gate has
+        # to end the run rather than park the engine on it forever.
+        "gate_timeout_seconds": 3600,
         # agent -> axis -> 0.0-1.0. What each CLI is taken to be good at, which
         # is half of what the router scores against. Empty means "use the
         # shipped profiles"; see router.DEFAULT_CAPABILITIES for those and for
@@ -800,10 +804,17 @@ class ConfigStore:
             return copy.deepcopy(self._data)
 
     def remember_workspace(self, folder: str, limit: int = 8) -> None:
-        """Push ``folder`` to the front of the most-recently-used list."""
+        """Push ``folder`` to the front of the most-recently-used list.
+
+        Re-reads first for the reason ``update`` does: this runs at the start
+        of every run with a chosen folder, and writing the whole file from a
+        stale in-memory copy would revert whatever another window - or a hand
+        edit - had changed since startup, ``zero_touch`` included.
+        """
         if not folder:
             return
         with self._lock:
+            self._data = self._load()
             recent = [r for r in self._data.get("recent_workspaces", []) if r != folder]
             recent.insert(0, folder)
             self._data["recent_workspaces"] = recent[:limit]

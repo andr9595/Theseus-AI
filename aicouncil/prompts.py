@@ -45,6 +45,17 @@ MAX_DRAFT_CHARS = 60_000
 # the second bound, on the whole rendered block, because a long enough thread
 # would otherwise crowd out the task itself.
 MAX_HISTORY_CHARS = 40_000
+# The two blocks the operator types and nothing else bounds: the task itself
+# and the standing project rules. Neither is clipped anywhere upstream - the
+# HTTP layer only refuses a 4 MB body - so without a bound here a pasted log
+# or a long rulebook lands in the argv of every seat, and the chairman's own
+# ceiling below cannot hold. Generous, because clipping either one is a real
+# loss; the point is that the worst case is a known number.
+MAX_TASK_CHARS = 24_000
+MAX_RULES_CHARS = 8_000
+# The steer typed at the approval gate. It outranks the council, so it is
+# bounded last and loosest of the three.
+MAX_REVIEWER_NOTE_CHARS = 6_000
 # How much of one stage's answer survives compaction. Enough to carry what was
 # decided; the full text stays on disk in that run's own transcript.
 MAX_COMPACT_REPLY_CHARS = 700
@@ -296,8 +307,9 @@ RULES - these are strict:
 plausible they sound. A confident paragraph about a function that does not \
 exist is the single most valuable thing you can catch here, and it is only \
 catchable by looking.
-3. You do not know which agent is which, and you are not told which reply is \
-your own. Judge the argument, not its author.
+3. You do not know which agent is which. Your own answer is not among those \
+below - every one of them is somebody else's. Judge the argument, not its \
+author.
 4. Do not invent disagreement. If a peer is right, saying so - once, briefly - \
 is a real contribution, because it tells the chairman the point is settled.
 
@@ -604,8 +616,13 @@ def _rules_block(house_rules: str) -> str:
     return (
         "\n\n# Standing project rules\n"
         "These override the general guidance above where they conflict.\n\n"
-        f"{house_rules.strip()}\n"
+        f"{clip(house_rules.strip(), MAX_RULES_CHARS)}\n"
     )
+
+
+def _task_block(task: str) -> str:
+    """The task as every stage is shown it, bounded."""
+    return f"# Task\n{clip(task.strip(), MAX_TASK_CHARS)}\n"
 
 
 # Caveman Mode. A style instruction, switched on per mode in Settings, and the
@@ -1101,7 +1118,7 @@ def build_member_prompt(
         f"{_rules_block(house_rules)}\n"
         f"# Context\n{_workspace_block(workspace, workspace_status)}\n"
         f"{_history_block(conversation)}\n"
-        f"# Task\n{task.strip()}\n"
+        f"{_task_block(task)}"
         f"\n{CONFIDENCE_CONTRACT}\n"
     )
 
@@ -1117,6 +1134,7 @@ def build_critique_prompt(
     system: str = "",
     caveman: bool = False,
     efficiency: bool = False,
+    own_position: str = "",
 ) -> str:
     """Stage 2: one member critiquing its peers, who are anonymous to it.
 
@@ -1125,11 +1143,25 @@ def build_critique_prompt(
     only the caller knows which seat this is; a member handed its own text back
     under an alias would be reviewing itself while believing it was reviewing a
     colleague, which is worse than not running the stage.
+
+    ``own_position`` is that same answer handed back *named as its own*, which
+    is the opposite case: every stage is a fresh process with no memory of the
+    last one, so without it the critic cannot say where a peer differs from
+    what it argued itself an hour ago. Labelled as context, never as a review
+    target.
     """
     system = system or COUNCIL_CRITIQUE_SYSTEM
     band = strictness(strictness_level)
 
-    budget = _share(MAX_POSITIONS_TOTAL, len(peers))
+    own = clip(str(own_position or "").strip(), _share(MAX_POSITIONS_TOTAL, 4))
+    own_text = (
+        f"\n# What you argued\n"
+        f"Your own answer to the same task, for comparison. It is context, not "
+        f"something to review - do not critique it below.\n\n"
+        f"---\n\n{own}\n"
+    ) if own else ""
+
+    budget = _share(MAX_POSITIONS_TOTAL, len(peers) + (1 if own else 0))
     blocks = []
     for peer in peers:
         alias = str(peer.get("alias") or "A peer")
@@ -1149,7 +1181,9 @@ def build_critique_prompt(
         f"{_efficiency_block(efficiency)}"
         f"{_rules_block(house_rules)}\n"
         f"# Context\n{_workspace_block(workspace, workspace_status)}\n"
-        f"# The task every member was given\n{task.strip()}\n"
+        f"# The task every member was given\n"
+        f"{clip(task.strip(), MAX_TASK_CHARS)}\n"
+        f"{own_text}"
         f"\n# Your fellow members' answers\n"
         f"These were written independently and at the same time as yours. One "
         f"of them may be better than yours; none of them is authoritative.\n\n"
@@ -1192,7 +1226,7 @@ def build_chairman_prompt(
             "The human operator read the council's deliberation and added "
             "this. It takes precedence over every member and over your own "
             "reading where they conflict.\n\n"
-            f"{reviewer_note.strip()}\n"
+            f"{clip(reviewer_note.strip(), MAX_REVIEWER_NOTE_CHARS)}\n"
         )
 
     # Everything that is not the deliberation itself, rendered first so the
@@ -1212,7 +1246,7 @@ def build_chairman_prompt(
         f"{_rules_block(house_rules)}\n"
         f"# Context\n{_workspace_block(workspace, workspace_status)}\n"
         f"{_history_block(conversation)}\n"
-        f"# Task\n{task.strip()}\n"
+        f"{_task_block(task)}"
         f"{note}\n"
     )
     tail = f"\n{CONFIDENCE_CONTRACT}\n"
@@ -1252,10 +1286,18 @@ def build_chairman_prompt(
     )
     # A last hard bound. The per-member shares above are the mechanism; this is
     # the guarantee, and it holds however many members were seated and however
-    # the shares round. Clipped here rather than at the end of the whole prompt
-    # so the contract trailer - the only thing that makes the reply parseable -
-    # can never be the part that gets cut.
-    return head + clip(deliberation, room) + tail
+    # the shares round.
+    #
+    # `room` alone is not that guarantee: it has a floor, so a head that is
+    # already large stops shrinking it and the total walks past the argv limit
+    # - which is a failed run, and a failed run *after* the gate, the branch
+    # and the snapshot. Every part of the head is bounded now (the rules, the
+    # task, the note and the thread each have a cap), so this clip should never
+    # fire; it is here so the sentence above is true rather than nearly true.
+    # The trailer is kept outside it because it is the only thing that makes
+    # the reply parseable and must never be the part that gets cut.
+    body = head + clip(deliberation, room)
+    return clip(body, MAX_CHAIRMAN_PROMPT - len(tail)) + tail
 
 
 def _chat_history_block(conversation: Optional[List[Dict[str, Any]]]) -> str:

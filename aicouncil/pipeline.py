@@ -126,6 +126,26 @@ MAX_PR_BODY_CHARS = 8_000
 # starts eliding a pull-request title.
 MAX_PR_TITLE_CHARS = 72
 
+# How long a degraded Zero-Touch run waits at the gate it did not ask for.
+# Zero-Touch means nobody is at the keyboard, so the gate that a failed
+# deliberation forces on has nobody to answer it; without a bound the worker
+# thread parks forever and the engine refuses every later run. Overridable per
+# install as ``council.gate_timeout_seconds``.
+DEFAULT_GATE_TIMEOUT = 3600.0
+
+
+def stage_succeeded(result: ProviderResult) -> bool:
+    """Whether a stage actually produced something, not merely exited zero.
+
+    A CLI that hits its own quota wall, refuses a sandbox or dies inside its
+    own harness can still exit 0 with an empty stdout - one of the three
+    catalogued agents does exactly that. Counted as success it costs twice
+    over: the seat is dropped from the deliberation, because there is no answer
+    to carry, while the transcript shows it green and the router is told the
+    agent did fine.
+    """
+    return bool(result.ok and result.stdout.strip())
+
 
 def resolve_workspace(folder: str) -> str:
     """The absolute directory a run should execute in.
@@ -989,7 +1009,13 @@ class Pipeline:
         stage.command = result.command
         stage.exit_code = result.exit_code
         stage.error = result.error
-        stage.state = "done" if result.ok else "failed"
+        ok = stage_succeeded(result)
+        if result.ok and not ok:
+            stage.error = (
+                "The CLI exited cleanly but printed nothing. Nothing from this "
+                "stage reached the rest of the run."
+            )
+        stage.state = "done" if ok else "failed"
         # Read the agent's own trailer off its reply. Absent is a legitimate
         # answer and stays None rather than becoming a default.
         trailer = prompts.parse_trailer(result.stdout)
@@ -1080,8 +1106,8 @@ class Pipeline:
 
         if self._is_cancelled():
             self._finish_cancelled(run)
-        elif not result.ok:
-            run.error = result.error or "The assistant failed."
+        elif not stage_succeeded(result):
+            run.error = run.stages["solo"].error or "The assistant failed."
             self._set_state(run, FAILED)
         elif writes and run.pull_request_mode:
             self._publish(run)
@@ -1147,6 +1173,21 @@ class Pipeline:
             t.join()
         return results
 
+    def _skip_unrun_critiques(self, run: Run, seating: router.Seating) -> None:
+        """Close off the critique stages that were never dispatched.
+
+        A seat only critiques if its own position survived, so a bench of
+        three with one silent member cross-evaluates in two. The stage record
+        for the third has to say `skipped` rather than stay `pending`: the
+        thread hides a pending stage with no output, so what the operator saw
+        was three positions, two critiques and no explanation.
+        """
+        for seat in seating.members:
+            stage = run.stages.get(f"{seat.id}_critique")
+            if stage and stage.state == "pending":
+                stage.state = "skipped"
+                stage.error = "No position from this seat, so it had no peers to review."
+
     def _persona_system(self, seat: router.Seat, roles: Dict[str, Any]) -> str:
         """The lens a seat brings, as edited in the Roles catalogue.
 
@@ -1203,6 +1244,28 @@ class Pipeline:
         for note in seating.notes:
             self.bus.publish("log", level="warn", message=note)
 
+        # Read-only is a role here, enforced by what the CLI is invoked with.
+        # A provider that declares no `read_only_args` - the Custom command
+        # preset ships with none - is held to it by the prompt alone, which is
+        # a weaker promise than the one the stage makes and is worth saying out
+        # loud rather than implying.
+        unguarded = sorted({
+            str(self._seat_provider(run, seat).get("label") or seat.agent)
+            for seat in seating.members
+            if not (self._seat_provider(run, seat).get("read_only_args") or [])
+        })
+        if unguarded:
+            self.bus.publish(
+                "log",
+                level="warn",
+                message=(
+                    f"{', '.join(unguarded)} has no read-only arguments "
+                    f"configured, so nothing but the prompt stops it writing "
+                    f"during the deliberation. Set them under Agents in "
+                    f"Settings."
+                ),
+            )
+
         results = self._run_parallel(
             run,
             [
@@ -1236,7 +1299,7 @@ class Pipeline:
         positions = [
             {"seat": seat, "alias": seat.alias, "output": results[seat.id].stdout}
             for seat in seating.members
-            if seat.id in results and results[seat.id].ok and results[seat.id].stdout.strip()
+            if seat.id in results and stage_succeeded(results[seat.id])
         ]
         if len(positions) < len(seating.members):
             lost = len(seating.members) - len(positions)
@@ -1261,6 +1324,29 @@ class Pipeline:
                         "deliberation to synthesise, and there is none."
                         if run.zero_touch
                         else "The chairman can still work the task alone."
+                    )
+                ),
+            )
+        elif len({p["seat"].agent for p in positions}) < 2:
+            # One voice is not a quorum however many chairs were laid out. It
+            # happens two ways: seats duplicated onto the only installed CLI,
+            # and everyone but one member failing. Either way what reaches the
+            # chairman is a single opinion with nothing to weigh it against,
+            # and Zero-Touch writing that unattended is not what the toggle
+            # promises - so the gate comes back on.
+            degraded = True
+            self.bus.publish(
+                "log",
+                level="warn",
+                message=(
+                    f"Only one CLI ({positions[0]['seat'].agent}) produced an "
+                    f"answer, so there was no second opinion to weigh it "
+                    f"against. "
+                    + (
+                        "Pausing for approval rather than writing on one "
+                        "voice unattended."
+                        if run.zero_touch
+                        else "The chairman is working from a single position."
                     )
                 ),
             )
@@ -1294,6 +1380,11 @@ class Pipeline:
                             strictness_level=run.strictness,
                             caveman=caveman,
                             efficiency=efficiency,
+                            # Its own answer, named as its own. A fresh process
+                            # has no memory of Stage 1, so without this it
+                            # cannot say where a peer differs from what it
+                            # argued itself.
+                            own_position=p["output"],
                         ),
                         False,
                         True,
@@ -1304,6 +1395,12 @@ class Pipeline:
             if self._is_cancelled():
                 self._finish_cancelled(run)
                 return
+            # A seat with no position has no peers to review and never ran.
+            # Saying so is the difference between a bench of three that
+            # cross-evaluated in pairs and one that silently did two of three:
+            # a stage left `pending` is filtered out of the thread entirely,
+            # so the missing card looked like a rendering quirk.
+            self._skip_unrun_critiques(run, seating)
             critiques = [
                 {
                     "alias": p["seat"].alias,
@@ -1311,13 +1408,10 @@ class Pipeline:
                 }
                 for p in positions
                 if f"{p['seat'].id}_critique" in critique_results
-                and critique_results[f"{p['seat'].id}_critique"].ok
+                and stage_succeeded(critique_results[f"{p['seat'].id}_critique"])
             ]
         else:
-            for seat in seating.members:
-                stage = run.stages.get(f"{seat.id}_critique")
-                if stage and stage.state == "pending":
-                    stage.state = "skipped"
+            self._skip_unrun_critiques(run, seating)
             if positions:
                 self.bus.publish(
                     "log",
@@ -1333,23 +1427,40 @@ class Pipeline:
         # write, and what it shows is now the whole deliberation rather than
         # one draft.
         if not run.zero_touch or degraded:
-            self._set_state(
-                run,
-                AWAITING_APPROVAL,
-                draft=positions[0]["output"] if positions else "",
-            )
+            self._set_state(run, AWAITING_APPROVAL)
             self.bus.publish(
                 "log",
                 level="info",
                 message=(
                     "Paused for review. Nothing has been written to disk yet."
                     if not degraded
-                    else "Paused for review: the council produced nothing to "
-                         "synthesise. Approving runs the chairman alone "
-                         "against your task."
+                    else "Paused for review: the council did not reach a "
+                         "quorum. Approving runs the chairman on what little "
+                         "there is."
                 ),
             )
-            self._gate.wait()
+            # A gate the operator chose waits as long as they need. A gate
+            # forced onto a Zero-Touch run has nobody to answer it - that is
+            # what the toggle said - so it waits a bounded time and then gives
+            # up, which is what it would have done had the chairman failed.
+            # Parking forever also leaves `is_busy()` true and refuses every
+            # later run and project.
+            timeout = (
+                float(
+                    (conf.get("council") or {}).get("gate_timeout_seconds")
+                    or DEFAULT_GATE_TIMEOUT
+                )
+                if run.zero_touch
+                else None
+            )
+            if not self._gate.wait(timeout):
+                self._finish_cancelled(
+                    run,
+                    f"Zero-Touch was on, the council did not reach a quorum, "
+                    f"and nobody approved the run within {int(timeout or 0)}s. "
+                    f"Nothing was written.",
+                )
+                return
             with self._lock:
                 decision = self._gate_decision
             if decision != "approve" or self._is_cancelled():
@@ -1411,8 +1522,16 @@ class Pipeline:
             self._finish_cancelled(run)
             return
 
-        if not result.ok:
-            run.error = result.error or "The chairman failed."
+        if not stage_succeeded(result):
+            run.error = run.stages["chair"].error or "The chairman failed."
+            # A failed chairman in delivery mode leaves the operator standing
+            # on the work branch, and the next run reads the current branch as
+            # its base - which is the hazard `_publish` checks out to avoid on
+            # the way past. Not checked out here: whatever the chairman half
+            # wrote is still uncommitted in the tree, and carrying that onto
+            # the base branch is worse than staying put. Said out loud
+            # instead, as the cancelled path does.
+            self._warn_left_on_work_branch(run)
             self._set_state(run, FAILED)
         elif run.pull_request_mode:
             self._publish(run)
@@ -1536,6 +1655,31 @@ class Pipeline:
         with self._lock:
             return self._cancel_requested
 
+    def _warn_left_on_work_branch(self, run: Run, why: str = "") -> None:
+        """Say so when a run ends with the repository on its delivery branch.
+
+        The next run takes whatever is checked out as its pull-request base, so
+        being left somewhere nobody chose is not cosmetic.
+        """
+        if not run.work_branch:
+            return
+        try:
+            here = gitutil.status(run.workspace).branch
+        except (gitutil.GitError, OSError):
+            return
+        if here != run.work_branch:
+            return
+        self.bus.publish(
+            "log",
+            level="warn",
+            message=(
+                f"{why or 'Ended'} on {run.work_branch}. Nothing was pushed and "
+                f"{run.base_branch} is unchanged - switch back to "
+                f"{run.base_branch} before the next run, or it will branch "
+                f"from here."
+            ),
+        )
+
     def _finish_cancelled(self, run: Run, message: str = "Run cancelled.") -> None:
         for stage in run.stages.values():
             if stage.state in ("pending", "running"):
@@ -1544,15 +1688,7 @@ class Pipeline:
         # A cancellation after the gate leaves the operator on the delivery
         # branch. Saying so is the difference between "nothing happened" and
         # "your repository is on a branch you did not create".
-        if run.work_branch and gitutil.status(run.workspace).branch == run.work_branch:
-            self.bus.publish(
-                "log",
-                level="warn",
-                message=(
-                    f"Cancelled on {run.work_branch}. Nothing was pushed and "
-                    f"{run.base_branch} is unchanged."
-                ),
-            )
+        self._warn_left_on_work_branch(run, "Cancelled")
         # Only a council run can have changed the tree. Reading a diff after a
         # cancelled conversation would attribute the operator's own
         # uncommitted work to an agent that never had permission to write.
@@ -1576,6 +1712,13 @@ class Pipeline:
         A rollback is recorded against the chairman alone. It is the seat that
         wrote the code the operator threw away; the members proposed, which is
         not the same thing and should not be penalised the same way.
+
+        What is recorded is deliberately narrow. A stage that never ran carries
+        no information about the agent that would have run it - an exception in
+        the engine, or a cancellation, used to be written into the history as a
+        failure by every seat - so only stages that actually finished are
+        sampled. Even then the signal is "the CLI answered", not "the answer
+        was good"; the only judgement in here is the operator's rollback.
         """
         if not run.seating:
             return
@@ -1592,9 +1735,11 @@ class Pipeline:
             else:
                 for seat in run.seating.members:
                     stage = run.stages.get(seat.id)
+                    if not stage or stage.state not in ("done", "failed"):
+                        continue
                     router.record_outcome(
                         stats, seat.agent, weights,
-                        ok=bool(stage and stage.state == "done"),
+                        ok=stage.state == "done",
                     )
                 chair_stage = run.stages.get("chair")
                 if chair_stage and chair_stage.state in ("done", "failed"):

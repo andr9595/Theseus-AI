@@ -104,6 +104,24 @@ class TestSeating(unittest.TestCase):
         agents = [s.agent for s in seating.members]
         self.assertEqual(len(set(agents)), 3, "a CLI was seated twice needlessly")
 
+    def test_asking_for_more_seats_than_there_are_clis_says_so(self):
+        # The Members setting is bounded by the bench that exists. Reducing it
+        # silently made a council of six look like one of three in the UI with
+        # nothing anywhere to explain the difference.
+        seating = router.route("anything", ["codex", "claude"], run_id="a",
+                               seat_count=6)
+        self.assertEqual(len(seating.members), 2)
+        self.assertTrue(
+            any("6 members were asked for" in n for n in seating.notes),
+            seating.notes,
+        )
+
+    def test_a_seat_count_that_fits_is_not_commented_on(self):
+        seating = router.route("anything", ALL, run_id="a", seat_count=3)
+        self.assertFalse(
+            [n for n in seating.notes if "asked for" in n], seating.notes
+        )
+
     def test_a_pin_is_honoured_and_says_so(self):
         seating = router.route(
             "anything", ALL, run_id="a", pins={"chair": "codex", "seat1": "agy"}
@@ -330,6 +348,65 @@ class TestCouncilPrompts(unittest.TestCase):
             conversation=[{"task": big, "replies": []}],
         )
         self.assertLess(len(text), ARGV_PROMPT_LIMIT)
+
+    def test_the_chairman_prompt_holds_when_the_head_is_the_long_part(self):
+        # The per-member budgets were the only real bound, and they only bound
+        # the deliberation. A pasted log as the task, a long rulebook and a
+        # replayed thread all land above it - and the run that failed on the
+        # argv limit failed in the chairman, after the gate, the branch and the
+        # snapshot, having already spent every member's quota.
+        from aicouncil.providers import ARGV_PROMPT_LIMIT
+
+        big = "x" * 200_000
+        text = prompts.build_chairman_prompt(
+            big,
+            [{"alias": "Agent A", "output": big}],
+            [{"alias": "Agent A", "output": big}],
+            "/tmp",
+            house_rules=big,
+            reviewer_note=big,
+            conversation=[{"task": big, "replies": []}],
+        )
+        self.assertLess(len(text), ARGV_PROMPT_LIMIT)
+        self.assertLessEqual(len(text), prompts.MAX_CHAIRMAN_PROMPT)
+        # The trailer is what makes the reply parseable and is never the part
+        # that gets cut.
+        self.assertIn("CONFIDENCE:", text)
+
+    def test_a_member_prompt_bounds_the_task_it_is_given(self):
+        from aicouncil.providers import ARGV_PROMPT_LIMIT
+
+        text = prompts.build_member_prompt("x" * 200_000, "/tmp",
+                                           house_rules="y" * 50_000)
+        self.assertLess(len(text), ARGV_PROMPT_LIMIT)
+        self.assertIn("CONFIDENCE:", text)
+
+    def test_a_critic_is_shown_its_own_answer_as_context_not_as_a_target(self):
+        # Every stage is a fresh process with no memory of the last one, so
+        # without this the critic cannot say where a peer differs from what it
+        # argued itself an hour ago.
+        text = prompts.build_critique_prompt(
+            "t",
+            [{"alias": "Agent B", "output": "peer said this"}],
+            "/tmp",
+            own_position="I said this",
+        )
+        self.assertIn("I said this", text)
+        self.assertIn("context, not", text)
+        self.assertLess(
+            text.index("I said this"),
+            text.index("peer said this"),
+            "the seat's own answer is not distinguishable from the peers",
+        )
+
+    def test_a_critic_is_never_told_it_might_be_reviewing_itself(self):
+        # The caller excludes the seat's own answer from `peers`, so a rule
+        # warning that it might be in there describes a case that cannot arise.
+        text = prompts.build_critique_prompt(
+            "t", [{"alias": "Agent B", "output": "x"}], "/tmp"
+        )
+        self.assertNotIn("not told which reply is your own", text)
+        self.assertIn("Your own answer is not among those below", text)
 
 
 if __name__ == "__main__":

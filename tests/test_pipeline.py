@@ -937,10 +937,12 @@ class TestFailureHandling(PipelineTestBase):
         self.pipeline.reject()
         self.wait_terminal()
 
-    def test_a_lone_position_skips_the_critique_stage(self):
+    def test_a_lone_position_skips_the_critique_stage_and_stops_at_the_gate(self):
         # One member handed its own answer back under an alias would be
         # reviewing itself while believing it a colleague. Skipping is right.
         # Chair sits out, so the bench is codex and agy - and only agy answers.
+        # One voice is not a quorum, so Zero-Touch pauses rather than letting a
+        # single unreviewed opinion be written unattended.
         self.store.update({
             "zero_touch": True,
             "providers": {
@@ -949,11 +951,68 @@ class TestFailureHandling(PipelineTestBase):
         })
         self.pin_chair("claude")
         run = self.pipeline.start("only one survives", str(self.repo))
+        self.wait_for(
+            lambda: run.state == "awaiting_approval", what="the quorum gate"
+        )
+        self.assertFalse((self.repo / "AI_COUNCIL_DEMO.md").exists())
+        self.pipeline.approve()
         self.wait_terminal()
 
         self.assertEqual(run.state, "complete", run.error)
         for stage in self.critique_stages(run):
             self.assertIn(stage.state, ("skipped", "failed"))
+
+    def test_two_seats_on_one_cli_are_not_a_quorum(self):
+        # A machine with one CLI installed gets two seats on it, which is two
+        # correlated answers rather than two votes. Zero-Touch stops for a
+        # human rather than writing on a council that never disagreed.
+        self.store.update({
+            "zero_touch": True,
+            "providers": {
+                cfg.council_provider_id(a): {
+                    "command": ["definitely-not-a-real-binary-xyz", "{prompt}"],
+                }
+                for a in cfg.AGENTS
+                if a != "codex"
+            },
+        })
+        run = self.pipeline.start("one voice only", str(self.repo))
+        self.wait_for(
+            lambda: run.state == "awaiting_approval", what="the quorum gate"
+        )
+        self.assertEqual({s.agent for s in run.seating.members}, {"codex"})
+        self.assertFalse((self.repo / "AI_COUNCIL_DEMO.md").exists())
+        self.pipeline.reject()
+        self.wait_terminal()
+
+    def test_a_silent_member_is_failed_not_counted_as_an_answer(self):
+        # Exit 0 with an empty stdout is what a CLI that hit its own quota
+        # wall does. Counted as success it costs twice: the seat is dropped
+        # from the deliberation anyway, while the transcript shows it green
+        # and its critique card is left pending with no explanation.
+        self.store.update({
+            "zero_touch": True,
+            "providers": {
+                cfg.council_provider_id("agy"): mock_council("agy", ["--silent"]),
+            },
+        })
+        run = self.pipeline.start("one seat says nothing", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        states = {s.agent: s.state for s in self.member_stages(run)}
+        self.assertEqual(states.get("agy"), "failed")
+        silent = [s for s in run.seating.members if s.agent == "agy"][0]
+        critique = run.stages[f"{silent.id}_critique"]
+        self.assertEqual(critique.state, "skipped")
+        self.assertIn("no peers", critique.error)
+        # The seats that did answer still cross-evaluated.
+        answered = [
+            run.stages[f"{s.id}_critique"]
+            for s in run.seating.members
+            if s.agent != "agy"
+        ]
+        self.assertTrue(all(s.state == "done" for s in answered))
 
     def test_no_installed_cli_refuses_to_start(self):
         # The router seats only CLIs that actually resolve, so a machine with

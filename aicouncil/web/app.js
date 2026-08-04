@@ -685,13 +685,14 @@ function renderStatus() {
     : state.busy ? 'A run is already in progress.'
     : hasTask ? 'Send' : 'Describe what you want first.';
 
-  // The gate itself is placed in the thread by `renderThread`, next to the
-  // draft it is judging. What it says still depends only on the run.
+  // The gate itself is placed in the thread by `renderThread`, after the
+  // deliberation it is judging. What it says still depends only on the run.
   const gated = !!(run && !run.solo && run.state === 'awaiting_approval');
   if (gated) {
     $('#approval-copy').innerHTML =
-      'The draft above is ready. <b>Nothing has been written to disk yet.</b> ' +
-      'Approving lets the senior stage apply changes in ' +
+      'The council has finished deliberating; the chairman has not run yet, ' +
+      'so <b>nothing has been written to disk</b>. ' +
+      'Approving lets the chairman apply changes in ' +
       `<b>${esc(runWorkspace(run))}</b>.` +
       // Whether a rollback point exists changes what approving costs, and the
       // gate is the last moment that can change the answer.
@@ -1500,8 +1501,8 @@ function renderMode() {
       ? 'One agent, one conversation — and Zero-Touch is on, so it can change files in your working folder.'
       : 'One agent, one conversation. Read-only: turn Zero-Touch on to let it change files.')
     : (armed
-      ? 'One agent drafts, the other applies — and Zero-Touch is on, so it will not stop to ask.'
-      : 'One agent drafts, you approve, the other applies.');
+      ? 'Several agents answer, review each other, and a chairman applies the outcome — and Zero-Touch is on, so it will not stop to ask.'
+      : 'Several agents answer, review each other, you approve, and a chairman applies the outcome.');
   sub.classList.toggle('armed', armed);
   $('#gear-btn').classList.toggle('armed', armed);
 
@@ -4087,7 +4088,12 @@ async function startRun() {
 
   // Quota warning. Advisory only: the reading is a snapshot, and only the
   // operator knows whether this particular task is worth the remaining budget.
-  const worst = worstUsageFor(solo ? ['solo'] : ['drafter', 'polisher']);
+  // Every council provider is checked because the bench is routed per run —
+  // which CLIs will be seated is not known until the run starts.
+  const worst = worstUsageFor(
+    solo ? ['solo'] : Object.keys(conf.providers || {})
+      .filter(id => id.startsWith('council_'))
+  );
   const threshold = Number(conf.usage_warn_percent ?? 85);
   if (worst && worst.percent >= threshold) {
     const ok = confirm(
@@ -4304,7 +4310,8 @@ function wire() {
   $('#rollback-btn').addEventListener('click', async () => {
     if (!confirm(
       'Roll back?\n\nThis resets the working tree to the snapshot taken before ' +
-      'the senior stage ran. Any change made during this run is discarded.'
+      'anything was allowed to write. Any change made during this run is ' +
+      'discarded.'
     )) return;
     try {
       await api('/api/rollback', { method: 'POST' });
