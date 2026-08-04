@@ -340,6 +340,123 @@ html, body {
 .council-steps { flex: 0 0 auto; padding: 0 20px 8px; }
 .council-steps .strip-cell.muted { opacity: .55; }
 
+/* Each cell opens. The counts on it ("2 of 3, 1 failed") are a summary of
+   things that individually have names, states and reasons, and the only place
+   those were readable before was the transcript below - which is exactly what
+   you cannot read when a member has failed and written nothing. */
+.step-cell {
+  position: relative;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  padding-right: 22px;
+}
+.step-cell[disabled] { cursor: default; opacity: .55; }
+.step-cell:not([disabled]):hover { background: var(--bg-3); border-color: var(--line); }
+.step-cell.open { background: var(--bg-3); border-color: var(--line); }
+/* A failed member is the one thing on this row that must not need a click to
+   be noticed, so the cell carries the count as a badge and reddens its edge. */
+.step-cell.has-failure { border-top-color: var(--red); }
+.step-cell.has-failure .strip-note { color: var(--red); }
+.step-fail-dot {
+  display: inline-grid; place-items: center;
+  min-width: 14px; height: 14px; padding: 0 4px; margin-left: 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--red) 20%, transparent);
+  color: var(--red);
+  font-family: var(--mono); font-size: 9.5px; font-weight: 700;
+  letter-spacing: 0; vertical-align: middle;
+}
+.step-chevron {
+  position: absolute; top: 9px; right: 8px;
+  font-size: 9px; color: var(--text-3); line-height: 1;
+}
+
+.step-panel {
+  margin-top: 6px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  background: var(--bg-1);
+  overflow: hidden;
+}
+.step-panel-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 10px; font-weight: 600;
+  letter-spacing: .8px; text-transform: uppercase; color: var(--text-3);
+}
+.step-close {
+  border: 0; background: none; cursor: pointer;
+  color: var(--text-3); font-size: 15px; line-height: 1; padding: 0 2px;
+}
+.step-close:hover { color: var(--text); }
+
+/* One row per seat, in seating order. A row is a link into the thread: the
+   panel says what happened, the message says what was said, and neither has
+   to repeat the other.
+
+   Scoped to the panel because the Projects timeline further down owns a
+   `.step-*` family of its own, and two unrelated things answering to the same
+   class name is how one of them starts restyling the other. */
+.step-panel .step-row {
+  display: flex; gap: 9px; align-items: flex-start; width: 100%;
+  padding: 8px 10px;
+  border: 0; border-top: 1px solid var(--line-soft);
+  background: none; color: inherit; font: inherit; text-align: left;
+  cursor: pointer;
+}
+.step-panel .step-row:first-of-type { border-top: 0; }
+.step-panel .step-row[disabled] { cursor: default; opacity: .6; }
+.step-panel .step-row:not([disabled]):hover { background: var(--bg-2); }
+.step-panel .step-mark {
+  display: grid; place-items: center;
+  width: 22px; height: 22px; flex: 0 0 auto;
+  border-radius: 6px;
+  background: var(--bg-3); color: var(--text-2);
+  font-family: var(--mono); font-size: 9.5px; font-weight: 700;
+}
+.step-panel .step-row-body { min-width: 0; flex: 1 1 auto; }
+.step-panel .step-row-head {
+  display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+  font-size: 12px;
+}
+.step-panel .step-who { font-weight: 600; }
+.step-panel .step-alias, .step-panel .step-model {
+  font-family: var(--mono); font-size: 10px; color: var(--text-3);
+}
+.step-panel .step-state {
+  font-size: 10px; font-weight: 600;
+  letter-spacing: .5px; text-transform: uppercase; color: var(--text-3);
+}
+.step-panel .step-dur { font-family: var(--mono); font-size: 10px; color: var(--text-3); }
+.step-panel .step-row.st-failed .step-mark {
+  background: color-mix(in srgb, var(--red) 16%, transparent); color: var(--red);
+}
+.step-panel .step-row.st-failed .step-state { color: var(--red); }
+.step-panel .step-row.st-done .step-state { color: var(--green); }
+.step-panel .step-row.st-running .step-state { color: var(--accent-2); }
+.step-panel .step-line {
+  display: block; margin-top: 3px;
+  font-size: 11.5px; line-height: 1.45; color: var(--text-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* The failure reason wraps instead: it is the answer to "why", and an
+   ellipsis in the middle of it would hide the part that says so. */
+.step-panel .step-line.err { color: var(--red); white-space: normal; }
+.step-panel .step-line.muted { color: var(--text-3); }
+
+/* Where a row lands. Long enough to catch the eye after the scroll settles,
+   and gone on its own so nothing has to be clicked to clear it. */
+.chat-message.flash {
+  animation: flash-msg 1.8s ease-out;
+}
+@keyframes flash-msg {
+  0%, 55% { box-shadow: 0 0 0 2px var(--accent-2) inset; }
+  100% { box-shadow: 0 0 0 2px transparent inset; }
+}
+
 .member-mark {
   display: grid; place-items: center;
   width: 28px; height: 28px; flex: 0 0 auto;

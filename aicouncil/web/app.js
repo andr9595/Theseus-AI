@@ -580,6 +580,10 @@ const state = {
   // from the prompt and a strip showing last run's council would be worse
   // than one showing none. Null until the first answer arrives.
   seating: null,
+  // Which stepper cell is opened out into a per-agent breakdown, by step key.
+  // Held here rather than on the DOM because the stepper is re-rendered on
+  // every event of a live run, which would otherwise close it as you read.
+  openStep: '',
 };
 
 const STATE_LABELS = {
@@ -995,12 +999,39 @@ const COUNCIL_STEPS = [
     states: ['synthesizing', 'awaiting_approval'] },
 ];
 
+/** The stages belonging to one step, in the order the run runs them. Read
+ *  through `stage_order` rather than off the object so the breakdown lists the
+ *  seats in the same order the bench above it seats them. */
+function stagesInStep(run, key) {
+  const stages = (run && run.stages) || {};
+  return ((run && run.stage_order) || Object.keys(stages))
+    .map(id => (stages[id] ? Object.assign({}, stages[id], { id }) : null))
+    .filter(s => s && s.kind === key);
+}
+
+// What a stage's state is called in the breakdown. Longer than the words used
+// on a message, because here they are the whole content of a row rather than a
+// footnote to output that is already on screen.
+const STEP_STATE_WORDS = {
+  done: 'answered', failed: 'failed', running: 'working',
+  skipped: 'skipped', pending: 'not started', waiting: 'gated',
+};
+
 function renderCouncilSteps() {
   const host = $('#council-steps');
   const run = runOnScreen();
   const show = uiMode() === 'council' && run && !run.solo && run.seating;
   host.classList.toggle('hidden', !show);
-  if (!show) { $('.project-strip', host).innerHTML = ''; return; }
+  if (!show) {
+    $('.project-strip', host).innerHTML = '';
+    $('#step-detail').innerHTML = '';
+    return;
+  }
+
+  // A step that has nothing under it cannot be opened, and one held open
+  // through a mode switch would reopen against a different run's stages.
+  let open = state.openStep;
+  if (open && !stagesInStep(run, open).length) open = state.openStep = '';
 
   const stages = Object.values(run.stages || {});
   $('.project-strip', host).innerHTML = COUNCIL_STEPS.map(step => {
@@ -1019,14 +1050,124 @@ function renderCouncilSteps() {
       (failed ? `, ${failed} failed` : '');
     else note = 'not reached';
 
+    // A cell with nothing behind it is still drawn, but as a plain cell: a
+    // button that opens an empty panel is worse than one that is not offered.
+    const openable = mine.length > 0;
+    const isOpen = openable && open === step.key;
     return (
-      `<span class="strip-cell${live ? ' live' : ''}${skipped ? ' muted' : ''}">` +
-        `<span class="strip-label">${esc(step.label)}</span>` +
+      `<button class="strip-cell step-cell${live ? ' live' : ''}` +
+        `${skipped ? ' muted' : ''}${failed ? ' has-failure' : ''}` +
+        `${isOpen ? ' open' : ''}" type="button" ` +
+        `data-step="${esc(step.key)}"${openable ? '' : ' disabled'} ` +
+        `aria-expanded="${isOpen ? 'true' : 'false'}" ` +
+        `title="${esc(openable
+          ? `${step.label} — click to see what each agent did here`
+          : `${step.label} — nothing has run here yet`)}">` +
+        `<span class="strip-label">${esc(step.label)}` +
+          (failed ? `<span class="step-fail-dot" title="${failed} failed">` +
+            `${failed}</span>` : '') +
+        `</span>` +
         `<span class="strip-value">${live ? 'Working' : (done ? 'Done' : 'Waiting')}</span>` +
         `<span class="strip-note">${esc(note)}</span>` +
-      `</span>`
+        (openable ? `<span class="step-chevron">${isOpen ? '▴' : '▾'}</span>` : '') +
+      `</button>`
     );
   }).join('');
+
+  $('#step-detail').innerHTML = open ? stepDetailHtml(run, open) : '';
+}
+
+/** The opened step, agent by agent. One row per seat: who it was, what
+ *  happened to it, and — when it failed — the reason, which is the thing the
+ *  counts on the cell above can only say the number of. */
+function stepDetailHtml(run, key) {
+  const step = COUNCIL_STEPS.find(s => s.key === key);
+  const rows = stagesInStep(run, key);
+
+  return (
+    `<div class="step-panel">` +
+      `<div class="step-panel-head">` +
+        `<span>${esc((step && step.label) || key)}</span>` +
+        `<button class="step-close" type="button" data-step-close="1" ` +
+          `title="Close">×</button>` +
+      `</div>` +
+      rows.map(s => stepRowHtml(s)).join('') +
+    `</div>`
+  );
+}
+
+function stepRowHtml(s) {
+  const st = s.state || 'pending';
+  const who = s.label || s.id;
+  const word = STEP_STATE_WORDS[st] || st;
+  const dur = s.duration ? fmtDuration(s.duration) : '';
+
+  // Why it failed, in the agent's own words where there are any. An exit code
+  // on its own is not a reason, but it is what there is when a CLI dies
+  // without saying anything, and saying nothing at all is worse.
+  const reason = s.error ||
+    (s.exit_code !== null && s.exit_code !== undefined && s.exit_code !== 0
+      ? `The CLI exited ${s.exit_code} without an error message.`
+      : 'No reason was reported.');
+  const excerpt = firstLine(stripTrailer(s.output || ''));
+
+  let line = '';
+  if (st === 'failed') line = `<span class="step-line err">${esc(reason)}</span>`;
+  else if (st === 'skipped')
+    // A skipped stage records why it was passed over — "no position from this
+    // seat, so it had no peers to review". That sentence is the whole reason
+    // the count above says 2 of 3, so it is what the row shows.
+    line = `<span class="step-line muted">${esc(s.error ||
+      'Not run — there was nothing for this seat to do.')}</span>`;
+  else if (st === 'pending')
+    line = `<span class="step-line muted">Queued behind the stage before it.</span>`;
+  else if (excerpt) line = `<span class="step-line">${esc(excerpt)}</span>`;
+  else if (st === 'running')
+    line = `<span class="step-line muted">Working — nothing written yet.</span>`;
+  else line = `<span class="step-line muted">Finished without output.</span>`;
+
+  // Only a stage with a message in the thread can be jumped to. A failed one
+  // has a message too: the reason is rendered as its body.
+  const jumpable = st !== 'pending' || (s.output || '').trim();
+
+  return (
+    `<button class="step-row st-${esc(st)}" type="button" ` +
+      `${jumpable ? `data-jump="${esc(s.id)}"` : 'disabled'} ` +
+      `title="${esc(jumpable ? `${who} — open this answer in the thread`
+                             : `${who} has not run yet`)}">` +
+      `<span class="step-mark">${esc(String(who).slice(0, 2).toUpperCase())}</span>` +
+      `<span class="step-row-body">` +
+        `<span class="step-row-head">` +
+          `<span class="step-who">${esc(who)}</span>` +
+          (s.alias ? `<span class="step-alias" ` +
+            `title="How this seat appeared to its peers">${esc(s.alias)}</span>` : '') +
+          (s.model ? `<span class="step-model">${esc(s.model)}</span>` : '') +
+          `<span class="step-state">${esc(word)}</span>` +
+          (dur ? `<span class="step-dur">${esc(dur)}</span>` : '') +
+        `</span>` +
+        line +
+      `</span>` +
+    `</button>`
+  );
+}
+
+/** The first line worth showing of an answer, as a one-line preview. */
+function firstLine(text) {
+  const line = String(text || '')
+    .split('\n')
+    .map(l => l.replace(/^[#>\s*-]+/, '').trim())
+    .find(l => l.length > 1) || '';
+  return line.length > 160 ? `${line.slice(0, 160)}…` : line;
+}
+
+/** Scroll the thread to a stage's message and flash it, so a row in the
+ *  breakdown lands on the answer it names rather than merely near it. */
+function jumpToStage(id) {
+  const el = $(`#thread .turn:not(.earlier) [data-stage-id="${CSS.escape(id)}"]`);
+  if (!el) { toast('That stage has not written anything yet.'); return; }
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  el.classList.add('flash');
+  setTimeout(() => el.classList.remove('flash'), 1800);
 }
 
 /** Ask the server who would sit for what is in the composer.
@@ -1648,7 +1789,11 @@ function messageHtml(reply, id) {
     `<p class="history-none">${esc(reply.error || `(${st || 'no output'})`)}</p>`;
 
   return (
+    // `data-stage-id` is what the stepper's breakdown scrolls to. Set from the
+    // stage's own id, so a council of two Claudes still resolves to the seat
+    // that was clicked rather than to whichever of them renders first.
     `<div class="chat-message assistant-message${chair ? ' verdict' : ''}" ` +
+      `data-stage-id="${esc(id || reply.stage || '')}" ` +
       `data-agent="${esc(reply.agent || id || '')}">` +
       `<div class="msg-head">` +
         `<span class="msg-mark">${esc(String(who).slice(0, 2).toUpperCase())}</span>` +
@@ -4464,6 +4609,23 @@ function wire() {
       seat: member.dataset.seat || '',
       seatLabel: member.dataset.seatLabel || '',
     });
+  });
+
+  // -- the stepper --------------------------------------------------------
+  // Delegated for the same reason: a live run re-renders these cells on every
+  // event, so a listener bound to one of them would not survive the next.
+  $('#council-steps').addEventListener('click', (e) => {
+    const jump = e.target.closest('[data-jump]');
+    if (jump) { jumpToStage(jump.dataset.jump); return; }
+    if (e.target.closest('[data-step-close]')) {
+      state.openStep = '';
+      renderCouncilSteps();
+      return;
+    }
+    const cell = e.target.closest('[data-step]');
+    if (!cell || cell.disabled) return;
+    state.openStep = state.openStep === cell.dataset.step ? '' : cell.dataset.step;
+    renderCouncilSteps();
   });
 
   $('#composer-chips').addEventListener('click', (e) => {
