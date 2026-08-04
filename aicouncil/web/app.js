@@ -1079,6 +1079,18 @@ function renderComposerChips() {
   const host = $('#composer-chips');
   if (uiMode() !== 'solo') { host.innerHTML = ''; return; }
 
+  // With Multi-agent answer on, the message does not go to the assistant on
+  // this card at all - it goes to every installed CLI, each running its own
+  // card in Settings. Leaving three pickers here that decide nothing would be
+  // the app lying about where the next answer comes from.
+  if ((state.config || {}).multi_agent) {
+    host.innerHTML =
+      `<span class="composer-note">Multi-agent answer: every installed agent ` +
+      `replies, each with its own default model from Settings &rsaquo; ` +
+      `Agents.</span>`;
+    return;
+  }
+
   const p = ((state.config || {}).providers || {}).solo || {};
   const agent = state.agents.find(a => a.id === agentOf(p));
   const agentLabel = agent && (agent.command || []).length ? agent.label : 'custom';
@@ -1642,6 +1654,14 @@ function messageHtml(reply, id) {
         `<span class="msg-mark">${esc(String(who).slice(0, 2).toUpperCase())}</span>` +
         `<span class="msg-who">${esc(who)}</span>` +
         (reply.role ? `<span class="msg-role">${esc(roleTag(reply.role))}</span>` : '') +
+        // Which model answered, on a multi-agent Chat turn only. Three answers
+        // are being compared, and "Claude said X, Codex said Y" is a different
+        // claim depending on which model each was. Blank means the CLI's own
+        // default was used, and no chip is shown rather than one that guesses.
+        (reply.kind === 'chat' && reply.model
+          ? `<span class="msg-model" title="Set for this CLI in Settings › Agents">` +
+            `${esc(reply.model)}</span>`
+          : '') +
         // The alias is what its peers knew it as. Shown on the member's own
         // card so a critique that says "Agent B was wrong" can be followed
         // back to a CLI without reading the transcript.
@@ -1688,6 +1708,10 @@ const STAGE_HEADINGS = {
   position: 'Independent positions',
   critique: 'Peer critique',
   chair: 'The verdict',
+  // Multi-agent Chat. Named for what it is rather than "the council": nothing
+  // here was anonymised, critiqued or weighed, and reading three answers as a
+  // verdict would be reading something this app did not do.
+  chat: 'What each agent answered',
 };
 
 function councilBodyHtml(run, gated) {
@@ -2817,6 +2841,10 @@ function openGearMenu(anchor) {
     (project ? '' : row('zero_touch', 'Zero-Touch mode', !!c.zero_touch, true)) +
     row('caveman', 'Caveman mode', cavemanOn(cavemanMode), false) +
     row('efficiency', 'Efficiency mode', efficiencyOn(efficiencyMode), false) +
+    // Chat only. Council already asks several agents and then weighs what
+    // came back; this asks them and weighs nothing, which is only a separate
+    // thing to want where there is one agent to begin with.
+    (chat ? row('multi_agent', 'Multi-agent answer', !!c.multi_agent, false) : '') +
     (project ? '' :
       row('pull_request_mode', 'Pull request mode', !!c.pull_request_mode, false)) +
     // Council only: Chat has one agent and no bench to show. It is a display
@@ -2853,6 +2881,10 @@ function openGearMenu(anchor) {
     closeModelMenu();
     if (btn.dataset.toggle === 'caveman') {
       patchConfig({ caveman: { [cavemanMode]: !cavemanOn(cavemanMode) } });
+      return;
+    }
+    if (btn.dataset.toggle === 'multi_agent') {
+      patchConfig({ multi_agent: !c.multi_agent });
       return;
     }
     if (btn.dataset.toggle === 'efficiency') {
@@ -3159,8 +3191,11 @@ function renderSettings() {
   // not chairs anybody sits in, and a form for them would be one that decided
   // nothing about the next run.
   const FORMS = [
+    // One card per CLI, not per chair. It is labelled "Agent" rather than
+    // "Council" because two things read it now: the council when it seats
+    // this CLI, and Chat's multi-agent answer when it asks every CLI at once.
     ...(state.agents || []).filter(a => (a.command || []).length).map(a => ({
-      id: `council_${a.id}`, num: 'Council', kind: 'seat', name: a.label,
+      id: `council_${a.id}`, num: 'Agent', kind: 'seat', name: a.label,
     })),
     { id: 'solo', num: 'Chat', kind: 'chat' },
     { id: 'architect', num: 'Project', kind: 'project', name: 'Architect' },
@@ -3187,9 +3222,12 @@ function renderSettings() {
           : '') +
         (kind === 'seat'
           ? `<p class="settings-note">` +
-              `How this CLI runs whenever the council seats it. Which seat it ` +
-              `holds, and what it is told to be, are decided per run &mdash; ` +
-              `pin either on the <b>Council</b> tab or on the bench above the ` +
+              `How this CLI runs wherever it is used: whenever the council ` +
+              `seats it, and whenever Chat's <b>Multi-agent answer</b> asks ` +
+              `every agent at once. The model and reasoning depth below are ` +
+              `this agent's defaults for both. Which council seat it holds, ` +
+              `and what it is told to be, are decided per run &mdash; pin ` +
+              `either on the <b>Council</b> tab or on the bench above the ` +
               `composer. Members are read-only; only the chair writes.</p>`
           : '') +
         // Nobody picks an agent here. Chat's is the chip on its card, a
@@ -3208,6 +3246,28 @@ function renderSettings() {
             `</label>` +
           `<input type="text" data-field="label" value="${esc(p.label || '')}">` +
         `</div>` +
+        // The default model for this agent, on the card rather than folded
+        // away with the command line: it is the setting an operator comes to
+        // this panel to change, and a multi-agent Chat answer is three CLIs
+        // running exactly what is typed here.
+        (kind === 'seat'
+          ? `<div class="field-row">` +
+              `<div class="field">` +
+                `<label>Default model ` +
+                  `<span class="field-hint">— blank uses the CLI's own</span>` +
+                  `</label>` +
+                `<input type="text" data-field="model" value="${esc(p.model || '')}" ` +
+                  `placeholder="the CLI's default">` +
+              `</div>` +
+              `<div class="field">` +
+                `<label>Reasoning effort ` +
+                  `<span class="field-hint">— blank uses the CLI's own</span>` +
+                  `</label>` +
+                `<input type="text" data-field="effort" value="${esc(p.effort || '')}" ` +
+                  `placeholder="the CLI's default">` +
+              `</div>` +
+            `</div>`
+          : '') +
         // No role, no template and no fallback: blank here means blank, so a
         // new Solo conversation reaches the CLI as the message alone. A
         // council seat and a project chair get neither box — see FORMS.
@@ -3260,10 +3320,16 @@ function renderSettings() {
               `<textarea rows="2" data-field="stream_args">${esc((p.stream_args || []).join('\n'))}</textarea>` +
             `</div>` +
             `<div class="field-row">` +
-              `<div class="field">` +
-                `<label>Model (blank = the CLI's own default)</label>` +
-                `<input type="text" data-field="model" value="${esc(p.model || '')}">` +
-              `</div>` +
+              // A seat's model and effort are its defaults for every use of
+              // this CLI, so they are asked for on the card itself rather than
+              // in here with the plumbing. One input each, never two: a second
+              // box bound to the same field would save whichever the form
+              // happened to read last.
+              (kind === 'seat' ? '' :
+                `<div class="field">` +
+                  `<label>Model (blank = the CLI's own default)</label>` +
+                  `<input type="text" data-field="model" value="${esc(p.model || '')}">` +
+                `</div>`) +
               `<div class="field">` +
                 `<label>Model flag (<code>{model}</code> substituted)</label>` +
                 `<input type="text" data-field="model_args" ` +
@@ -3276,10 +3342,11 @@ function renderSettings() {
               `<textarea rows="4" data-field="models">${esc((p.models || []).join('\n'))}</textarea>` +
             `</div>` +
             `<div class="field-row">` +
-              `<div class="field">` +
-                `<label>Reasoning effort (blank = the CLI's own default)</label>` +
-                `<input type="text" data-field="effort" value="${esc(p.effort || '')}">` +
-              `</div>` +
+              (kind === 'seat' ? '' :
+                `<div class="field">` +
+                  `<label>Reasoning effort (blank = the CLI's own default)</label>` +
+                  `<input type="text" data-field="effort" value="${esc(p.effort || '')}">` +
+                `</div>`) +
               `<div class="field">` +
                 `<label>Effort flag (<code>{effort}</code> substituted)</label>` +
                 `<input type="text" data-field="effort_args" ` +

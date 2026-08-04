@@ -548,6 +548,19 @@ DEFAULTS: Dict[str, Any] = {
         "chat": False,
         "project": False,
     },
+    # Multi-agent answer: a Chat message goes to every installed CLI at once
+    # and each answers on its own, one under the other. Chat only - Council
+    # already asks several agents and then does something with the spread,
+    # which is a different question from "what would each of you say".
+    #
+    # Each CLI answers with the model and reasoning depth set against it in
+    # Settings > Agents. Those are the same per-CLI cards the council seats
+    # read, because they describe the CLI rather than the job it is doing.
+    #
+    # Always read-only, whatever Zero-Touch says: three agents editing one
+    # folder at the same time with nothing arbitrating between them is not a
+    # feature, it is a race. See `_execute_chat_bench`.
+    "multi_agent": False,
     # Efficiency Mode: concise normal prose without Caveman Mode's deliberately
     # telegraphic grammar. It is independent so either style, both, or neither
     # can be selected for each kind of run.

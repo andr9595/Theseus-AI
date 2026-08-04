@@ -134,6 +134,17 @@ MAX_PR_TITLE_CHARS = 72
 DEFAULT_GATE_TIMEOUT = 3600.0
 
 
+def chat_stage_id(agent: str) -> str:
+    """The stage id one CLI answers a multi-agent Chat turn under.
+
+    Distinct from the council seat ids on purpose. Both read the same per-CLI
+    configuration, but a transcript has to say which of the two a stage was:
+    a council member was anonymised, critiqued and weighed, and one of three
+    Chat answers was none of those things.
+    """
+    return f"chat_{agent}"
+
+
 def stage_succeeded(result: ProviderResult) -> bool:
     """Whether a stage actually produced something, not merely exited zero.
 
@@ -421,6 +432,11 @@ class Run:
             order += [s.id for s in self.seating.members]
             order += [f"{s.id}_critique" for s in self.seating.members]
             order.append("chair")
+        # A multi-agent Chat turn has one stage per CLI, listed in the
+        # catalogue's order so the same three answers appear in the same three
+        # places every time - they are read side by side, and a bench that
+        # reshuffled itself per turn would make that comparison work.
+        order += [chat_stage_id(agent) for agent in cfg.AGENTS]
         return [
             s for s in [*order, "solo", "drafter", "polisher"]
             if s in self.stages
@@ -628,7 +644,13 @@ class Pipeline:
         # reply to review - so Zero-Touch is the only way to grant it there,
         # and without it the provider is invoked read-only.
         zero_touch = bool(conf.get("zero_touch"))
-        writes = mode == "council" or zero_touch
+        # A multi-agent Chat turn is read-only whatever Zero-Touch says, so it
+        # is settled here, before `writes` decides whether this run branches,
+        # snapshots or opens a pull request. Three CLIs turned loose on one
+        # folder at the same time would interleave their edits, and the diff
+        # afterwards could not say which agent wrote which line.
+        multi_agent = mode == "solo" and bool(conf.get("multi_agent"))
+        writes = (mode == "council" or zero_touch) and not multi_agent
         # Delivery protects a run that writes. On a read-only conversation
         # there is nothing to branch, nothing to commit, and refusing to start
         # because the tree is dirty would be absurd.
@@ -722,17 +744,41 @@ class Pipeline:
                 config=conf,
             )
             if mode == "solo":
-                # One agent with a configuration of its own. Recorded as a
-                # stage because that is how output, timings and the command
-                # echo are carried to the UI - not because it is one.
-                p = providers.get("solo", {})
-                run.stages["solo"] = StageRecord(
-                    id="solo",
-                    label=p.get("label", "Assistant"),
-                    role="Assistant",
-                    model=str(p.get("model") or ""),
-                    effort=str(p.get("effort") or ""),
-                )
+                bench = self.available_agents(providers) if multi_agent else []
+                if len(bench) > 1:
+                    # One stage per installed CLI, each reading that CLI's own
+                    # card in Settings. Built here rather than in the worker so
+                    # all three are on screen as "queued" the moment the
+                    # message is sent, instead of appearing one at a time.
+                    for agent in bench:
+                        p = providers.get(cfg.council_provider_id(agent)) or {}
+                        stage_id = chat_stage_id(agent)
+                        run.stages[stage_id] = StageRecord(
+                            id=stage_id,
+                            label=str(p.get("label") or cfg.AGENTS[agent]["label"]),
+                            role="Assistant",
+                            model=str(p.get("model") or ""),
+                            effort=str(p.get("effort") or ""),
+                            kind="chat",
+                            agent=agent,
+                        )
+                else:
+                    # One agent with a configuration of its own. Recorded as a
+                    # stage because that is how output, timings and the command
+                    # echo are carried to the UI - not because it is one.
+                    #
+                    # Also where a multi-agent turn lands when only one CLI is
+                    # installed: a bench of one is the ordinary Chat assistant,
+                    # and refusing to answer would be worse than answering.
+                    p = providers.get("solo", {})
+                    run.stages["solo"] = StageRecord(
+                        id="solo",
+                        label=p.get("label", "Assistant"),
+                        role="Assistant",
+                        model=str(p.get("model") or ""),
+                        effort=str(p.get("effort") or ""),
+                        kind="solo",
+                    )
             else:
                 run.strictness = prompts.strictness(
                     (conf.get("council") or {}).get("strictness")
@@ -1035,7 +1081,12 @@ class Pipeline:
     def _execute(self, run: Run) -> None:
         """Worker-thread body for one run, in whichever mode it was started."""
         try:
-            if run.solo:
+            if run.solo and "solo" not in run.stages:
+                # Chat, asked of every CLI at once. Told apart by the stages
+                # built at start rather than by re-reading the toggle, which
+                # can be flipped while the run is in flight.
+                self._execute_chat_bench(run)
+            elif run.solo:
                 self._execute_solo(run)
             else:
                 self._execute_council(run)
@@ -1046,6 +1097,65 @@ class Pipeline:
             if not run.solo:
                 self._record_router_feedback(run)
             self._persist(run)
+
+    def _chat_prompt(self, run: Run, behavior: str = "") -> str:
+        """The prompt for one Chat turn, in either shape.
+
+        Shared so a multi-agent turn cannot drift from a single-agent one: the
+        three CLIs must be asked exactly what one would have been asked, or
+        their answers are not comparable and the feature is worth nothing.
+        """
+        return prompts.build_chat_prompt(
+            run.task,
+            run.conversation,
+            behavior=behavior,
+            caveman=bool((run.config.get("caveman") or {}).get("chat")),
+            efficiency=bool((run.config.get("efficiency") or {}).get("chat")),
+        )
+
+    def _execute_chat_bench(self, run: Run) -> None:
+        """Every installed CLI answers the same message, at once, on its own.
+
+        Not a council: nobody is anonymised, nothing is critiqued and nothing
+        is synthesised. Three answers to one question, left as three answers -
+        the comparison is the operator's to make, and this app does not rank
+        them or pick a winner.
+
+        Read-only without exception, and the run carries no diff, no snapshot
+        and no delivery for the reason given where `multi_agent` is defined.
+        """
+        providers = run.config.get("providers") or {}
+        self._set_state(run, RUNNING)
+
+        specs = []
+        for stage_id in run.stage_order:
+            stage = run.stages[stage_id]
+            provider = providers.get(cfg.council_provider_id(stage.agent)) or {}
+            # A behaviour typed for Chat is the operator's instruction to the
+            # assistant, not to a CLI, so all three carry it. Without it a
+            # multi-agent turn would silently drop an instruction that a
+            # single-agent turn honours.
+            behavior = str((providers.get("solo") or {}).get("behavior") or "")
+            specs.append((
+                stage_id,
+                provider,
+                self._chat_prompt(run, behavior),
+                False,  # never auto-approve
+                True,   # always read-only
+            ))
+
+        results = self._run_parallel(run, specs)
+
+        if self._is_cancelled():
+            self._finish_cancelled(run)
+            return
+        # One CLI that could not run is a bench of two, which still answers the
+        # question. The run fails only when nothing at all came back.
+        if not any(stage_succeeded(r) for r in results.values()):
+            run.error = "No agent answered."
+            self._set_state(run, FAILED)
+            return
+        self._set_state(run, COMPLETE)
 
     def _execute_solo(self, run: Run) -> None:
         """One assistant, one message, one answer.
@@ -1079,15 +1189,7 @@ class Pipeline:
             # repository preamble into a message they typed themselves. The
             # style switches below are the operator's own, set for Chat in
             # Settings, and add nothing when they are off.
-            prompts.build_chat_prompt(
-                run.task,
-                run.conversation,
-                behavior=str(provider.get("behavior") or ""),
-                caveman=bool((run.config.get("caveman") or {}).get("chat")),
-                efficiency=bool(
-                    (run.config.get("efficiency") or {}).get("chat")
-                ),
-            ),
+            self._chat_prompt(run, str(provider.get("behavior") or "")),
             auto_approve=writes,
             read_only=not writes,
         )

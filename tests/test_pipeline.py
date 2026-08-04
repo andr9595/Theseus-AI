@@ -520,6 +520,102 @@ class TestSoloMode(PipelineTestBase):
             )
 
 
+class TestMultiAgentChat(PipelineTestBase):
+    """One message, every installed CLI, three answers left as three answers."""
+
+    def setUp(self):
+        super().setUp()
+        assistant = mock_provider("solo", "Assistant")
+        assistant["read_only_args"] = ["--read-only"]
+        assistant["behavior"] = ""
+        # Both halves of the config: the per-CLI cards the bench reads, and the
+        # single assistant it falls back to when only one CLI is installed.
+        self.store.update({
+            "mode": "solo",
+            "multi_agent": True,
+            "providers": {"solo": assistant, **council_providers()},
+        })
+
+    def test_every_installed_agent_answers_the_same_message(self):
+        run = self.pipeline.start("what is this repo?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(
+            sorted(run.stages),
+            sorted(f"chat_{agent}" for agent in cfg.AGENTS),
+        )
+        self.assertNotIn("solo", run.stages)
+        for stage in run.stages.values():
+            self.assertTrue(stage.output.strip(), stage.id)
+            self.assertEqual(stage.kind, "chat")
+
+    def test_the_bench_is_read_only_even_with_zero_touch_on(self):
+        # Three agents editing one folder at once, with nothing arbitrating
+        # between them, is a race rather than a feature - so the grant Chat
+        # would otherwise get is refused for this shape of turn.
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        for stage in run.stages.values():
+            self.assertIn("--read-only", stage.command)
+            self.assertNotIn("--dangerously-skip-permissions", stage.command)
+        self.assertTrue(gitutil.status(self.repo).clean)
+        self.assertIsNone(run.snapshot)
+        self.assertEqual(run.diff, "")
+
+    def test_one_agent_installed_falls_back_to_the_single_assistant(self):
+        # A bench of one is the ordinary Chat assistant. Refusing to answer
+        # because two CLIs are missing would be worse than answering.
+        only = council_providers()[cfg.council_provider_id("codex")]
+        self.store.update({
+            "providers": {
+                cfg.council_provider_id(a): {
+                    **council_providers()[cfg.council_provider_id(a)],
+                    "enabled": a == "codex",
+                }
+                for a in cfg.AGENTS
+            },
+        })
+        self.assertTrue(only["command"])
+        run = self.pipeline.start("hello", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(list(run.stages), ["solo"])
+
+    def test_all_three_answers_carry_into_the_next_turn(self):
+        first = self.pipeline.start("first question", str(self.repo))
+        self.wait_terminal()
+        second = self.pipeline.start(
+            "and now?", str(self.repo), continue_from=first.transcript_name
+        )
+        self.wait_terminal()
+
+        self.assertEqual(second.state, "complete", second.error)
+        self.assertEqual(len(second.conversation), 1)
+        replies = second.conversation[0]["replies"]
+        self.assertEqual(
+            sorted(r["stage"] for r in replies),
+            sorted(f"chat_{agent}" for agent in cfg.AGENTS),
+        )
+        # Labelled, not merged: a follow-up has to be able to say "Codex was
+        # right" and have that mean something.
+        for reply in replies:
+            self.assertTrue(reply["label"].strip())
+            self.assertTrue(reply["output"].strip())
+
+    def test_the_toggle_off_is_the_ordinary_single_assistant(self):
+        self.store.update({"multi_agent": False})
+        run = self.pipeline.start("hello", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(list(run.stages), ["solo"])
+
+
 class TestWorkingFolderIsOptional(PipelineTestBase):
     """A repository is what makes a run reviewable, not what makes it possible.
 

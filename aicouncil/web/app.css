@@ -464,6 +464,24 @@ html, body {
   border-radius: 5px;
 }
 
+/* Stands in for the agent/model/effort chips when the multi-agent answer has
+   taken the choice out of the composer's hands. */
+.composer-note {
+  font-family: var(--mono); font-size: 10px;
+  color: var(--text-3);
+  padding: 2px 0;
+}
+
+/* Which model answered. Same shape as the alias chip beside it - both say
+   "this is which agent you are reading", one by seat and one by model. */
+.msg-model {
+  font-family: var(--mono); font-size: 9.5px;
+  color: var(--accent-2);
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+}
+
 /* A figure an agent stated about itself. Never one this app worked out: there
    is no ground truth here to score an answer against, so a computed number
    would be indistinguishable on screen from a reported one. A stage that gave
