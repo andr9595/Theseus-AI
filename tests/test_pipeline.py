@@ -2161,6 +2161,46 @@ class TestEfficiencyPrompt(unittest.TestCase):
         self.assertIn(self.MARK, prompt)
         self.assertIn("ULTRA-LOW TOKEN EFFICIENCY MODE", prompt)
 
+    def test_both_styles_arrive_under_one_heading_everywhere(self):
+        # Two identically-titled sections is the agent being told twice, in
+        # different words, how to write. Every builder composes them the same
+        # way, so every builder is checked.
+        from aicouncil import prompts
+
+        built = (
+            prompts.build_chat_prompt("hello", caveman=True, efficiency=True),
+            prompts.build_member_prompt(
+                "t", "/tmp", caveman=True, efficiency=True
+            ),
+            prompts.build_critique_prompt(
+                "t",
+                [{"alias": "Agent B", "output": "x"}],
+                "/tmp",
+                caveman=True,
+                efficiency=True,
+            ),
+            prompts.build_chairman_prompt(
+                "t",
+                [{"alias": "Agent A", "output": "x"}],
+                [],
+                "/tmp",
+                caveman=True,
+                efficiency=True,
+            ),
+            prompts.project_context_block(
+                "p1", "/tmp", "{}", caveman=True, efficiency=True
+            ),
+        )
+        for prompt in built:
+            self.assertEqual(prompt.count("# How to write your answer"), 1)
+            self.assertIn(self.MARK, prompt)
+            self.assertIn("ULTRA-LOW TOKEN EFFICIENCY MODE", prompt)
+            # Caveman is the claim on the voice; Efficiency applies inside it.
+            self.assertLess(
+                prompt.index("ULTRA-LOW TOKEN EFFICIENCY MODE"),
+                prompt.index(self.MARK),
+            )
+
     def test_a_project_turn_carries_it_only_when_it_is_on(self):
         from aicouncil import prompts
 
@@ -2173,6 +2213,49 @@ class TestEfficiencyPrompt(unittest.TestCase):
         )
         self.assertNotIn(self.MARK, off)
         self.assertIn(self.MARK, on)
+
+
+class TestWritingStyleReading(unittest.TestCase):
+    """The one reader all three run loops pull their style switches through."""
+
+    def test_each_mode_sees_only_its_own_switches(self):
+        conf = {
+            "caveman": {"council": True, "chat": False, "project": True},
+            "efficiency": {"council": False, "chat": True, "project": True},
+        }
+        self.assertEqual(
+            cfg.writing_styles(conf, "council"),
+            {"caveman": True, "efficiency": False},
+        )
+        self.assertEqual(
+            cfg.writing_styles(conf, "chat"),
+            {"caveman": False, "efficiency": True},
+        )
+        self.assertEqual(
+            cfg.writing_styles(conf, "project"),
+            {"caveman": True, "efficiency": True},
+        )
+
+    def test_a_hand_edited_config_is_off_rather_than_a_crash(self):
+        # These are read inside a running loop, so a config someone typed into
+        # by hand has to degrade to "off", not take the run down with it.
+        for broken in ({}, {"efficiency": None}, {"efficiency": "yes"}):
+            with self.subTest(broken=broken):
+                self.assertEqual(
+                    cfg.writing_styles(broken, "chat"),
+                    {"caveman": False, "efficiency": False},
+                )
+
+    def test_the_keys_it_returns_are_what_the_builders_take(self):
+        # It is splatted straight into the prompt builders; a style added to
+        # one and not the other is a TypeError at run time, not import time.
+        from aicouncil import prompts
+
+        prompts.build_chat_prompt("hi", **cfg.writing_styles({}, "chat"))
+        self.assertEqual(
+            sorted(cfg.writing_styles({}, "council")),
+            sorted(cfg.WRITING_STYLES),
+        )
 
 
 class TestCavemanReachesTheRun(PipelineTestBase):
@@ -2276,6 +2359,34 @@ class TestEfficiencyReachesTheRun(PipelineTestBase):
 
         self.assertEqual(run.state, "complete", run.error)
         self.assertNotIn(self.MARK, run.stages["solo"].output)
+
+    def test_it_can_be_switched_off_again(self):
+        # `ConfigStore.update` deep-merges, so a switch is only really a switch
+        # if writing False over True survives the merge.
+        self.store.update({"efficiency": {"chat": True}})
+        self.store.update({"efficiency": {"chat": False}})
+        run = self.pipeline.start("what does this repo do?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertNotIn(self.MARK, run.stages["solo"].output)
+
+    def test_a_multi_agent_answer_carries_it_to_every_cli(self):
+        # The bench shares `_chat_prompt` with the single-agent turn, which is
+        # what makes the two answers comparable. Pinned so a future prompt
+        # built separately for the bench cannot quietly drop the style.
+        self.store.update({
+            "multi_agent": True,
+            "efficiency": {"chat": True},
+            "providers": council_providers(),
+        })
+        run = self.pipeline.start("what is this repo?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(len(run.stages), len(cfg.AGENTS))
+        for stage in run.stages.values():
+            self.assertIn(self.MARK, stage.output, stage.id)
 
 
 class TestEfficiencyReachesCouncilRun(PipelineTestBase):

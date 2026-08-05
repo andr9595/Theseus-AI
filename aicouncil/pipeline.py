@@ -1117,8 +1117,7 @@ class Pipeline:
             run.task,
             run.conversation,
             behavior=behavior,
-            caveman=bool((run.config.get("caveman") or {}).get("chat")),
-            efficiency=bool((run.config.get("efficiency") or {}).get("chat")),
+            **cfg.writing_styles(run.config, "chat"),
         )
 
     def _execute_chat_bench(self, run: Run) -> None:
@@ -1325,11 +1324,11 @@ class Pipeline:
         conf = run.config
         roles = conf.get("roles", {})
         house_rules = conf.get("house_rules", "")
-        # One reading for the whole run: a mid-run edit in Settings would
-        # otherwise leave the chairman writing in a different voice to the
-        # members it is synthesising.
-        caveman = bool((conf.get("caveman") or {}).get("council"))
-        efficiency = bool((conf.get("efficiency") or {}).get("council"))
+        # One reading for the whole run, off the config frozen at start: a
+        # mid-run edit in the gear would otherwise leave the chairman writing in
+        # a different voice to the members it is synthesising. Projects is the
+        # deliberate exception - see `ProjectEngine._context`.
+        styles = cfg.writing_styles(conf, "council")
         workspace_status = gitutil.status(run.workspace).to_dict()
         seating = run.seating
         if seating is None:  # start() always seats a council run
@@ -1389,8 +1388,7 @@ class Pipeline:
                         house_rules,
                         run.conversation,
                         persona_system=self._persona_system(seat, roles),
-                        caveman=caveman,
-                        efficiency=efficiency,
+                        **styles,
                     ),
                     False,  # never auto-approved
                     True,   # and explicitly read-only
@@ -1488,8 +1486,7 @@ class Pipeline:
                             house_rules,
                             persona_system=self._persona_system(p["seat"], roles),
                             strictness_level=run.strictness,
-                            caveman=caveman,
-                            efficiency=efficiency,
+                            **styles,
                             # Its own answer, named as its own. A fresh process
                             # has no memory of Stage 1, so without this it
                             # cannot say where a peer differs from what it
@@ -1613,8 +1610,7 @@ class Pipeline:
                 run.conversation,
                 strictness_level=run.strictness,
                 system=str(chair_role.get("system") or ""),
-                caveman=caveman,
-                efficiency=efficiency,
+                **styles,
             ),
             auto_approve=execute_approved,
         )

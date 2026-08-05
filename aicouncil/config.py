@@ -614,6 +614,31 @@ DEFAULTS: Dict[str, Any] = {
 }
 
 
+# The two writing-style switches, and the three kinds of run that each hold
+# their own copy of both. Named here so the gear, the prompt builders and the
+# three run loops are all talking about the same set.
+WRITING_STYLES = ("caveman", "efficiency")
+RUN_MODES = ("council", "chat", "project")
+
+
+def writing_styles(conf: Dict[str, Any], mode: str) -> Dict[str, bool]:
+    """The style switches one kind of run should answer under.
+
+    One reader for all three: Council, Chat and Projects each pull the same two
+    keys out of the same nested shape, and the result is splatted straight into
+    the prompt builders, so a style added to `WRITING_STYLES` and to the
+    builders reaches every mode without a fourth copy of this.
+
+    Defensive rather than strict, like every other read of a persisted config
+    here: a key hand-edited to a string or a null is off, not a crash mid-run.
+    """
+    styles: Dict[str, bool] = {}
+    for style in WRITING_STYLES:
+        modes = conf.get(style)
+        styles[style] = bool(modes.get(mode)) if isinstance(modes, dict) else False
+    return styles
+
+
 # --------------------------------------------------------------------------
 # Store
 # --------------------------------------------------------------------------

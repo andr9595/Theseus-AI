@@ -666,23 +666,29 @@ error messages complete and exact.
 applying these efficiency rules."""
 
 
-def _caveman_block(caveman: bool) -> str:
-    """Caveman Mode, as its own section rather than folded into house rules.
+def _style_block(caveman: bool = False, efficiency: bool = False) -> str:
+    """The writing-style switches, as one section however many are on.
 
-    The rules the operator typed and a style switch this app owns are different
-    kinds of instruction, and a run that answered strangely should show which
-    of the two asked for it.
+    Its own section rather than folded into house rules: the rules the operator
+    typed and a style switch this app owns are different kinds of instruction,
+    and a run that answered strangely should show which of the two asked for
+    it.
+
+    One heading even when both are selected - and `config.DEFAULTS` says either,
+    both or neither may be. Two identically-titled sections is an agent being
+    told twice, in different words, how to write, and the model has nothing to
+    go on when they differ. Caveman leads because it is the claim on the voice;
+    Efficiency follows and is applied inside it, which is what its own rule 7
+    already asks for.
     """
-    if not caveman:
+    bodies = [
+        body
+        for body, on in ((CAVEMAN_SYSTEM, caveman), (EFFICIENCY_SYSTEM, efficiency))
+        if on
+    ]
+    if not bodies:
         return ""
-    return f"\n# How to write your answer\n{CAVEMAN_SYSTEM}\n"
-
-
-def _efficiency_block(efficiency: bool) -> str:
-    """Efficiency Mode's concise normal-prose instruction."""
-    if not efficiency:
-        return ""
-    return f"\n# How to write your answer\n{EFFICIENCY_SYSTEM}\n"
+    return "\n# How to write your answer\n" + "\n\n".join(bodies) + "\n"
 
 
 @dataclass(frozen=True)
@@ -1113,8 +1119,7 @@ def build_member_prompt(
     return (
         f"{system}\n"
         f"{_persona_block(persona_system)}"
-        f"{_caveman_block(caveman)}"
-        f"{_efficiency_block(efficiency)}"
+        f"{_style_block(caveman, efficiency)}"
         f"{_rules_block(house_rules)}\n"
         f"# Context\n{_workspace_block(workspace, workspace_status)}\n"
         f"{_history_block(conversation)}\n"
@@ -1177,8 +1182,7 @@ def build_critique_prompt(
         f"{system}\n"
         f"{_persona_block(persona_system)}"
         f"\n# How hard to push ({band['name']})\n{band['critique']}\n"
-        f"{_caveman_block(caveman)}"
-        f"{_efficiency_block(efficiency)}"
+        f"{_style_block(caveman, efficiency)}"
         f"{_rules_block(house_rules)}\n"
         f"# Context\n{_workspace_block(workspace, workspace_status)}\n"
         f"# The task every member was given\n"
@@ -1241,8 +1245,7 @@ def build_chairman_prompt(
     head = (
         f"{system}\n"
         f"\n# How much agreement to require ({band['name']})\n{band['chair']}\n"
-        f"{_caveman_block(caveman)}"
-        f"{_efficiency_block(efficiency)}"
+        f"{_style_block(caveman, efficiency)}"
         f"{_rules_block(house_rules)}\n"
         f"# Context\n{_workspace_block(workspace, workspace_status)}\n"
         f"{_history_block(conversation)}\n"
@@ -1339,9 +1342,7 @@ def build_chat_prompt(
     """
     message = task.strip()
     behavior = behavior.strip()
-    style = (
-        _caveman_block(caveman) + _efficiency_block(efficiency)
-    ).strip()
+    style = _style_block(caveman, efficiency).strip()
     history = _chat_history_block(conversation)
     if not behavior and not history and not style:
         return message
@@ -1635,15 +1636,13 @@ def project_context_block(
             "",
             house_rules.strip(),
         ]
-    if caveman:
-        # Last, so it is the nearest instruction to the turn itself. The report
-        # contract is a fenced JSON block and rule 5 leaves fences alone, so
-        # the engine still gets something it can parse.
-        parts += ["", _caveman_block(True).strip()]
-    if efficiency:
-        # Like Caveman Mode, keep the selected writing instruction next to the
-        # turn contract and outside all fenced machine-readable content.
-        parts += ["", _efficiency_block(True).strip()]
+    if caveman or efficiency:
+        # Last in the preamble, so the selected style sits as close to the turn
+        # contract as this block can put it - the role builders append the goal,
+        # the card and the report contract after this. Caveman rule 5 and
+        # Efficiency rule 6 both leave fences alone, so the engine still gets a
+        # report it can parse.
+        parts += ["", _style_block(caveman, efficiency).strip()]
     return "\n".join(parts)
 
 

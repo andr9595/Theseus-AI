@@ -1806,6 +1806,16 @@ class ProjectEngine:
         working diff, the last build failure and the house rules - never the
         previous turns' terminal output, which is the single largest thing that
         could be sent and the least useful per token.
+
+        The two writing-style switches are the one thing read live rather than
+        off `project.config`, which is a deep copy frozen at `start()`. A
+        council run is minutes and has one voice to keep consistent; a project
+        is dozens of independent turns across three CLIs over hours, and the
+        gear that sets these sits in the tracker header of a *running* project.
+        Reading them off the snapshot made that gear tick and change nothing.
+        Only these two keys - providers, safety and house rules stay frozen,
+        because a turn that changed CLI or permissions halfway is a different
+        run, not a restyled one.
         """
         diff = ""
         try:
@@ -1822,10 +1832,7 @@ class ProjectEngine:
             build_log=project.last_build_log,
             diff=diff,
             house_rules=str(project.config.get("house_rules") or ""),
-            caveman=bool((project.config.get("caveman") or {}).get("project")),
-            efficiency=bool(
-                (project.config.get("efficiency") or {}).get("project")
-            ),
+            **cfg.writing_styles(self.store.all(), "project"),
         )
 
     # -- state transitions -------------------------------------------------

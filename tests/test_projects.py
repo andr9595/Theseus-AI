@@ -475,7 +475,7 @@ class TestDecisionEngine(unittest.TestCase):
 
 
 class TestCavemanModeInProjects(unittest.TestCase):
-    """Projects has its own switch, read from the config frozen at start."""
+    """Projects has its own switch, read live on every turn."""
 
     MARK = "ULTRA-LOW TOKEN EFFICIENCY MODE"
 
@@ -509,7 +509,7 @@ class TestCavemanModeInProjects(unittest.TestCase):
 
 
 class TestEfficiencyModeInProjects(unittest.TestCase):
-    """Projects reads its independent Efficiency switch at run start."""
+    """Projects reads its independent Efficiency switch, live, on every turn."""
 
     MARK = "[SYSTEM INSTRUCTION: EFFICIENCY MODE]"
 
@@ -522,6 +522,8 @@ class TestEfficiencyModeInProjects(unittest.TestCase):
         self.engine = ProjectEngine(self.store, EventBus())
 
     def tearDown(self):
+        self.engine.stop()
+        self.engine.wait_for_worker(30)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def context(self):
@@ -534,13 +536,47 @@ class TestEfficiencyModeInProjects(unittest.TestCase):
 
     def test_switching_it_on_reaches_every_project_turn(self):
         self.store.update({"efficiency": {"project": True}})
-        self.assertIn(self.MARK, self.context())
+        for role in ROLES:
+            with self.subTest(role=role):
+                project = Project(id="p1", goal="g", workspace=str(self.root))
+                project.config = self.store.all()
+                self.assertIn(self.MARK, self.engine._context(project, role))
 
     def test_chat_switch_does_not_change_projects(self):
         self.store.update({
             "efficiency": {"chat": True, "project": False},
         })
         self.assertNotIn(self.MARK, self.context())
+
+    def test_switching_it_on_mid_project_reaches_the_next_turn(self):
+        # The gear that sets this sits in the tracker header of a *running*
+        # project, and `start()` pins a deep copy of the config onto it. Read
+        # off that snapshot the tick came on and nothing else did, for every
+        # remaining turn of a run that can last hours.
+        self.store.update({"providers": {r: mock_provider(r) for r in ROLES}})
+        project = self.engine.start("build it", str(self.root))
+        self.engine.stop()
+        self.engine.wait_for_worker(30)
+
+        self.assertNotIn(self.MARK, self.engine._context(project, "coder"))
+        self.store.update({"efficiency": {"project": True}})
+        self.assertIn(self.MARK, self.engine._context(project, "coder"))
+
+    def test_the_rest_of_the_config_stays_frozen_at_start(self):
+        # Only the style switches are live. Changing the CLI or the house rules
+        # halfway through is a different run, not a restyled one.
+        self.store.update({
+            "providers": {r: mock_provider(r) for r in ROLES},
+            "house_rules": "Original rules.",
+        })
+        project = self.engine.start("build it", str(self.root))
+        self.engine.stop()
+        self.engine.wait_for_worker(30)
+
+        self.store.update({"house_rules": "Replaced mid-run."})
+        context = self.engine._context(project, "coder")
+        self.assertIn("Original rules.", context)
+        self.assertNotIn("Replaced mid-run.", context)
 
 
 class TestApplyingReports(unittest.TestCase):

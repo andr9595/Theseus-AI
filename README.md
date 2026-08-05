@@ -394,11 +394,49 @@ Four properties hold throughout, and they are covered by tests:
 > branch, keep Safety Snapshot on, and don't point it at anything you can't
 > afford to lose.
 
+### Writing modes
+
+Two style switches, both off by default, both on the gear in **all three
+tabs** — beside the composer in Council and Chat, and in Projects both beside
+the goal box and in the tracker header of a running project.
+
+| Mode | What it asks for |
+|---|---|
+| **Efficiency mode** | Concise professional prose. Lead with the answer, drop filler, repetition and unrequested examples, keep the reasoning, assumptions, uncertainty and safety notes that make the answer usable. |
+| **Caveman mode** | The same goal pushed much harder: telegraphic grammar, no articles, no preamble. Cheapest and bluntest. |
+
+Both carve out the same exception — code blocks, shell commands, file paths,
+variables, configuration and error messages stay complete and byte-exact. So do
+the confidence trailer and the Project report contract, which are fixed-format
+or fenced.
+
+**They are one implementation, reaching every tab through the same seam.** The
+instruction text lives once in `aicouncil/prompts.py`, is composed once by
+`_style_block()`, and is read once per run by `config.writing_styles()`. What
+differs per tab is only where the block is injected:
+
+| Tab | Reaches |
+|---|---|
+| **Council** | Every member, every critique and the chairman — one reading taken at run start, so the chairman does not end up writing in a different voice to the answers it is synthesising. |
+| **Chat** | Every turn, including each CLI of a multi-agent answer. |
+| **Projects** | Every Architect, Developer and QA turn. Read live rather than frozen: a project runs for hours, so toggling it from the tracker header changes the *next* turn, not the next project. |
+
+Each tab stores its own value, so Efficiency in Chat does not switch it on for
+Council. Selecting both modes at once is supported and produces one combined
+instruction, not two competing ones: Caveman sets the voice and Efficiency is
+applied inside it.
+
+These are style instructions to the agent and nothing more. They do not compact
+the conversation history, change the model or its reasoning depth, or impose a
+hard output-token ceiling — whether a given CLI actually answers shorter is up
+to the model.
+
 ### Other toggles
 
-The gear beside the composer carries the two that change per run — Zero-Touch
-and Pull request. The rest live in **Settings → Run**, split by what they
-decide: how the next run behaves, and where the work lands. All of them are
+The gear beside the composer also carries Zero-Touch and Pull request, which
+change per run, plus **Multi-agent answer** in Chat and **Show the council
+seats** in Council. The rest live in **Settings → Run**, split by what they
+decide: how the next run behaves, and where the work lands. All of those are
 Council-only, and the gear says so rather than going quiet in Chat, which has
 no gate and no branch for them to decide anything about.
 
