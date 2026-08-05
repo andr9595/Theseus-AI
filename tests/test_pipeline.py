@@ -1199,6 +1199,215 @@ class TestFailureHandling(PipelineTestBase):
         self.assertIn("uncommitted", str(ctx.exception))
 
 
+class TestContinuingAFailedRun(PipelineTestBase):
+    """Continue: run what failed again, and nothing that did not.
+
+    The reason it exists is money. A council that loses only its chairman - to
+    a quota wall, a timeout, a CLI that fell over - has already paid for every
+    member position and every peer critique, and starting again spends all of
+    it a second time to get back to where it stopped.
+    """
+
+    def fail_the_chair(self):
+        self.store.update({"zero_touch": True})
+        self.pin_chair("claude", mock_council("claude", ["--fail"]))
+        run = self.pipeline.start("write the greeting", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "failed")
+        return run
+
+    def mend_the_chair(self):
+        self.store.update({
+            "providers": {cfg.council_provider_id("claude"): mock_council("claude")},
+        })
+
+    def test_only_the_failed_stage_is_offered(self):
+        run = self.fail_the_chair()
+        self.assertTrue(run.can_resume)
+        self.assertEqual(run.unfinished_stages, ["chair"])
+
+    def test_a_finished_run_has_nothing_to_continue(self):
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("finish cleanly", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertFalse(run.can_resume)
+        with self.assertRaises(ValueError):
+            self.pipeline.resume()
+
+    def test_the_members_are_not_asked_again(self):
+        # The whole saving, asserted on the clock: a reused stage keeps the
+        # timestamps of the attempt that actually ran it.
+        run = self.fail_the_chair()
+        before = {s.id: (s.started_at, s.output) for s in self.member_stages(run)}
+        self.mend_the_chair()
+
+        self.pipeline.resume()
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        after = {s.id: (s.started_at, s.output) for s in self.member_stages(run)}
+        self.assertEqual(before, after)
+        self.assertEqual(run.stages["chair"].state, "done")
+        self.assertTrue(run.stages["chair"].output.strip())
+
+    def test_a_continued_run_keeps_its_identity(self):
+        # One run, one id, one transcript. Two half-runs the operator has to
+        # line up by hand would lose the thing the transcript is for.
+        run = self.fail_the_chair()
+        run_id = run.id
+        self.mend_the_chair()
+
+        resumed = self.pipeline.resume()
+        self.wait_terminal()
+
+        self.assertIs(resumed, run)
+        self.assertEqual(resumed.id, run_id)
+        self.assertEqual(resumed.resumed, 1)
+
+    def test_continuing_picks_up_a_seat_pointed_at_a_working_command(self):
+        # Why providers are re-read on continue and nothing else is: the fix
+        # for "this CLI hit its quota" is to change what that seat runs, and a
+        # frozen command would continue straight back into the same wall.
+        run = self.fail_the_chair()
+        self.assertIn("chair", run.unfinished_stages)
+        self.mend_the_chair()
+
+        self.pipeline.resume()
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertTrue((self.repo / "AI_COUNCIL_DEMO.md").exists())
+
+    def test_a_failed_chair_that_fails_again_can_be_continued_again(self):
+        run = self.fail_the_chair()
+        self.pipeline.resume()
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "failed")
+        self.assertEqual(run.resumed, 1)
+        self.assertTrue(run.can_resume)
+
+        self.mend_the_chair()
+        self.pipeline.resume()
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(run.resumed, 2)
+
+    def test_the_gate_is_not_asked_twice(self):
+        # A human approved this bench and these positions once. Continuing
+        # reuses both unchanged, so asking again would be asking about
+        # something that has not changed.
+        self.pin_chair("claude", mock_council("claude", ["--fail"]))
+        run = self.pipeline.start("needs approval", str(self.repo))
+        self.wait_for(lambda: run.state == "awaiting_approval", what="the gate")
+        self.pipeline.approve("go ahead")
+        self.wait_terminal()
+        self.assertEqual(run.state, "failed")
+        self.assertTrue(run.approved)
+
+        self.mend_the_chair()
+        self.pipeline.resume()
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        # And the grant survived with it: the chairman was invoked with the
+        # auto-approve flag the human granted, not read-only.
+        self.assertIn(
+            "--dangerously-skip-permissions", run.stages["chair"].command
+        )
+
+    def test_the_first_attempts_snapshot_is_kept(self):
+        # Rollback after a continuation must undo the whole run, including
+        # whatever the first, failed chairman had already written.
+        run = self.fail_the_chair()
+        snapshot = run.snapshot
+        self.assertIsNotNone(snapshot)
+        self.mend_the_chair()
+
+        self.pipeline.resume()
+        self.wait_terminal()
+
+        self.assertIs(run.snapshot, snapshot)
+
+    def test_nothing_to_continue_without_a_run(self):
+        with self.assertRaises(ValueError):
+            self.pipeline.resume()
+
+    def test_a_failed_run_can_be_continued_after_a_restart(self):
+        # The case in-memory continuation cannot cover: the app was closed
+        # between the failure and the decision to continue. A fresh Pipeline
+        # standing in for the restart - same runs directory, no memory of the
+        # run - still finishes it without asking the members again.
+        run = self.fail_the_chair()
+        name = run.transcript_name
+        members = {s.id: s.output for s in self.member_stages(run)}
+        self.mend_the_chair()
+
+        restarted = Pipeline(self.store, self.bus, runs_dir=self.runs_dir)
+        self.addCleanup(restarted.wait_for_worker)
+        revived = restarted.revive(name)
+        self.wait_for(
+            lambda: not restarted.is_busy(), what="the revived run to finish"
+        )
+        restarted.wait_for_worker()
+
+        self.assertEqual(revived.state, "complete", revived.error)
+        self.assertEqual(revived.id, run.id)
+        self.assertEqual(
+            {s.id: s.output for s in self.member_stages(revived)}, members
+        )
+        self.assertTrue(revived.stages["chair"].output.strip())
+
+    def test_a_finished_transcript_is_not_revived(self):
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("finish cleanly", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+
+        with self.assertRaises(ValueError):
+            self.pipeline.revive(run.transcript_name)
+
+    def test_reviving_a_transcript_that_is_gone_says_so(self):
+        with self.assertRaises(ValueError):
+            self.pipeline.revive("1700000000-nosuchrun.json")
+
+    def test_a_pull_request_run_is_not_revived_after_a_restart(self):
+        # Its branch, its commits and possibly a published PR are all outside
+        # the transcript. Half-reconstructing that would be a guess about the
+        # repository, so it is refused in words the operator can act on.
+        run = self.fail_the_chair()
+        path = self.runs_dir / run.transcript_name
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["pull_request_mode"] = True
+        data["work_branch"] = "council/whatever"
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        with self.assertRaises(ValueError) as caught:
+            self.pipeline.revive(run.transcript_name)
+        self.assertIn("pull request", str(caught.exception).lower())
+
+    def test_a_failed_chat_turn_can_be_continued_too(self):
+        # Chat has one stage, so there is nothing to reuse - but the message,
+        # the thread and the folder are all still here, and retyping them is
+        # the thing continuing is meant to save.
+        self.store.update({
+            "mode": "solo",
+            "providers": {"solo": mock_provider("solo", "Assistant", ["--fail"])},
+        })
+        run = self.pipeline.start("what does this repo do?", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "failed")
+        self.assertTrue(run.can_resume)
+
+        self.store.update({"providers": {"solo": mock_provider("solo", "Assistant")}})
+        self.pipeline.resume()
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(run.task, "what does this repo do?")
+
+
 class TestCancellation(PipelineTestBase):
     def test_cancel_at_the_gate_ends_the_run(self):
         self.store.update({"zero_touch": False})

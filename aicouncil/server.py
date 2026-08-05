@@ -267,6 +267,7 @@ class Handler(BaseHTTPRequestHandler):
             ("POST", "/api/approve"): self._api_approve,
             ("POST", "/api/reject"): self._api_reject,
             ("POST", "/api/cancel"): self._api_cancel,
+            ("POST", "/api/resume"): self._api_resume,
             ("POST", "/api/rollback"): self._api_rollback,
             ("POST", "/api/commit"): self._api_commit,
             ("GET", "/api/project"): self._api_project,
@@ -560,6 +561,19 @@ class Handler(BaseHTTPRequestHandler):
     def _api_cancel(self, params: Dict[str, list]) -> Dict[str, Any]:
         self.app.pipeline.cancel()
         return {"ok": True}
+
+    def _api_resume(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Run the failed run's unfinished stages again, reusing the rest.
+
+        With no ``file`` this continues the run the engine is still holding.
+        With one it loads that transcript back first, which is the path after
+        the app has been restarted - the answers already paid for are on disk
+        either way.
+        """
+        name = str(self._read_body().get("file") or "")
+        pipeline = self.app.pipeline
+        run = pipeline.revive(name) if name else pipeline.resume()
+        return {"ok": True, "run": run.to_dict()}
 
     def _api_commit(self, params: Dict[str, list]) -> Dict[str, Any]:
         """Commit the working tree of the selected folder."""

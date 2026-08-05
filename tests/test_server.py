@@ -578,6 +578,14 @@ class TestSoloConfigMigration(unittest.TestCase):
 
 
 class TestApi(ServerTestBase):
+    def test_resume_says_why_when_there_is_nothing_to_continue(self):
+        # The button is only offered on a failed run, but the endpoint is
+        # reachable regardless - and whoever reaches it should be told what is
+        # wrong rather than handed a stack trace.
+        status, data = self.request("/api/resume", method="POST")
+        self.assertEqual(status, 400)
+        self.assertIn("no run to continue", data["error"].lower())
+
     def test_config_round_trips(self):
         status, data = self.request(
             "/api/config", method="POST", body={"house_rules": "use tabs"}

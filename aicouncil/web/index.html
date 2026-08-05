@@ -66,6 +66,11 @@
       </div>
       <div class="mode-bar-right">
         <button id="cancel-btn" class="btn btn-quiet btn-sm hidden" type="button">Cancel</button>
+        <!-- Shown only on a failed run that still has stages left. Continuing
+             reuses every answer already given and pays only for the stage that
+             failed, which is the difference between losing a chairman and
+             losing the whole council. -->
+        <button id="continue-btn" class="btn btn-quiet btn-sm hidden" type="button">Continue</button>
         <button id="rollback-btn" class="btn btn-quiet btn-sm hidden" type="button">Roll back</button>
         <button id="pr-btn" class="btn btn-quiet btn-sm hidden" type="button">View pull request</button>
       </div>

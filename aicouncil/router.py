@@ -238,6 +238,22 @@ class TaskProfile:
             "length": self.length,
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TaskProfile":
+        """Read a profile back off a persisted transcript.
+
+        ``dominant`` is deliberately not read: it is derived from the weights,
+        and a stored copy that disagreed with them would be a second, stale
+        answer to a question the weights already settle.
+        """
+        data = data or {}
+        weights = data.get("weights") or {}
+        return cls(
+            weights={axis: float(weights.get(axis) or 0.0) for axis in DIMENSIONS},
+            signals=list(data.get("signals") or []),
+            length=int(data.get("length") or 0),
+        )
+
 
 def profile_task(task: str) -> TaskProfile:
     """Turn a prompt into a task profile by lexical and structural extraction.
@@ -413,6 +429,29 @@ class Seat:
             "pinned": self.pinned,
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Seat":
+        """Rebuild a seat from a persisted transcript.
+
+        Read back rather than re-routed on purpose: continuing a run must sit
+        the bench that ran, not the bench the router would choose today. The
+        agents have their own feedback loop, and a seat that moved between the
+        two halves of one run would leave a transcript nobody can read.
+        """
+        data = data or {}
+        return cls(
+            id=str(data.get("id") or ""),
+            agent=str(data.get("agent") or ""),
+            provider_id=str(data.get("provider_id") or ""),
+            chairman=bool(data.get("chairman")),
+            alias=str(data.get("alias") or ""),
+            persona=str(data.get("persona") or ""),
+            persona_name=str(data.get("persona_name") or ""),
+            score=float(data.get("score") or 0.0),
+            reasons=list(data.get("reasons") or []),
+            pinned=bool(data.get("pinned")),
+        )
+
 
 @dataclass
 class Seating:
@@ -441,6 +480,27 @@ class Seating:
             "profile": self.profile.to_dict(),
             "notes": self.notes,
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> Optional["Seating"]:
+        """Rebuild a bench from a persisted transcript, or None if there is none.
+
+        None covers the transcripts that predate routing entirely - the
+        two-stage council wrote no seating - and a truncated file. Both are
+        read-only history; neither can be continued, and the caller says so
+        rather than guessing at a bench.
+        """
+        data = data or {}
+        chair = data.get("chair")
+        members = data.get("members")
+        if not chair or not members:
+            return None
+        return cls(
+            members=[Seat.from_dict(s) for s in members],
+            chair=Seat.from_dict(chair),
+            profile=TaskProfile.from_dict(data.get("profile") or {}),
+            notes=list(data.get("notes") or []),
+        )
 
 
 # The anonymous names peers are shown under. Latin letters because the critique

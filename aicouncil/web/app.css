@@ -650,6 +650,13 @@ html, body {
   padding-top: 4px;
 }
 
+/* A failure and the way out of it on one line: the button belongs beside the
+   sentence that explains why it is there, not elsewhere on the page. */
+.turn-note-fail {
+  display: flex; align-items: center; justify-content: center;
+  gap: 10px; flex-wrap: wrap;
+}
+
 /* ---- Collapsible console and diff ---- */
 
 .console-block,

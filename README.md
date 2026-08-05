@@ -182,19 +182,23 @@ the same command works whichever seat it lands in.
    something" work before you have configured anything. See
    [The working folder](#the-working-folder).
 2. **Describe the task.** Be specific about files, behaviour and edge cases —
-   the draft stage is only as good as its brief.
+   every seat answers the brief you wrote, and no council is better than it.
 3. **Send it** with <kbd>Enter</kbd>, or the arrow button.
    <kbd>Shift</kbd>+<kbd>Enter</kbd> is a newline.
 4. **Watch the council work.** The strip above the conversation shows which
    member is active. Each stage's answer arrives as a message in the thread;
    the raw stdout/stderr is in the **Console output** block beneath it.
 5. **Review and approve.** The run pauses with a gate card sitting directly
-   under the draft, and nothing yet written to disk. Optionally type a steer —
-   it takes precedence over the draft — then click **Approve & execute**.
+   under the deliberation, and nothing yet written to disk. Optionally type a
+   steer — it takes precedence over every member — then click
+   **Approve & execute**.
 6. **Inspect the result.** A **Changes** block closes the turn, holding the
    real `git diff` per file with line numbers, and the commit bar.
 7. **Roll back** if you don't like it. One click restores the tree exactly.
-8. **Or keep going.** Just type again — the composer stays attached to the
+8. **Continue it if it fell over.** A failed run keeps every answer it already
+   got and offers **Continue**, which re-runs only the stage that failed. See
+   [Continuing a run that failed](#continuing-a-run-that-failed).
+9. **Or keep going.** Just type again — the composer stays attached to the
    conversation. See [Continuing a run](#continuing-a-run).
 
 ### The three tabs
@@ -227,7 +231,7 @@ What the folder decides is which half of the safety model is available:
 | Working folder | You get | You do not get |
 |---|---|---|
 | A git repository | Everything below | — |
-| Any other folder | Draft, approval gate, console, conversations, and agents that can still write to it | Diff, safety snapshot, rollback, commit bar, pull-request mode |
+| Any other folder | Deliberation, critique, approval gate, console, conversations, and a chairman that can still write to it | Diff, safety snapshot, rollback, commit bar, pull-request mode |
 | None chosen | The same, in `~/.config/ai-council/workspace` | The same |
 
 None of that is enforced by refusing to start. The status bar says which
@@ -274,12 +278,12 @@ and the list shows one row per thread named for the message it opened with.
 Continue the same run twice and you get two rows, because the history really is
 a tree and folding one branch away silently would lose it.
 
-**Continue** — on the open conversation, or in the top bar as soon as a run
-finishes — attaches that exchange to your next message. The follow-up is a
+Opening a conversation — or finishing a run — attaches it to your next
+message, and the banner above the composer says which one. The follow-up is a
 **new run** with its own transcript, approval gate and rollback point; nothing
-about the earlier one is overwritten. Both stages are given the thread, so the
-junior drafts with the earlier reasoning in view and the senior sees what it
-already told you.
+about the earlier one is overwritten. Every seat is given the thread, so each
+member answers with the earlier reasoning in view, each critique knows what was
+already argued, and the chairman sees what it already told you.
 
 Two deliberate limits:
 
@@ -292,6 +296,56 @@ Two deliberate limits:
   carries it, more accurately.
 
 Continuation only works within the folder the run started in.
+
+### Continuing a run that failed
+
+Different thing, same word. Above is continuing a *conversation*, which starts
+a new run. This is finishing *one* run that stopped halfway.
+
+A council run is five or seven agent invocations, and the expensive ones come
+first. When the chairman falls over — a quota wall, a timeout, a CLI that dies
+in its own harness — every member position and every peer critique has already
+been paid for. Starting again spends all of it a second time to get back to
+where it stopped.
+
+A failed run therefore offers **Continue**, in the top bar and beside the
+failure in the thread. Its tooltip says exactly what that costs:
+
+```text
+Runs Chairman (Claude) again, reusing 4 answers already given.
+```
+
+Clicking it runs the unfinished stages and replays the rest from the record. It
+is the same run — same id, same transcript, same thread — not a new one.
+
+What continuing does and does not carry over:
+
+- **Answers already given are reused, not re-asked.** A stage that produced an
+  answer is replayed from the transcript. Only what failed is dispatched again.
+- **The approval gate is not asked twice.** If you already approved this run,
+  the chairman keeps the write permission you granted — the bench and the
+  positions it was approving are exactly the ones being reused. A run that
+  failed *before* the gate still stops there.
+- **The safety snapshot is the first attempt's.** Rollback after a
+  continuation undoes the whole run, including anything the failed chairman had
+  already written.
+- **Providers and roles are re-read from Settings; nothing else is.** This is
+  the one place a run's frozen configuration is deliberately refreshed: the
+  usual reason to continue is that a seat hit its quota, and the usual fix is
+  to point that seat at another model or another CLI first. Zero-Touch,
+  pull-request delivery, the snapshot setting and the bench itself stay as they
+  were — the bench especially, because a run whose seats moved halfway through
+  would leave a transcript nobody can read.
+- **It survives a restart.** The button also appears on a failed run opened
+  from history, so closing the app — or restarting it to install the CLI update
+  that fixes the failure — costs nothing. The answers are on disk. The
+  exception is a pull-request run, which is refused after a restart: its
+  branch, its commits and possibly a published PR live outside the transcript,
+  and half-reconstructing that would be a guess about your repository.
+
+Chat can be continued the same way. There is only one stage, so nothing is
+reused — but the message, the thread and the folder are still there, which is
+the retyping it saves.
 
 ### The context meter, and compaction
 
@@ -307,9 +361,9 @@ reports its tokenizer's count back to this app, so the token figure is the usual
 four-characters-per-token approximation. The window is the
 `context_window_tokens` setting in your config — 200k by default, which suits
 current Claude and Codex models — and not a number any vendor told us. And it
-measures the replayed conversation only: your task, the junior's draft and
-whatever the agent reads for itself all land in the same window, so treat it as
-a floor rather than a total.
+measures the replayed conversation only: your task, the other members' answers
+quoted into a critique, and whatever the agent reads for itself all land in the
+same window, so treat it as a floor rather than a total.
 
 How far below the total is worth knowing. A `claude -p` run with a 22-character
 prompt — one this meter would price at ~6 tokens — reports **36,560 input
@@ -470,8 +524,8 @@ ChatGPT is. It has:
   to replay, your message reaches the CLI *exactly as typed* — no persona, no
   house rules, no folder preamble. Type something into that box and it is
   put in front of the message; that is the whole of it.
-- **No draft and no approval gate**, and no member strip — just the message
-  and the reply.
+- **No deliberation and no approval gate**, and no member strip — just the
+  message and the reply.
 - **Read-only until you say otherwise.** By default Chat is invoked with its
   agent's read-only arguments (`--sandbox read-only` for `codex`,
   `--permission-mode plan` for `claude`, and `--mode plan
@@ -876,17 +930,24 @@ under Settings → **Roles**:
 
 | Template | Behaviour | Writes |
 |---|---|---|
-| Junior Draft *(legacy)* | Surveys the repo, proposes a change | no |
-| Senior Polish *(legacy)* | Verifies a draft, corrects it, applies it | yes |
-| Direct Implementer | Works the task directly, no draft to review | yes |
+| Council Member | The neutral lens — what an unrouted seat gets | no |
+| Pragmatist | Smallest change that works, shipped today | no |
+| Visionary | The longer view, and what this decision costs later | no |
 | Adversarial Reviewer | Hunts for defects, fixes nothing | no |
 | Test Writer | Writes tests that would have caught real bugs | yes |
 | Security Reviewer | Findings with a real attacker and a real path | no |
+| Direct Implementer | Works the task directly, nothing to review | yes |
+| Chairman | Weighs the bench and applies the outcome | yes |
+| Junior Draft *(legacy)* | Surveys the repo, proposes a change | no |
+| Senior Polish *(legacy)* | Verifies a draft, corrects it, applies it | yes |
 
-Junior Draft and Senior Polish are the two-stage council's personas, kept
-selectable but no longer wired to a stage that resolves them by name; every
-member seat today is read-only regardless of which persona it holds, and only
-the chairman can write. Pick a persona and it takes effect on the next run.
+**Chairman** is not offered as a member's lens: it is what the third stage
+*is*, not a lens over it, so the chair's seat has no persona picker and edits
+to that template change how the chair is briefed. Junior Draft and Senior
+Polish are the two-stage council's personas, kept selectable but no longer
+wired to a stage that resolves them by name; every member seat today is
+read-only regardless of which persona it holds, and only the chairman can
+write. Pick a persona and it takes effect on the next run.
 The text box below it overrides the template entirely — edit it, or clear it
 to go back. Blank means "use the template", so clearing the box restores the
 default rather than sending an empty prompt.
@@ -921,9 +982,8 @@ into lines:
 ← def do_GET(self): (+118 lines)   what came back, summarised
 ```
 
-The **Draft** and **Senior review** tabs still show the agent's final answer
-alone, not this transcript — the events carry both, and each pane gets the one
-it wants.
+A seat's card in the thread still shows that agent's final answer alone, not
+this transcript — the events carry both, and each pane gets the one it wants.
 
 If a future CLI release renames these flags, edit the field; nothing here is
 compiled into the app. Clearing it is safe too — you simply get the old
@@ -1073,7 +1133,9 @@ guessed at, since a wrong guess would be read as the prompt or rejected.
 aicouncil/
 ├── __main__.py     Entry point, browser launcher, --doctor
 ├── server.py       http.server + SSE, token auth, Origin/Host validation
-├── pipeline.py     The state machine: deliberate → critique → gate → synthesize → complete
+├── pipeline.py     The state machine: deliberate → critique → gate → synthesize → complete,
+│                   plus continuing a failed run from the stages that answered
+├── router.py       Seats the bench: task profile → capability profile → score → seating
 ├── projects.py     The board-driven autonomous loop and its .theseus/ board
 ├── providers.py    CLI adapters: argv construction, streaming, cancellation
 ├── prompts.py      Role catalogue, stage prompts and the project phase prompts
@@ -1138,8 +1200,12 @@ Coverage focuses on the properties that matter if they're wrong:
 - Pull-request mode leaves the base branch **byte-for-byte as it was**, opens
   the PR against the branch that was checked out, and says where the work is
   when publishing fails.
-- A continued run carries the earlier exchange to **both** stages and refuses a
-  transcript from another folder.
+- A continued conversation carries the earlier exchange to **every seat** and
+  refuses a transcript from another folder.
+- Continuing a *failed* run re-runs only what failed: the members' timestamps
+  and answers are asserted to be **the ones from the first attempt**, the
+  approval gate is not asked a second time, the first snapshot is kept, and a
+  fresh engine handed nothing but the transcript still finishes the run.
 - Both modes start with no working folder and in a folder with no git; what
   those runs lose is the diff, the snapshot and pull-request delivery, and a
   config written when the folder was a mandatory repository still migrates.
@@ -1178,6 +1244,7 @@ Coverage focuses on the properties that matter if they're wrong:
 | "Missing session token" | The dashboard was opened without the launcher's URL. Restart with `./run.sh`. |
 | Pull-request mode refuses to start | It says which precondition failed — a dirty tree, no `origin`, no git identity, or `gh` missing or logged out. Fix that one thing. |
 | Run hangs, no output | The CLI is waiting on interactive input. Check its auto-approve arguments in Settings. |
+| A seat hit its quota and the run failed | Don't start again — the answers already given are kept. Point that seat at another model or CLI, then click **Continue**: only the stage that failed runs. It works on a failed run reopened from history too, so restarting the app costs nothing. See [Continuing a run that failed](#continuing-a-run-that-failed). |
 | A seat says **"exited cleanly but printed nothing"** | The CLI produced no answer despite a zero exit status. Click the step in the strip: whatever the CLI said on its way out is on that seat's row. For `agy` the usual cause is a missing read grant — see [Antigravity's read-only flags](#antigravitys-read-only-flags). |
 | Port already in use | The server falls back to a free port automatically; read the URL it prints. |
 | Stream shows "reconnecting" | The server stopped. It reconnects with backoff once it's back. |

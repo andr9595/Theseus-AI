@@ -355,6 +355,37 @@ class StageRecord:
             "consensus": self.consensus,
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "StageRecord":
+        """Rebuild a stage record from a persisted transcript.
+
+        Only the fields a resumed run has to know about: what this stage is,
+        whether it got an answer, and the answer itself. `duration` is derived
+        on the way out and is not read back.
+        """
+        return cls(
+            id=str(data.get("id") or ""),
+            label=str(data.get("label") or ""),
+            role=str(data.get("role") or ""),
+            state=str(data.get("state") or "pending"),
+            started_at=float(data.get("started_at") or 0.0),
+            ended_at=float(data.get("ended_at") or 0.0),
+            output=str(data.get("output") or ""),
+            error=str(data.get("error") or ""),
+            command=list(data.get("command") or []),
+            exit_code=data.get("exit_code"),
+            model=str(data.get("model") or ""),
+            effort=str(data.get("effort") or ""),
+            seat=str(data.get("seat") or ""),
+            kind=str(data.get("kind") or "legacy"),
+            agent=str(data.get("agent") or ""),
+            alias=str(data.get("alias") or ""),
+            persona=str(data.get("persona") or ""),
+            confidence=data.get("confidence"),
+            because=str(data.get("because") or ""),
+            consensus=data.get("consensus"),
+        )
+
 
 @dataclass
 class Run:
@@ -390,6 +421,15 @@ class Run:
     reviewer_note: str = ""
     error: str = ""
     rollback_note: str = ""
+    # Whether a human has already let this run past the approval gate. Carried
+    # on the run so continuing a failed chairman does not ask again: what the
+    # gate approved was this bench and these positions, and continuing reuses
+    # both unchanged. A run that never reached the gate has nothing approved,
+    # so it stops there exactly as it did the first time.
+    approved: bool = False
+    # How many times this run has been continued. Kept because a transcript
+    # showing one chairman answer that took three attempts should say so.
+    resumed: int = 0
     # Continuation lineage. A follow-up run is a new, independently auditable
     # run that carries the earlier turns of its thread rather than reopening
     # the transcript it came from.
@@ -455,6 +495,28 @@ class Run:
         return chair.confidence if chair else None
 
     @property
+    def unfinished_stages(self) -> List[str]:
+        """The stages a continuation would have to run again.
+
+        Anything that failed, and anything the run never reached. A stage that
+        answered is not in here, which is the whole point: its output is on the
+        record and continuing replays it instead of paying for it twice.
+        """
+        return [
+            sid for sid in self.stage_order
+            if self.stages[sid].state in ("failed", "pending", "running")
+        ]
+
+    @property
+    def can_resume(self) -> bool:
+        """Whether Continue is worth offering on this run.
+
+        Only a failed one, and only while there is something left to run. A
+        cancelled run is not offered: it stopped because somebody said stop.
+        """
+        return self.state == FAILED and bool(self.unfinished_stages)
+
+    @property
     def transcript_name(self) -> str:
         """The filename this run's transcript is persisted under.
 
@@ -514,6 +576,13 @@ class Run:
             "reviewer_note": self.reviewer_note,
             "error": self.error,
             "rollback_note": self.rollback_note,
+            "approved": self.approved,
+            "resumed": self.resumed,
+            # What Continue would cost, decided here rather than in the browser
+            # so the button and the engine cannot disagree about whether there
+            # is anything left to do.
+            "can_resume": self.can_resume,
+            "unfinished_stages": self.unfinished_stages,
             "parent_run_id": self.parent_run_id,
             "conversation": self.conversation,
             "context": self.context,
@@ -951,6 +1020,188 @@ class Pipeline:
             self._gate.set()
         self.bus.publish("log", level="warn", message="Cancellation requested.")
 
+    def revive(self, name: str) -> Run:
+        """Load a failed transcript back into the engine so it can be continued.
+
+        For the case the in-memory path cannot cover: the app was closed - or
+        crashed, or was restarted to install the CLI update that fixes the
+        failure - between the failed run and the decision to continue it. The
+        transcript has every answer already given, so continuing from disk
+        costs exactly what continuing in memory costs.
+
+        What is *not* on the transcript is the configuration, which is not
+        written into it. A revived run is therefore configured from Settings as
+        it stands now. That is the same rule `resume` follows for providers,
+        applied to the whole run because there is nothing else to apply.
+        """
+        data = self.load_run(name)
+        if data is None:
+            raise ValueError("That run transcript no longer exists.")
+        if str(data.get("state") or "") != FAILED:
+            raise ValueError("Only a failed run can be continued.")
+        if data.get("pull_request_mode"):
+            # A PR run's branch, its commits and possibly a published pull
+            # request are all outside this transcript. Reconstructing half of
+            # that and calling it the same run would be a guess about the
+            # repository, so it is refused in as many words instead.
+            raise ValueError(
+                "That run was delivering a pull request, and the app has been "
+                "restarted since. Continue it by starting a new run on the "
+                "work branch."
+            )
+
+        seating = router.Seating.from_dict(data.get("seating") or {})
+        mode = str(data.get("mode") or "") or ("solo" if data.get("solo") else "council")
+        if mode == "council" and seating is None:
+            raise ValueError(
+                "That transcript has no seating recorded, so there is no bench "
+                "to put back. It can be read, but not continued."
+            )
+
+        workspace = str(data.get("workspace") or data.get("repo") or "")
+        if workspace and not Path(workspace).is_dir():
+            raise ValueError(
+                f"The folder that run worked in is gone: {workspace}"
+            )
+
+        with self._lock:
+            if self._run is not None and self._run.state not in TERMINAL_STATES:
+                raise PipelineBusy("A run is already in progress.")
+
+            run = Run(
+                id=str(data.get("id") or ""),
+                task=str(data.get("task") or ""),
+                workspace=resolve_workspace(workspace),
+                zero_touch=bool(data.get("zero_touch")),
+                mode=mode,
+                snapshot_planned=bool(data.get("snapshot_planned")),
+                state=FAILED,
+                created_at=float(data.get("created_at") or time.time()),
+                ended_at=float(data.get("ended_at") or 0.0),
+                stages={
+                    sid: StageRecord.from_dict(sdata)
+                    for sid, sdata in (data.get("stages") or {}).items()
+                },
+                diff=str(data.get("diff") or ""),
+                diff_stat=dict(data.get("diff_stat") or {}),
+                snapshot=(
+                    gitutil.Snapshot(**data["snapshot"])
+                    if isinstance(data.get("snapshot"), dict)
+                    else None
+                ),
+                reviewer_note=str(data.get("reviewer_note") or ""),
+                error=str(data.get("error") or ""),
+                approved=bool(data.get("approved")),
+                resumed=int(data.get("resumed") or 0),
+                seating=seating,
+                strictness=int(
+                    data.get("strictness") or prompts.DEFAULT_STRICTNESS
+                ),
+                parent_run_id=str(data.get("parent_run_id") or ""),
+                conversation=list(data.get("conversation") or []),
+                context=dict(data.get("context") or {}),
+                config=self.store.all(),
+            )
+            self._run = run
+            self._cancel_requested = False
+            self._gate.clear()
+            self._gate_decision = ""
+
+        self.bus.publish("run_started", run=run.to_dict())
+        return self.resume()
+
+    def resume(self) -> Run:
+        """Run a failed run's unfinished stages again, keeping the rest.
+
+        The saving is the point: a council that lost only its chairman - to a
+        quota wall, a timeout, a CLI that fell over - has already paid for
+        every member position and every peer critique, and they are on the
+        record. Continuing replays those and asks only the stage that failed.
+
+        Not a new run. The same run resumes under the same id, so the
+        transcript stays one auditable history of one task rather than two
+        halves the operator has to line up by hand.
+        """
+        with self._lock:
+            run = self._run
+            if run is None:
+                raise ValueError("There is no run to continue.")
+            if run.state not in TERMINAL_STATES:
+                raise PipelineBusy("A run is already in progress.")
+            if run.state != FAILED:
+                raise ValueError(
+                    "Only a failed run can be continued. This one "
+                    f"{run.state.replace('_', ' ')}."
+                )
+            if not run.unfinished_stages:
+                raise ValueError(
+                    "Every stage of that run answered, so there is nothing "
+                    "left to continue."
+                )
+
+            # A stage that failed starts again from nothing. Leaving its error
+            # and its half-written output in place would put the first
+            # attempt's failure next to the second attempt's answer with no
+            # way to tell which is which.
+            for stage in run.stages.values():
+                if stage.state in ("failed", "skipped", "running"):
+                    stage.state = "pending"
+                    stage.error = ""
+                    stage.output = ""
+                    stage.exit_code = None
+                    stage.command = []
+                    stage.started_at = 0.0
+                    stage.ended_at = 0.0
+                    stage.confidence = None
+                    stage.because = ""
+                    stage.consensus = None
+
+            # Providers and roles are re-read from Settings; everything else
+            # about the run stays frozen. Deliberate, and the one exception to
+            # the rule that a run's configuration is fixed at start: the
+            # commonest reason to continue is that a seat hit its quota wall,
+            # and the commonest fix is to point that seat at a different model
+            # first. Freezing the command here would mean continuing into the
+            # same wall. What is *not* re-read is what the run is allowed to do
+            # - Zero-Touch, pull-request delivery, the snapshot, the bench -
+            # because those were decided, and in some cases approved, once.
+            fresh = self.store.all()
+            run.config = {
+                **run.config,
+                "providers": fresh.get("providers") or {},
+                "roles": fresh.get("roles") or {},
+            }
+
+            run.error = ""
+            run.ended_at = 0.0
+            run.resumed += 1
+            run.state = RUNNING
+            self._cancel_requested = False
+            self._gate.clear()
+            self._gate_decision = ""
+
+        kept = [
+            sid for sid in run.stage_order if run.stages[sid].state == "done"
+        ]
+        self.bus.publish(
+            "log",
+            level="info",
+            message=(
+                f"Continuing this run. {len(kept)} answer(s) already given are "
+                f"being reused; {len(run.unfinished_stages)} stage(s) will run "
+                f"again."
+            ),
+        )
+        self.bus.publish("state", state=run.state, run=run.to_dict())
+
+        thread = threading.Thread(
+            target=self._execute, args=(run,), name=f"run-{run.id}-resume", daemon=True
+        )
+        with self._lock:
+            self._thread = thread
+        thread.start()
+        return run
+
     def wait_for_worker(self, timeout: float = 30.0) -> bool:
         """Block until the worker thread has fully wound down.
 
@@ -1025,8 +1276,42 @@ class Pipeline:
         auto_approve: bool,
         read_only: bool = False,
     ) -> ProviderResult:
-        """Run one stage. ``provider`` comes from the run's frozen config."""
+        """Run one stage. ``provider`` comes from the run's frozen config.
+
+        A stage that already answered is replayed rather than re-run. During a
+        first execution nothing is `done` before it runs, so this costs
+        nothing; on a continuation it is the whole saving - the members and
+        their critiques are already on the record, and only the stage that
+        failed is asked to spend anything.
+        """
         stage = run.stages[stage_id]
+        if stage.state == "done" and stage.output.strip():
+            self.bus.publish(
+                "log",
+                level="info",
+                message=(
+                    f"Reusing {stage.label}'s answer from the first attempt - "
+                    f"it is not being asked again."
+                ),
+            )
+            replayed = ProviderResult(
+                provider_id=str(provider.get("id") or stage_id),
+                ok=True,
+                exit_code=stage.exit_code if stage.exit_code is not None else 0,
+                stdout=stage.output,
+                stderr="",
+                duration=0.0,
+                command=list(stage.command),
+            )
+            self.bus.publish(
+                "stage_finished",
+                stage=stage_id,
+                ok=True,
+                run=run.to_dict(),
+                result=replayed.to_dict(),
+            )
+            return replayed
+
         stage.model = str(provider.get("model") or "")
         stage.effort = str(provider.get("effort") or "")
         stage.state = "running"
@@ -1334,7 +1619,9 @@ class Pipeline:
         if seating is None:  # start() always seats a council run
             raise RuntimeError("Council run reached execution with no seating.")
 
-        execute_approved = run.zero_touch
+        # Zero-Touch grants it up front; `approved` is a grant a human already
+        # made at the gate on an earlier attempt at this same run.
+        execute_approved = run.zero_touch or run.approved
         # Set when the deliberation produced too little to synthesise from,
         # which forces the gate back on even under Zero-Touch.
         degraded = False
@@ -1533,7 +1820,11 @@ class Pipeline:
         # Unmoved: it is still the last thing before the only stage that can
         # write, and what it shows is now the whole deliberation rather than
         # one draft.
-        if not run.zero_touch or degraded:
+        # `run.approved` is the continuation case: this bench and these
+        # positions have already been through the gate once, and re-asking
+        # would make the operator approve the identical deliberation twice to
+        # get one chairman answer.
+        if (not run.zero_touch or degraded) and not run.approved:
             self._set_state(run, AWAITING_APPROVAL)
             self.bus.publish(
                 "log",
@@ -1574,6 +1865,7 @@ class Pipeline:
                 self._finish_cancelled(run, "Rejected at the approval gate.")
                 return
             execute_approved = True
+            run.approved = True
 
         # ---- Delivery branch and safety snapshot ------------------------
         # Both happen here, after permission to write has been granted, so
@@ -1654,6 +1946,12 @@ class Pipeline:
         """
         if not run.pull_request_mode:
             return
+        if run.resumed and gitutil.status(run.workspace).branch == run.work_branch:
+            # A continuation is already standing on the branch the first
+            # attempt cut. `git checkout -b` would fail on it, and failing the
+            # run over a branch that already exists is the opposite of what
+            # continuing is for.
+            return
         gitutil.create_branch(run.workspace, run.work_branch)
         self.bus.publish(
             "log",
@@ -1667,6 +1965,12 @@ class Pipeline:
     def _take_snapshot(self, run: Run) -> None:
         """Anchor the tree immediately before anything writes to it."""
         if not run.config.get("safety_snapshot", True):
+            return
+        if run.snapshot is not None:
+            # A continuation keeps the first attempt's anchor. Re-taking it
+            # here would anchor to whatever the failed chairman had already
+            # written, and rollback would then restore the half-applied state
+            # rather than the tree the run started from.
             return
         try:
             run.snapshot = gitutil.take_snapshot(run.workspace)

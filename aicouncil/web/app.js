@@ -674,6 +674,12 @@ function renderStatus() {
   $('#topbar-meta').textContent = meta.join('  ·  ');
 
   $('#cancel-btn').classList.toggle('hidden', !state.busy);
+  // On the live run, and on a failed one opened from history: that second case
+  // is the app having been restarted since it failed, which is exactly when
+  // the answers already paid for are worth most.
+  const resumable = !!(run && run.can_resume && !state.busy);
+  $('#continue-btn').classList.toggle('hidden', !resumable);
+  if (resumable) $('#continue-btn').title = continueHint(run);
   $('#rollback-btn').classList.toggle('hidden', !(run && run.can_rollback));
   $('#pr-btn').classList.toggle('hidden', !(run && run.pull_request && run.pull_request.url));
   renderContinuation();
@@ -704,6 +710,45 @@ function renderStatus() {
         ' <b>No safety snapshot will be taken</b>, so this run cannot be ' +
         'rolled back.');
   }
+}
+
+/** What Continue would do, in stages rather than in reassurance.
+ *
+ *  The number that matters is how much is *not* being paid for again — that is
+ *  the whole reason to continue rather than to ask again from the top. */
+function continueHint(run) {
+  const stages = run.stages || {};
+  const name = id => {
+    const st = stages[id] || {};
+    return st.role && st.label ? `${st.role} (${st.label})` : (st.label || id);
+  };
+  const left = (run.unfinished_stages || []).map(name);
+  const kept = (run.stage_order || [])
+    .filter(id => (stages[id] || {}).state === 'done').length;
+  if (!left.length) return 'Continue this run.';
+  return `Runs ${left.join(', ')} again` +
+    (kept ? `, reusing ${kept} answer${kept === 1 ? '' : 's'} already given.`
+          : '. Nothing from the first attempt survived to reuse.');
+}
+
+/** Continue the failed run: same run, same id, only the unfinished stages.
+ *
+ *  Not to be confused with `continueRun` below, which continues a *thread* by
+ *  starting a new run that replays it. This one finishes a run that stopped
+ *  halfway, and pays for nothing that already answered.
+ *
+ *  A transcript opened from history carries its filename, which is what lets
+ *  the engine load a run back after the app has been restarted. */
+async function resumeRun() {
+  const run = runOnScreen();
+  if (!run) return;
+  const body = state.openChat && run.file ? { file: run.file } : {};
+  try {
+    await api('/api/resume', { method: 'POST', body });
+    // The run is live again, so the thread has to stop rendering the frozen
+    // copy history handed it or the stages would never appear to move.
+    state.openChat = null;
+  } catch (err) { toast(err.message, 'error', 9000); }
 }
 
 /** One line describing what a thread costs to replay.
@@ -1938,7 +1983,17 @@ function renderThread() {
       (council && live ? '<div data-slot="console-block"></div>' : '') +
       (hasDiff ? '<div data-slot="diff-block"></div>' : '') +
       (run.rollback_note ? `<div class="turn-note">${esc(run.rollback_note)}</div>` : '') +
-      (run.error ? `<div class="turn-note">${esc(run.error)}</div>` : '') +
+      // The failure, and next to it the way out of it. A Continue button only
+      // in the top bar would be a long way from the thing that failed, which
+      // is where the operator is actually looking.
+      (run.error
+        ? `<div class="turn-note turn-note-fail">${esc(run.error)}` +
+          (run.can_resume
+            ? `<button class="btn btn-quiet btn-sm" type="button" ` +
+              `data-continue title="${esc(continueHint(run))}">Continue</button>`
+            : '') +
+          `</div>`
+        : '') +
     '</div>';
 
   thread.innerHTML = earlier + current;
@@ -4519,6 +4574,8 @@ function wire() {
   $('#cancel-btn').addEventListener('click', () =>
     api('/api/cancel', { method: 'POST' }).catch(e => toast(e.message, 'error')));
 
+  $('#continue-btn').addEventListener('click', resumeRun);
+
   $('#rollback-btn').addEventListener('click', async () => {
     if (!confirm(
       'Roll back?\n\nThis resets the working tree to the snapshot taken before ' +
@@ -4582,6 +4639,12 @@ function wire() {
       if (!ok) { e.target.checked = false; return; }
     }
     patchConfig({ pull_request_mode: e.target.checked });
+  });
+
+  // Delegated: the thread is rewritten on every state change, so the Continue
+  // button beside a failure cannot carry a listener of its own.
+  $('#thread').addEventListener('click', (e) => {
+    if (e.target.closest('[data-continue]')) resumeRun();
   });
 
   // -- agent, model, effort and role pickers ----------------------------
