@@ -347,6 +347,41 @@ Chat can be continued the same way. There is only one stage, so nothing is
 reused — but the message, the thread and the folder are still there, which is
 the retyping it saves.
 
+The sidebar marks the rows worth going back to: a conversation that stopped
+halfway reads **· can continue** under its title, so finding it does not mean
+opening every failed run in the list.
+
+### Running one seat again
+
+Continue finishes a run that stopped. This replaces an answer you have and do
+not want — a seat that timed out into two lines, hit its wall mid-sentence, or
+simply argued badly — without disturbing the seats that did fine. Hover any
+answer in the thread and an **again** button appears on its card. It is offered
+on finished runs of either kind, so the common case Continue cannot reach —
+*the council carried on with two of three, the chairman answered, and the run
+says `complete`* — is one click rather than a whole new run.
+
+What it re-runs is not only the seat you clicked, and the button says so before
+you click it:
+
+| You run again | So does | Why |
+|---|---|---|
+| A member's position | Every peer critique, and the verdict | Each critique quotes every other position, and the chairman quotes all of them |
+| A critique | The verdict | The chairman weighed it |
+| The verdict | Nothing else | Nothing reads the chairman |
+
+That cascade is the honest cost. Re-running a member and keeping the reviews
+would leave a transcript whose critiques discuss an answer that is no longer in
+it, and a verdict that weighed one the run no longer contains. Continuing a
+failed run applies the same rule for the same reason: if a member died in Stage
+1 and the critiques were written without it, continuing rewrites those
+critiques rather than pretending they saw it.
+
+Everything else is replayed from the record, exactly as with Continue — and,
+also as with Continue, the seat's provider is re-read from Settings first, so
+pointing it at another model between attempts is the point rather than a
+side-effect.
+
 ### The context meter, and compaction
 
 Attaching a conversation shows what replaying it will cost, next to the banner
@@ -1217,6 +1252,10 @@ Coverage focuses on the properties that matter if they're wrong:
   and answers are asserted to be **the ones from the first attempt**, the
   approval gate is not asked a second time, the first snapshot is kept, and a
   fresh engine handed nothing but the transcript still finishes the run.
+- Running one seat again re-runs **what quoted it and nothing else**: a member
+  takes the critiques and the verdict with it, a critique takes the verdict, the
+  chairman takes nothing — checked on the clock, so a stage that was "kept" is
+  one that really did not run twice.
 - Both modes start with no working folder and in a folder with no git; what
   those runs lose is the diff, the snapshot and pull-request delivery, and a
   config written when the folder was a mandatory repository still migrates.

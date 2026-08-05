@@ -268,6 +268,7 @@ class Handler(BaseHTTPRequestHandler):
             ("POST", "/api/reject"): self._api_reject,
             ("POST", "/api/cancel"): self._api_cancel,
             ("POST", "/api/resume"): self._api_resume,
+            ("POST", "/api/retry"): self._api_retry,
             ("POST", "/api/rollback"): self._api_rollback,
             ("POST", "/api/commit"): self._api_commit,
             ("GET", "/api/project"): self._api_project,
@@ -574,6 +575,23 @@ class Handler(BaseHTTPRequestHandler):
         pipeline = self.app.pipeline
         run = pipeline.revive(name) if name else pipeline.resume()
         return {"ok": True, "run": run.to_dict()}
+
+    def _api_retry(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Run one seat again, with whatever quoted it.
+
+        ``file`` loads a transcript back first, exactly as `/api/resume` does:
+        a seat whose answer is not good enough is worth replacing whether or
+        not the app has been restarted since it gave it.
+        """
+        body = self._read_body()
+        stage = str(body.get("stage") or "")
+        if not stage:
+            raise ValueError("Which stage should run again?")
+        name = str(body.get("file") or "")
+        pipeline = self.app.pipeline
+        if name:
+            pipeline.revive(name, start=False)
+        return {"ok": True, "run": pipeline.retry(stage).to_dict()}
 
     def _api_commit(self, params: Dict[str, list]) -> Dict[str, Any]:
         """Commit the working tree of the selected folder."""

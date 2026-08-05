@@ -1372,6 +1372,49 @@ class TestContinuingAFailedRun(PipelineTestBase):
         with self.assertRaises(ValueError):
             self.pipeline.revive("1700000000-nosuchrun.json")
 
+    def test_a_transcript_written_before_continue_existed_can_still_continue(self):
+        # The runs that need this most are the ones already on disk: a council
+        # that paid for six answers and lost its chairman to a quota wall,
+        # written by a version that had no `can_resume` to record. Answering
+        # from the stored key would call those unusable, which is backwards.
+        run = self.fail_the_chair()
+        path = self.runs_dir / run.transcript_name
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.pop("can_resume", None)
+        data.pop("unfinished_stages", None)
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        loaded = self.pipeline.load_run(run.transcript_name)
+        self.assertTrue(loaded["can_resume"])
+        self.assertEqual(loaded["unfinished_stages"], ["chair"])
+
+        # And it is not merely labelled continuable - it continues.
+        self.mend_the_chair()
+        restarted = Pipeline(self.store, self.bus, runs_dir=self.runs_dir)
+        self.addCleanup(restarted.wait_for_worker)
+        revived = restarted.revive(run.transcript_name)
+        self.wait_for(lambda: not restarted.is_busy(), what="the revived run")
+        restarted.wait_for_worker()
+        self.assertEqual(revived.state, "complete", revived.error)
+
+    def test_the_conversation_list_says_which_rows_can_continue(self):
+        # Discoverability: whoever needs this is scanning a list of
+        # conversations for the one they gave up on, not opening each in turn.
+        run = self.fail_the_chair()
+        rows = self.pipeline.history(mode="council")
+        row = next(r for r in rows if r["file"] == run.transcript_name)
+        self.assertTrue(row["can_resume"])
+
+    def test_a_completed_run_is_not_offered_in_the_list(self):
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("finish cleanly", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+
+        rows = self.pipeline.history(mode="council")
+        row = next(r for r in rows if r["file"] == run.transcript_name)
+        self.assertFalse(row["can_resume"])
+
     def test_a_pull_request_run_is_not_revived_after_a_restart(self):
         # Its branch, its commits and possibly a published PR are all outside
         # the transcript. Half-reconstructing that would be a guess about the
@@ -1406,6 +1449,187 @@ class TestContinuingAFailedRun(PipelineTestBase):
 
         self.assertEqual(run.state, "complete", run.error)
         self.assertEqual(run.task, "what does this repo do?")
+
+
+class TestRunningOneSeatAgain(PipelineTestBase):
+    """Retry: replace one answer without throwing away the rest.
+
+    The rule that makes it honest is what follows a re-run. A position is
+    quoted into every peer's critique and into the chairman's prompt, so a seat
+    that answers again invalidates the reviews of it - keeping them would leave
+    a transcript whose critiques discuss an answer no longer in it.
+    """
+
+    def council(self):
+        self.store.update({"mode": "council", "zero_touch": True})
+        run = self.pipeline.start("do a thing", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+        return run
+
+    def test_a_finished_run_offers_every_seat(self):
+        run = self.council()
+        plan = run.to_dict()["retry_plan"]
+        self.assertEqual(sorted(plan), sorted(run.stage_order))
+
+    def test_re_running_a_position_takes_the_reviews_of_it_with_it(self):
+        run = self.council()
+        seat = run.seating.members[0].id
+        plan = run.to_dict()["retry_plan"][seat]
+
+        self.assertEqual(plan[0], seat)
+        for member in run.seating.members:
+            self.assertIn(f"{member.id}_critique", plan)
+        self.assertIn("chair", plan)
+        # Not the other members' own positions: they were written blind, at the
+        # same time, and are not downstream of this one.
+        for other in run.seating.members[1:]:
+            self.assertNotIn(other.id, plan)
+
+    def test_re_running_a_critique_only_takes_the_verdict(self):
+        run = self.council()
+        critique = f"{run.seating.members[0].id}_critique"
+        self.assertEqual(run.to_dict()["retry_plan"][critique], [critique, "chair"])
+
+    def test_re_running_the_chair_takes_nothing_else(self):
+        run = self.council()
+        self.assertEqual(run.to_dict()["retry_plan"]["chair"], ["chair"])
+
+    def test_the_kept_answers_are_not_asked_again(self):
+        run = self.council()
+        seat = run.seating.members[0].id
+        untouched = [
+            s for s in run.seating.members[1:]
+        ]
+        before = {s.id: run.stages[s.id].started_at for s in untouched}
+
+        self.pipeline.retry(seat)
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        after = {s.id: run.stages[s.id].started_at for s in untouched}
+        self.assertEqual(before, after)
+        # And the stage asked for really did run again.
+        self.assertEqual(run.stages[seat].state, "done")
+        self.assertEqual(run.resumed, 1)
+
+    def test_the_reviews_of_a_re_run_position_are_written_fresh(self):
+        run = self.council()
+        seat = run.seating.members[0].id
+        before = {
+            f"{m.id}_critique": run.stages[f"{m.id}_critique"].started_at
+            for m in run.seating.members
+        }
+
+        self.pipeline.retry(seat)
+        self.wait_terminal()
+
+        for stage_id, started in before.items():
+            self.assertNotEqual(run.stages[stage_id].started_at, started, stage_id)
+
+    def test_a_chat_turn_has_nothing_downstream(self):
+        self.store.update({
+            "mode": "solo",
+            "providers": {"solo": mock_provider("solo", "Assistant")},
+        })
+        run = self.pipeline.start("what is this?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.to_dict()["retry_plan"], {"solo": ["solo"]})
+
+    def test_a_seat_that_died_can_be_replaced_on_a_run_that_finished(self):
+        # The case the operator actually hits: the council carried on with two
+        # of three, the chairman answered, and the run reads `complete` - so
+        # Continue is not offered and the dead seat is nobody's problem. Here
+        # it is one click, and the reviews and verdict are rewritten around the
+        # answer that was missing when they were written.
+        self.store.update({
+            "zero_touch": True,
+            "council": {"chair_deliberates": True},
+            "providers": {
+                cfg.council_provider_id("codex"): mock_council("codex", ["--fail"]),
+            },
+        })
+        run = self.pipeline.start("carry on regardless", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+
+        dead = next(
+            s for s in self.member_stages(run) if s.agent == "codex"
+        )
+        self.assertEqual(dead.state, "failed")
+        survivors = {
+            s.id: s.started_at for s in self.member_stages(run) if s.state == "done"
+        }
+        reviews = {
+            s.id: s.started_at for s in self.critique_stages(run)
+            if s.state == "done"
+        }
+        self.assertTrue(survivors and reviews)
+
+        self.store.update({
+            "providers": {cfg.council_provider_id("codex"): mock_council("codex")},
+        })
+        self.pipeline.retry(dead.id)
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(run.stages[dead.id].state, "done")
+        # The positions that answered the first time are untouched...
+        for stage_id, started in survivors.items():
+            self.assertEqual(run.stages[stage_id].started_at, started, stage_id)
+        # ...and the reviews of them are not, because the bench they reviewed
+        # has a member in it that was not there before.
+        for stage_id, started in reviews.items():
+            self.assertNotEqual(run.stages[stage_id].started_at, started, stage_id)
+
+    def test_an_archived_run_is_offered_the_same_plan(self):
+        # Asked of a transcript, not of the engine: the runs worth re-seating a
+        # dead member on are usually yesterday's, and a file written before the
+        # question existed has to answer it the same way.
+        run = self.council()
+        path = self.runs_dir / run.transcript_name
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.pop("retry_plan", None)
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        loaded = self.pipeline.load_run(run.transcript_name)
+        self.assertEqual(loaded["retry_plan"], run.to_dict()["retry_plan"])
+
+    def test_a_seat_can_be_re_run_after_a_restart(self):
+        run = self.council()
+        seat = run.seating.members[0].id
+        kept = {
+            s.id: s.started_at for s in self.member_stages(run) if s.id != seat
+        }
+
+        restarted = Pipeline(self.store, self.bus, runs_dir=self.runs_dir)
+        self.addCleanup(restarted.wait_for_worker)
+        restarted.revive(run.transcript_name, start=False)
+        revived = restarted.retry(seat)
+        self.wait_for(lambda: not restarted.is_busy(), what="the retried run")
+        restarted.wait_for_worker()
+
+        self.assertEqual(revived.state, "complete", revived.error)
+        self.assertEqual(revived.id, run.id)
+        for stage_id, started in kept.items():
+            self.assertEqual(revived.stages[stage_id].started_at, started, stage_id)
+
+    def test_a_stage_this_run_never_had_is_refused(self):
+        self.council()
+        with self.assertRaises(ValueError):
+            self.pipeline.retry("seat9")
+
+    def test_nothing_is_offered_while_a_run_is_in_flight(self):
+        # The plan is a question about a finished run. Offered mid-run it would
+        # invite a click that the engine would have to refuse anyway.
+        self.store.update({"mode": "council", "zero_touch": True})
+        run = self.pipeline.start("do a thing", str(self.repo))
+        self.wait_for(
+            lambda: run.state not in ("idle", "queued"), what="the run to start"
+        )
+        self.assertEqual(run.to_dict()["retry_plan"], {})
+        self.wait_terminal()
 
 
 class TestCancellation(PipelineTestBase):

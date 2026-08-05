@@ -79,7 +79,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from . import config as cfg
 from . import gitutil, prompts, router
@@ -143,6 +143,93 @@ def chat_stage_id(agent: str) -> str:
     Chat answers was none of those things.
     """
     return f"chat_{agent}"
+
+
+# Stage states that a continuation would have to run: it failed, or the run
+# never got to it.
+UNFINISHED_STATES = ("failed", "pending", "running")
+
+
+def _with_resumability(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Answer "can this transcript be continued?" for a run read off disk.
+
+    Recomputed on load rather than trusted from the file, because the answer is
+    a property of the stages and the file may predate the question being asked.
+    Every transcript written before Continue existed carries a failed chairman
+    and six paid-for answers and no `can_resume` key at all - reading the key
+    would tell the operator those are unusable, which is exactly backwards.
+    """
+    stages = data.get("stages") or {}
+    order = [s for s in (data.get("stage_order") or list(stages)) if s in stages]
+    unfinished = [
+        sid for sid in order
+        if str((stages.get(sid) or {}).get("state") or "") in UNFINISHED_STATES
+    ]
+    data["unfinished_stages"] = unfinished
+    data["can_resume"] = data.get("state") == FAILED and bool(unfinished)
+    # And the same for running one seat again, for the same reason: a
+    # transcript written before the question existed still has to answer it, or
+    # every archived run reads as one nothing can be done with.
+    kinds = {sid: str((stages.get(sid) or {}).get("kind") or "") for sid in order}
+    solo = bool(data.get("solo")) or str(data.get("mode") or "") == "solo"
+    data["retry_plan"] = (
+        {
+            sid: [sid, *_dependent_ids(kinds, order, solo, sid)]
+            for sid in order
+        }
+        if str(data.get("state") or "") in TERMINAL_STATES
+        else {}
+    )
+    return data
+
+
+def _dependent_ids(
+    kinds: Dict[str, str], order: List[str], solo: bool, stage_id: str
+) -> List[str]:
+    """`dependent_stages`, expressed over ids and kinds alone.
+
+    Taken apart from the `Run` so a transcript read off disk gets the same
+    answer as the run in memory: the question "what would re-running this
+    cost?" is asked of archived runs too, and two implementations of it would
+    eventually disagree.
+    """
+    kind = kinds.get(stage_id)
+    if kind is None or solo:
+        return []
+
+    after: List[str] = []
+    if kind == "position":
+        # Every critique, not just this seat's own: the others quoted it.
+        after = [sid for sid in order if kinds.get(sid) == "critique"]
+    if kind in ("position", "critique") and "chair" in kinds:
+        # The chairman reads all of it, so it follows any council stage.
+        after.append("chair")
+    return [sid for sid in after if sid != stage_id]
+
+
+def dependent_stages(run: "Run", stage_id: str) -> List[str]:
+    """The stages that quoted ``stage_id`` and so cannot outlive a new answer.
+
+    The council is not three independent rounds; each one is built out of the
+    last. A member's position is quoted verbatim into every *other* member's
+    critique - each seat reviews its peers - and every position and critique is
+    quoted into the chairman's prompt. So replacing one answer invalidates
+    everything downstream of it, and the honest cost of re-running a member is
+    the critiques and the verdict as well.
+
+    The alternative - re-run the seat and keep the reviews - reads fine in the
+    UI and is a lie in the transcript: peers would appear to have reviewed an
+    answer that was not there when they wrote, and the chairman would appear to
+    have weighed one it never saw.
+
+    Chat has no downstream: each CLI answers the message on its own.
+    """
+    return _dependent_ids(
+        {sid: stage.kind for sid, stage in run.stages.items()},
+        run.stage_order,
+        run.solo,
+        stage_id,
+    )
 
 
 def stage_succeeded(result: ProviderResult) -> bool:
@@ -591,6 +678,18 @@ class Run:
             # is anything left to do.
             "can_resume": self.can_resume,
             "unfinished_stages": self.unfinished_stages,
+            # And what running one seat again would cost: per stage, everything
+            # that would have to run with it because it quoted that stage. The
+            # rule lives in `dependent_stages`; this is it applied, so the
+            # button can say the price before it is paid.
+            "retry_plan": (
+                {
+                    sid: [sid, *dependent_stages(self, sid)]
+                    for sid in self.stage_order
+                }
+                if self.state in TERMINAL_STATES
+                else {}
+            ),
             "parent_run_id": self.parent_run_id,
             "conversation": self.conversation,
             "context": self.context,
@@ -1028,8 +1127,8 @@ class Pipeline:
             self._gate.set()
         self.bus.publish("log", level="warn", message="Cancellation requested.")
 
-    def revive(self, name: str) -> Run:
-        """Load a failed transcript back into the engine so it can be continued.
+    def revive(self, name: str, start: bool = True) -> Run:
+        """Load a finished transcript back into the engine so it can go again.
 
         For the case the in-memory path cannot cover: the app was closed - or
         crashed, or was restarted to install the CLI update that fixes the
@@ -1045,8 +1144,19 @@ class Pipeline:
         data = self.load_run(name)
         if data is None:
             raise ValueError("That run transcript no longer exists.")
-        if str(data.get("state") or "") != FAILED:
+        state = str(data.get("state") or "")
+        # `start` is what this is being loaded *for*. Continuing means finishing
+        # what stopped, so it needs a run that stopped; running one seat again
+        # is worth doing on a run that completed with an answer the operator
+        # does not accept, which is a different question with a different rule.
+        if start and state != FAILED:
             raise ValueError("Only a failed run can be continued.")
+        if state not in TERMINAL_STATES:
+            raise ValueError(
+                "That transcript was written while the run was still going, so "
+                "what it holds is a half-finished record rather than a run to "
+                "pick up."
+            )
         if data.get("pull_request_mode"):
             # A PR run's branch, its commits and possibly a published pull
             # request are all outside this transcript. Reconstructing half of
@@ -1116,7 +1226,7 @@ class Pipeline:
             self._gate_decision = ""
 
         self.bus.publish("run_started", run=run.to_dict())
-        return self.resume()
+        return self.resume() if start else run
 
     def resume(self) -> Run:
         """Run a failed run's unfinished stages again, keeping the rest.
@@ -1147,22 +1257,18 @@ class Pipeline:
                     "left to continue."
                 )
 
-            # A stage that failed starts again from nothing. Leaving its error
-            # and its half-written output in place would put the first
-            # attempt's failure next to the second attempt's answer with no
-            # way to tell which is which.
-            for stage in run.stages.values():
-                if stage.state in ("failed", "skipped", "running"):
-                    stage.state = "pending"
-                    stage.error = ""
-                    stage.output = ""
-                    stage.exit_code = None
-                    stage.command = []
-                    stage.started_at = 0.0
-                    stage.ended_at = 0.0
-                    stage.confidence = None
-                    stage.because = ""
-                    stage.consensus = None
+            # Everything that did not answer, plus everything downstream of it.
+            # A member re-run after the critiques were written would otherwise
+            # leave the transcript claiming its peers reviewed a position that
+            # did not exist when they wrote.
+            failed = {
+                sid for sid, stage in run.stages.items()
+                if stage.state in ("failed", "skipped", "running")
+            }
+            todo = set(failed)
+            for stage_id in failed:
+                todo |= set(dependent_stages(run, stage_id))
+            self._reset_stages(run, todo)
 
             # Providers and roles are re-read from Settings; everything else
             # about the run stays frozen. Deliberate, and the one exception to
@@ -1191,6 +1297,11 @@ class Pipeline:
         kept = [
             sid for sid in run.stage_order if run.stages[sid].state == "done"
         ]
+        # A stage that answered and is running anyway is one that quoted a
+        # stage which did not. Said out loud: it is the difference between the
+        # cheapest continuation and an honest one, and the operator paying for
+        # it should know which they got.
+        cascaded = [sid for sid in run.unfinished_stages if sid not in failed]
         self.bus.publish(
             "log",
             level="info",
@@ -1198,12 +1309,106 @@ class Pipeline:
                 f"Continuing this run. {len(kept)} answer(s) already given are "
                 f"being reused; {len(run.unfinished_stages)} stage(s) will run "
                 f"again."
+                + (
+                    f" {len(cascaded)} of those did answer, and are being "
+                    f"asked again because they quoted one that did not."
+                    if cascaded else ""
+                )
             ),
         )
         self.bus.publish("state", state=run.state, run=run.to_dict())
 
         thread = threading.Thread(
             target=self._execute, args=(run,), name=f"run-{run.id}-resume", daemon=True
+        )
+        with self._lock:
+            self._thread = thread
+        thread.start()
+        return run
+
+    def _reset_stages(self, run: Run, stage_ids: Iterable[str]) -> None:
+        """Put stages back to `pending` so the next execution runs them.
+
+        A stage starts again from nothing: leaving the first attempt's error,
+        half-written output or confidence trailer in place would put one
+        attempt's failure beside another attempt's answer with nothing to say
+        which is which.
+        """
+        for stage_id in stage_ids:
+            stage = run.stages.get(stage_id)
+            if stage is None:
+                continue
+            stage.state = "pending"
+            stage.error = ""
+            stage.output = ""
+            stage.exit_code = None
+            stage.command = []
+            stage.started_at = 0.0
+            stage.ended_at = 0.0
+            stage.confidence = None
+            stage.because = ""
+            stage.consensus = None
+
+    def retry(self, stage_id: str) -> Run:
+        """Run one stage again, along with whatever quoted it.
+
+        The other half of continuing. `resume` finishes a run that stopped;
+        this re-runs a seat whose answer the operator does not accept - one
+        that timed out into an empty reply, or hit its wall mid-sentence, or
+        simply answered badly - without disturbing the seats that did fine.
+
+        What it does *not* do is re-run that seat alone regardless of who read
+        it. A position is quoted into every peer's critique and into the
+        chairman's prompt, so replacing it and keeping those would leave a
+        transcript whose reviews discuss an answer that is no longer in it.
+        `dependent_stages` decides what follows, and the UI states the cost
+        before the click rather than after.
+        """
+        with self._lock:
+            run = self._run
+            if run is None:
+                raise ValueError("There is no run to retry a stage of.")
+            if run.state not in TERMINAL_STATES:
+                raise PipelineBusy("A run is already in progress.")
+            if stage_id not in run.stages:
+                raise ValueError(f"This run has no {stage_id!r} stage.")
+
+            again = [stage_id, *dependent_stages(run, stage_id)]
+            self._reset_stages(run, again)
+
+            fresh = self.store.all()
+            run.config = {
+                **run.config,
+                "providers": fresh.get("providers") or {},
+                "roles": fresh.get("roles") or {},
+            }
+            run.error = ""
+            run.ended_at = 0.0
+            run.resumed += 1
+            run.state = RUNNING
+            self._cancel_requested = False
+            self._gate.clear()
+            self._gate_decision = ""
+
+        label = run.stages[stage_id].label
+        others = len(again) - 1
+        self.bus.publish(
+            "log",
+            level="info",
+            message=(
+                f"Running {label} again"
+                + (
+                    f", with {others} stage(s) that quoted it. "
+                    if others else ". "
+                )
+                + f"{len(run.stage_order) - len(again)} answer(s) are being "
+                f"reused."
+            ),
+        )
+        self.bus.publish("state", state=run.state, run=run.to_dict())
+
+        thread = threading.Thread(
+            target=self._execute, args=(run,), name=f"run-{run.id}-retry", daemon=True
         )
         with self._lock:
             self._thread = thread
@@ -2254,6 +2459,11 @@ class Pipeline:
                     # continuing, rather than let the server refuse it after.
                     "mode": run_mode,
                     "zero_touch": data.get("zero_touch"),
+                    # So the row itself can say a run stopped halfway and can
+                    # still be finished. Discoverability is the whole problem
+                    # here: the operator who needs this is looking at a list of
+                    # conversations, not at the run they gave up on.
+                    "can_resume": _with_resumability(data)["can_resume"],
                     "diff_stat": data.get("diff_stat") or {},
                     # Every earlier turn, plus this run's own message.
                     "messages": len(conversation) + 1,
@@ -2353,6 +2563,7 @@ class Pipeline:
         if path is None or not path.exists():
             return None
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return None
+        return _with_resumability(data)

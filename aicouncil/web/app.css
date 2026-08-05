@@ -565,6 +565,20 @@ html, body {
 .msg-state { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--text-3); }
 .msg-state.failed { color: var(--red); }
 
+/* "again" on a seat's card. Quiet until the card is hovered: it is a per-seat
+   escape hatch, not a call to action, and a row of live buttons down the
+   thread would read as though something were wrong with every answer. */
+.msg-retry {
+  margin-left: 8px; padding: 1px 7px;
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: .04em;
+  color: var(--text-3); background: none;
+  border: 1px solid var(--line); border-radius: 999px;
+  opacity: 0; cursor: pointer; transition: opacity .12s ease, color .12s ease;
+}
+.chat-message:hover .msg-retry,
+.msg-retry:focus-visible { opacity: 1; }
+.msg-retry:hover { color: var(--text-1); border-color: var(--line-soft); }
+
 .assistant-message[data-agent="drafter"]  { --agent-color: var(--cyan); }
 .assistant-message[data-agent="polisher"] { --agent-color: var(--amber); }
 .assistant-message[data-agent="codex"]    { --agent-color: var(--cyan); }

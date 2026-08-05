@@ -578,6 +578,18 @@ class TestSoloConfigMigration(unittest.TestCase):
 
 
 class TestApi(ServerTestBase):
+    def test_retry_needs_to_be_told_which_stage(self):
+        status, data = self.request("/api/retry", method="POST", body={})
+        self.assertEqual(status, 400)
+        self.assertIn("which stage", data["error"].lower())
+
+    def test_retry_says_why_when_there_is_no_run(self):
+        status, data = self.request(
+            "/api/retry", method="POST", body={"stage": "chair"}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("no run", data["error"].lower())
+
     def test_resume_says_why_when_there_is_nothing_to_continue(self):
         # The button is only offered on a failed run, but the endpoint is
         # reachable regardless - and whoever reaches it should be told what is

@@ -736,6 +736,58 @@ function continueHint(run) {
           : '. Nothing from the first attempt survived to reuse.');
 }
 
+/** The "again" control on one seat's card, when running it again is possible.
+ *
+ *  Offered on any finished run, not only a failed one: a seat that answered
+ *  badly, timed out into two lines, or hit its wall mid-sentence is worth
+ *  replacing on a run that otherwise went fine. The title carries the price,
+ *  because re-running a position also re-runs everything that quoted it. */
+function retryHtml(stageId) {
+  const run = runOnScreen();
+  if (!run || state.busy || !stageId) return '';
+  const plan = (run.retry_plan || {})[stageId];
+  if (!plan || !plan.length) return '';
+
+  const stages = run.stages || {};
+  const kindOf = id => (stages[id] || {}).kind || '';
+  const label = id => (stages[id] || {}).label || id;
+  // Named by what each one *is*, not by which CLI ran it. Three critiques and
+  // a chairman are often the same two CLIs, so a list of labels reads as
+  // "Claude, Antigravity, Codex, Claude" — which says nothing about what is
+  // being spent.
+  const seat = kindOf(stageId) === 'critique'
+    ? `${label(stageId)}'s critique`
+    : kindOf(stageId) === 'chair' ? 'the verdict' : label(stageId);
+  const others = plan.slice(1);
+  const critiques = others.filter(id => kindOf(id) === 'critique').length;
+  const parts = [];
+  if (critiques) {
+    parts.push(`${critiques} peer critique${critiques === 1 ? '' : 's'}`);
+  }
+  if (others.some(id => kindOf(id) === 'chair')) parts.push('the verdict');
+  const kept = Object.keys(stages).length - plan.length;
+
+  const cost = parts.length
+    ? `Runs ${seat} again, and with it ${parts.join(' and ')} — they quoted ` +
+      `it. ${kept} answer${kept === 1 ? '' : 's'} kept.`
+    : `Runs ${seat} again. Every other answer is kept.`;
+
+  return `<button class="msg-retry" type="button" data-retry="${esc(stageId)}" ` +
+    `title="${esc(cost)}">again</button>`;
+}
+
+/** Run one seat again, with whatever quoted it. */
+async function retryStage(stageId) {
+  const run = runOnScreen();
+  if (!run) return;
+  const body = { stage: stageId };
+  if (state.openChat && run.file) body.file = run.file;
+  try {
+    await api('/api/retry', { method: 'POST', body });
+    state.openChat = null;
+  } catch (err) { toast(err.message, 'error', 9000); }
+}
+
 /** Continue the failed run: same run, same id, only the unfinished stages.
  *
  *  Not to be confused with `continueRun` below, which continues a *thread* by
@@ -1826,7 +1878,11 @@ function confidenceChip(value, label, why) {
   );
 }
 
-function messageHtml(reply, id) {
+// `retry` is off for the replayed turns of a thread: those stages belong to an
+// earlier run with its own transcript, and the engine only holds this one. The
+// stage ids repeat across turns, so without this every earlier answer would
+// sprout a button that re-ran a different run's seat.
+function messageHtml(reply, id, { retry = false } = {}) {
   const who = reply.label || reply.stage || id || 'Agent';
   const st = reply.state || '';
   const dur = reply.duration ? ` · ${fmtDuration(reply.duration)}` : '';
@@ -1870,6 +1926,7 @@ function messageHtml(reply, id) {
         confidenceChip(reply.confidence, 'confidence', reply.because) +
         `<span class="msg-state${st === 'failed' ? ' failed' : ''}">` +
           `${esc(word)}${esc(dur)}</span>` +
+        (retry ? retryHtml(id || reply.stage || '') : '') +
       `</div>` +
       // `data-live` marks the one body `stage_output` may append to. Only a
       // running stage has it, so a finished message can never be scribbled on.
@@ -1922,7 +1979,7 @@ function councilBodyHtml(run, gated) {
     // so it reads as "here is everything the council said; now decide".
     const gateHere = gated && s.kind === 'chair';
     return (gateHere ? '<div data-slot="approval-gate"></div>' : '') +
-      heading + messageHtml(s, s.id);
+      heading + messageHtml(s, s.id, { retry: true });
   }).join('') +
     // A gated run has not reached the chairman yet, so there is no chair
     // message to anchor the gate to. It goes at the end of what has been said.
@@ -3945,7 +4002,12 @@ function renderChats() {
         `title="${esc(c.workspace || 'Scratch workspace')}">` +
         `<span class="chat-row-title">${esc(c.title || c.task || '(no task)')}</span>` +
         `<span class="chat-row-meta">${esc(chatWhen(c.created_at))}` +
-          `${c.zero_touch ? ' · zero-touch' : ''}</span>` +
+          `${c.zero_touch ? ' · zero-touch' : ''}` +
+          // The row a quota wall left behind looks like any other row, and the
+          // operator who needs this most is the one scanning the list for the
+          // run they gave up on. Said here so it is findable without opening
+          // every failed conversation to check.
+          `${c.can_resume ? ' · <b>can continue</b>' : ''}</span>` +
       `</button>` +
       // Outside the row's own button, not inside it: a button within a button
       // is invalid HTML and the browser hoists it out, which lands it in the
@@ -4649,7 +4711,9 @@ function wire() {
   // Delegated: the thread is rewritten on every state change, so the Continue
   // button beside a failure cannot carry a listener of its own.
   $('#thread').addEventListener('click', (e) => {
-    if (e.target.closest('[data-continue]')) resumeRun();
+    if (e.target.closest('[data-continue]')) { resumeRun(); return; }
+    const again = e.target.closest('[data-retry]');
+    if (again) retryStage(again.dataset.retry);
   });
 
   // -- agent, model, effort and role pickers ----------------------------
