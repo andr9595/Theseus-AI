@@ -2056,6 +2056,19 @@ function renderThread() {
             : '') +
           `</div>`
         : '') +
+      // A server older than this page answers without the two keys Continue
+      // and "again" are decided from, so both go quiet and the page looks
+      // broken rather than out of date. The browser reloads app.js on its own;
+      // the engine only reloads when the app is restarted, and this says so
+      // rather than leaving the operator hunting for a button that cannot be
+      // drawn. Absence of the key is the signal - `false` is a real answer.
+      (run.state === 'failed' && run.can_resume === undefined
+        ? '<div class="turn-note">This app was started before Continue ' +
+          'existed, so the engine cannot offer it for this run. Restart the ' +
+          'app (<code>./run.sh</code>) and open this conversation again — ' +
+          'the answers it already paid for are on disk and will be reused.' +
+          '</div>'
+        : '') +
     '</div>';
 
   thread.innerHTML = earlier + current;

@@ -578,6 +578,15 @@ class TestSoloConfigMigration(unittest.TestCase):
 
 
 class TestApi(ServerTestBase):
+    def test_the_page_explains_an_engine_too_old_to_offer_continue(self):
+        # The browser reloads app.js by itself; the engine only reloads when
+        # the app is restarted. A page newer than the server it is talking to
+        # would otherwise draw neither button and give no reason.
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn("run.can_resume === undefined", script)
+        self.assertIn("started before Continue", script)
+
     def test_retry_needs_to_be_told_which_stage(self):
         status, data = self.request("/api/retry", method="POST", body={})
         self.assertEqual(status, 400)
