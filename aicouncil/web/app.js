@@ -665,6 +665,11 @@ function renderStatus() {
       meta.push(STATE_LABELS[s] || s);
     }
     if (run.zero_touch) meta.push('ZERO-TOUCH');
+    // Which writing styles this run was answered under, off the run rather
+    // than off the gear: an archived answer that reads strangely should say
+    // why, and the switch that did it may since have been turned off.
+    if ((run.styles || {}).caveman) meta.push('CAVEMAN');
+    if ((run.styles || {}).efficiency) meta.push('EFFICIENCY');
     if (run.work_branch) meta.push(run.work_branch);
     if (run.diff_stat && run.diff_stat.files) {
       meta.push(`${run.diff_stat.files} file(s) +${run.diff_stat.insertions}/-${run.diff_stat.deletions}`);

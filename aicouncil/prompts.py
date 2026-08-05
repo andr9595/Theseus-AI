@@ -647,7 +647,8 @@ variables, configuration files, and error messages MUST remain untouched, \
 complete, and byte-exact. Do not compress code or syntax.
 
 Example Output: User: How do I restart Nginx on Ubuntu? Assistant: Run \
-sudo systemctl restart nginx. Check status with sudo systemctl status nginx."""
+`sudo systemctl restart nginx`. Check status with `sudo systemctl status \
+nginx`."""
 
 EFFICIENCY_SYSTEM = """\
 [SYSTEM INSTRUCTION: EFFICIENCY MODE] Write concise, professional responses \
@@ -664,6 +665,24 @@ unrequested examples.
 error messages complete and exact.
 7. If another requested writing style is active, preserve its voice while \
 applying these efficiency rules."""
+
+
+# Both switches above tell an agent to cut what is not needed, and both list
+# what may not be cut - but they list *code*, because they were written about
+# prose answers rather than about this app's stages. What they do not mention
+# is the machine-read part of a reply: the confidence trailer every council
+# seat ends with, and the fenced JSON a project turn is parsed for. An agent
+# pruning "unnecessary headings" has no way to know that one of those headings
+# is what the engine reads, so it is said here rather than hoped for. This is
+# the app's own sentence, kept out of the two bodies so that what the operator
+# pasted into Settings stays what the operator pasted.
+STYLE_CONTRACT_GUARD = (
+    "This changes your voice, not the contract. Anything this prompt requires "
+    "you to end with - a confidence trailer, a fenced report block, a named "
+    "section - is still required, in full and in the format asked for. It is "
+    "read by a program, not skimmed by a person, and shortening it is the one "
+    "economy that costs more than it saves."
+)
 
 
 def _style_block(caveman: bool = False, efficiency: bool = False) -> str:
@@ -688,7 +707,11 @@ def _style_block(caveman: bool = False, efficiency: bool = False) -> str:
     ]
     if not bodies:
         return ""
-    return "\n# How to write your answer\n" + "\n\n".join(bodies) + "\n"
+    return (
+        "\n# How to write your answer\n"
+        + "\n\n".join(bodies)
+        + f"\n\n{STYLE_CONTRACT_GUARD}\n"
+    )
 
 
 @dataclass(frozen=True)

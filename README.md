@@ -460,9 +460,20 @@ the goal box and in the tracker header of a running project.
 | **Caveman mode** | The same goal pushed much harder: telegraphic grammar, no articles, no preamble. Cheapest and bluntest. |
 
 Both carve out the same exception — code blocks, shell commands, file paths,
-variables, configuration and error messages stay complete and byte-exact. So do
-the confidence trailer and the Project report contract, which are fixed-format
-or fenced.
+variables, configuration and error messages stay complete and byte-exact.
+
+The confidence trailer and the Project report contract are carved out too, by a
+sentence this app appends after whichever bodies are on: *this changes your
+voice, not the contract*. It is kept out of the two instruction texts
+themselves, so what you paste into a style stays what you pasted. It exists
+because both bodies were written about prose and name only *code* as
+unshortenable — an agent pruning "unnecessary headings" has no way to know one
+of those headings is what the engine parses.
+
+A run records which switches it answered under, and the top bar shows
+**CAVEMAN** / **EFFICIENCY** beside Zero-Touch. It is read off the run, not off
+the gear: an archived answer that reads strangely should be able to say why,
+and the switch that did it may since have been turned off.
 
 **They are one implementation, reaching every tab through the same seam.** The
 instruction text lives once in `aicouncil/prompts.py`, is composed once by

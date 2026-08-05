@@ -555,6 +555,14 @@ class Run:
             "seating": self.seating.to_dict() if self.seating else None,
             "strictness": self.strictness,
             "strictness_name": prompts.strictness(self.strictness)["name"],
+            # Which writing styles this run answered under, read off the config
+            # frozen at start rather than off the gear as it stands now. The
+            # transcript is the only thing that can explain why an archived
+            # answer reads the way it does, and the switch it was written under
+            # may since have been turned off.
+            "styles": cfg.writing_styles(
+                self.config, "chat" if self.solo else "council"
+            ),
             # The chairman's own two figures, lifted to the top of the run
             # because they are what the verdict card shows. Both are the
             # chairman's claims, not this app's arithmetic, and both are None

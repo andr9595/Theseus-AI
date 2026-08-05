@@ -2424,6 +2424,115 @@ class TestEfficiencyPrompt(unittest.TestCase):
         self.assertIn(self.MARK, on)
 
 
+class TestStyleDoesNotEatTheContract(unittest.TestCase):
+    """A shortened answer must still be a parseable one.
+
+    Both switches tell an agent to cut what is not needed, and both name code
+    as the thing that may not be cut - which leaves the machine-read part of a
+    reply unmentioned. A seat that pruned its confidence trailer, or a project
+    turn that dropped its fenced report, would be obeying the style and
+    breaking the engine.
+    """
+
+    GUARD = "This changes your voice, not the contract."
+
+    def _prompts(self, **styles):
+        from aicouncil import prompts
+
+        return {
+            "chat": prompts.build_chat_prompt("hello", **styles),
+            "member": prompts.build_member_prompt("t", "/tmp", **styles),
+            "critique": prompts.build_critique_prompt(
+                "t", [{"alias": "Agent B", "output": "x"}], "/tmp", **styles
+            ),
+            "chair": prompts.build_chairman_prompt(
+                "t", [{"alias": "Agent A", "output": "x"}], [], "/tmp", **styles
+            ),
+            "project": prompts.project_context_block(
+                "p1", "/tmp", "{}", **styles
+            ),
+        }
+
+    def test_every_styled_prompt_says_the_contract_still_stands(self):
+        for style in cfg.WRITING_STYLES:
+            for name, prompt in self._prompts(**{style: True}).items():
+                with self.subTest(style=style, prompt=name):
+                    self.assertIn(self.GUARD, prompt)
+
+    def test_it_is_said_once_when_both_are_on(self):
+        # Same reason the heading is one heading: an agent told the same thing
+        # twice in different words has nothing to go on when they differ.
+        for name, prompt in self._prompts(caveman=True, efficiency=True).items():
+            with self.subTest(prompt=name):
+                self.assertEqual(prompt.count(self.GUARD), 1)
+
+    def test_an_unstyled_prompt_is_left_alone(self):
+        # It is part of the style block, not a new standing instruction: a run
+        # with no style switched on is byte-for-byte what it always was.
+        for name, prompt in self._prompts().items():
+            with self.subTest(prompt=name):
+                self.assertNotIn(self.GUARD, prompt)
+
+    def test_the_thing_it_protects_is_actually_in_the_prompt(self):
+        # The guard would be words about nothing if the trailer it defends had
+        # been dropped from the stage contract.
+        from aicouncil import prompts
+
+        for name, prompt in self._prompts(caveman=True).items():
+            if name in ("chat", "project"):
+                continue
+            with self.subTest(prompt=name):
+                self.assertIn(prompts.CONFIDENCE_CONTRACT.strip()[:40], prompt)
+
+
+class TestTheTranscriptRecordsItsStyles(PipelineTestBase):
+    """An archived answer has to be able to say why it reads as it does."""
+
+    def test_a_run_records_the_switches_it_answered_under(self):
+        self.store.update({
+            "mode": "solo",
+            "efficiency": {"chat": True},
+            "providers": {"solo": mock_provider("solo", "Assistant")},
+        })
+        run = self.pipeline.start("what is this?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(
+            run.to_dict()["styles"], {"caveman": False, "efficiency": True}
+        )
+
+    def test_turning_the_switch_off_afterwards_does_not_rewrite_history(self):
+        # The gear is a live setting; the transcript is a record. A run written
+        # under Caveman still says so once Caveman is off, or the record
+        # explains the wrong answer.
+        self.store.update({
+            "mode": "solo",
+            "caveman": {"chat": True},
+            "providers": {"solo": mock_provider("solo", "Assistant")},
+        })
+        run = self.pipeline.start("what is this?", str(self.repo))
+        self.wait_terminal()
+        self.store.update({"caveman": {"chat": False}})
+
+        self.assertTrue(run.to_dict()["styles"]["caveman"])
+        persisted = self.pipeline.load_run(run.transcript_name)
+        self.assertTrue(persisted["styles"]["caveman"])
+
+    def test_a_council_run_records_the_councils_switches(self):
+        # Not Chat's. The two are independent, and a transcript that quoted the
+        # wrong one would be worse than quoting none.
+        self.store.update({
+            "mode": "council",
+            "zero_touch": True,
+            "caveman": {"council": True, "chat": False},
+        })
+        run = self.pipeline.start("do a thing", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertTrue(run.to_dict()["styles"]["caveman"])
+
+
 class TestWritingStyleReading(unittest.TestCase):
     """The one reader all three run loops pull their style switches through."""
 
