@@ -153,6 +153,26 @@ class TestStaticFiles(ServerTestBase):
         self.assertIn("patchConfig({", script)
         self.assertIn("efficiency: {", script)
 
+    def test_deliberation_effort_is_settable_and_saved(self):
+        # A knob only reachable by hand-editing the config file is half a
+        # setting, so this checks both ends: the control is served, and the
+        # save collects it rather than leaving the stored value behind.
+        with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
+            body = res.read().decode()
+        self.assertIn('id="council-deliberation-effort"', body)
+
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn(
+            "$('#council-deliberation-effort').value = "
+            "council.deliberation_effort || '';",
+            script,
+        )
+        self.assertIn(
+            "deliberation_effort: $('#council-deliberation-effort').value,",
+            script,
+        )
+
     def test_project_has_its_own_run_options_cogwheel(self):
         with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
             body = res.read().decode()

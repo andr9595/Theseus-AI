@@ -268,8 +268,12 @@ RULES - these are strict:
 1. DO NOT modify, create or delete any file. Do not run commands that write to \
 disk, stage changes, or commit. This stage is read-only. A later stage applies \
 whatever the council settles on.
-2. DO read the working folder as much as you need. Ground every claim in code \
-that actually exists, and cite real file paths and real symbol names.
+2. DO read the working folder - as much as the claims you are about to make \
+require, and no further. Ground every claim in code that actually exists, and \
+cite real file paths and real symbol names. Read to be right, not to be \
+thorough: a file you have already read does not get stronger on the second \
+pass, and a sweep of the tree is not grounding. Stop when what you are about \
+to say is grounded.
 3. Where you are uncertain, say so in the place where it matters rather than \
 in a disclaimer at the end.
 
@@ -337,7 +341,11 @@ disagree, at least one of them is wrong.
 YOUR JOB:
 1. WEIGH the positions against the critiques and against the repository \
 itself. A critique is not automatically right either - verify the ones you act \
-on. Where the council is split, decide, and say what decided it.
+on, the ones the members dispute, and anything a critique called invented. \
+Verify those properly. Do not re-derive the parts nobody contests: the members \
+read this folder already and cited where they read, and a third pass over an \
+uncontested file buys the run nothing. Where the council is split, decide, and \
+say what decided it.
 2. DISCARD what does not survive. A position that a peer showed to be \
 hallucinated does not get softened into a caveat; it gets dropped.
 3. IMPLEMENT the outcome. Apply the edits to the working tree yourself. You \

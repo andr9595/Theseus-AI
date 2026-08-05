@@ -2950,6 +2950,59 @@ class TestEfficiencyReachesCouncilRun(PipelineTestBase):
             self.assertIn(self.MARK, stage.output, stage.id)
 
 
+class TestDeliberationEffort(PipelineTestBase):
+    """Stages 1 and 2 can be told to think less hard than the one that writes.
+
+    Worth an end-to-end run rather than a unit test on the helper: the point of
+    the setting is that one agent's member seat and its chair stop sharing a
+    provider, and only a routed run puts the same CLI in both.
+    """
+
+    def graded_providers(self):
+        # `effort_args` cleared for the reason `mock_council` clears
+        # `stream_args`: these merge onto the CLI preset, and Claude's
+        # `--effort {effort}` on a command that is not Claude would hand the
+        # mock a flag it has never heard of.
+        return {
+            pid: dict(provider, effort="high", effort_args=[])
+            for pid, provider in council_providers().items()
+        }
+
+    def test_it_is_unset_by_default(self):
+        # Off unless asked for: a council that quietly thought less hard than
+        # the CLIs were configured to would be a worse council for no stated
+        # reason.
+        self.assertEqual(cfg.DEFAULTS["council"]["deliberation_effort"], "")
+
+    def test_it_demotes_the_members_and_leaves_the_chair(self):
+        self.store.update({
+            "zero_touch": True,
+            "providers": self.graded_providers(),
+            "council": {"deliberation_effort": "low"},
+        })
+        run = self.pipeline.start("do a thing", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        for stage in self.member_stages(run) + self.critique_stages(run):
+            self.assertEqual(stage.effort, "low", stage.id)
+        self.assertEqual(run.stages["chair"].effort, "high")
+
+    def test_blank_leaves_every_seat_on_its_own_setting(self):
+        self.store.update({
+            "zero_touch": True,
+            "providers": self.graded_providers(),
+        })
+        run = self.pipeline.start("do a thing", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        stages = self.member_stages(run) + self.critique_stages(run)
+        stages.append(run.stages["chair"])
+        for stage in stages:
+            self.assertEqual(stage.effort, "high", stage.id)
+
+
 class TestRoleReachesTheRun(PipelineTestBase):
     def test_a_configured_persona_is_used_by_a_real_run(self):
         # End to end: pin a seat's lens, run, and confirm the agent answered

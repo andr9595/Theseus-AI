@@ -492,6 +492,15 @@ DEFAULTS: Dict[str, Any] = {
         # the whole of Stage 1. The cost - a chairman weighing a position it
         # wrote - is real, and the seating discloses it rather than hiding it.
         "chair_deliberates": True,
+        # Reasoning effort for Stages 1 and 2, overriding whatever each seat's
+        # CLI is set to. Empty - the default - leaves every seat alone.
+        #
+        # Why it exists: effort belongs to the CLI, so the seat Claude holds
+        # and the chair Claude runs share one setting, and there was no way to
+        # buy a cheaper deliberation without also demoting the only stage that
+        # writes. Reading and re-reading the folder is where a council spends
+        # its quota, and the chairman verifies that half anyway.
+        "deliberation_effort": "",
         # How hard the critique stage pushes and how much agreement the chair
         # requires, 0-5. A prompt knob, not a sampling one: none of these CLIs
         # expose temperature, so a temperature slider here would move nothing.

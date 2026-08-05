@@ -3696,6 +3696,7 @@ function renderCouncilSettings() {
 
   $('#council-seats').value = council.seat_count ?? 3;
   $('#council-chair-timeout').value = council.chair_timeout_seconds ?? 1800;
+  $('#council-deliberation-effort').value = council.deliberation_effort || '';
   $('#council-routing').checked = (council.routing || 'auto') !== 'manual';
   $('#council-chair-deliberates').checked = council.chair_deliberates !== false;
   $('#council-strictness').value = council.strictness ?? 2;
@@ -3804,6 +3805,7 @@ function readCouncilSettings() {
   return {
     seat_count: Number($('#council-seats').value) || 3,
     chair_timeout_seconds: Number($('#council-chair-timeout').value) || 1800,
+    deliberation_effort: $('#council-deliberation-effort').value,
     routing: $('#council-routing').checked ? 'auto' : 'manual',
     chair_deliberates: $('#council-chair-deliberates').checked,
     strictness: Number($('#council-strictness').value),

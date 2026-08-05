@@ -465,6 +465,22 @@
             </span>
           </div>
           <div class="field">
+            <label for="council-deliberation-effort">Deliberation effort</label>
+            <select id="council-deliberation-effort">
+              <option value="">Each CLI's own setting</option>
+              <option value="low">Low &mdash; fastest, least thinking</option>
+              <option value="medium">Medium &mdash; balanced</option>
+              <option value="high">High &mdash; deeper thinking, slower</option>
+            </select>
+            <span class="field-hint">
+              How hard the members think in Stages 1 and 2, overriding what
+              each agent is set to under Agents. Reading the folder is where a
+              council spends its quota, and the chair verifies that reading
+              anyway &mdash; so this buys a cheaper bench without demoting the
+              one stage that writes. The chair keeps its CLI's own setting.
+            </span>
+          </div>
+          <div class="field">
             <label for="council-chair-timeout">Chair timeout (s)</label>
             <input id="council-chair-timeout" type="number" min="60" max="7200">
             <span class="field-hint">

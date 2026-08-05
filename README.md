@@ -1171,6 +1171,60 @@ take `--effort high`, Codex takes `-c model_reasoning_effort=high`. A configured
 command with no `effort_args` has no effort knob, and gets no chip — nothing is
 guessed at, since a wrong guess would be read as the prompt or rejected.
 
+### What a council run costs, and where it goes
+
+A three-seat council is seven CLI launches, and those seven are not seven model
+requests — each one is an agentic loop that reads, greps and re-reads until it
+is satisfied. That loop, not the prompt, is what the run spends. On one
+measured run here the prompts came to about 83,000 characters of text against
+6.4 *million* input tokens processed: a quarter of one percent.
+
+The bench is also not evenly loaded. The chair is picked first and from the
+whole field, so the strongest CLI tends to chair — and with
+`chair_deliberates` on it holds a member seat as well, which is three of the
+seven launches for one agent. On that same run:
+
+| stage | requests | input | output |
+|---|---:|---:|---:|
+| member seat | 31 | 2,175,599 | 24,383 |
+| its critique | 9 | 390,603 | 13,082 |
+| chairing | 52 | 3,838,229 | 24,129 |
+
+Two things follow, and they point at different fixes. The member seat and its
+critique are **40% of that agent's spend** — the part a second seat costs, and
+the part `chair_deliberates: false` removes. But the chair alone is 60%, and no
+seating change touches it: it re-derived a repository three members had already
+read and cited.
+
+So there are two knobs, and they are meant to be used together:
+
+- **Deliberation effort** (Settings → Council) overrides the reasoning effort
+  of Stages 1 and 2 only. Effort otherwise belongs to the CLI, so the seat an
+  agent holds and the chair it also runs share one setting and there was no way
+  to buy a cheaper bench without demoting the only stage that writes. Blank —
+  the default — leaves every seat on its own setting.
+- **Chair deliberates** (Settings → Council) benches the chair for Stage 1.
+  With three CLIs installed that costs a position: the member pool excludes the
+  chair, so a bench of three becomes a bench of two. The seating says so when
+  it happens. It is the bigger single saving and the bigger single loss.
+
+Neither is measured by guesswork. `scripts/council-cost.py` joins a finished
+transcript to the logs the CLIs write for themselves and prints the run seat by
+seat:
+
+```bash
+python3 scripts/council-cost.py              # the most recent run
+python3 scripts/council-cost.py <run-id>
+```
+
+It opens nothing for writing and computes no figure of its own beyond summing
+what the vendors reported — the same rule `usage.py` follows. Two caveats it
+prints rather than hides: an agent whose CLI logs no usage (Antigravity, today)
+is left out of the shares, and the input figures are dominated by **cache
+reads**, which are not billed as fresh tokens and whose weight against a
+subscription quota no vendor publishes. Read it to compare one run against
+another, not as an invoice.
+
 ---
 
 ## Architecture

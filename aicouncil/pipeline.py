@@ -1809,6 +1809,24 @@ class Pipeline:
         providers = run.config.get("providers", {})
         return providers.get(seat.provider_id) or {}
 
+    def _deliberation_provider(self, run: Run, seat: router.Seat) -> Dict[str, Any]:
+        """The same, with Stages 1 and 2 held to their own reasoning effort.
+
+        Effort is a property of the CLI, so the seat an agent holds and the
+        chair it may also run share one setting. This is the only place the two
+        come apart: a council's quota goes on the members reading the folder,
+        and the chairman verifies that reading anyway - so the deliberation can
+        think cheaper without demoting the one stage that writes. Empty, the
+        default, hands back the seat's own provider untouched.
+        """
+        provider = self._seat_provider(run, seat)
+        effort = str(
+            (run.config.get("council") or {}).get("deliberation_effort") or ""
+        ).strip()
+        if not effort or not provider:
+            return provider
+        return dict(provider, effort=effort)
+
     def _execute_council(self, run: Run) -> None:
         """One council run: deliberate, critique, gate, synthesise, deliver.
 
@@ -1880,7 +1898,7 @@ class Pipeline:
             [
                 (
                     seat.id,
-                    self._seat_provider(run, seat),
+                    self._deliberation_provider(run, seat),
                     prompts.build_member_prompt(
                         run.task,
                         run.workspace,
@@ -1972,7 +1990,7 @@ class Pipeline:
                 [
                     (
                         f"{p['seat'].id}_critique",
-                        self._seat_provider(run, p["seat"]),
+                        self._deliberation_provider(run, p["seat"]),
                         prompts.build_critique_prompt(
                             run.task,
                             # Every position except this seat's own.
