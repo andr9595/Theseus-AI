@@ -1110,6 +1110,28 @@ class TestFailureHandling(PipelineTestBase):
         ]
         self.assertTrue(all(s.state == "done" for s in answered))
 
+    def test_a_silent_member_that_said_why_has_its_reason_carried(self):
+        # The half of "printed nothing" that is actually actionable. A CLI
+        # that names the permission it was denied has told the operator how to
+        # fix it; replacing that with a generic sentence about empty output
+        # turns a two-minute settings change into a mystery.
+        reason = 'a tool required the "read_file" permission and was auto-denied'
+        self.store.update({
+            "zero_touch": True,
+            "providers": {
+                cfg.council_provider_id("agy"): mock_council(
+                    "agy", ["--silent-reason", reason]
+                ),
+            },
+        })
+        run = self.pipeline.start("one seat is denied its tools", str(self.repo))
+        self.wait_terminal()
+
+        silent = [s for s in self.member_stages(run) if s.agent == "agy"][0]
+        self.assertEqual(silent.state, "failed")
+        self.assertIn("read_file", silent.error)
+        self.assertIn("printed nothing", silent.error)
+
     def test_no_installed_cli_refuses_to_start(self):
         # The router seats only CLIs that actually resolve, so a machine with
         # none of them says so before a run begins rather than failing at the

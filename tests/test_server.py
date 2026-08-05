@@ -532,6 +532,50 @@ class TestSoloConfigMigration(unittest.TestCase):
     def test_an_unknown_mode_falls_back_to_council(self):
         self.assertEqual(self.load({"mode": "committee"})["mode"], "council")
 
+    def test_a_stored_antigravity_seat_gets_the_missing_read_grant(self):
+        # `--mode plan` alone made every Antigravity read-only stage produce
+        # nothing: headless `agy` auto-denies the `read_file` it cannot prompt
+        # for. The merge cannot repair this on its own - a list is replaced
+        # wholesale, so a config written before the fix keeps the broken pair
+        # forever.
+        conf = self.load({"providers": {
+            "council_agy": {
+                "command": ["agy", "--print-timeout", "60m", "--prompt={prompt}"],
+                "read_only_args": ["--mode", "plan"],
+            },
+            "qa": {
+                "command": ["/home/x/.local/bin/agy", "--prompt={prompt}"],
+                "read_only_args": ["--mode", "plan"],
+            },
+        }})
+        for pid in ("council_agy", "qa"):
+            self.assertEqual(
+                conf["providers"][pid]["read_only_args"],
+                ["--mode", "plan", "--dangerously-skip-permissions"],
+                f"{pid} still cannot read anything in a read-only stage",
+            )
+
+    def test_the_repair_leaves_hand_written_flags_alone(self):
+        # Only the exact broken default is replaced. Anything else is a choice
+        # somebody made, and this is not entitled to overrule it.
+        conf = self.load({"providers": {"council_agy": {
+            "command": ["agy", "--prompt={prompt}"],
+            "read_only_args": ["--mode", "plan", "--sandbox"],
+        }}})
+        self.assertEqual(
+            conf["providers"]["council_agy"]["read_only_args"],
+            ["--mode", "plan", "--sandbox"],
+        )
+
+    def test_the_repair_does_not_reach_the_other_clis(self):
+        conf = self.load({"providers": {"council_claude": {
+            "command": ["claude", "-p", "{prompt}"],
+            "read_only_args": ["--mode", "plan"],
+        }}})
+        self.assertEqual(
+            conf["providers"]["council_claude"]["read_only_args"], ["--mode", "plan"]
+        )
+
 
 class TestApi(ServerTestBase):
     def test_config_round_trips(self):

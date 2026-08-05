@@ -602,6 +602,43 @@ class TestRunnerConfiguration(unittest.TestCase):
         self.assertIn("positive", result.error)
 
 
+class TestSilentSuccess(unittest.TestCase):
+    """Exit 0, nothing on stdout, an explanation on stderr.
+
+    How `agy` ends a run whose tools were auto-denied. The status says fine,
+    the output says nothing, and the only account of what happened is the
+    sentence on stderr - so that sentence has to survive onto the result even
+    though nothing here calls the run a failure.
+    """
+
+    def run_sh(self, script):
+        provider = {
+            "id": "seat2", "command": ["sh", "-c", script, "sh"], "timeout_seconds": 60,
+        }
+        return ProviderRunner(provider, lambda *_: None).run(
+            "hi", cwd=str(Path(__file__).parent), auto_approve=False
+        )
+
+    def test_the_reason_on_stderr_is_kept(self):
+        result = self.run_sh('echo "a tool was auto-denied" >&2')
+        self.assertTrue(result.ok)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("auto-denied", result.error)
+
+    def test_a_clean_silent_run_reports_no_reason(self):
+        result = self.run_sh("true")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.error, "")
+
+    def test_stderr_beside_real_output_is_not_an_error(self):
+        # Progress notes and deprecation warnings go to stderr all the time.
+        # Only a run that produced nothing at all has anything to explain.
+        result = self.run_sh('echo warning >&2; echo "the answer"')
+        self.assertTrue(result.ok)
+        self.assertEqual(result.stdout, "the answer")
+        self.assertEqual(result.error, "")
+
+
 class TestResolveBinary(unittest.TestCase):
     def test_finds_an_executable_on_path(self):
         self.assertIsNotNone(resolve_binary(["sh"]))
@@ -827,8 +864,26 @@ class TestAntigravityAgent(unittest.TestCase):
         self.assertNotIn("plan", granted)
 
         withheld, _ = build_argv(AGY, "task", auto_approve=False, read_only=True)
-        self.assertEqual(withheld[-3:-1], ["--mode", "plan"])
-        self.assertNotIn("--dangerously-skip-permissions", withheld)
+        self.assertIn("--mode", withheld)
+        self.assertEqual(withheld[withheld.index("--mode") + 1], "plan")
+
+    def test_read_only_still_lets_it_read(self):
+        # The asymmetry with Claude and Codex, and the reason every Antigravity
+        # seat used to fail: `agy --print` cannot ask a permission question, so
+        # it auto-denies one - including the `read_file` a read-only stage is
+        # entirely built around. Plan mode is what withholds the write; without
+        # the approval beside it the stage reads nothing, answers nothing, and
+        # exits 0.
+        withheld, _ = build_argv(AGY, "task", auto_approve=False, read_only=True)
+        self.assertIn("--mode", withheld)
+        self.assertIn("--dangerously-skip-permissions", withheld)
+
+    def test_nothing_is_granted_without_a_grant(self):
+        # Neither grant means neither flag: the approval only ever arrives
+        # attached to one of them, never on its own.
+        argv, _ = build_argv(AGY, "task", auto_approve=False, read_only=False)
+        self.assertNotIn("--dangerously-skip-permissions", argv)
+        self.assertNotIn("--mode", argv)
 
     def test_nothing_is_granted_by_default(self):
         argv, _ = build_argv(AGY, "task", auto_approve=False)

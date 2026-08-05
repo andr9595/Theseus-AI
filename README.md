@@ -357,10 +357,15 @@ It is the one thing that hands a CLI its auto-approve flag
 both modes — but it means something slightly different in each, because only
 one of them has a gate.
 
+(`agy` is the exception to the shape, not to the rule: its read-only flags
+carry an approval too, because headless `agy` denies its own *reads* without
+one. Plan mode is what refuses the write either way — see [Antigravity's
+read-only flags](#antigravitys-read-only-flags).)
+
 | | Zero-Touch **off** (default) | Zero-Touch **on** |
 |---|---|---|
 | **Council** | Pauses at the gate. Nothing is on disk yet; **Approve & execute** is what grants the chairman permission. | No gate. Runs start to finish unattended, the chairman writing as it goes. |
-| **Chat** | Read-only. The assistant is invoked with its agent's read-only arguments (`--sandbox read-only`, `--permission-mode plan`) and can talk about the folder but not change it. | The assistant can create, modify and delete files, exactly as the chairman can. |
+| **Chat** | Read-only. The assistant is invoked with its agent's read-only arguments (`--sandbox read-only`, `--permission-mode plan`, `--mode plan`) and can talk about the folder but not change it. | The assistant can create, modify and delete files, exactly as the chairman can. |
 
 Chat has no approval gate — nothing stands between the message and the reply
 for a human to review — so Zero-Touch is the *only* way to grant it write
@@ -431,8 +436,10 @@ ChatGPT is. It has:
   and the reply.
 - **Read-only until you say otherwise.** By default Chat is invoked with its
   agent's read-only arguments (`--sandbox read-only` for `codex`,
-  `--permission-mode plan` for `claude`, `--mode plan` for `agy`) and never
-  receives an auto-approve flag. Turn Zero-Touch on and it can change files,
+  `--permission-mode plan` for `claude`, and `--mode plan
+  --dangerously-skip-permissions` for `agy` — [that pair is not the typo it
+  looks like](#antigravitys-read-only-flags)) and never receives an
+  auto-approve flag of its own. Turn Zero-Touch on and it can change files,
   takes a snapshot first and shows the diff afterwards, exactly as the
   council's writing stage does. See [Zero-Touch mode](#zero-touch-mode).
 
@@ -512,7 +519,7 @@ already have.
 Most projects are not empty folders, and this one is built for that case.
 
 **The first turn is read-only.** Before anything is written, the QA chair is
-invoked with its read-only flags and *no auto-approve grant at all*, and asked
+invoked with its read-only flags and *no write grant at all*, and asked
 what is already here: the layout, the configs, what of the goal exists, and
 anything that would break if an agent touched it. Nothing can change during that
 turn, by construction rather than by instruction.
@@ -777,6 +784,7 @@ The defaults:
 |---|---|---|
 | Codex | `codex exec {prompt}` | `--dangerously-bypass-approvals-and-sandbox` |
 | Claude | `claude -p {prompt}` | `--dangerously-skip-permissions` |
+| Antigravity | `agy --print-timeout 60m --prompt={prompt}` | `--dangerously-skip-permissions` |
 
 **Standing project rules** are appended to every member's and the chairman's
 prompt — a good place for "use tabs", "never add a dependency without
@@ -882,6 +890,34 @@ it wants.
 If a future CLI release renames these flags, edit the field; nothing here is
 compiled into the app. Clearing it is safe too — you simply get the old
 all-at-the-end behaviour back, and the app stops trying to parse events.
+
+### Antigravity's read-only flags
+
+The other two CLIs take one flag to be read-only. `agy` takes two, and the
+second one is called `--dangerously-skip-permissions`, which looks like exactly
+the wrong flag to find in a read-only slot. It is not.
+
+The two do different jobs. `--mode plan` is the restriction: it is what refuses
+the write, and it refuses it whether the write comes from an edit tool or from
+a shell redirect. The permission prompt is a separate mechanism, and in
+`--print` mode `agy` has no terminal to ask it on — so it auto-**denies**
+instead, including the `read_file` that a read-only stage exists to do. A
+plan-mode run without the second flag therefore reads nothing, answers nothing,
+and still exits 0:
+
+```text
+jetski: no output produced — a tool required the "read_file" permission that
+headless mode cannot prompt for, so it was auto-denied.
+```
+
+Which is what every Antigravity council seat did until this pairing was fixed:
+the seat came back blank, was dropped from the deliberation, and the strip said
+`2 of 3, 1 failed`. Both flags together give the stage its reads back while
+plan mode keeps refusing the writes — verified against `agy` 1.1.10 by asking
+it to overwrite a file both ways and confirming the file was untouched.
+
+A config written before the fix is repaired on load, but only if it still
+carries the exact broken pair; hand-edited flags are left alone.
 
 ### Quota
 
@@ -1104,6 +1140,7 @@ Coverage focuses on the properties that matter if they're wrong:
 | "Missing session token" | The dashboard was opened without the launcher's URL. Restart with `./run.sh`. |
 | Pull-request mode refuses to start | It says which precondition failed — a dirty tree, no `origin`, no git identity, or `gh` missing or logged out. Fix that one thing. |
 | Run hangs, no output | The CLI is waiting on interactive input. Check its auto-approve arguments in Settings. |
+| A seat says **"exited cleanly but printed nothing"** | The CLI produced no answer despite a zero exit status. Click the step in the strip: whatever the CLI said on its way out is on that seat's row. For `agy` the usual cause is a missing read grant — see [Antigravity's read-only flags](#antigravitys-read-only-flags). |
 | Port already in use | The server falls back to a free port automatically; read the URL it prints. |
 | Stream shows "reconnecting" | The server stopped. It reconnects with backoff once it's back. |
 

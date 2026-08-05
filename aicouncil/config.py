@@ -170,7 +170,21 @@ AGENTS: Dict[str, Dict[str, Any]] = {
         "stream_args": [],
         # `--mode plan` is Antigravity's read-only mode: it reads the
         # repository and answers, and will not edit.
-        "read_only_args": ["--mode", "plan"],
+        #
+        # The second flag looks like the opposite of read-only and is not.
+        # `--mode plan` is what withholds the write; the permission prompt is a
+        # separate thing, and in `--print` mode `agy` cannot ask it - it
+        # auto-*denies* instead. So a plan-mode run without this flag has every
+        # `read_file` denied, produces no output at all, and still exits 0:
+        #
+        #   jetski: no output produced - a tool required the "read_file"
+        #   permission that headless mode cannot prompt for, so it was
+        #   auto-denied.
+        #
+        # which is exactly what made every Antigravity seat fail its position
+        # stage. Verified against agy 1.1.10: with both flags a write, whether
+        # by edit tool or by a shell redirect, is still refused by plan mode.
+        "read_only_args": ["--mode", "plan", "--dangerously-skip-permissions"],
     },
 }
 
@@ -683,7 +697,34 @@ def _migrate(merged: Dict[str, Any], raw: Dict[str, Any]) -> Dict[str, Any]:
             provider.pop("role_system", None)
     if merged.get("mode") not in ("council", "solo"):
         merged["mode"] = "council"
+    _repair_agy_read_only(merged)
     return merged
+
+
+# What `agy`'s read-only grant used to be, before the auto-deny above was
+# understood. A provider still carrying exactly this is carrying a bug rather
+# than a preference, so it is repaired in place.
+_BROKEN_AGY_READ_ONLY = ["--mode", "plan"]
+
+
+def _repair_agy_read_only(merged: Dict[str, Any]) -> None:
+    """Give stored Antigravity providers the read grant they were missing.
+
+    ``_deep_merge`` cannot do this: a list is replaced wholesale, so a config
+    written before the fix keeps its own two-element list forever and every
+    read-only stage it runs keeps producing nothing.
+
+    Matched exactly against the old default, never merely by agent. An operator
+    who has hand-written their own flags has said something, and this is not
+    entitled to overrule it.
+    """
+    for provider in (merged.get("providers") or {}).values():
+        if not isinstance(provider, dict):
+            continue
+        if agent_for(provider) != "agy":
+            continue
+        if list(provider.get("read_only_args") or []) == _BROKEN_AGY_READ_ONLY:
+            provider["read_only_args"] = list(AGENTS["agy"]["read_only_args"])
 
 
 def _resolve_agent_choices(

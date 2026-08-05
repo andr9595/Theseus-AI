@@ -672,6 +672,15 @@ def main() -> int:
     parser.add_argument(
         "--silent", action="store_true", help="exit zero with no output at all"
     )
+    # The same, except the CLI says why on its way out. Antigravity does this
+    # when a tool it needed was auto-denied: exit 0, stdout empty, and one
+    # sentence on stderr naming the permission and how to grant it. That
+    # sentence is the whole difference between a fixable configuration problem
+    # and an unexplained blank stage.
+    parser.add_argument(
+        "--silent-reason", default="",
+        help="exit zero with nothing on stdout and this line on stderr",
+    )
     args, unknown = parser.parse_known_args()
 
     if unknown:
@@ -684,6 +693,9 @@ def main() -> int:
     # Before the banner: a silent CLI is silent on every stream, which is what
     # makes it look like a success to anything reading the exit code.
     if args.silent:
+        return 0
+    if args.silent_reason:
+        print(args.silent_reason, file=sys.stderr, flush=True)
         return 0
 
     zero_touch = (

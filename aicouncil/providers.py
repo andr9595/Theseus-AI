@@ -657,6 +657,14 @@ class ProviderRunner:
             # stderr empty, and that reason beats a bare exit status.
             reported = reader.error if reader is not None else ""
             error = last_stderr or reported or f"Exited with status {exit_code}."
+        elif not stdout.strip() and stderr.strip():
+            # Exit 0, nothing on stdout, and something on stderr. `agy` ends
+            # this way when a tool it needed was auto-denied, and the sentence
+            # it leaves there names the tool and the fix. The caller decides
+            # whether an empty answer counts as failure - all this does is make
+            # sure the reason survives if it does, rather than being thrown
+            # away for the want of a non-zero status.
+            error = stderr.strip().splitlines()[-1]
 
         return ProviderResult(
             provider_id=pid,

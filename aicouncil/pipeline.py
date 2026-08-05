@@ -1057,7 +1057,15 @@ class Pipeline:
         stage.error = result.error
         ok = stage_succeeded(result)
         if result.ok and not ok:
+            # `result.error` is whatever the CLI said on the way out. A CLI
+            # that explains itself and still exits 0 - Antigravity naming the
+            # tool permission it auto-denied, say - has already given the
+            # operator the one sentence worth reading, and burying it under a
+            # generic "printed nothing" is how a fixable configuration problem
+            # comes to look like an act of God.
             stage.error = (
+                f"The CLI exited cleanly but printed nothing: {result.error}"
+                if result.error else
                 "The CLI exited cleanly but printed nothing. Nothing from this "
                 "stage reached the rest of the run."
             )
