@@ -96,14 +96,30 @@ Theseus AI v1.0.0
 Providers:
   [MISS] council_codex  Codex    codex      -> not found on PATH
   [MISS] council_claude Claude   claude     -> not found on PATH
-  [MISS] council_agy    Antigravity agy     -> not found on PATH
+  [MISS] council_agy    Antigravity agy        -> not found on PATH
+  [MISS] (retired)      Codex    codex      -> not found on PATH
+  [MISS] (retired)      Claude   claude     -> not found on PATH
+  [MISS] Chat assistant Claude   claude     -> not found on PATH
+  [MISS] Project: arch  Claude   claude     -> not found on PATH
+  [MISS] Project: dev   Codex    codex      -> not found on PATH
+  [MISS] Project: QA    Antigravity agy        -> not found on PATH
+
+  9 CLI(s) missing: codex, claude, agy, codex, claude, claude, claude, codex, agy.
+  Run scripts/install-deps.sh, or repoint the command in Settings.
 ```
+
+Every configured provider gets a row, not only the three council seats: the two
+retired stages, the Chat assistant and the three project chairs are all listed,
+because a project that cannot start for want of `agy` is exactly what this
+command exists to find first. The trailing count and install hint are printed
+only when at least one CLI is missing.
 
 ### Launcher flags
 
 | Flag | Effect |
 |---|---|
 | `--doctor` | Report environment and CLI availability, then exit |
+| `--host IP` | Bind address, default `127.0.0.1`. Loopback only — `127.0.0.1`, `localhost` and `::1` are accepted and anything else exits with status 2, because the app can run an agent with auto-approve flags. |
 | `--no-browser` | Start the server without opening a window |
 | `--port N` | Preferred port (falls back to a free one if taken) |
 | `--print-url` | Print only the dashboard URL, then serve |
@@ -478,6 +494,18 @@ Four properties hold throughout, and they are covered by tests:
   is the chairman or a Chat turn. A read-only run skips both, because reading a
   diff after one would report your own uncommitted work as the agent's.
 
+**One exception, and it is worth knowing before you configure one.** Read-only
+is enforced by the arguments a CLI is launched with, so it is only as strong as
+the `read_only_args` that provider declares. The three shipped agents declare
+theirs; the **Custom command** preset ships with an empty list, and nothing
+substitutes for it. A member seat on a custom command is therefore held to
+read-only by the prompt alone — an executable that writes regardless of what it
+was asked will write, before the approval gate and before the safety snapshot,
+which then records the already-modified tree as the starting state. The app
+does not refuse that seat; it publishes a warning naming each unguarded provider
+when the run starts. Give a custom command its own read-only flag in Settings,
+or don't seat it.
+
 > **Zero-Touch means what it says.** An agent will create, modify and delete
 > files in your working folder with no further confirmation. Use it on a
 > branch, keep Safety Snapshot on, and don't point it at anything you can't
@@ -608,13 +636,23 @@ There is no step 1, step 2, step 3. Every turn the engine reads
 next?* — and the answer picks the agent:
 
 ```text
+  never audited ........ QA reads the folder, read-only
+  board empty .......... the architect breaks the goal into cards
   build FAILING ........ the developer fixes it
-  build UNKNOWN ........ QA builds and tests it
+  changes unverified ... QA builds and tests it
   cards in review ...... the architect reviews the diff
   cards in backlog ..... the developer claims the top one
-  board clear, green ... the architect proposes what is missing
+  board clear .......... the architect proposes what is missing
   nothing left ......... COMPLETED
 ```
+
+Read the fourth line precisely: the trigger is **unverified changes**, not an
+`UNKNOWN` build. The engine raises that flag when an agent writes code, and QA
+lowers it by running the build. A board that reads `UNKNOWN` with nothing
+unverified — an audited folder in which no tooling was detected, or a resumed
+board whose flag was already cleared — does not schedule a QA turn on health
+alone, so it can reach the last line with the build still `UNKNOWN`. The
+completion note says so; see [When a project stops](#when-a-project-stops).
 
 That ordering *is* the design, and it is the part worth arguing about:
 
@@ -656,11 +694,18 @@ already have.
 
 Most projects are not empty folders, and this one is built for that case.
 
-**The first turn is read-only.** Before anything is written, the QA chair is
-invoked with its read-only flags and *no write grant at all*, and asked
+**The first turn is read-only.** Before any of *your* files are touched, the QA
+chair is invoked with its read-only flags and *no write grant at all*, and asked
 what is already here: the layout, the configs, what of the goal exists, and
 anything that would break if an agent touched it. Nothing can change during that
 turn, by construction rather than by instruction.
+
+Two things are written before that turn, and both are the engine's own
+bookkeeping rather than an agent's work: `.theseus/` is created with the
+starting `BOARD.json` in it, and `.theseus/` is appended to `.gitignore` if the
+folder is a git repository. Both happen while the project is being started, so
+the safety snapshot taken immediately afterwards already contains them — rolling
+a project back by hand will not remove the `.gitignore` line.
 
 **It adopts your build, it does not invent one.** The engine reads the tooling
 off disk itself — `go.mod`, `package.json`, `Cargo.toml`, `pyproject.toml`,
@@ -693,9 +738,38 @@ and no setting changes that. Zero-Touch is not involved; pressing **Start
 project** *is* the grant. That is why the confirmation names the folder: it is
 the one thing that turns a misclick into a question.
 
-A git snapshot is taken before the first write where there is one to take, so an
-entire build can be undone. In a folder that is not a repository there is nothing
-to snapshot and the app says so before you start.
+A git snapshot is taken before the first write where there is one to take, using
+the same mechanism a council run uses — see [How rollback
+works](#how-rollback-works). In a folder that is not a repository there is
+nothing to snapshot and the app says so before you start.
+
+**There is no Project rollback button, and no undo-the-build endpoint.** The
+snapshot is recorded and stored on the board, but nothing in the app restores
+it: the **Roll back** control belongs to the last council or Chat run, not to a
+project. Undo a build by hand instead. The snapshot is a real commit, anchored
+under `refs/ai-council/snapshots/` and also recorded in `.theseus/BOARD.json`
+under `snapshot`, so either of these finds it:
+
+```bash
+git -C <project folder> for-each-ref refs/ai-council/snapshots
+python3 -c "import json;print(json.load(open('.theseus/BOARD.json'))['snapshot'])"
+```
+
+The board's `snapshot` object holds `head` (the commit HEAD was on), `commit`
+(the commit whose tree is the pre-project worktree) and `ref` (the anchor
+keeping it alive). Those are the two ids below, and this is the sequence the
+app's own rollback runs, in order — the `clean` must come before the tree is
+laid down, or it deletes the files it just restored:
+
+```bash
+git reset --hard -q <head-at-snapshot-time>
+git clean -fdq
+git read-tree -u --reset <snapshot-commit>
+git reset --mixed -q <head-at-snapshot-time>
+```
+
+Reopening the app does not reload the snapshot into memory, so read the commit
+id off the ref or the board rather than expecting the UI to offer it.
 
 ### What it writes
 
@@ -789,6 +863,31 @@ an instrument to notice that an hour early.
 Hitting a limit is not data loss: everything built is on disk, the board says
 where it got to, and the project can be resumed once you have unstuck it.
 
+### When a project stops
+
+A project ends in one of two states, and the distinction is narrower than it
+sounds:
+
+- **FAILED** — the step limit was reached, the board stopped moving for three
+  turns, the operator pressed **Stop**, or the worker crashed. The board keeps
+  the reason.
+- **COMPLETED** — the engine had nothing left to schedule.
+
+**`COMPLETED` does not on its own mean green.** The last rung of the ladder is
+"nothing left to do", not "the build passes", so a project can complete with the
+build `UNKNOWN` (nobody ever verified it) or `FAILING` (the developer used up
+its fix attempts). The completion note is the authoritative reading and states
+the health explicitly — *"Finished: 6 of 7 cards done, build unknown, in 22
+agent turns"* — along with any cards that never reached Done. Read that line,
+or read `build_health` in `.theseus/BOARD.json`, before treating a finished
+project as a working one.
+
+One consequence of that worth naming: when the build has failed more times in a
+row than **Fix attempts** allows, the engine records the failure and its reason,
+then immediately reports the project as `COMPLETED` with *"the build is
+FAILING"* as a caveat rather than leaving it `FAILED`. The caveat is accurate;
+the status is not the one you would expect.
+
 ### Trying it without spending quota
 
 `scripts/mock-agent.py` speaks the project protocol. Point all three chairs at
@@ -798,8 +897,6 @@ genuine bug in it**, fails its own test suite, is handed the real trace, fixes
 it, gets the cards reviewed and proposes one enhancement before declaring itself
 finished. Nothing in that sequence is faked — the tests really run and really
 fail — which is the only way to know the loop works rather than to believe it.
-
----
 
 ---
 
@@ -894,6 +991,15 @@ is told so in the live stream and
 distinguish "your tree was clean" from "we recorded nothing", and resetting on
 that assumption would destroy the work the snapshot exists to protect.
 
+**Rollback belongs to the last council or Chat run, and it does not know about
+projects.** Starting a project does not retire the previous run, so its **Roll
+back** button stays on screen and stays live — and clicking it resets and cleans
+the working tree while the project's agents are writing to it, discarding their
+work and whatever else was in flight. The two features refuse each other at
+*start* (a run will not start during a project and a project will not start
+during a run), but not here. If you started a project in the same folder as a
+finished council run, treat that button as armed until the project is over.
+
 ---
 
 ## Configuring the providers
@@ -986,6 +1092,12 @@ under Settings → **Roles**:
 | Chairman | Weighs the bench and applies the outcome | yes |
 | Junior Draft *(legacy)* | Surveys the repo, proposes a change | no |
 | Senior Polish *(legacy)* | Verifies a draft, corrects it, applies it | yes |
+
+**Writes** is what the persona *expects to do*, not what its seat is allowed to
+do. It is advisory metadata on the template — it grants nothing and blocks
+nothing. Permission is granted per seat, so a `yes` persona on a member seat is
+an agent told to modify files that cannot, which is the mismatch the paragraph
+below describes and the one Settings flags rather than silently resolving.
 
 **Chairman** is not offered as a member's lens: it is what the third stage
 *is*, not a lens over it, so the chair's seat has no persona picker and edits
@@ -1330,12 +1442,18 @@ Coverage focuses on the properties that matter if they're wrong:
   must not build on top of. Writing code sets the build back to unknown, so a
   green board cannot survive an edit.
 - The first turn of a run is verified to be **read-only against a real
-  invocation**: no write grant, and no files modified.
+  invocation**: the audit turn is launched with its read-only arguments and no
+  write grant, and reports having modified nothing. The "modified nothing" half
+  is the agent's own account of its turn, not a diff of the tree taken around
+  it; the grant is what is enforced.
 - `.theseus/` is appended to an existing `.gitignore` rather than replacing it,
   and never added twice.
 - Build tooling is **read off disk, not guessed** — `package.json` scripts that
   do not exist are never run.
-- A project and a run refuse each other, in both directions.
+- A project and a run refuse each other, in both directions — at *start*. That
+  is the covered case; rolling back a finished run while a project is live is
+  not blocked, and is the caveat under [How rollback
+  works](#how-rollback-works).
 
 ---
 
@@ -1358,5 +1476,3 @@ Coverage focuses on the properties that matter if they're wrong:
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
-<!-- commit bar verification -->
