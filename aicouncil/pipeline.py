@@ -718,7 +718,7 @@ class Pipeline:
         # environment during cleanup) sends a late transcript somewhere the
         # run was never meant to touch.
         self._runs_dir = Path(runs_dir) if runs_dir else cfg.runs_dir()
-        self._runs_dir.mkdir(parents=True, exist_ok=True)
+        cfg.private_dir(self._runs_dir)
         self._lock = threading.RLock()
         self._run: Optional[Run] = None
         self._thread: Optional[threading.Thread] = None
@@ -2400,8 +2400,10 @@ class Pipeline:
         """Write the run transcript to disk for later inspection."""
         try:
             path = self._runs_dir / run.transcript_name
-            path.write_text(
-                json.dumps(run.to_dict(), indent=2, default=str), encoding="utf-8"
+            # Owner-only: a transcript carries the task, every stage's output
+            # and the whole diff of the repository the run touched.
+            cfg.write_private_text(
+                path, json.dumps(run.to_dict(), indent=2, default=str)
             )
         except OSError:
             pass  # a transcript we cannot save is not worth failing a run over

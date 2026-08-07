@@ -62,18 +62,33 @@ function toast(message, kind = 'info', ttl = 5200) {
    2. API client
    ========================================================================== */
 
-/** The launcher hands us the session token in the query string. Strip it from
- *  the visible URL immediately so it does not end up in a screenshot, a
- *  bookmark or the window title. */
-const TOKEN = (() => {
+/** The launcher hands us a single-use *ticket* in the query string, never the
+ *  session token itself - the token would sit in the browser's command line
+ *  for the whole session, where any other local user can read it. `claimSession`
+ *  trades the ticket for the token before anything else runs, and strips it
+ *  from the visible URL so it cannot end up in a screenshot or a bookmark. */
+let TOKEN = sessionStorage.getItem('ac_token') || '';
+
+async function claimSession() {
   const params = new URLSearchParams(location.search);
-  const t = params.get('token') || sessionStorage.getItem('ac_token') || '';
-  if (params.get('token')) {
-    sessionStorage.setItem('ac_token', t);
-    history.replaceState(null, '', location.pathname);
-  }
-  return t;
-})();
+  const ticket = params.get('ticket');
+  if (!ticket) return;
+  history.replaceState(null, '', location.pathname);
+  try {
+    const res = await fetch('/api/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ticket }),
+    });
+    const data = await res.json();
+    // Only on success: a spent ticket (a reload of an old URL) must not throw
+    // away a token this tab already holds.
+    if (data.token) {
+      TOKEN = data.token;
+      sessionStorage.setItem('ac_token', TOKEN);
+    }
+  } catch { /* boot() shows the missing-session screen */ }
+}
 
 async function api(path, { method = 'GET', body } = {}) {
   const res = await fetch(path, {
@@ -5006,12 +5021,14 @@ function wire() {
 }
 
 async function boot() {
+  await claimSession();
   if (!TOKEN) {
     document.body.innerHTML =
       '<div class="boot-error">' +
       '<h2>Missing session token</h2>' +
       '<p>Open the dashboard using the URL the launcher ' +
-      'printed &mdash; it carries a one-time token for this session.</p></div>';
+      'printed &mdash; it carries a one-time ticket for this session, and a ' +
+      'ticket can only be claimed once.</p></div>';
     return;
   }
   wire();

@@ -36,13 +36,52 @@ from typing import Any, Dict, List
 PKG_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = PKG_ROOT.parent
 
+# Owner-only, stated rather than inherited. What lands under these paths is the
+# task, the model's output and the full diff of a private repository, plus the
+# command templates a run executes - under the usual 022 umask every one of
+# those would be world-readable on a shared machine.
+DIR_MODE = 0o700
+FILE_MODE = 0o600
+
+
+def private_dir(path: Path) -> Path:
+    """Create ``path`` owner-only, tightening it if it already exists.
+
+    The tighten pass is for directories an earlier version created with the
+    ambient umask: ``mkdir(mode=...)`` only applies to a directory it actually
+    creates, so without it an upgrade would leave the old mode in place
+    forever.
+    """
+    path.mkdir(parents=True, exist_ok=True, mode=DIR_MODE)
+    try:
+        if path.stat().st_mode & 0o077:
+            path.chmod(DIR_MODE)
+    except OSError:
+        # Filesystems without POSIX modes (Windows, some network mounts) are a
+        # supported place to keep a config; they are simply not protected here.
+        pass
+    return path
+
+
+def write_private_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` as an owner-only file.
+
+    ``Path.write_text`` creates at 0666 & ~umask - typically 0644 - and leaves
+    an existing file's mode alone, so both halves are stated here.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    try:
+        os.chmod(path, FILE_MODE)
+    except OSError:
+        pass
+
 
 def config_dir() -> Path:
     """Return the XDG config directory for the app, creating it if needed."""
     base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
-    d = Path(base) / "ai-council"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return private_dir(Path(base) / "ai-council")
 
 
 def config_path() -> Path:
@@ -58,9 +97,7 @@ def config_path() -> Path:
 
 def runs_dir() -> Path:
     """Directory holding the JSON transcript of every pipeline run."""
-    d = config_dir() / "runs"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return private_dir(config_dir() / "runs")
 
 
 def workspace_dir() -> Path:
@@ -72,9 +109,7 @@ def workspace_dir() -> Path:
     is deliberately not a git repository - there is nothing here to snapshot,
     and the UI says so rather than offering a rollback that cannot work.
     """
-    d = config_dir() / "workspace"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return private_dir(config_dir() / "workspace")
 
 
 # --------------------------------------------------------------------------
@@ -830,7 +865,9 @@ class ConfigStore:
     def _write(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self._data, indent=2) + "\n", encoding="utf-8")
+        # Owner-only, and set on the temporary file so the config is never
+        # world-readable even for the instant before the rename.
+        write_private_text(tmp, json.dumps(self._data, indent=2) + "\n")
         tmp.replace(self._path)  # atomic on POSIX
 
     # -- api ---------------------------------------------------------------

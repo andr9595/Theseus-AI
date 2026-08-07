@@ -1377,6 +1377,12 @@ to `127.0.0.1:8760`. Since this app's API can run a coding agent with
 auto-approve flags, four defences are layered:
 
 1. **Per-launch session token**, never persisted, required on every `/api/` call.
+   The token itself never reaches a command line: the launcher's URL carries a
+   **single-use ticket**, which the page trades for the token through
+   `POST /api/session` on load. A browser's argv is readable by every other user
+   on the machine, and the ticket is spent by the time they can look. One
+   consequence: the printed URL opens the dashboard *once*. Reload the tab
+   freely — reopening the link needs a fresh launch.
 2. **Origin validation** — rejects requests from real remote sites (drive-by CSRF).
 3. **Host validation** — rejects non-loopback `Host` headers (DNS rebinding).
 4. **No shell** — commands run as argv lists with `shell=False`, so a prompt
@@ -1384,7 +1390,18 @@ auto-approve flags, four defences are layered:
 
 The UI is served under a strict CSP with no external assets, so agent output
 rendered as Markdown can never pull in a third party. Binding to anything other
-than loopback is refused outright.
+than loopback is refused outright. Everything written under
+`~/.config/ai-council` — the config, the workspace and every run transcript,
+which holds the task, each stage's output and the full diff — is created
+owner-only (`0700`/`0600`) rather than at whatever the ambient umask allows.
+
+What this does **not** defend against: a coding agent granted write permission
+runs unsandboxed, as you, with your whole environment. In Projects Mode the QA
+turn runs the repository's own `npm test`/`make test`, so opening a repository
+you do not trust and starting a project is equivalent to running its scripts by
+hand. Treat an untrusted repository accordingly — a container or a throwaway
+user account, not just a git snapshot, which is a recovery aid and not
+containment.
 
 ---
 
@@ -1463,7 +1480,7 @@ Coverage focuses on the properties that matter if they're wrong:
 |---|---|
 | `codex`/`claude` shows **not found** | Not on `PATH`. Run `./scripts/install-deps.sh`, or set an absolute path in Settings. |
 | The chairman finishes but the diff is empty | The CLI ran without write permission. With Zero-Touch off, you must click **Approve & execute** — that's what grants it. |
-| "Missing session token" | The dashboard was opened without the launcher's URL. Restart with `./run.sh`. |
+| "Missing session token" | The dashboard was opened without the launcher's URL, or with one whose one-time ticket has already been claimed by another window. Restart with `./run.sh`. |
 | Pull-request mode refuses to start | It says which precondition failed — a dirty tree, no `origin`, no git identity, or `gh` missing or logged out. Fix that one thing. |
 | Run hangs, no output | The CLI is waiting on interactive input. Check its auto-approve arguments in Settings. |
 | A seat hit its quota and the run failed | Don't start again — the answers already given are kept. Point that seat at another model or CLI, then click **Continue**: only the stage that failed runs. It works on a failed run reopened from history too, so restarting the app costs nothing. See [Continuing a run that failed](#continuing-a-run-that-failed). |

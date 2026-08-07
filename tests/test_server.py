@@ -109,6 +109,41 @@ class TestAuth(ServerTestBase):
         self.assertEqual(status, 403)
 
 
+class TestLaunchTicket(ServerTestBase):
+    """A session token on a browser's command line is readable by every other
+    user on the machine for as long as the window is open, so the launch URL
+    carries a ticket that buys the token once instead."""
+
+    def test_session_endpoint_rejects_get(self):
+        status, _ = self.request("/api/session", token="")
+        self.assertEqual(status, 405)
+
+    def test_the_launch_url_does_not_carry_the_session_token(self):
+        self.assertIn("ticket=", self.url)
+        self.assertNotIn(self.state.token, self.url)
+
+    def test_ticket_buys_the_token_exactly_once(self):
+        ticket = self.state.ticket
+        status, data = self.request(
+            "/api/session", method="POST", body={"ticket": ticket}, token=""
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["token"], self.token)
+
+        # Replay: whoever read the ticket out of the process table arrives
+        # second, and second gets nothing.
+        status, _ = self.request(
+            "/api/session", method="POST", body={"ticket": ticket}, token=""
+        )
+        self.assertEqual(status, 401)
+
+    def test_unknown_ticket_is_rejected(self):
+        status, _ = self.request(
+            "/api/session", method="POST", body={"ticket": "not-the-ticket"}, token=""
+        )
+        self.assertEqual(status, 401)
+
+
 class TestStaticFiles(ServerTestBase):
     def test_index_is_served_without_a_token(self):
         with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
@@ -189,7 +224,9 @@ class TestStaticFiles(ServerTestBase):
         self.assertIn("const project = mode === 'project';", script)
         self.assertIn("project ? 'project' : (chat ? 'chat' : 'council')", script)
         self.assertIn("$$('.project-gear-btn').forEach", script)
-        self.assertIn("openSettings(project ? 'project' : 'stages')", script)
+        # 'run' and 'agents' are the live tab ids in index.html; the pair this
+        # once asserted ('project'/'stages') was renamed out of the dialog.
+        self.assertIn("openSettings(project ? 'run' : 'agents')", script)
 
     def test_completed_run_is_only_rendered_in_its_own_mode(self):
         with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:

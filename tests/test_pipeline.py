@@ -727,6 +727,43 @@ class TestDiffStat(PipelineTestBase):
         diff = gitutil.working_diff(self.repo)
         self.assertIn("blob.bin", diff)
 
+    def test_an_enormous_diff_is_capped_rather_than_read_whole(self):
+        # The point of the cap is memory, not display: a staged 500 MB asset
+        # used to be a 500 MB string before anything clipped it. Asserting the
+        # returned length proves git was stopped at the cap.
+        big = self.repo / "big.txt"
+        big.write_text("original\n")
+        git(["add", "-A"], self.repo)
+        git(["commit", "-qm", "add big"], self.repo)
+        big.write_text("".join(f"line {i}\n" for i in range(200_000)))
+
+        diff = gitutil.working_diff(self.repo, max_bytes=20_000)
+        self.assertIn("diff truncated for display", diff)
+        self.assertLess(len(diff), 21_000)
+
+
+class TestPrivateOnDisk(PipelineTestBase):
+    """What this app writes is private: the task, every stage's output and the
+    full diff of a repository that is not ours to leak to the next login."""
+
+    @unittest.skipUnless(os.name == "posix", "file modes are a POSIX concept")
+    def test_transcripts_and_config_are_owner_only(self):
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+
+        transcript = self.runs_dir / run.transcript_name
+        self.assertEqual(transcript.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.runs_dir.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.config_path.stat().st_mode & 0o777, 0o600)
+
+    @unittest.skipUnless(os.name == "posix", "file modes are a POSIX concept")
+    def test_a_directory_an_earlier_version_left_open_is_tightened(self):
+        loose = self.tmp / "loose-runs"
+        loose.mkdir(mode=0o755)
+        cfg.private_dir(loose)
+        self.assertEqual(loose.stat().st_mode & 0o777, 0o700)
+
 
 class TestApprovalGate(PipelineTestBase):
     def test_run_pauses_and_writes_nothing_before_approval(self):

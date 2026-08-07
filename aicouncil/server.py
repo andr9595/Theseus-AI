@@ -9,7 +9,9 @@ app's API can execute a coding agent with ``--dangerously-skip-permissions``,
 three defences are layered on:
 
 1. **Session token.** Generated per launch, never persisted. Every ``/api/``
-   request must present it. The launcher puts it in the URL fragment/query.
+   request must present it. The token never reaches a command line: the
+   launcher's URL carries a single-use *ticket*, which the page trades for the
+   token through ``POST /api/session`` before its first real request.
 2. **Origin / Host validation.** Requests whose ``Origin`` is a real remote
    site are rejected, which blocks the drive-by CSRF case, and a non-loopback
    ``Host`` header is rejected, which blocks DNS rebinding.
@@ -67,6 +69,15 @@ class AppState:
         # that refuses on the other's behalf.
         self.projects = ProjectEngine(store, self.bus, busy_check=self._refuse_if_busy)
         self.token = secrets.token_urlsafe(24)
+        # The launcher has no way to hand a browser a secret except on its
+        # command line, where every other user on the machine can read it out
+        # of the process table for as long as the window stays open. So the
+        # URL carries a *ticket* rather than the token: the first page to
+        # present it is given the token in a response body and the ticket dies
+        # on the spot, which narrows the exposure from the whole session to
+        # however long the browser takes to start.
+        self._ticket = secrets.token_urlsafe(24)
+        self._ticket_lock = threading.Lock()
         self.started_at = time.time()
         # Publishing on the bus means every open tab updates together, and a
         # tab opened later replays the last reading instead of showing blank.
@@ -80,6 +91,27 @@ class AppState:
         # without it, which is why this is wiring rather than a constructor
         # argument. Readings are the vendor's own; nothing here computes one.
         self.pipeline.quota_source = self._agent_quota
+
+    @property
+    def ticket(self) -> str:
+        """The unredeemed launch ticket, or "" once it has been spent."""
+        with self._ticket_lock:
+            return self._ticket
+
+    def redeem_ticket(self, supplied: str) -> Optional[str]:
+        """Trade a valid, unspent ticket for the session token.
+
+        Under the lock, so two windows racing to open the same printed URL
+        cannot both win - exactly one gets the token and the other is told to
+        relaunch.
+        """
+        with self._ticket_lock:
+            if not supplied or not self._ticket:
+                return None
+            if not secrets.compare_digest(supplied, self._ticket):
+                return None
+            self._ticket = ""
+            return self.token
 
     def _agent_quota(self) -> Dict[str, Optional[float]]:
         """Percent of its window each council CLI has consumed, where known.
@@ -231,6 +263,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._serve_static(path)
             return
 
+        # The one API call that cannot present a token: it is how the page
+        # gets one. The Origin and Host checks above still apply to it.
+        if path == "/api/session":
+            self._api_session(method)
+            return
+
         if not self._authorized(params):
             self._error(
                 HTTPStatus.UNAUTHORIZED,
@@ -308,6 +346,30 @@ class Handler(BaseHTTPRequestHandler):
             )
         else:
             self._json(HTTPStatus.OK, result)
+
+    # -- session -----------------------------------------------------------
+
+    def _api_session(self, method: str) -> None:
+        """Exchange the launcher's one-time ticket for the session token."""
+        if method != "POST":
+            self._error(HTTPStatus.METHOD_NOT_ALLOWED, "Method not allowed.")
+            return
+        try:
+            body = self._read_body()
+        except ValueError as exc:
+            self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        # Body only, never the query string: a ticket in a URL is a ticket in
+        # a referrer, a history entry and a server log.
+        token = self.app.redeem_ticket(str(body.get("ticket") or "").strip())
+        if token is None:
+            self._error(
+                HTTPStatus.UNAUTHORIZED,
+                "That launch ticket is not valid, or has already been used. "
+                "Restart the app to get a fresh URL.",
+            )
+            return
+        self._json(HTTPStatus.OK, {"ok": True, "token": token})
 
     # -- static ------------------------------------------------------------
 
@@ -831,7 +893,7 @@ def make_server(
 
     handler = type("BoundHandler", (Handler,), {"app": state})
     server = Server((host, chosen), handler)
-    url = f"http://{host}:{chosen}/?token={urllib.parse.quote(state.token)}"
+    url = f"http://{host}:{chosen}/?ticket={urllib.parse.quote(state.ticket)}"
     return server, state, url
 
 

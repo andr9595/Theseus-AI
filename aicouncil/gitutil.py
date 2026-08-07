@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -30,6 +31,10 @@ GIT_TIMEOUT = 60
 # Pushing and talking to GitHub crosses the network, so they get their own,
 # longer budget than local plumbing.
 REMOTE_TIMEOUT = 300
+# How much of a capped command's output is read at a time. Big enough that a
+# normal diff arrives in one or two reads, small enough that the timeout is
+# checked often on a slow one.
+READ_CHUNK = 64 * 1024
 
 
 class GitError(RuntimeError):
@@ -90,6 +95,63 @@ def _run(
             f"{proc.stderr.strip() or proc.stdout.strip()}"
         )
     return proc
+
+
+def _run_capped(
+    args: List[str],
+    cwd: str | Path,
+    max_bytes: int,
+    timeout: int = GIT_TIMEOUT,
+) -> subprocess.CompletedProcess:
+    """Run a git command, reading at most ``max_bytes`` of its output.
+
+    ``_run`` buffers a command's entire stdout before any caller can look at
+    it. That is right for plumbing that answers in a line and wrong for
+    ``diff``: one accidentally staged multi-gigabyte asset is that many bytes
+    held in memory, only to be clipped to 400 KB a moment later. This stops one
+    byte past the cap and kills git rather than reading the rest.
+
+    A capped run reports ``returncode == 0``: *we* stopped it, git did not
+    fail, and a caller that reads a non-zero status as "no HEAD yet" would
+    otherwise re-run the same enormous diff. The extra byte is deliberate too -
+    it is what makes ``_clip_diff`` add its truncation notice.
+    """
+    deadline = time.monotonic() + timeout
+    proc = subprocess.Popen(
+        ["git", *args],
+        cwd=str(cwd),
+        env=_child_env(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        errors="replace",
+    )
+
+    out: List[str] = []
+    size = 0
+    with proc:
+        while size <= max_bytes:
+            if time.monotonic() > deadline:
+                proc.kill()
+                raise GitError(f"git {' '.join(args)} timed out after {timeout}s")
+            chunk = proc.stdout.read(READ_CHUNK) if proc.stdout else ""
+            if not chunk:
+                break
+            out.append(chunk)
+            size += len(chunk)
+        capped = size > max_bytes
+        if capped:
+            proc.kill()
+        try:
+            code = proc.wait(timeout=max(1, int(deadline - time.monotonic())))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise GitError(f"git {' '.join(args)} timed out after {timeout}s") from None
+
+    return subprocess.CompletedProcess(
+        ["git", *args], 0 if capped else code, "".join(out), ""
+    )
 
 
 # --------------------------------------------------------------------------
@@ -231,23 +293,31 @@ def working_diff(path: str | Path, max_bytes: int = 400_000) -> str:
         return ""
 
     chunks: List[str] = []
-    tracked = _run(["diff", "HEAD", "--no-color"], root, check=False)
+    tracked = _run_capped(["diff", "HEAD", "--no-color"], root, max_bytes)
     if tracked.returncode == 0 and tracked.stdout.strip():
         chunks.append(tracked.stdout)
     elif tracked.returncode != 0:
         # No HEAD yet (empty repo): fall back to the index-less diff.
-        fallback = _run(["diff", "--no-color"], root, check=False)
+        fallback = _run_capped(["diff", "--no-color"], root, max_bytes)
         if fallback.stdout.strip():
             chunks.append(fallback.stdout)
+    collected = sum(len(c) for c in chunks)
 
     for rel in _untracked_files(root):
+        # Each new file is capped on its own below, but a thousand of them are
+        # not: stop once there is already more than will survive the clip,
+        # rather than diffing files whose output is guaranteed to be cut.
+        if collected > max_bytes:
+            break
         target = Path(root) / rel
         try:
             if target.stat().st_size > 200_000:
-                chunks.append(
+                note = (
                     f"diff --git a/{rel} b/{rel}\n"
                     f"new file (skipped: larger than 200 KB)\n"
                 )
+                chunks.append(note)
+                collected += len(note)
                 continue
         except OSError:
             continue
@@ -259,6 +329,7 @@ def working_diff(path: str | Path, max_bytes: int = 400_000) -> str:
         )
         if proc.stdout:
             chunks.append(proc.stdout)
+            collected += len(proc.stdout)
 
     # Each chunk already ends with a newline; joining on "\n" would insert a
     # blank line between files that no diff parser expects.
@@ -661,7 +732,7 @@ def branch_diff(
     root = repo_root(path)
     if root is None:
         return ""
-    proc = _run(["diff", "--no-color", f"{base}...{head}"], root, check=False)
+    proc = _run_capped(["diff", "--no-color", f"{base}...{head}"], root, max_bytes)
     return _clip_diff(proc.stdout, max_bytes)
 
 

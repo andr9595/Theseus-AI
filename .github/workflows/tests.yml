@@ -10,6 +10,35 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # ruff is a CI tool, not a dependency: the app itself stays standard
+      # library only, and the "no third-party imports" check above is what
+      # enforces that. Installing a linter here breaks no such rule.
+      - name: Install ruff
+        run: pip install ruff
+
+      # Deliberately the hard-error rules only - syntax errors (E9), invalid
+      # comparisons and assertions (F63, F7) and undefined names (F82). Style
+      # is not what this job is for, and a lint job that argues about quotes is
+      # a lint job people learn to ignore. F82 is the one that matters: a name
+      # that only exists on an error path is a defect the tests can miss.
+      - name: Lint (errors and undefined names)
+        run: ruff check --select E9,F63,F7,F82 aicouncil tests
+
+      # The dashboard is plain ES2020 loaded as a classic script. Nothing else
+      # in CI parses it - the server tests only read it as text - so a stray
+      # comma would ship and only fail in the browser.
+      - name: Syntax-check the dashboard bundle
+        run: for f in aicouncil/web/*.js; do node --check "$f"; done
+
   test:
     runs-on: ubuntu-latest
     strategy:

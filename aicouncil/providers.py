@@ -164,6 +164,14 @@ def build_argv(
             if use_stdin:
                 # Drop a bare placeholder; keep a decorated one with the token
                 # emptied out so flags like `--message=` are not malformed.
+                #
+                # The one shape this cannot see: a template that splits an
+                # option from its value, `cli -m {prompt}`. Dropping the value
+                # leaves `-m` looking for one. It is not detectable by
+                # inspection - the shipped `claude -p {prompt}` is the same
+                # shape with a standalone flag - so an operator whose CLI takes
+                # the prompt as a separate option value should enable 'Pipe the
+                # prompt on stdin' rather than rely on the argv path.
                 if token.strip() == PROMPT_TOKEN:
                     continue
                 argv.append(token.replace(PROMPT_TOKEN, ""))
