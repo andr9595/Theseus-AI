@@ -423,16 +423,32 @@
     </header>
     <!-- One destination per kind of setting, so no panel is scrolled past to
          reach another. Every panel stays in the DOM: Save reads them all. -->
-    <div class="settings-tabs" role="tablist">
-      <button class="settings-tab active" data-settings-tab="stages" role="tab">Agents</button>
-      <button class="settings-tab" data-settings-tab="council" role="tab">Council</button>
-      <button class="settings-tab" data-settings-tab="roles" role="tab">Roles</button>
-      <button class="settings-tab" data-settings-tab="run" role="tab">Run</button>
-      <button class="settings-tab" data-settings-tab="project" role="tab">Project</button>
-      <button class="settings-tab" data-settings-tab="app" role="tab">App</button>
+    <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+      <button class="settings-tab active" type="button" role="tab"
+        id="settings-tab-agents" data-settings-tab="agents"
+        aria-controls="settings-panel-agents" aria-selected="true">Agents</button>
+      <button class="settings-tab" type="button" role="tab" tabindex="-1"
+        id="settings-tab-council" data-settings-tab="council"
+        aria-controls="settings-panel-council" aria-selected="false">Council</button>
+      <button class="settings-tab" type="button" role="tab" tabindex="-1"
+        id="settings-tab-roles" data-settings-tab="roles"
+        aria-controls="settings-panel-roles" aria-selected="false">Roles</button>
+      <button class="settings-tab" type="button" role="tab" tabindex="-1"
+        id="settings-tab-run" data-settings-tab="run"
+        aria-controls="settings-panel-run" aria-selected="false">Runs</button>
+      <button class="settings-tab" type="button" role="tab" tabindex="-1"
+        id="settings-tab-app" data-settings-tab="app"
+        aria-controls="settings-panel-app" aria-selected="false">General</button>
     </div>
     <div class="modal-body">
-      <section class="settings-panel active" data-settings-panel="stages">
+      <section class="settings-panel active" data-settings-panel="agents"
+        id="settings-panel-agents" role="tabpanel" aria-labelledby="settings-tab-agents">
+        <h4 class="settings-head">
+          Agents
+          <button id="run-doctor" class="btn btn-quiet btn-sm" type="button">
+            Re-check CLIs
+          </button>
+        </h4>
         <p class="settings-note">
           Each one shells out to a locally installed CLI that carries your own
           subscription auth. No API keys are stored or sent. One card per CLI
@@ -445,7 +461,9 @@
         <div id="doctor-out" class="doctor"></div>
       </section>
 
-      <section class="settings-panel" data-settings-panel="council">
+      <section class="settings-panel" data-settings-panel="council"
+        id="settings-panel-council" role="tabpanel" aria-labelledby="settings-tab-council"
+        hidden>
         <p class="settings-note">
           Who deliberates, and how hard they push each other. The bench is
           chosen per run from what you asked for &mdash; a security question
@@ -538,7 +556,9 @@
         <div id="council-capabilities" class="council-caps"></div>
       </section>
 
-      <section class="settings-panel" data-settings-panel="roles">
+      <section class="settings-panel" data-settings-panel="roles"
+        id="settings-panel-roles" role="tabpanel" aria-labelledby="settings-tab-roles"
+        hidden>
         <h4 class="settings-head">
           Roles
           <button id="role-new" class="btn btn-quiet btn-sm" type="button">New role</button>
@@ -554,7 +574,9 @@
       <!-- The full set. The gear beside the composer carries the two that get
            changed per run; these are the rest, in one place rather than
            stacked down a sidebar that is now history. -->
-      <section class="settings-panel" data-settings-panel="run">
+      <section class="settings-panel" data-settings-panel="run"
+        id="settings-panel-run" role="tabpanel" aria-labelledby="settings-tab-run"
+        hidden>
         <p class="settings-note">
           Zero-Touch applies in both modes: it is what hands the CLI its
           auto-approve flags. Council can also be granted that at the approval
@@ -629,29 +651,22 @@
             <span class="field-hint">Where the initializer's slider starts. Zero builds what was asked for and stops.</span>
           </div>
         </div>
-      </section>
 
-      <section class="settings-panel" data-settings-panel="project">
-        <p class="settings-note">
-          Appended to every prompt the council is given, whichever folder the
-          run happens in. Chat does not get them: it is a conversation, not a
-          run against a project.
-        </p>
         <div class="field">
           <label for="house-rules">Standing project rules</label>
-          <textarea id="house-rules" rows="10" spellcheck="false"
+          <textarea id="house-rules" rows="8" spellcheck="false"
             placeholder="e.g. Use tabs. Never add dependencies without asking. All new code needs tests."></textarea>
+          <span class="field-hint">
+            Appended to every council and project prompt, whichever folder the
+            run happens in. Chat does not get them: it is a conversation, not
+            a run against a project.
+          </span>
         </div>
-
-        <p class="settings-note">
-          Caveman mode and Efficiency mode are set from the gear on the
-          composer, the same as in Council and Chat &mdash; in Projects that
-          is the gear beside the goal box, and the one in the tracker header
-          once a run is going.
-        </p>
       </section>
 
-      <section class="settings-panel" data-settings-panel="app">
+      <section class="settings-panel" data-settings-panel="app"
+        id="settings-panel-app" role="tabpanel" aria-labelledby="settings-tab-app"
+        hidden>
         <p class="settings-note">
           Where this dashboard serves itself, and what it calls you. A changed
           port takes effect the next time the app starts.
@@ -693,12 +708,22 @@
             Delete all chats <span id="count-chat" class="count"></span>
           </button>
         </div>
+
+        <h4 class="settings-head">Reset</h4>
+        <p class="settings-note">
+          Puts every setting on every tab back to the shipped default, at once
+          and without saving first. Conversations and files are untouched.
+        </p>
+        <div class="history-actions">
+          <button id="reset-config" class="btn btn-quiet btn-sm" type="button">
+            Reset all settings
+          </button>
+        </div>
       </section>
     </div>
     <footer class="modal-foot">
-      <button id="reset-config" class="btn btn-quiet" type="button">Reset to defaults</button>
       <span class="modal-foot-spacer"></span>
-      <button id="run-doctor" class="btn btn-quiet" type="button">Re-check CLIs</button>
+      <button class="btn btn-quiet" data-close="settings" type="button">Cancel</button>
       <button id="save-settings" class="btn btn-primary" type="button">Save</button>
     </footer>
   </div>

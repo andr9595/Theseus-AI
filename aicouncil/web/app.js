@@ -3148,7 +3148,7 @@ function openGearMenu(anchor) {
   menu.addEventListener('click', (e) => {
     if (e.target.closest('[data-open="settings"]')) {
       closeModelMenu();
-      openSettings(project ? 'project' : 'stages');
+      openSettings(project ? 'run' : 'agents');
       return;
     }
     const btn = e.target.closest('[data-toggle]');
@@ -3309,7 +3309,15 @@ async function dropUnsupportedEffort(providerId, provider) {
    ========================================================================== */
 
 function openModal(id) { $(`#${id}`).classList.remove('hidden'); }
-function closeModal(id) { $(`#${id}`).classList.add('hidden'); }
+function closeModal(id) {
+  $(`#${id}`).classList.add('hidden');
+  // Settings is the one dialog reached from a button rather than a row that
+  // has just been replaced, so it is the one that has somewhere to go back to.
+  if (id === 'settings' && settingsOpener && settingsOpener.isConnected) {
+    settingsOpener.focus();
+    settingsOpener = null;
+  }
+}
 
 /* ---- Directory picker ---- */
 
@@ -3412,21 +3420,45 @@ async function clearWorkspace() {
 /* ---- Settings ---- */
 
 /** Own selectors, not the output pane's `.tab`: that click handler is bound
- *  document-wide at boot and would fire on these too. */
+ *  document-wide at boot and would fire on these too. `hidden` and
+ *  `aria-selected` move with the class so a screen reader and the roving
+ *  tabstop describe the same panel the eye is on. */
 function switchSettingsTab(name) {
-  $$('.settings-tab').forEach(t =>
-    t.classList.toggle('active', t.dataset.settingsTab === name));
-  $$('.settings-panel').forEach(p =>
-    p.classList.toggle('active', p.dataset.settingsPanel === name));
+  const tabs = $$('.settings-tab');
+  // An unknown destination would otherwise hide every panel and open blank.
+  const wanted = tabs.some(t => t.dataset.settingsTab === name)
+    ? name : tabs[0].dataset.settingsTab;
+  tabs.forEach(t => {
+    const on = t.dataset.settingsTab === wanted;
+    t.classList.toggle('active', on);
+    t.setAttribute('aria-selected', on ? 'true' : 'false');
+    if (on) t.removeAttribute('tabindex'); else t.tabIndex = -1;
+  });
+  $$('.settings-panel').forEach(p => {
+    const on = p.dataset.settingsPanel === wanted;
+    p.classList.toggle('active', on);
+    p.hidden = !on;
+  });
 }
 
-async function openSettings(tab = 'stages') {
-  await refreshDoctor(true);
+/** Whatever opened the dialog, so closing it puts the keyboard back there
+ *  rather than at the top of the document. */
+let settingsOpener = null;
+
+function openSettings(tab = 'agents') {
+  // Reached from the composer gear as well as the button, and that menu has
+  // already closed by now — so the button is the fallback, not the body.
+  const from = document.activeElement;
+  settingsOpener = from && from !== document.body ? from : $('#settings-btn');
   renderSettings();
   renderRoleList();
   renderHistoryCounts();
   switchSettingsTab(tab);
   openModal('settings');
+  $('.settings-tab.active').focus();
+  // The CLI probe shells out once per agent, so it is slower than the dialog
+  // needs to be: show the settings, fill the report in when it lands.
+  refreshDoctor(true);
 }
 
 /** Writing modes are scoped to 'council', 'chat' or 'project'. Each mode gets
@@ -3480,11 +3512,9 @@ function renderSettings() {
 
   host.innerHTML = FORMS.map(({ id, num, kind, name }) => {
     const p = providers[id] || {};
-    const info = state.providers.find(x => x.id === id);
-    const probeHtml = info
-      ? `<span class="probe ${info.available ? 'ok' : 'miss'}">` +
-        `${info.available ? 'found' : 'not found'}</span>`
-      : '';
+    // Filled by `renderProbeBadges` when the probe lands, which is after this
+    // panel is on screen.
+    const probeHtml = `<span class="probe" data-probe="${id}"></span>`;
     return (
       `<div class="provider-form" data-provider="${id}" data-kind="${kind}">` +
         `<h4><span class="stage-num">${esc(num)}</span> ` +
@@ -3823,6 +3853,7 @@ function readCouncilSettings() {
 
 async function saveSettings() {
   const providers = {};
+  let firstInvalid = null;
   let valid = true;
 
   $$('.provider-form').forEach(form => {
@@ -3839,6 +3870,7 @@ async function saveSettings() {
       // see is not a validation message - open it so the toast has a referent.
       const advanced = cmdInput.closest('.advanced');
       if (advanced) advanced.open = true;
+      if (!firstInvalid) firstInvalid = cmdInput;
       valid = false;
     } else {
       cmdInput.classList.remove('invalid');
@@ -3877,6 +3909,10 @@ async function saveSettings() {
   });
 
   if (!valid) {
+    // The cards are on one tab, and Save is reachable from all of them: a
+    // toast about a field on a panel that is not on screen names nothing.
+    switchSettingsTab('agents');
+    firstInvalid.focus();
     toast('Every agent needs a command.', 'error');
     return;
   }
@@ -3932,10 +3968,21 @@ async function refreshDoctor(show = false) {
       $('#doctor-out').textContent = lines.join('\n');
     }
     renderStrip();
-    if (show) renderSettings();
+    renderProbeBadges();
   } catch (err) {
     toast(err.message, 'error');
   }
+}
+
+/** The one part of a provider card the probe decides. Patched in place rather
+ *  than re-rendering the panel: the probe lands after Settings is on screen,
+ *  and a re-render would take back whatever had been typed by then. */
+function renderProbeBadges() {
+  $$('[data-probe]').forEach(el => {
+    const info = state.providers.find(x => x.id === el.dataset.probe);
+    el.className = info ? `probe ${info.available ? 'ok' : 'miss'}` : 'probe';
+    el.textContent = info ? (info.available ? 'found' : 'not found') : '';
+  });
 }
 
 /* ---- Conversations ---- */
@@ -4812,12 +4859,27 @@ function wire() {
   });
 
   // -- settings ---------------------------------------------------------
-  $('#settings-btn').addEventListener('click', () => openSettings('stages'));
+  $('#settings-btn').addEventListener('click', () => openSettings('agents'));
   $('#clear-council').addEventListener('click', () => clearHistory('council'));
   $('#clear-chat').addEventListener('click', () => clearHistory('solo'));
   $('.settings-tabs').addEventListener('click', (e) => {
     const tab = e.target.closest('.settings-tab');
     if (tab) switchSettingsTab(tab.dataset.settingsTab);
+  });
+  // Arrow keys move between tabs, as they do in any other tablist: with one
+  // tabstop on the strip, Tab has to reach the fields rather than walk the
+  // five destinations first.
+  $('.settings-tabs').addEventListener('keydown', (e) => {
+    const step = { ArrowRight: 1, ArrowLeft: -1, Home: 'first', End: 'last' }[e.key];
+    if (step === undefined) return;
+    e.preventDefault();
+    const tabs = $$('.settings-tab');
+    const here = tabs.findIndex(t => t.classList.contains('active'));
+    const next = step === 'first' ? 0
+      : step === 'last' ? tabs.length - 1
+      : (here + step + tabs.length) % tabs.length;
+    switchSettingsTab(tabs[next].dataset.settingsTab);
+    tabs[next].focus();
   });
   $('#commit-btn').addEventListener('click', doCommit);
   $('#commit-message').addEventListener('keydown', (e) => {
@@ -4838,17 +4900,17 @@ function wire() {
   // The server still pairs a command with its permission flags on the paths
   // that do swap - that pairing is the part that has to stay honest.
 
-  // The probe results print into the Stages panel, so show it.
-  $('#run-doctor').addEventListener('click', () => {
-    switchSettingsTab('stages');
-    refreshDoctor(true);
-  });
+  // The button sits in the Agents panel, beside the report it prints into.
+  $('#run-doctor').addEventListener('click', () => refreshDoctor(true));
   $('#reset-config').addEventListener('click', async () => {
     if (!confirm('Reset every setting to its default?')) return;
     try {
       const { config } = await api('/api/config/reset', { method: 'POST' });
       state.config = config;
       renderSettings();
+      // Roles are part of what was reset, and the dialog is still open on
+      // whichever tab was being read.
+      renderRoleList();
       renderAll();
       toast('Settings reset.', 'ok');
     } catch (err) { toast(err.message, 'error'); }
@@ -4910,12 +4972,12 @@ function wire() {
   $$('[data-close]').forEach(btn =>
     btn.addEventListener('click', () => closeModal(btn.dataset.close)));
   $$('.modal').forEach(modal => modal.addEventListener('click', (e) => {
-    if (e.target === modal) modal.classList.add('hidden');
+    if (e.target === modal) closeModal(modal.id);
   }));
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       closeModelMenu();
-      $$('.modal').forEach(m => m.classList.add('hidden'));
+      $$('.modal').forEach(m => closeModal(m.id));
     }
   });
 
