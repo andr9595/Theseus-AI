@@ -30,6 +30,30 @@ from aicouncil.providers import (  # noqa: E402
     stream_reader_for,
 )
 
+
+def setUpModule():
+    """Keep the discovery catalogue out of the operator's real config dir.
+
+    Discovery writes what it learns to `catalog.json` beside the config, and a
+    test run that asked a stub binary for its models would otherwise leave the
+    answer sitting in the machine's own catalogue.
+    """
+    global _CATALOG_HOME, _OLD_XDG
+    _CATALOG_HOME = tempfile.mkdtemp(prefix="aicouncil-catalog-")
+    _OLD_XDG = os.environ.get("XDG_CONFIG_HOME")
+    os.environ["XDG_CONFIG_HOME"] = _CATALOG_HOME
+    providers._CATALOG = None
+
+
+def tearDownModule():
+    if _OLD_XDG is None:
+        os.environ.pop("XDG_CONFIG_HOME", None)
+    else:
+        os.environ["XDG_CONFIG_HOME"] = _OLD_XDG
+    providers._CATALOG = None
+    shutil.rmtree(_CATALOG_HOME, ignore_errors=True)
+
+
 CLAUDE = {
     "id": "polisher",
     "command": ["claude", "-p", "{prompt}"],
@@ -909,14 +933,17 @@ class TestAntigravityAgent(unittest.TestCase):
 class TestAntigravityDiscovery(unittest.TestCase):
     """What `agy` can run, asked of `agy`."""
 
+    # Transcribed from `agy models` on Antigravity CLI 1.1.10: one line per
+    # model, the id and the human-readable name separated by a tab. The
+    # heading and the blank line are there because dropping them is this
+    # parser's other job.
     MODELS_STUB = (
         "#!/usr/bin/env python3\n"
         "import sys\n"
         "if sys.argv[1:2] == ['models']:\n"
         "    print('Available models:')\n"
-        "    print('gemini-3.6-flash-high')\n"
-        "    print('claude-sonnet-4-6')\n"
-        "    print('Gemini 3.6 Flash (High)')\n"
+        "    print('gemini-3.6-flash-high\\tGemini 3.6 Flash (High)')\n"
+        "    print('claude-sonnet-4-6\\tClaude Sonnet 4.6 (Thinking)')\n"
         "    print('')\n"
         "else:\n"
         "    sys.stderr.write('Error: invalid model selection "
@@ -945,10 +972,19 @@ class TestAntigravityDiscovery(unittest.TestCase):
 
     def test_model_ids_are_taken_and_prose_is_left(self):
         r = discover_models(self._stub(self.MODELS_STUB))
-        # The heading and the human-readable form of a model name are both
-        # dropped without this code having to know either was coming.
+        # The heading is dropped without this code having to know it was
+        # coming. The regression this guards: every line of the real listing
+        # carries a tab and a display name, and judging the whole line rather
+        # than the id threw all of them away - the Antigravity picker showed no
+        # models at all, on every tab, however many times it was opened.
         self.assertEqual(r["models"], ["gemini-3.6-flash-high", "claude-sonnet-4-6"])
         self.assertFalse(r["error"])
+
+    def test_the_name_beside_each_id_is_kept(self):
+        # `gemini-3.6-flash-high` and `gemini-3.5-flash-high` are one character
+        # apart. The CLI names both, so the picker does not have to guess.
+        r = discover_models(self._stub(self.MODELS_STUB))
+        self.assertEqual(r["labels"]["claude-sonnet-4-6"], "Claude Sonnet 4.6 (Thinking)")
 
     def test_being_signed_out_is_reported_in_the_clis_own_words(self):
         r = discover_models(self._stub(self.SIGNED_OUT_STUB))
@@ -988,6 +1024,128 @@ class TestAntigravityDiscovery(unittest.TestCase):
         r = discover_models(dict(AGY, command=["agy-not-installed"]))
         self.assertEqual(r["models"], [])
         self.assertIn("PATH", r["error"])
+
+
+class TestDiscoveryCatalogue(unittest.TestCase):
+    """Asking a CLI what it can run is a process launch; opening a menu is a
+    click, and it was paying for one every time.
+
+    `agy models` takes seconds on a cold start and up to a minute on a loaded
+    machine, which is what put "Asking Antigravity…" in front of every picker
+    in the app. The answer is kept beside the config instead, and re-asked
+    only when the binary changes or the operator asks for it.
+    """
+
+    STUB = (
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "open(sys.argv[0] + '.calls', 'a').write('x')\n"
+        "if 'models' in sys.argv:\n"
+        "    print('Available models:')\n"
+        "    print('gemini-3.6-flash-high')\n"
+        "else:\n"
+        "    sys.stderr.write('Error: invalid model selection "
+        "(--effort \"?ask\"): invalid --effort \"?ask\" "
+        "(valid: low, medium, high)\\n')\n"
+    )
+
+    SIGNED_OUT_STUB = (
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "open(sys.argv[0] + '.calls', 'a').write('x')\n"
+        "sys.stderr.write('Error: Please sign in to view available models.\\n')\n"
+        "sys.exit(1)\n"
+    )
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-catalogued-"))
+        self.path = self.tmp / "agy"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _stub(self, body=None, **extra):
+        self.path.write_text(body or self.STUB)
+        self.path.chmod(0o755)
+        return dict(AGY, command=[str(self.path), "--prompt={prompt}"], **extra)
+
+    def _calls(self):
+        marker = Path(str(self.path) + ".calls")
+        return len(marker.read_text()) if marker.exists() else 0
+
+    def test_a_second_menu_does_not_launch_the_cli_again(self):
+        provider = self._stub()
+        first = discover_models(provider)
+        second = discover_models(provider)
+        self.assertEqual(second["models"], first["models"])
+        self.assertEqual(self._calls(), 1)
+        # The menu says which it is showing, so a stored list cannot pass for
+        # one that was just asked for.
+        self.assertFalse(first["cached"])
+        self.assertTrue(second["cached"])
+
+    def test_it_survives_a_restart(self):
+        provider = self._stub()
+        discover_models(provider)
+        providers._CATALOG = None  # what a fresh process starts with
+        again = discover_models(provider)
+        self.assertEqual(again["models"], ["gemini-3.6-flash-high"])
+        self.assertTrue(again["cached"])
+        self.assertEqual(self._calls(), 1)
+
+    def test_an_upgraded_cli_is_asked_again(self):
+        # A new binary can run new models, and nothing else would ever expire
+        # the entry - the catalogue would otherwise describe the old one until
+        # someone thought to press Refresh.
+        provider = self._stub()
+        discover_models(provider)
+        self._stub(self.STUB + "# rebuilt\n")
+        discover_models(provider)
+        self.assertEqual(self._calls(), 2)
+
+    def test_refresh_asks_again_regardless(self):
+        provider = self._stub()
+        discover_models(provider)
+        discover_models(provider, refresh=True)
+        self.assertEqual(self._calls(), 2)
+
+    def test_a_signed_out_cli_is_not_remembered(self):
+        # Signing in does not touch the binary, so a stored refusal would
+        # outlive its cause and never be re-asked.
+        provider = self._stub(self.SIGNED_OUT_STUB)
+        first = discover_models(provider)
+        second = discover_models(provider)
+        self.assertIn("sign in", first["error"])
+        self.assertIn("sign in", second["error"])
+        self.assertEqual(self._calls(), 2)
+
+    def test_the_fallback_effort_set_is_shown_but_not_stored(self):
+        # The levels below are this app's transcription, not the CLI's answer.
+        # Stored, one busy moment would stop it ever asking again.
+        provider = dict(AGY, command=[str(self.tmp / "agy-not-installed")])
+        first = discover_efforts(provider)
+        second = discover_efforts(provider)
+        self.assertEqual([lv["effort"] for lv in first["levels"]],
+                         ["low", "medium", "high"])
+        self.assertFalse(second["cached"])
+
+    def test_effort_levels_are_kept_per_model(self):
+        # `agy` refuses --effort beside a model it lists and accepts one beside
+        # a base name it does not. One entry per CLI would answer whichever
+        # question was asked first, for both.
+        listed = discover_efforts(self._stub(model="gemini-3.6-flash-high"))
+        base = discover_efforts(self._stub(model="gemini-3.6-flash"))
+        self.assertTrue(listed["conflicts_with_model"])
+        self.assertEqual([lv["effort"] for lv in base["levels"]],
+                         ["low", "medium", "high"])
+
+    def test_the_effort_menu_reuses_the_stored_model_list(self):
+        # It has to know whether the model is one `agy models` lists. Asking
+        # for that list again would be a second process behind one dropdown.
+        provider = self._stub(model="gemini-3.6-flash-high")
+        discover_models(provider)
+        discover_efforts(provider)
+        self.assertEqual(self._calls(), 1)
 
 
 class TestEffortDiscovery(unittest.TestCase):

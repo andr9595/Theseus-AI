@@ -514,6 +514,133 @@ class TestAgentAssignment(unittest.TestCase):
         )
 
 
+class TestGlobalAgentSettings(unittest.TestCase):
+    """One CLI, one model, one reasoning level - wherever it is sitting.
+
+    Antigravity is a single login with a single catalogue. Choosing a model for
+    it on the Projects tab and finding the council still on the old one is a
+    setting that did not take, not a per-tab preference: the CLI is the thing
+    being configured, and every chair it holds runs the same binary.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-global-"))
+        self.path = self.tmp / "config.json"
+        self.store = ConfigStore(self.path)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _agy(self, conf):
+        """Every provider that runs `agy`: the council seat and the QA chair."""
+        return [
+            p for p in conf["providers"].values()
+            if isinstance(p, dict) and agent_for(p) == "agy"
+        ]
+
+    def test_a_model_chosen_on_one_chair_is_the_clis_everywhere(self):
+        conf = self.store.update({"providers": {"qa": {"model": "gemini-3.6-flash"}}})
+        self.assertTrue(len(self._agy(conf)) > 1)
+        for provider in self._agy(conf):
+            self.assertEqual(provider["model"], "gemini-3.6-flash")
+        self.assertEqual(conf["agent_settings"]["agy"]["model"], "gemini-3.6-flash")
+
+    def test_an_effort_chosen_on_one_chair_is_the_clis_everywhere(self):
+        conf = self.store.update({"providers": {"council_agy": {"effort": "high"}}})
+        for provider in self._agy(conf):
+            self.assertEqual(provider["effort"], "high")
+
+    def test_a_hand_typed_model_is_remembered_for_every_chair(self):
+        # The picker saves what was typed so it is offered next time. Offered
+        # on one card and missing on another would be the same list problem in
+        # a new place.
+        conf = self.store.update({
+            "providers": {"qa": {"model": "new-agy-model", "models": ["new-agy-model"]}}
+        })
+        for provider in self._agy(conf):
+            self.assertEqual(provider["models"], ["new-agy-model"])
+
+    def test_the_setting_is_stored_against_the_cli(self):
+        # The provider copies on disk are derived from this one, projected on
+        # every load. Written the other way round, five chairs would be five
+        # answers to the same question.
+        self.store.update({"providers": {"qa": {"model": "gemini-3.6-flash"}}})
+        raw = json.loads(self.path.read_text())
+        self.assertEqual(raw["agent_settings"]["agy"]["model"], "gemini-3.6-flash")
+
+    def test_a_stale_copy_in_the_same_save_does_not_undo_an_edit(self):
+        # Settings posts every card at once, so a save that changes Claude's
+        # model on the council card also carries the chat card's copy of the
+        # old one. Taking the last one read would discard the edit.
+        self.store.update({"providers": {"council_claude": {"model": "opus"}}})
+        conf = self.store.update({
+            "providers": {
+                "council_claude": {"model": "sonnet"},
+                "solo": {"model": "opus"},
+            }
+        })
+        self.assertEqual(conf["providers"]["solo"]["model"], "sonnet")
+
+    def test_a_hand_written_command_keeps_its_own(self):
+        # A custom template is nobody's catalogued agent; there is no CLI for
+        # it to share a setting with.
+        self.store.update({
+            "providers": {"drafter": {"command": ["python3", "mock-agent.py", "{prompt}"]}}
+        })
+        self.store.update({"providers": {"drafter": {"model": "mock-1"}}})
+        conf = self.store.update({"providers": {"council_claude": {"model": "opus"}}})
+        self.assertEqual(conf["providers"]["drafter"]["model"], "mock-1")
+
+    def test_a_swapped_chair_arrives_on_the_new_clis_settings(self):
+        # Not the departing CLI's model, which would be rejected at launch,
+        # and not a blank either: the arriving CLI already has one.
+        self.store.update({"providers": {"council_codex": {"model": "gpt-5.5"}}})
+        conf = self.store.update({"providers": {"qa": {"agent": "codex"}}})
+        self.assertEqual(conf["providers"]["qa"]["model"], "gpt-5.5")
+        # And the CLI that left is untouched by having been swapped out.
+        self.assertEqual(conf["agent_settings"]["agy"]["model"], "")
+
+    def test_an_existing_config_adopts_what_each_cli_was_already_set_to(self):
+        # Written before the setting was global: the same CLI carried its own
+        # model in every chair. The council seat is the one the operator sees
+        # on the bench, so it is the one that wins.
+        self.path.write_text(json.dumps({
+            "providers": {
+                "council_agy": {
+                    "command": ["agy", "--prompt={prompt}"],
+                    "model": "gemini-3.6-flash",
+                    "models": ["gemini-3.6-flash"],
+                    "effort": "high",
+                },
+                "qa": {
+                    "command": ["agy", "--prompt={prompt}"],
+                    "model": "gemini-3.6-pro",
+                    "models": ["gemini-3.6-pro"],
+                },
+            },
+        }))
+        conf = ConfigStore(self.path).all()
+        self.assertEqual(conf["agent_settings"]["agy"]["model"], "gemini-3.6-flash")
+        self.assertEqual(conf["providers"]["qa"]["model"], "gemini-3.6-flash")
+        self.assertEqual(conf["providers"]["qa"]["effort"], "high")
+        # The remembered lists are unioned rather than picked between: they are
+        # only names typed into the picker, and a precedence rule would lose
+        # one of them for no reason.
+        self.assertEqual(
+            conf["agent_settings"]["agy"]["models"],
+            ["gemini-3.6-flash", "gemini-3.6-pro"],
+        )
+
+    def test_an_adopted_config_is_not_re_adopted_afterwards(self):
+        # Once the settings exist they are the source; re-reading the provider
+        # copies would resurrect a value the operator had since cleared.
+        self.store.update({"providers": {"council_agy": {"model": "gemini-3.6-flash"}}})
+        self.store.update({"providers": {"council_agy": {"model": ""}}})
+        conf = ConfigStore(self.path).all()
+        self.assertEqual(conf["agent_settings"]["agy"]["model"], "")
+        self.assertEqual(conf["providers"]["qa"]["model"], "")
+
+
 class TestSoloConfigMigration(unittest.TestCase):
     """A config written when Solo was a toggle over one council stage."""
 
@@ -839,6 +966,49 @@ class TestApi(ServerTestBase):
         status, data = self.request("/api/context?file=1700000000-nosuchrun.json")
         self.assertEqual(status, 400)
         self.assertIn("No such run transcript", data["error"])
+
+
+class TestPickerEndpoints(ServerTestBase):
+    """What the model and effort menus are served, and how often it costs a
+    process launch. Opening a picker used to run `agy models` every time."""
+
+    STUB = (
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "open(sys.argv[0] + '.calls', 'a').write('x')\n"
+        "print('gemini-3.6-flash-high')\n"
+    )
+
+    def setUp(self):
+        self.stub = self.tmp / "agy"
+        self.stub.write_text(self.STUB)
+        self.stub.chmod(0o755)
+        # Rewriting it dates it, so each test starts with the catalogue empty
+        # for this binary; the launch count has to start from zero with it.
+        Path(str(self.stub) + ".calls").unlink(missing_ok=True)
+        self.store.update({
+            "providers": {
+                "council_agy": {"command": [str(self.stub), "--prompt={prompt}"]}
+            }
+        })
+
+    def _calls(self):
+        marker = Path(str(self.stub) + ".calls")
+        return len(marker.read_text()) if marker.exists() else 0
+
+    def test_reopening_the_menu_does_not_relaunch_the_cli(self):
+        _, first = self.request("/api/models?provider=council_agy")
+        _, second = self.request("/api/models?provider=council_agy")
+        self.assertEqual(first["models"], ["gemini-3.6-flash-high"])
+        self.assertEqual(second["models"], ["gemini-3.6-flash-high"])
+        self.assertTrue(second["cached"])
+        self.assertEqual(self._calls(), 1)
+
+    def test_refresh_asks_the_cli_again(self):
+        self.request("/api/models?provider=council_agy")
+        _, fresh = self.request("/api/models?provider=council_agy&refresh=1")
+        self.assertFalse(fresh["cached"])
+        self.assertEqual(self._calls(), 2)
 
 
 class TestProjectRoutes(ServerTestBase):

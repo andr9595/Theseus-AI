@@ -961,6 +961,16 @@ html, body {
   word-break: break-all;
 }
 
+/* Where the list came from, and the way to ask for it again. The button sits
+   with the provenance rather than in the list of models: it changes nothing
+   about the configuration, it only re-asks. */
+.model-menu-foot {
+  display: flex; align-items: flex-end; gap: 6px;
+  margin-top: 2px; padding-top: 2px;
+}
+.model-menu-foot .model-menu-source { flex: 1; min-width: 0; }
+.model-menu-foot .model-menu-refresh { flex: none; margin: 0 4px 2px 0; }
+
 .model-menu-custom {
   display: flex; gap: 5px;
   margin-top: 4px; padding: 6px 4px 2px;

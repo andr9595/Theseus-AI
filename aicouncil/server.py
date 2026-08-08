@@ -557,13 +557,23 @@ class Handler(BaseHTTPRequestHandler):
             "providers": probe_all(providers, cfg.PROVIDER_ORDER),
         }
 
+    @staticmethod
+    def _refresh_asked(params: Dict[str, list]) -> bool:
+        """Whether the menu asked for a fresh probe rather than the catalogue.
+
+        Sent only by its Refresh button. Everything else - opening a picker,
+        the alias prefetch at boot - takes the stored answer, which is the
+        difference between a dropdown that paints and one that waits on `agy`.
+        """
+        return (params.get("refresh") or [""])[0] in ("1", "true")
+
     def _api_models(self, params: Dict[str, list]) -> Dict[str, Any]:
         """What models the configured CLI reports it can actually run."""
         pid = (params.get("provider") or [""])[0]
         provider = self.app.store.get("providers", {}).get(pid)
         if not provider:
             raise ValueError(f"No such provider: {pid!r}")
-        result = discover_models(provider)
+        result = discover_models(provider, refresh=self._refresh_asked(params))
         result["ok"] = True
         result["provider"] = pid
         result["current"] = provider.get("model", "")
@@ -575,7 +585,7 @@ class Handler(BaseHTTPRequestHandler):
         provider = self.app.store.get("providers", {}).get(pid)
         if not provider:
             raise ValueError(f"No such provider: {pid!r}")
-        result = discover_efforts(provider)
+        result = discover_efforts(provider, refresh=self._refresh_asked(params))
         result["ok"] = True
         result["provider"] = pid
         result["current"] = provider.get("effort", "")

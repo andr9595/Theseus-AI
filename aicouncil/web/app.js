@@ -590,6 +590,11 @@ const state = {
   // pointer, and the version it points at is the thing worth knowing. Filled
   // in from /api/models; empty until the CLI has been asked once.
   resolvedModels: {},
+  // The last answer each picker got, keyed by agent — see `catalogKey`. The
+  // server keeps its own copy across restarts; this one is what lets a
+  // reopened menu paint on the click instead of after the round trip.
+  modelLists: {},
+  effortLists: {},
   // Who the router would seat for what is currently in the composer, from
   // /api/council/route. Refreshed as you type, because the bench is chosen
   // from the prompt and a strip showing last run's council would be worse
@@ -2684,6 +2689,29 @@ function modelDetail(model) {
   return points && points !== model ? `${model} (${points})` : model;
 }
 
+/** Where the last answer for a menu is kept, so reopening it paints on the
+ *  click instead of after a round trip. Keyed by agent rather than by provider
+ *  because the setting is the CLI's: the same list serves the council seat,
+ *  the chat card and every project chair. The server holds the durable copy —
+ *  this is only what saves the second wait.
+ *
+ *  `withModel` for the effort menu: which levels are legal depends on which
+ *  model is pinned, so one entry per CLI would answer the wrong question. */
+function catalogKey(providerId, withModel = false) {
+  const provider = ((state.config || {}).providers || {})[providerId] || {};
+  return agentOf(provider) + (withModel ? `|${provider.model || ''}` : '');
+}
+
+/** "asked just now" or how old the stored answer is, for the menu's footer. A
+ *  catalogued list that says nothing about its age reads as a live one. Blank
+ *  when the request never landed — there is no answer to date. */
+function catalogAge(data) {
+  if (!data || !data.fetched_at) return '';
+  if (!data.cached) return 'asked just now';
+  const mins = Math.max(0, (Date.now() / 1000 - data.fetched_at) / 60);
+  return `saved ${fmtAge(mins)} ago`;
+}
+
 /** Ask once, in the background, so the very first tooltip is already specific.
  *  Costs nothing per alias — the server kills each probe at the handshake —
  *  and the answer is cached there for the life of the process. */
@@ -2714,80 +2742,86 @@ function positionModelMenu(menu, anchor) {
   }
 }
 
-async function openModelMenu(anchor, providerId) {
+async function openModelMenu(anchor, providerId, refresh = false) {
   closeModelMenu();
   const provider = ((state.config || {}).providers || {})[providerId] || {};
   const current = provider.model || '';
+  const who = provider.label || providerId;
+  const key = catalogKey(providerId);
 
   const menu = document.createElement('div');
   menu.className = 'model-menu';
-  menu.innerHTML =
-    `<div class="model-menu-head">${esc(provider.label || providerId)} model</div>` +
-    `<div class="model-loading">Asking ${esc(provider.label || providerId)}…</div>`;
   document.body.appendChild(menu);
-  positionModelMenu(menu, anchor);
 
-  // Ask the CLI what it can actually run. A list shipped in this app would be
-  // wrong for accounts with different entitlements — a ChatGPT-account Codex
-  // login rejects models an API key would accept, with a 400 at run time.
-  let models = provider.models || [];
-  let source = 'configured in Settings';
-  let error = '';
-  let resolved = {};
-  try {
-    const data = await api(`/api/models?provider=${encodeURIComponent(providerId)}`);
-    if (data.models && data.models.length) {
-      models = data.models;
-      source = data.source || '';
-    }
-    resolved = data.resolved || {};
-    rememberResolved(resolved);
-    error = data.error || '';
-  } catch (err) {
-    error = err.message;
-  }
+  const draw = (data) => {
+    // Everything the CLI reports, then anything saved that it does not: a
+    // model typed into the box below lives in the config and not in the
+    // answer, and replacing one list with the other is what made it vanish
+    // from the picker the moment it was chosen.
+    const listed = (data && data.models) || [];
+    const models = listed.concat(
+      (provider.models || []).filter(m => !listed.includes(m))
+    );
+    const resolved = (data && data.resolved) || {};
+    // Antigravity names each id in its own listing, and the names are the only
+    // thing telling `gemini-3.6-flash-high` from `gemini-3.5-flash-high` at a
+    // glance. Shown as given rather than prettified here.
+    const labels = (data && data.labels) || {};
+    const error = (data && data.error) || '';
+    const source = (data && data.source) || 'configured in Settings';
+    // Redrawing must not swallow what is half-typed into the custom box.
+    const typed = $('.model-custom-input', menu);
+    const pending = typed ? typed.value : (models.includes(current) ? '' : current);
 
-  menu.innerHTML =
-    `<div class="model-menu-head">${esc(provider.label || providerId)} model</div>` +
-    `<button class="model-opt${current ? '' : ' active'}" data-value="">` +
-      `<span class="model-opt-name">CLI default</span>` +
-      `<span class="model-opt-note">whatever the CLI is set to</span>` +
-    `</button>` +
-    models.map(m => {
-      // An alias tracks the newest model in its family, so on its own it does
-      // not say which generation you are about to run. Name the model it
-      // points at right now; a pinned id already names itself.
-      const points = resolved[m] || '';
-      const note = points ? `→ ${points}` : (/^[a-z]+$/.test(m) ? 'alias · always latest' : '');
-      const why = points
-        ? `${m} is an alias — it currently runs ${points}, and will follow that family as it is updated.`
-        : '';
-      return (
-        `<button class="model-opt${m === current ? ' active' : ''}" data-value="${esc(m)}"` +
-          `${why ? ` title="${esc(why)}"` : ''}>` +
-          `<span class="model-opt-name">${esc(m)}</span>` +
-          `<span class="model-opt-note">${esc(note)}</span>` +
-        `</button>`
-      );
-    }).join('') +
-    (error ? `<div class="model-menu-error">${esc(error)}</div>` : '') +
-    `<div class="model-menu-custom">` +
-      `<input class="model-custom-input" placeholder="Other model…" spellcheck="false" ` +
-        `value="${esc(models.includes(current) ? '' : current)}">` +
-      `<button class="btn btn-quiet btn-sm model-custom-apply" type="button">Set</button>` +
-    `</div>` +
-    (source ? `<div class="model-menu-source">${esc(source)}</div>` : '');
+    menu.innerHTML =
+      `<div class="model-menu-head">${esc(who)} model</div>` +
+      `<button class="model-opt${current ? '' : ' active'}" data-value="">` +
+        `<span class="model-opt-name">CLI default</span>` +
+        `<span class="model-opt-note">whatever the CLI is set to</span>` +
+      `</button>` +
+      models.map(m => {
+        // An alias tracks the newest model in its family, so on its own it does
+        // not say which generation you are about to run. Name the model it
+        // points at right now; a pinned id already names itself.
+        const points = resolved[m] || '';
+        const note = points
+          ? `→ ${points}`
+          : (labels[m] || (/^[a-z]+$/.test(m) ? 'alias · always latest' : ''));
+        const why = points
+          ? `${m} is an alias — it currently runs ${points}, and will follow that family as it is updated.`
+          : '';
+        return (
+          `<button class="model-opt${m === current ? ' active' : ''}" data-value="${esc(m)}"` +
+            `${why ? ` title="${esc(why)}"` : ''}>` +
+            `<span class="model-opt-name">${esc(m)}</span>` +
+            `<span class="model-opt-note">${esc(note)}</span>` +
+          `</button>`
+        );
+      }).join('') +
+      (error ? `<div class="model-menu-error">${esc(error)}</div>` : '') +
+      `<div class="model-menu-custom">` +
+        `<input class="model-custom-input" placeholder="Other model…" spellcheck="false" ` +
+          `value="${esc(pending)}">` +
+        `<button class="btn btn-quiet btn-sm model-custom-apply" type="button">Set</button>` +
+      `</div>` +
+      catalogFootHtml(source, data);
+    positionModelMenu(menu, anchor);
+  };
 
-  positionModelMenu(menu, anchor);
-
+  // Bound to the menu itself rather than to what is inside it: the body is
+  // redrawn when the answer lands, and a listener on a button would go with
+  // the button it was bound to.
   const apply = (value) => {
     closeModelMenu();
     setModel(providerId, value);
   };
-
   menu.addEventListener('click', (e) => {
     const opt = e.target.closest('.model-opt');
     if (opt) { apply(opt.dataset.value); return; }
+    if (e.target.closest('.model-menu-refresh')) {
+      openModelMenu(anchor, providerId, true);
+      return;
+    }
     if (e.target.closest('.model-custom-apply')) {
       apply($('.model-custom-input', menu).value.trim());
     }
@@ -2798,10 +2832,53 @@ async function openModelMenu(anchor, providerId) {
     }
   });
 
+  // The list as it was last drawn, straight away. The request below is then a
+  // refresh of something already on screen rather than the thing being waited
+  // for — which is the whole difference from "Asking Antigravity…".
+  const known = refresh ? null : state.modelLists[key];
+  if (known) draw(known);
+  else {
+    menu.innerHTML =
+      `<div class="model-menu-head">${esc(who)} model</div>` +
+      `<div class="model-loading">Asking ${esc(who)}…</div>`;
+    positionModelMenu(menu, anchor);
+  }
+
   // Defer so the click that opened the menu doesn't immediately close it.
   setTimeout(() => {
     document.addEventListener('click', onDocClickCloseModel, { once: true });
   }, 0);
+
+  let data;
+  try {
+    data = await api(
+      `/api/models?provider=${encodeURIComponent(providerId)}` +
+      (refresh ? '&refresh=1' : '')
+    );
+    state.modelLists[key] = data;
+    rememberResolved(data.resolved);
+  } catch (err) {
+    data = { models: [], error: err.message, source: '' };
+  }
+  // The menu may have been closed, or another opened over it, while the
+  // request was in flight. Writing into a detached node would leave the click
+  // that opened it looking like it did nothing at all.
+  if (menu.isConnected) draw(data);
+}
+
+/** The footer both menus share: where the list came from, how old it is, and
+ *  the way to ask again. Refresh is the answer to a probe that was unlucky —
+ *  a signed-out CLI, a machine too busy to reply — which is otherwise stored
+ *  as nothing and re-asked on every open. */
+function catalogFootHtml(source, data) {
+  const provenance = [source, catalogAge(data)].filter(Boolean).join(' · ');
+  return (
+    `<div class="model-menu-foot">` +
+      `<span class="model-menu-source">${esc(provenance)}</span>` +
+      `<button class="btn btn-quiet btn-sm model-menu-refresh" type="button">` +
+        `Refresh</button>` +
+    `</div>`
+  );
 }
 
 function onDocClickCloseModel(e) {
@@ -2816,72 +2893,88 @@ function onDocClickCloseModel(e) {
  *  the same gesture on the same card, and a second set of styles would drift.
  *  No free-text entry here — an effort the CLI does not know is either ignored
  *  with a warning (Claude) or fatal (Codex), and neither is worth offering. */
-async function openEffortMenu(anchor, providerId) {
+async function openEffortMenu(anchor, providerId, refresh = false) {
   closeModelMenu();
   const provider = ((state.config || {}).providers || {})[providerId] || {};
   const current = provider.effort || '';
   const who = provider.label || providerId;
+  const key = catalogKey(providerId, true);
 
   const menu = document.createElement('div');
   menu.className = 'model-menu';
-  menu.innerHTML =
-    `<div class="model-menu-head">${esc(who)} reasoning effort</div>` +
-    `<div class="model-loading">Asking ${esc(who)}…</div>`;
   document.body.appendChild(menu);
-  positionModelMenu(menu, anchor);
 
-  let levels = [], fallback = '', source = '', error = '', model = '';
-  try {
-    const data = await api(`/api/efforts?provider=${encodeURIComponent(providerId)}`);
-    levels = data.levels || [];
-    fallback = data.default || '';
-    source = data.source || '';
-    error = data.error || '';
-    model = data.model || '';
-  } catch (err) {
-    error = err.message;
-  }
+  const draw = (data) => {
+    const levels = (data && data.levels) || [];
+    const fallback = (data && data.default) || '';
+    const error = (data && data.error) || '';
+    const model = (data && data.model) || '';
 
-  menu.innerHTML =
-    `<div class="model-menu-head">${esc(who)} reasoning effort` +
-      // Codex's levels differ per model, so name the one they belong to.
-      (model ? ` · ${esc(model)}` : '') +
-    `</div>` +
-    `<button class="model-opt${current ? '' : ' active'}" data-value="">` +
-      `<span class="model-opt-name">CLI default</span>` +
-      `<span class="model-opt-note">` +
-        `${fallback ? esc(fallback) : 'whatever the CLI is set to'}</span>` +
-    `</button>` +
-    levels.map(l =>
-      `<button class="model-opt${l.effort === current ? ' active' : ''}" ` +
-        `data-value="${esc(l.effort)}" title="${esc(l.description || '')}">` +
-        `<span class="model-opt-name">${esc(l.effort)}</span>` +
-        `<span class="model-opt-note">${esc(l.description || '')}</span>` +
-      `</button>`
-    ).join('') +
-    // A level set before the model changed, or typed into Settings by hand.
-    // Codex fails the run on one it does not recognise, so say so here rather
-    // than letting it surface as a launch error minutes into a task.
-    (current && levels.length && !levels.some(l => l.effort === current)
-      ? `<div class="model-menu-error">` +
-        `${esc(current)} is set but not offered here. It will be rejected at ` +
-        `launch — pick one above.</div>`
-      : '') +
-    (error ? `<div class="model-menu-error">${esc(error)}</div>` : '') +
-    (source ? `<div class="model-menu-source">${esc(source)}</div>` : '');
-
-  positionModelMenu(menu, anchor);
+    menu.innerHTML =
+      `<div class="model-menu-head">${esc(who)} reasoning effort` +
+        // Codex's levels differ per model, so name the one they belong to.
+        (model ? ` · ${esc(model)}` : '') +
+      `</div>` +
+      `<button class="model-opt${current ? '' : ' active'}" data-value="">` +
+        `<span class="model-opt-name">CLI default</span>` +
+        `<span class="model-opt-note">` +
+          `${fallback ? esc(fallback) : 'whatever the CLI is set to'}</span>` +
+      `</button>` +
+      levels.map(l =>
+        `<button class="model-opt${l.effort === current ? ' active' : ''}" ` +
+          `data-value="${esc(l.effort)}" title="${esc(l.description || '')}">` +
+          `<span class="model-opt-name">${esc(l.effort)}</span>` +
+          `<span class="model-opt-note">${esc(l.description || '')}</span>` +
+        `</button>`
+      ).join('') +
+      // A level set before the model changed, or typed into Settings by hand.
+      // Codex fails the run on one it does not recognise, so say so here rather
+      // than letting it surface as a launch error minutes into a task.
+      (current && levels.length && !levels.some(l => l.effort === current)
+        ? `<div class="model-menu-error">` +
+          `${esc(current)} is set but not offered here. It will be rejected at ` +
+          `launch — pick one above.</div>`
+        : '') +
+      (error ? `<div class="model-menu-error">${esc(error)}</div>` : '') +
+      catalogFootHtml((data && data.source) || '', data);
+    positionModelMenu(menu, anchor);
+  };
 
   menu.addEventListener('click', (e) => {
+    if (e.target.closest('.model-menu-refresh')) {
+      openEffortMenu(anchor, providerId, true);
+      return;
+    }
     const opt = e.target.closest('.model-opt');
     if (!opt) return;
     closeModelMenu();
     setEffort(providerId, opt.dataset.value);
   });
 
+  const known = refresh ? null : state.effortLists[key];
+  if (known) draw(known);
+  else {
+    menu.innerHTML =
+      `<div class="model-menu-head">${esc(who)} reasoning effort</div>` +
+      `<div class="model-loading">Asking ${esc(who)}…</div>`;
+    positionModelMenu(menu, anchor);
+  }
+
   setTimeout(() => {
     document.addEventListener('click', onDocClickCloseModel, { once: true });
   }, 0);
+
+  let data;
+  try {
+    data = await api(
+      `/api/efforts?provider=${encodeURIComponent(providerId)}` +
+      (refresh ? '&refresh=1' : '')
+    );
+    state.effortLists[key] = data;
+  } catch (err) {
+    data = { levels: [], error: err.message, source: '' };
+  }
+  if (menu.isConnected) draw(data);
 }
 
 async function setEffort(providerId, value) {
@@ -2957,7 +3050,7 @@ function openMemberMenu(anchor, providerId, { note = '', seat = '', seatLabel = 
             'wherever this CLI sits.'
           : 'Pin a seat and the routing works around it. Model and effort ' +
             'apply wherever this CLI sits.')
-        : 'Applies to this stage only.')) +
+        : 'Model and effort apply wherever this CLI sits.')) +
     `</div>`;
   document.body.appendChild(menu);
   positionModelMenu(menu, anchor);
@@ -3269,10 +3362,13 @@ async function setAgent(providerId, agentId) {
 async function setModel(providerId, value) {
   const providers = (state.config || {}).providers || {};
   const provider = providers[providerId] || {};
-  // Remember a hand-typed model so it appears in the list next time.
+  // Remember a hand-typed model so it appears in the list next time — and only
+  // that. One the CLI reported is already offered on its own, and saving a
+  // copy beside the list would grow the config on every choice.
   const models = provider.models || [];
+  const known = (state.modelLists[catalogKey(providerId)] || {}).models || [];
   const patch = { providers: { [providerId]: { model: value } } };
-  if (value && !models.includes(value)) {
+  if (value && !models.includes(value) && !known.includes(value)) {
     patch.providers[providerId].models = [...models, value];
   }
   await patchConfig(patch);
@@ -3536,16 +3632,18 @@ function renderSettings() {
           `${esc(name || p.label || 'Assistant')} ${probeHtml}</h4>` +
         (kind === 'project'
           ? `<p class="settings-note">` +
-              `Its agent, model and reasoning depth are set in the Projects ` +
-              `tab's matrix. There is no role to choose: what this chair is ` +
+              `Its agent is set in the Projects tab's matrix; the model and ` +
+              `reasoning depth are that CLI's own, shared with every other ` +
+              `place it sits. There is no role to choose: what this chair is ` +
               `told to do comes from the phase it is in.</p>`
           : '') +
         (kind === 'seat'
           ? `<p class="settings-note">` +
               `How this CLI runs wherever it is used: whenever the council ` +
-              `seats it, and whenever Chat's <b>Multi-agent answer</b> asks ` +
-              `every agent at once. The model and reasoning depth below are ` +
-              `this agent's defaults for both. Which council seat it holds, ` +
+              `seats it, whenever Chat's <b>Multi-agent answer</b> asks every ` +
+              `agent at once, and whenever it holds a project chair. The ` +
+              `model and reasoning depth below are the CLI's own and are ` +
+              `shared by all three. Which council seat it holds, ` +
               `and what it is told to be, are decided per run &mdash; pin ` +
               `either on the <b>Council</b> tab or on the bench above the ` +
               `composer. Members are read-only; only the chair writes.</p>`
@@ -4657,7 +4755,12 @@ function wire() {
     e.stopPropagation();
     if ($('.model-menu')) { closeModelMenu(); return; }
     openMemberMenu(chair, chair.dataset.chair, {
-      note: 'What this chair is told to do comes from the board, not a role.',
+      // Both halves matter here: a project chair has no role, and its model
+      // and effort are the CLI's everywhere rather than this chair's. A
+      // project already running keeps the ones it started with.
+      note: 'What this chair is told to do comes from the board, not a role. ' +
+        'Model and effort apply wherever this CLI sits; a running project ' +
+        'keeps what it started with.',
     });
   });
 

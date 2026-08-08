@@ -1016,9 +1016,9 @@ with an explanation rather than quietly sending an empty `--message=`.)
 | **Command** | argv, one argument per line. Never passed through a shell. |
 | **Auto-approve arguments** | Appended *only* when permission has been granted. |
 | **Streaming arguments** | Always appended. How this CLI is asked to narrate its work. See below. |
-| **Model** | Blank means the CLI's own default. See below. |
+| **Model** | Blank means the CLI's own default. Belongs to the CLI, so it is shared by every card running it. See below. |
 | **Model flag** | How the model is passed — `--model {model}`, `-m {model}`, `--model={model}`. |
-| **Selectable models** | The list offered in the picker, one per line. |
+| **Selectable models** | The list offered in the picker, one per line. Shared by the CLI's cards, like the model itself. |
 | **Timeout** | Seconds before the child process group is killed. |
 | **Pipe the prompt on stdin** | For CLIs that prefer stdin. Automatic above 96 KB regardless. |
 
@@ -1200,21 +1200,41 @@ Amber at 75%, red at 90%. At 85% a run warns first — a warning only, always
 forceable, because the reading is a snapshot and only you know what the task
 is worth.
 
-### Choosing a model per stage
+### Choosing a model per CLI
 
 In Chat, click the model chip under the composer. In Council, click a member on
-the strip and choose **Model**. The picker offers the configured list, the
-CLI's own default, and a free-text box for anything else — typing a model adds
-it to the list for next time.
+the strip and choose **Model**. On the Projects tab, click a chair in the
+matrix and choose **Model**. The picker offers the configured list, the CLI's
+own default, and a free-text box for anything else — typing a model adds it to
+the list for next time.
+
+**The choice belongs to the CLI, not to the tab it was made on.** Antigravity
+is one login with one catalogue, so picking a model for it on the Projects tab
+is the same act as picking one on the bench: the council seat, the chat
+assistant and every project chair that runs `agy` all follow. The one exception
+is a project already running, which keeps the settings it started with — a turn
+that changed CLI halfway is a different run, not a restyled one. Under the
+hood, `agent_settings` in the config file is where they live; the copies on
+each provider are projected from it on every load.
 
 The picker asks each CLI what it can actually run. Codex publishes an
 account-scoped list in `$CODEX_HOME/models_cache.json` — read live, so it
 reflects your login's entitlements. Antigravity has a subcommand for it, so the
-picker runs `agy models` and shows exactly what it prints (which includes
-Anthropic and open-weight models served through Antigravity, not just Gemini
-ones). Claude ships neither, so the picker offers its documented `--model`
+picker runs `agy models` and shows exactly what it prints — the id you select
+and, beside it, the name that listing gives it, because `gemini-3.6-flash-high`
+and `gemini-3.5-flash-high` are one character apart. (It includes the Anthropic
+and open-weight models served through Antigravity, not just the Gemini ones.) Claude ships neither, so the picker offers its documented `--model`
 aliases. Nothing is hardcoded, deliberately: a shipped list is wrong the moment
 a model is renamed, and wrong *per account* regardless.
+
+Asking costs a process launch — `agy models` takes seconds on a cold start and
+up to a minute on a loaded machine — so each complete answer is written to
+`~/.config/ai-council/catalog.json` and served from there, across restarts
+included. The menu says which it is showing (`agy models · saved 40 min ago`)
+and carries a **Refresh** button for asking again. It re-asks on its own when
+the binary changes or, for Codex, when its account cache does. A refusal is
+never stored: a signed-out `agy`, or a level set the CLI was too busy to name,
+is shown once and asked for again next time.
 
 Aliases (`opus`, `sonnet`, `haiku`, `fable`) always resolve to the newest model
 in that family; a pinned ID stays where you put it. On its own, though, an
@@ -1233,13 +1253,17 @@ correct in six months. A practical split: put the cheap, generous-quota model
 on the member seats and spend the rationed one on the chairman, which is where
 judgement actually matters.
 
-### Choosing a reasoning effort per seat
+### Choosing a reasoning effort per CLI
 
 Beside the model chip is a second one for **reasoning effort** — the same knob
-`/effort` sets in Claude Code and the reasoning selector sets in Codex. Depth
-costs quota, and different seats want different amounts of it: a member
-sketching an independent answer rarely needs what a chairman weighing every
-answer and critique against the real code does.
+`/effort` sets in Claude Code and the reasoning selector sets in Codex. It is
+the CLI's, like the model, and follows it into every seat and chair it holds.
+
+Depth costs quota, and the stages do not all want the same amount of it: a
+member sketching an independent answer rarely needs what a chairman weighing
+every answer and critique against the real code does. That split is
+`deliberation_effort` in **Settings → Council**, which sets the depth for
+Stages 1 and 2 and leaves the chairman on the level its CLI carries.
 
 The levels are asked for, not shipped, for the same reason the model list is —
 and here it matters more, because the legal set is **per model**. Codex

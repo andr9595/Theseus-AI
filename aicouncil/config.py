@@ -296,6 +296,34 @@ def agent_catalog() -> List[Dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------
+# Per-agent settings
+# --------------------------------------------------------------------------
+#
+# Which model a CLI runs, and how hard it is asked to think, belong to the CLI
+# and not to the place it happens to be sitting. Antigravity is one login with
+# one catalogue: choosing `gemini-3.6-flash` for it on the Projects tab and
+# finding Council still on the old one is a setting that did not take, not a
+# per-tab preference anybody asked for.
+#
+# So they live here, once per agent, and are *projected* onto every provider
+# that runs that agent on load and after every save. The copies on the provider
+# records are derived - everything that reads a model reads it off a provider
+# (`build_argv`, the project engine's frozen config, the UI's chips), and one
+# place to write beats rewriting all of them. Editing a provider's model by
+# hand in config.json is therefore overwritten at the next load; edit
+# ``agent_settings`` instead, which is what the pickers write.
+#
+# A provider running a hand-written command is nobody's agent and keeps its own.
+AGENT_SETTING_KEYS = ("model", "models", "effort")
+
+
+def _default_agent_settings() -> Dict[str, Any]:
+    return {
+        agent: {"model": "", "models": [], "effort": ""} for agent in AGENTS
+    }
+
+
+# --------------------------------------------------------------------------
 # Defaults
 # --------------------------------------------------------------------------
 
@@ -514,6 +542,11 @@ DEFAULTS: Dict[str, Any] = {
         "coder": DEFAULT_CODER,
         "qa": DEFAULT_QA,
     },
+    # --- What each CLI runs -------------------------------------------------
+    # One model and one reasoning level per agent, applied wherever that agent
+    # sits - council seat, chat assistant or project chair. See the section
+    # above for why the provider records carry copies of them.
+    "agent_settings": _default_agent_settings(),
     # --- Council ------------------------------------------------------------
     # The deliberating bench: who sits, how hard they push, and how much of
     # that the operator fixes by hand.
@@ -767,7 +800,100 @@ def _migrate(merged: Dict[str, Any], raw: Dict[str, Any]) -> Dict[str, Any]:
     if merged.get("mode") not in ("council", "solo"):
         merged["mode"] = "council"
     _repair_agy_read_only(merged)
+    _adopt_agent_settings(merged, raw)
+    _apply_agent_settings(merged)
     return merged
+
+
+def _adopt_agent_settings(merged: Dict[str, Any], raw: Dict[str, Any]) -> None:
+    """Take each CLI's global model and level from wherever it already sat.
+
+    Before this, the same CLI carried its own model and level in every place it
+    was seated, and a config in that shape holds up to five answers for one
+    agent. The first non-empty one wins, council seat first, because that is
+    the one the operator sees on the bench and is most likely to have set
+    deliberately. The remembered *lists* are unioned instead: they are only the
+    hand-typed names the picker offers next time, and losing one to a
+    precedence rule would be a name the operator typed disappearing.
+    """
+    if isinstance(raw.get("agent_settings"), dict):
+        return
+    providers = merged.get("providers") or {}
+    ordered = [pid for pid in PROVIDER_ORDER if pid in providers]
+    ordered += [pid for pid in providers if pid not in ordered]
+
+    settings = merged.setdefault("agent_settings", _default_agent_settings())
+    for agent in AGENTS:
+        entry = settings.setdefault(agent, {"model": "", "models": [], "effort": ""})
+        for pid in ordered:
+            provider = providers.get(pid)
+            if not isinstance(provider, dict) or agent_for(provider) != agent:
+                continue
+            for key in ("model", "effort"):
+                if not entry.get(key) and provider.get(key):
+                    entry[key] = provider[key]
+            for model in provider.get("models") or []:
+                if model not in entry["models"]:
+                    entry["models"].append(model)
+
+
+def _apply_agent_settings(merged: Dict[str, Any]) -> None:
+    """Give every provider the settings of the agent it runs."""
+    settings = merged.get("agent_settings") or {}
+    for provider in (merged.get("providers") or {}).values():
+        if not isinstance(provider, dict):
+            continue
+        chosen = settings.get(agent_for(provider))
+        if not isinstance(chosen, dict):
+            continue  # a hand-written command answers to nobody's settings
+        provider["model"] = str(chosen.get("model") or "")
+        provider["models"] = [str(m) for m in (chosen.get("models") or [])]
+        provider["effort"] = str(chosen.get("effort") or "")
+
+
+def _lift_agent_settings(
+    current: Dict[str, Any], patch: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Rewrite a per-provider model or effort change as a per-agent one.
+
+    The pickers patch the provider they were opened on, which is the only id
+    they have; this is where that becomes a setting for the CLI itself. The
+    provider keys are removed from the patch rather than left beside the lifted
+    copy, so the two cannot disagree - ``_apply_agent_settings`` writes them
+    back from the one source afterwards.
+
+    A value equal to what the agent already has is dropped rather than lifted.
+    That is what makes the Settings form safe: it posts every card at once, so
+    a save that edits Claude's model on the council card also carries the chat
+    card's unedited copy of it, and taking the last one read would undo the
+    edit. Two cards edited to different values in one save is still last-wins,
+    and there is no way to tell those apart.
+    """
+    if not isinstance(patch.get("providers"), dict):
+        return patch
+    out = copy.deepcopy(patch)
+    settings = current.get("agent_settings") or {}
+    lifted: Dict[str, Dict[str, Any]] = {}
+    for pid, changes in out["providers"].items():
+        if not isinstance(changes, dict):
+            continue
+        # An agent swap clears the model and level of the CLI leaving the
+        # chair (see `_resolve_agent_choices`); lifting those clears would wipe
+        # the settings of the CLI arriving in it.
+        if changes.get("agent"):
+            continue
+        agent = agent_for((current.get("providers") or {}).get(pid) or {})
+        if agent not in AGENTS:
+            continue
+        for key in AGENT_SETTING_KEYS:
+            if key not in changes:
+                continue
+            value = changes.pop(key)
+            if value != (settings.get(agent) or {}).get(key):
+                lifted.setdefault(agent, {})[key] = value
+    if lifted:
+        out["agent_settings"] = _deep_merge(out.get("agent_settings") or {}, lifted)
+    return out
 
 
 # What `agy`'s read-only grant used to be, before the auto-deny above was
@@ -899,11 +1025,17 @@ class ConfigStore:
 
         A ``providers.<job>.agent`` key is resolved against that same freshly
         read copy, so assigning an agent swaps its command and permission
-        flags as one unit.
+        flags as one unit. A model or reasoning level is lifted onto the agent
+        itself before the merge, and projected back onto every provider running
+        that agent after it - one CLI, one setting, wherever it sits.
         """
         with self._lock:
             current = self._load()
-            self._data = _deep_merge(current, _resolve_agent_choices(current, patch))
+            resolved = _resolve_agent_choices(
+                current, _lift_agent_settings(current, patch)
+            )
+            self._data = _deep_merge(current, resolved)
+            _apply_agent_settings(self._data)
             self._write()
             return copy.deepcopy(self._data)
 
