@@ -315,6 +315,7 @@ class Handler(BaseHTTPRequestHandler):
             ("POST", "/api/project/resume"): self._api_project_resume,
             ("POST", "/api/project/stop"): self._api_project_stop,
             ("POST", "/api/project/handoff"): self._api_project_handoff,
+            ("POST", "/api/project/dismiss"): self._api_project_dismiss,
             ("GET", "/api/project/file"): self._api_project_file,
             ("POST", "/api/council/route"): self._api_council_route,
             ("GET", "/api/roles"): lambda p: {
@@ -732,6 +733,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_project_handoff(self, params: Dict[str, list]) -> Dict[str, Any]:
         self.app.projects.handoff(str(self._read_body().get("role") or ""))
+        return {"ok": True}
+
+    def _api_project_dismiss(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Close the report on a finished project so the tab offers a new one.
+
+        Server-side because the engine holds the project in memory and finds it
+        again in ``.theseus/BOARD.json``: clearing it in the browser alone lasts
+        until the next reload. Nothing on disk is deleted.
+        """
+        body = self._read_body()
+        self.app.projects.dismiss(str(body.get("workspace") or ""))
         return {"ok": True}
 
     def _api_project_file(self, params: Dict[str, list]) -> Dict[str, Any]:

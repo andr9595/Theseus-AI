@@ -32,6 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from aicouncil import gitutil  # noqa: E402
 from aicouncil.config import ConfigStore  # noqa: E402
 from aicouncil.events import EventBus  # noqa: E402
 from aicouncil.projects import (  # noqa: E402
@@ -112,6 +113,11 @@ class TestReportParsing(unittest.TestCase):
     def test_an_unfenced_trailing_object_is_read(self):
         report = parse_report('Done.\n{"status": "ok", "reasoning": "wrote it"}')
         self.assertEqual(report["reasoning"], "wrote it")
+
+    def test_a_reply_that_is_only_the_object_is_read(self):
+        # An agent told to end on a JSON block and nothing else sometimes
+        # sends exactly that, with no prose in front of it.
+        self.assertEqual(parse_report('{"status": "blocked"}')["status"], "blocked")
 
     def test_a_board_only_report_is_read(self):
         # A QA turn reports a build and nothing else; a reviewer reports
@@ -318,6 +324,30 @@ class TestBoardFile(unittest.TestCase):
         self.assertEqual(back.column(COL_IN_REVIEW)[0]["id"], "t1")
         self.assertEqual(back.column(COL_BACKLOG)[0]["kind"], KIND_BUG)
 
+    def test_the_safety_snapshot_comes_back_with_the_board(self):
+        # The one piece of state whose loss cannot be repaired by running the
+        # project again: it points at the tree as it was before the first agent
+        # wrote anything.
+        ws = Workspace(self.tmp)
+        ws.ensure()
+        original = Project(id="p1", goal="build it", workspace=str(self.tmp))
+        original.snapshot = gitutil.Snapshot(
+            root=str(self.tmp), head="a" * 40, commit="b" * 40,
+            had_changes=True, ref="refs/ai-council/snapshots/p1",
+        )
+        ws.write_board(original.board_document())
+
+        back = Project.from_board(str(self.tmp), ws.read_board())
+        self.assertEqual(back.snapshot.commit, "b" * 40)
+        self.assertEqual(back.snapshot.ref, "refs/ai-council/snapshots/p1")
+        self.assertTrue(back.snapshot.had_changes)
+
+    def test_a_snapshot_with_no_commit_restores_nothing_and_is_read_as_absent(self):
+        back = Project.from_board(
+            str(self.tmp), {"snapshot": {"root": "/x", "head": "a" * 40}}
+        )
+        self.assertIsNone(back.snapshot)
+
     def test_a_mangled_health_resumes_as_unknown_never_passing(self):
         # The one field that must never fail open. A board somebody hand-edited
         # into nonsense resumes as unverified, not as green.
@@ -473,6 +503,19 @@ class TestDecisionEngine(unittest.TestCase):
         self.assertEqual(self.project.status, FAILED)
         self.assertIn("failed 3 times", self.project.error)
 
+    def test_giving_up_is_not_relabelled_as_finishing(self):
+        # Every "nothing left to schedule" looks the same to the loop, which
+        # reads it as success - so the run that gave up on a red build used to
+        # be overwritten by COMPLETED one line later. The first ending wins.
+        self.project.tasks = [card("t1")]
+        self.project.build_health = HEALTH_FAILING
+        self.project.fix_attempts = 3
+        self.assertIsNone(self.decide())
+        self.engine._complete(self.project)
+        self.assertEqual(self.project.status, FAILED)
+        self.assertIn("failed 3 times", self.project.error)
+        self.assertEqual(self.project.note, "")
+
 
 class TestCavemanModeInProjects(unittest.TestCase):
     """Projects has its own switch, read live on every turn."""
@@ -595,10 +638,12 @@ class TestApplyingReports(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def step(self, role="qa", ok=True) -> StepRecord:
+    def step(self, role="qa", ok=True, reported="", files=()) -> StepRecord:
         s = StepRecord(index=1, role=role, label="stub", heading="h", trigger="t")
         s.ok = ok
         s.error = "" if ok else "Exited with status 1."
+        s.reported_status = reported
+        s.files_modified = list(files)
         return s
 
     # -- verification is fail-closed ---------------------------------------
@@ -618,6 +663,27 @@ class TestApplyingReports(unittest.TestCase):
         self.engine._apply_verify(self.project, None, self.step(), {})
         self.assertEqual(self.project.build_health, HEALTH_FAILING)
         self.assertIn("without reporting a build status", self.project.last_build_log)
+
+    def test_a_verification_that_never_ran_is_not_a_failing_build(self):
+        # The other half of fail-closed, and the half that used to be wrong: a
+        # QA turn that crashed has tested nothing. Recording it as FAILING
+        # hands the developer the app's own error message to fix, which it
+        # cannot, and spends the whole fix budget finding that out.
+        self.project.needs_verification = True
+        self.engine._apply_verify(self.project, None, self.step(ok=False), {})
+        self.assertEqual(self.project.build_health, HEALTH_UNKNOWN)
+        self.assertTrue(self.project.needs_verification)
+        self.assertEqual(self.project.last_build_log, "")
+
+    def test_a_crashed_verification_that_still_reported_is_taken_at_its_word(self):
+        # Partial output is output. If the trace made it out before the CLI
+        # fell over, that trace is a real build failure.
+        self.engine._apply_verify(
+            self.project, None, self.step(ok=False),
+            {"build": {"health": "FAILING", "log": "3 tests failed"}},
+        )
+        self.assertEqual(self.project.build_health, HEALTH_FAILING)
+        self.assertIn("3 tests failed", self.project.last_build_log)
 
     def test_an_unrecognised_verdict_is_failing(self):
         self.engine._apply_verify(
@@ -668,6 +734,32 @@ class TestApplyingReports(unittest.TestCase):
         )
         self.assertEqual(self.project.column(COL_IN_PROGRESS)[0]["id"], "t1")
 
+    def test_a_developer_that_says_it_is_blocked_keeps_its_card(self):
+        # Exit zero is not the same as done. The contract asks for `blocked`
+        # when an agent could not proceed, and sending that card to review
+        # asks the architect to read a diff that was never written.
+        self.project.build_health = HEALTH_PASSING
+        self.project.tasks = [card("t1", COL_IN_PROGRESS)]
+        self.engine._apply_implement(
+            self.project, _decision([card("t1", COL_IN_PROGRESS)]),
+            self.step("coder", reported="blocked"), {"status": "blocked"},
+        )
+        self.assertEqual(self.project.column(COL_IN_PROGRESS)[0]["id"], "t1")
+        # Nothing was written, so nothing needs retesting either.
+        self.assertEqual(self.project.build_health, HEALTH_PASSING)
+        self.assertFalse(self.project.needs_verification)
+
+    def test_a_blocked_turn_that_still_wrote_files_invalidates_the_build(self):
+        self.project.build_health = HEALTH_PASSING
+        self.project.tasks = [card("t1", COL_IN_PROGRESS)]
+        self.engine._apply_implement(
+            self.project, _decision([card("t1", COL_IN_PROGRESS)]),
+            self.step("coder", reported="blocked", files=["a.py"]),
+            {"status": "blocked"},
+        )
+        self.assertEqual(self.project.build_health, HEALTH_UNKNOWN)
+        self.assertTrue(self.project.needs_verification)
+
     # -- review --------------------------------------------------------------
 
     def test_approval_moves_a_card_to_done(self):
@@ -689,6 +781,34 @@ class TestApplyingReports(unittest.TestCase):
         back = self.project.column(COL_BACKLOG)[0]
         self.assertEqual(back["id"], "t1")
         self.assertEqual(back["note"], "stubbed out")
+
+    def test_bouncing_a_card_does_not_retest_an_untouched_tree(self):
+        # A review moves cards; it does not write code. Marking the build
+        # unverified here spends a QA turn rebuilding a tree nothing has
+        # touched since it last passed - once per bounced card, before the
+        # developer has changed a line.
+        self.project.build_health = HEALTH_PASSING
+        self.project.tasks = [card("t1", COL_IN_REVIEW)]
+        self.engine._apply_review(
+            self.project, _decision([card("t1", COL_IN_REVIEW)]),
+            self.step("architect"),
+            {"reviews": [{"id": "t1", "verdict": "changes", "note": "no tests"}]},
+        )
+        self.assertEqual(self.project.column(COL_BACKLOG)[0]["id"], "t1")
+        self.assertEqual(self.project.build_health, HEALTH_PASSING)
+        self.assertFalse(self.project.needs_verification)
+
+    def test_a_reviewer_that_edited_something_does_invalidate_the_build(self):
+        # It can: every turn after the audit carries its CLI's write grant.
+        self.project.build_health = HEALTH_PASSING
+        self.project.tasks = [card("t1", COL_IN_REVIEW)]
+        self.engine._apply_review(
+            self.project, _decision([card("t1", COL_IN_REVIEW)]),
+            self.step("architect", files=["greeter.py"]),
+            {"reviews": [{"id": "t1", "verdict": "approve"}]},
+        )
+        self.assertEqual(self.project.build_health, HEALTH_UNKNOWN)
+        self.assertTrue(self.project.needs_verification)
 
     def test_a_card_with_no_verdict_stays_in_review(self):
         # Not approved by default. An unreviewed card sitting in review shows
@@ -919,6 +1039,60 @@ class TestPreflight(unittest.TestCase):
         self.assertNotEqual(project.id, "abc")
         self.engine.stop()
 
+    def test_a_run_that_hit_a_limit_resumes_with_its_budget_cleared(self):
+        # The bounds exist so an unattended loop stops; resuming is what makes
+        # them cheap. Leaving the counter that ended the run at its limit would
+        # end the resumed run on its first decision, for a reason it has
+        # already reported.
+        ws = Workspace(self.root)
+        ws.ensure()
+        ws.write_board({
+            "project_id": "abc", "goal": "build it", "status": FAILED,
+            "fix_attempts": 3, "build_health": HEALTH_FAILING,
+            "error": "The build has failed 3 times in a row",
+            "columns": {COL_BACKLOG: [{"id": "t1", "title": "finish it"}]},
+        })
+        project = self.engine.start("", str(self.root), resume=True)
+        self.assertEqual(project.id, "abc")
+        self.assertEqual(project.fix_attempts, 0)
+        self.assertEqual(project.error, "")
+        self.assertNotIn(project.status, (COMPLETED, FAILED))
+        self.engine.stop()
+
+    def test_a_completed_project_is_not_resumed(self):
+        ws = Workspace(self.root)
+        ws.ensure()
+        ws.write_board({"project_id": "abc", "goal": "g", "status": COMPLETED})
+        with self.assertRaises(ValueError) as ctx:
+            self.engine.start("", str(self.root), resume=True)
+        self.assertIn("already finished", str(ctx.exception))
+
+    def test_a_resumed_project_keeps_the_snapshot_it_started_with(self):
+        # Retaking it here would anchor the half-built codebase and quietly
+        # replace the only thing a rollback could restore.
+        taken = []
+        self.engine._take_snapshot = lambda p: taken.append(p)
+        Workspace(self.root).ensure()
+        project = Project(id="abc", goal="g", workspace=str(self.root))
+        project.config = self.store.all()
+        project.snapshot = gitutil.Snapshot(
+            root=str(self.root), head="a" * 40, commit="b" * 40,
+        )
+        self.engine._stop.set()
+        self.engine._execute(project)
+        self.assertEqual(taken, [])
+        self.assertEqual(project.snapshot.commit, "b" * 40)
+
+    def test_a_fresh_project_takes_one(self):
+        taken = []
+        self.engine._take_snapshot = lambda p: taken.append(p)
+        Workspace(self.root).ensure()
+        project = Project(id="abc", goal="g", workspace=str(self.root))
+        project.config = self.store.all()
+        self.engine._stop.set()
+        self.engine._execute(project)
+        self.assertEqual(len(taken), 1)
+
     def test_the_innovation_slider_overrides_the_setting(self):
         self.store.update({"project": {"innovation_rounds": 2}})
         project = self.engine.start("build it", str(self.root), innovation=0)
@@ -1142,6 +1316,34 @@ class TestSnapshotState(unittest.TestCase):
         ws.write_board({"project_id": "abc", "goal": "g", "status": COMPLETED})
         state = self.engine.snapshot_state(str(self.root))
         self.assertFalse(state["resumable"])
+
+    def test_a_dismissed_project_is_not_offered_again(self):
+        ws = Workspace(self.root)
+        ws.ensure()
+        project = Project(id="abc", goal="build it", workspace=str(self.root))
+        project.status = COMPLETED
+        self.engine._project = project
+
+        self.engine.dismiss(str(self.root))
+        # Both copies: the one in memory, and the board it would be found in
+        # again on the next reload.
+        self.assertIsNone(self.engine.snapshot_state(str(self.root))["project"])
+        self.assertTrue(ws.read_board()["dismissed"])
+
+    def test_a_board_left_on_disk_can_be_dismissed_without_being_in_memory(self):
+        ws = Workspace(self.root)
+        ws.ensure()
+        ws.write_board({"project_id": "abc", "goal": "g", "status": COMPLETED})
+        self.engine.dismiss(str(self.root))
+        self.assertIsNone(self.engine.snapshot_state(str(self.root))["project"])
+
+    def test_a_run_that_hit_a_limit_is_still_resumable(self):
+        # Everything it built is on disk and the board says where it got to.
+        # Only COMPLETED means there is nothing left to schedule.
+        ws = Workspace(self.root)
+        ws.ensure()
+        ws.write_board({"project_id": "abc", "goal": "g", "status": FAILED})
+        self.assertTrue(self.engine.snapshot_state(str(self.root))["resumable"])
 
     def test_a_finished_project_does_not_follow_you_to_another_folder(self):
         # A completed run stays in memory, but asked about a different folder

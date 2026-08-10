@@ -192,6 +192,16 @@ EXHAUSTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# What an agent says about its own turn, when what it says is "no". The
+# contract in ``prompts.REPORT_CONTRACT`` documents three values - `ok`,
+# `blocked`, `failed` - and says in as many words that a false `ok` "sends the
+# next agent off to review something that was never written". The engine reads
+# the honest ones: a CLI that exits zero having got nowhere has not done the
+# work, whatever its exit status says.
+UNSUCCESSFUL_STATUSES = frozenset(
+    {"blocked", "failed", "error", "aborted", "cancelled", "canceled"}
+)
+
 # How many consecutive turns may leave the board completely unchanged before
 # the run is called stalled. Three agents that all decline to move a card are
 # not making progress, and the step limit is too blunt an instrument to notice
@@ -341,6 +351,10 @@ def parse_report(text: str) -> Dict[str, Any]:
         start = tail.rfind("\n{")
         if start != -1:
             candidates.append(tail[start + 1 :])
+        elif tail.startswith("{"):
+            # A reply that is nothing but the object, which is what an agent
+            # told to end on a JSON block and nothing else sometimes sends.
+            candidates.append(tail)
 
     keys = {"status", "files_modified", "reasoning", "tasks", "build", "reviews", "ideas"}
     for raw in reversed(candidates):
@@ -432,6 +446,28 @@ def _as_health(value: Any) -> str:
     if text in ("FAIL", "FAILED", "RED", "BROKEN", "ERROR"):
         return HEALTH_FAILING
     return HEALTH_UNKNOWN
+
+
+def _as_snapshot(value: Any) -> Optional[gitutil.Snapshot]:
+    """The safety snapshot back off the board, or None if it is not one.
+
+    A snapshot without a commit records no tree and would restore nothing, so
+    it is read as absent rather than as protection that is not there.
+    """
+    if not isinstance(value, dict):
+        return None
+    root = str(value.get("root") or "")
+    head = str(value.get("head") or "")
+    commit = str(value.get("commit") or "")
+    if not (root and head and commit):
+        return None
+    return gitutil.Snapshot(
+        root=root,
+        head=head,
+        commit=commit,
+        had_changes=bool(value.get("had_changes")),
+        ref=str(value.get("ref") or ""),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -631,6 +667,10 @@ class Project:
     # that checks whether one is set, starting with the banner.
     note: str = ""
     paused: bool = False
+    # Set when the operator closes the report on a finished project. The build
+    # stays exactly where it is; this is what stops the tab handing the same
+    # finished board back the moment it reloads.
+    dismissed: bool = False
     snapshot: Optional[gitutil.Snapshot] = None
     steps: List[StepRecord] = field(default_factory=list)
     # Frozen at start, exactly as a council run freezes its own: a project runs
@@ -713,15 +753,19 @@ class Project:
             # -- engine bookkeeping --------------------------------------
             "audited": self.audited,
             "created_at": self.created_at,
+            "ended_at": self.ended_at,
             "steps_used": self.steps_used,
             "fix_attempts": self.fix_attempts,
             "innovation_rounds": self.innovation_rounds,
             "error": self.error,
             "note": self.note,
+            "dismissed": self.dismissed,
             "snapshot": self.snapshot.to_dict() if self.snapshot else None,
         }
 
-    def to_dict(self, critique: str = "", board_json: str = "") -> Dict[str, Any]:
+    def to_dict(
+        self, critique: str = "", board_json: str = "", pausing: bool = False
+    ) -> Dict[str, Any]:
         doc = self.board_document()
         counts = {name: len(self.column(name)) for name in COLUMNS}
         return {
@@ -733,6 +777,10 @@ class Project:
             "role_labels": ROLE_LABELS,
             "counts": counts,
             "paused": self.paused,
+            # A pause is a request until the agent that was mid-turn exits. The
+            # two states read very differently to somebody deciding whether to
+            # open the folder, so the banner is told them apart.
+            "pausing": pausing,
             "ended_at": self.ended_at,
             "done": self.status in TERMINAL_STATUSES,
             "steps": [s.to_dict() for s in self.steps],
@@ -756,6 +804,12 @@ class Project:
         Anything missing or mangled falls back to a value that makes the run
         finishable rather than one that makes it look finished - which is why
         an unreadable ``build_health`` lands on UNKNOWN, not PASSING.
+
+        The snapshot comes back with it. It is the pointer to the tree as it
+        was before the first agent wrote anything, and a resumed project that
+        forgets it takes a fresh one over the half-built codebase - which is
+        the one piece of state whose loss cannot be repaired by running the
+        project again.
         """
         tasks: List[Dict[str, Any]] = []
         columns = data.get("columns")
@@ -794,11 +848,14 @@ class Project:
             continuation_needed=bool(data.get("continuation_needed")),
             last_run_timestamp=str(data.get("last_run_timestamp") or ""),
             created_at=_as_float(data.get("created_at"), time.time()),
+            ended_at=_as_float(data.get("ended_at"), 0.0),
             steps_used=int(_as_float(data.get("steps_used"), 0)),
             fix_attempts=int(_as_float(data.get("fix_attempts"), 0)),
             innovation_rounds=int(_as_float(data.get("innovation_rounds"), 0)),
             error=str(data.get("error") or ""),
             note=str(data.get("note") or ""),
+            dismissed=bool(data.get("dismissed")),
+            snapshot=_as_snapshot(data.get("snapshot")),
         )
 
 
@@ -878,7 +935,7 @@ class ProjectEngine:
         if project is not None:
             return {
                 "running": running,
-                "resumable": not running and project.status not in TERMINAL_STATUSES,
+                "resumable": not running and _resumable(project),
                 "project": self._payload(project),
             }
 
@@ -886,12 +943,12 @@ class ProjectEngine:
         if folder:
             ws = Workspace(folder)
             data = ws.read_board()
-            if data.get("project_id"):
+            if data.get("project_id") and not data.get("dismissed"):
                 found = Project.from_board(folder, data)
                 found.config = self.store.all()
                 return {
                     "running": False,
-                    "resumable": found.status not in TERMINAL_STATUSES,
+                    "resumable": _resumable(found),
                     "found_on_disk": True,
                     "project": found.to_dict(
                         critique=ws.critique(MAX_UI_TEXT),
@@ -938,12 +995,24 @@ class ProjectEngine:
                     f"{THESEUS_DIR}/{BOARD_FILE} was found there."
                 )
             project = Project.from_board(root, data)
-            if project.status in TERMINAL_STATUSES:
+            if project.status == COMPLETED:
                 raise ValueError(
                     f"That project already finished ({project.status.title()}). "
                     f"Start a new one, or move {THESEUS_DIR}/ aside to build "
                     f"here again."
                 )
+            if project.status == FAILED:
+                # A run that hit a limit is exactly the case the limits exist
+                # for, and the bounds documentation promises it can be picked
+                # up once the operator has unstuck it. The two counters that
+                # ended it are the two that have to be cleared, or the first
+                # decision of the resumed run ends it again for the same
+                # reason - having spent nothing and learned nothing.
+                project.status = PLANNING
+                project.fix_attempts = 0
+                project.stall_count = 0
+                project.ended_at = 0.0
+                project.note = ""
             if goal:
                 project.goal = goal
             if not project.goal:
@@ -973,6 +1042,7 @@ class ProjectEngine:
         project.config = conf
         project.paused = False
         project.error = ""
+        project.dismissed = False
 
         missing = self._unavailable_roles(conf)
         if missing:
@@ -1088,6 +1158,48 @@ class ProjectEngine:
         if project is not None:
             self._log("warn", "Stop requested.")
 
+    def dismiss(self, workspace: str = "") -> None:
+        """Close the report on a project, so the tab offers a fresh one.
+
+        This is *closing the report*, not deleting the build: everything the
+        agents wrote stays where it is and the board keeps saying what happened.
+        What it stops is the tab handing the same finished project straight back
+        - the engine holds it in memory and finds it again on disk, so clearing
+        it in the browser alone lasts exactly until the next reload.
+
+        A run in flight cannot be dismissed. Hiding three agents mid-build
+        behind an initializer is the wrong thing to show.
+        """
+        folder = (workspace or "").strip()
+        with self._lock:
+            if self.is_running():
+                raise ValueError(
+                    "That project is still running. Pause or stop it first."
+                )
+            project = self._project
+            if project is not None and (not folder or folder == project.workspace):
+                project.dismissed = True
+                self._project = None
+            else:
+                project = None
+
+        if project is not None:
+            self._write_board(project)
+            return
+        if not folder:
+            return
+        ws = Workspace(folder)
+        data = ws.read_board()
+        if not data.get("project_id"):
+            return
+        data["dismissed"] = True
+        try:
+            ws.write_board(data)
+        except OSError as exc:
+            raise ValueError(
+                f"Could not close that project's board: {exc}"
+            ) from exc
+
     def wait_for_worker(self, timeout: float = 60.0) -> bool:
         """Block until the worker thread has wound down. False if it has not."""
         with self._lock:
@@ -1146,7 +1258,13 @@ class ProjectEngine:
     def _execute(self, project: Project) -> None:
         """Worker-thread body: read the board, pick an agent, repeat."""
         try:
-            self._take_snapshot(project)
+            # Only where there is not one already. A resumed project carries
+            # the snapshot of the tree as it was before the first agent wrote
+            # anything; retaking it here would anchor the half-built codebase
+            # instead and quietly replace the only thing a rollback could
+            # restore.
+            if project.snapshot is None:
+                self._take_snapshot(project)
             settings = project.config.get("project") or {}
             max_steps = _int_setting(settings, "max_steps", 40)
             project.last_fingerprint = project.fingerprint()
@@ -1397,15 +1515,16 @@ class ProjectEngine:
     ) -> None:
         card_id = decision.tasks[0]["id"] if decision.tasks else ""
         project.tasks = merge_tasks(project.tasks, report.get("tasks"), "coder")
+        worked = self._turn_succeeded(step)
 
         # If the developer did not say where the card went, the engine decides
         # from the outcome. A turn that ran cleanly puts its work up for
-        # review; one that failed leaves the card in progress for the next
-        # attempt rather than quietly parking it.
+        # review; one that failed - or that said so itself - leaves the card in
+        # progress for the next attempt rather than quietly parking it.
         if card_id and not self._reported(report, card_id):
-            self._move(project, card_id, COL_IN_REVIEW if step.ok else COL_IN_PROGRESS)
+            self._move(project, card_id, COL_IN_REVIEW if worked else COL_IN_PROGRESS)
 
-        if step.files_modified or step.ok:
+        if step.files_modified or worked:
             self._mark_dirty(project, f"the {ROLE_LABELS[step.role]} agent wrote code")
 
     def _apply_fix(
@@ -1420,11 +1539,19 @@ class ProjectEngine:
     ) -> None:
         """Fold a QA verdict into the board.
 
-        Fail-closed on purpose. QA that returns nothing usable is recorded as
-        FAILING, never as passing: a silent verification turning the board
-        green is the one outcome the rest of the loop must not build on, since
-        every downstream decision - review, innovation, completion - reads
-        PASSING as "somebody ran the tests".
+        Fail-closed on purpose. QA that *ran* and returned nothing usable is
+        recorded as FAILING, never as passing: a silent verification turning
+        the board green is the one outcome the rest of the loop must not build
+        on, since every downstream decision - review, innovation, completion -
+        reads PASSING as "somebody ran the tests".
+
+        A QA turn that never ran is a different thing and is not written down
+        as a red build. The trace would be the CLI's own crash, and the next
+        turn hands it to the developer as something to fix - which it cannot,
+        so it spends the whole fix budget on an error message about the app.
+        The truthful state is the one before the turn: nobody has tested this
+        tree. The stall guard is what ends a run whose QA chair keeps falling
+        over, in three turns rather than in the fix budget plus three.
         """
         build = report.get("build")
         health = HEALTH_UNKNOWN
@@ -1435,14 +1562,23 @@ class ProjectEngine:
         elif build is not None:
             health = _as_health(build)
 
+        if health == HEALTH_UNKNOWN and not step.ok:
+            project.tasks = merge_tasks(project.tasks, report.get("tasks"), "coder")
+            self._log(
+                "warn",
+                f"The verification turn did not run ({step.error or 'no detail'}). "
+                f"The build stays unverified rather than being recorded as "
+                f"failing - nothing about this tree has been tested.",
+            )
+            return
+
         if health == HEALTH_UNKNOWN:
             health = HEALTH_FAILING
             log = log or (
                 f"QA ({ROLE_LABELS[step.role]}) finished without reporting a "
-                f"build status, so the build is treated as failing. "
-                + (f"The turn itself failed: {step.error}" if not step.ok else
-                   "Run the project's build and tests and report `build.health` "
-                   "explicitly.")
+                f"build status, so the build is treated as failing. Run the "
+                f"project's build and tests and report `build.health` "
+                f"explicitly."
             )
 
         project.build_health = health
@@ -1512,8 +1648,14 @@ class ProjectEngine:
                 f"The {ROLE_LABELS[step.role]} agent returned no review verdict, "
                 f"so nothing moved out of review.",
             )
-        if bounced:
-            self._mark_dirty(project, "review sent work back")
+        # A review moves cards; it does not write code. Sending work back does
+        # not make a verified tree unverified, and marking it so would spend a
+        # QA turn rebuilding a tree nothing has touched since it last passed -
+        # once per bounced card, before the developer has changed a line. What
+        # *does* invalidate it is the reviewer editing something, which it can:
+        # every turn after the audit carries its CLI's write grant.
+        if step.files_modified:
+            self._mark_dirty(project, f"the {ROLE_LABELS[step.role]} agent wrote code")
 
     def _apply_innovate(
         self, project: Project, decision: Decision, step: StepRecord, report: Dict[str, Any]
@@ -1569,6 +1711,27 @@ class ProjectEngine:
                 if note:
                     card["note"] = prompts.clip(note, 600)
                 return
+
+    def _turn_succeeded(self, step: StepRecord) -> bool:
+        """Whether a turn did its job, not merely whether the CLI exited zero.
+
+        The report contract asks for `ok`, `blocked` or `failed` and says what
+        a false `ok` costs. The reverse is worth the same care: an agent that
+        exits cleanly and reports `blocked` has told us it got nowhere, and
+        sending its card to review anyway asks the architect to read a diff
+        that was never written.
+        """
+        if not step.ok:
+            return False
+        reported = step.reported_status.strip().lower()
+        if reported in UNSUCCESSFUL_STATUSES:
+            self._log(
+                "warn",
+                f"The {ROLE_LABELS[step.role]} agent exited cleanly but "
+                f"reported `{reported}`, so its work is not treated as done.",
+            )
+            return False
+        return True
 
     def _reported(self, report: Dict[str, Any], card_id: str) -> bool:
         """Whether the agent's report says anything about one card."""
@@ -1840,6 +2003,17 @@ class ProjectEngine:
     def _finish(
         self, project: Project, status: str, error: str, note: str = ""
     ) -> None:
+        """End the run. The first ending wins.
+
+        A decision that ends the project has to report it *and* return - and
+        every "nothing more to schedule" return looks the same to the loop,
+        which reads it as success. Without this guard, giving up on a build
+        that has failed its way through the fix budget is immediately
+        overwritten by COMPLETED, and the run that gave up reports as the run
+        that finished.
+        """
+        if project.status in TERMINAL_STATUSES:
+            return
         project.status = status
         project.error = error
         project.note = note
@@ -1889,9 +2063,16 @@ class ProjectEngine:
 
     def _payload(self, project: Project) -> Dict[str, Any]:
         ws = Workspace(project.workspace)
+        with self._lock:
+            # A live runner while paused means the pause has been asked for and
+            # the agent it interrupts has not exited yet. Only once that is
+            # gone is the claim the banner wants to make - nothing was
+            # interrupted mid-write - actually true.
+            pausing = project.paused and self._runner is not None
         return project.to_dict(
             critique=ws.critique(MAX_UI_TEXT),
             board_json=json.dumps(project.board_document(), indent=2),
+            pausing=pausing,
         )
 
     def _publish_state(self) -> None:
@@ -1907,6 +2088,18 @@ class ProjectEngine:
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
+
+def _resumable(project: Project) -> bool:
+    """Whether this project can be picked up again.
+
+    A run that hit a limit is the case the limits exist for: everything built
+    is on disk, the board says where it got to, and the operator is meant to
+    unstick it and carry on. COMPLETED is the only genuine end - there is
+    nothing left to schedule - and a dismissed report is one the operator has
+    already closed.
+    """
+    return project.status != COMPLETED and not project.dismissed
 
 
 def _stamp() -> str:

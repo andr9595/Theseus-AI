@@ -1092,6 +1092,30 @@ class TestProjectRoutes(ServerTestBase):
             self.assertEqual(status, 400, path)
             self.assertFalse(data["ok"])
 
+    def test_dismissing_closes_the_board_so_the_tab_offers_a_new_one(self):
+        # Clearing it in the browser alone lasts until the next reload: the
+        # engine finds the same board again on disk.
+        theseus = self.folder / ".theseus"
+        theseus.mkdir()
+        (theseus / "BOARD.json").write_text(
+            json.dumps({"project_id": "abc123", "status": "COMPLETED",
+                        "goal": "a thing"}),
+            encoding="utf-8",
+        )
+        status, data = self.request(
+            "/api/project/dismiss", method="POST",
+            body={"workspace": str(self.folder)},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+
+        _, after = self.request(
+            f"/api/project?workspace={urllib.parse.quote(str(self.folder))}"
+        )
+        self.assertIsNone(after["project"])
+        # Closing the report is not deleting the build.
+        self.assertTrue((theseus / "BOARD.json").exists())
+
     def test_an_unknown_handoff_role_is_refused(self):
         status, data = self.request(
             "/api/project/handoff", method="POST", body={"role": "janitor"}

@@ -664,7 +664,18 @@ That ordering *is* the design, and it is the part worth arguing about:
   the person who has to read it.
 - **Only a QA turn can set the build to PASSING**, and the engine sets it back
   to UNKNOWN the moment anyone writes code. A green board therefore always
-  means somebody ran the tests *after* the last edit.
+  means somebody ran the tests *after* the last edit. Writing code is the only
+  thing that clears it: a review that sends a card back has moved a card, not
+  edited a file, and retesting an untouched tree costs a QA turn per bounce.
+- **A QA turn that never ran is not a red build.** A CLI that crashed or timed
+  out has tested nothing, so the tree stays *unverified* rather than being
+  recorded as `FAILING` — which would hand the developer a crash report from
+  the app itself to fix, and spend the whole fix budget failing to. A QA turn
+  that *ran* and reported nothing usable is still `FAILING`; that half is
+  deliberate and unchanged.
+- **An agent that reports `blocked` or `failed` has not done the work**, even
+  if its CLI exited zero. Its card stays in progress instead of going to a
+  reviewer to read a diff that was never written.
 
 Bugs are cards too. QA raises them off a build failure, and they jump the
 developer's queue ahead of the backlog.
@@ -816,17 +827,22 @@ single hand-off, which is survivable.
 - **Pause** stops the loop *after* the running agent finishes its turn. It does
   not interrupt: a CLI killed between two file writes leaves a tree nothing in
   the run knows is half-written. It costs a few minutes and leaves the folder
-  consistent.
-- **Resume** picks up from the board.
+  consistent. Until that agent exits the tab says **Pausing**, because "nothing
+  was interrupted mid-write" is only true once it has.
+- **Resume** picks up from the board — a pause, or a run that stopped at one of
+  the bounds below.
 - **Hand off** forces the next turn onto a chair you choose. For the failure the
   board cannot see — an agent answering, exiting zero, and going in circles.
 - **Stop** ends it now, killing whatever is executing. Use Pause unless you mean
   that.
 
 Close the window mid-build and the project is still on disk; reopening the app
-finds it and offers to resume. A project that is still running when you open the
-app pulls you to the tab, because an idle-looking window while three agents
-rewrite a folder is the wrong thing to show.
+finds it and offers to resume. The safety snapshot is read back off the board
+with it, so a resumed project keeps pointing at the tree as it was before the
+first agent wrote anything rather than anchoring the half-built one. A project
+that is still running when you open the app pulls you to the tab, because an
+idle-looking window while three agents rewrite a folder is the wrong thing to
+show.
 
 ### Proactive innovation
 
@@ -868,25 +884,37 @@ where it got to, and the project can be resumed once you have unstuck it.
 A project ends in one of two states, and the distinction is narrower than it
 sounds:
 
-- **FAILED** — the step limit was reached, the board stopped moving for three
-  turns, the operator pressed **Stop**, or the worker crashed. The board keeps
-  the reason.
+- **FAILED** — the step limit was reached, the fix budget ran out, the board
+  stopped moving for three turns, the operator pressed **Stop**, or the worker
+  crashed. The board keeps the reason.
 - **COMPLETED** — the engine had nothing left to schedule.
+
+**The first ending wins.** A run that gave up says so and stays saying so:
+nothing downstream may relabel a project that stopped as one that finished.
 
 **`COMPLETED` does not on its own mean green.** The last rung of the ladder is
 "nothing left to do", not "the build passes", so a project can complete with the
-build `UNKNOWN` (nobody ever verified it) or `FAILING` (the developer used up
-its fix attempts). The completion note is the authoritative reading and states
+build `UNKNOWN` — nobody ever verified it, because nothing was ever flagged as
+needing it. It cannot complete `FAILING`: a red build outranks everything until
+it is green or the fix budget runs out, and running out is a `FAILED` run, not a
+finished one. The completion note is the authoritative reading and states
 the health explicitly — *"Finished: 6 of 7 cards done, build unknown, in 22
 agent turns"* — along with any cards that never reached Done. Read that line,
 or read `build_health` in `.theseus/BOARD.json`, before treating a finished
 project as a working one.
 
-One consequence of that worth naming: when the build has failed more times in a
-row than **Fix attempts** allows, the engine records the failure and its reason,
-then immediately reports the project as `COMPLETED` with *"the build is
-FAILING"* as a caveat rather than leaving it `FAILED`. The caveat is accurate;
-the status is not the one you would expect.
+**`FAILED` is not the end of the project, only of that run.** Everything built
+is on disk, the board says where it got to, and **Resume** picks it up from
+there — which is the whole point of bounding a loop nobody is watching. The two
+counters that ended the run are cleared as it restarts, so a project that ran
+out of fix attempts gets the full budget again rather than giving up on its
+first turn for a reason it has already reported. `COMPLETED` is the one ending
+that cannot be resumed: there is nothing left to schedule. Start a new project,
+or move `.theseus/` aside.
+
+**New project** closes the report and puts the initializer back. It deletes
+nothing — the board is marked closed so the tab stops offering it, and the
+build stays exactly where the agents left it.
 
 ### Trying it without spending quota
 

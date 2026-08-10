@@ -2254,8 +2254,11 @@ function renderProjectLive() {
 
   // Controls. Pause and Resume are the same button's two states rather than
   // two live buttons, so there is never a pair where only one does anything.
+  // Resume doubles as the way back into a run that hit a limit: everything it
+  // built is on disk, and picking it up again is the documented next move.
   $('#project-pause').classList.toggle('hidden', !running || p.paused);
-  $('#project-resume').classList.toggle('hidden', !(running && p.paused));
+  $('#project-resume').classList.toggle('hidden',
+    !((running && p.paused) || (!running && p.status === 'FAILED')));
   $('#project-handoff').classList.toggle('hidden', !running);
   $('#project-stop').classList.toggle('hidden', !running);
   $('#project-new').classList.toggle('hidden', running);
@@ -2318,11 +2321,13 @@ function renderStatusStrip(p, running, done) {
   const last = (p.steps || [])[(p.steps || []).length - 1];
   const who = done
     ? ''
-    : p.paused
-      ? 'Paused'
-      : running
-        ? `${ROLE_NAMES[p.active_agent] || p.active_agent} working`
-        : 'Idle';
+    : p.pausing
+      ? 'Pausing'
+      : p.paused
+        ? 'Paused'
+        : running
+          ? `${ROLE_NAMES[p.active_agent] || p.active_agent} working`
+          : 'Idle';
   const why = !done && running && last ? last.trigger || '' : '';
 
   $('#project-status-strip').innerHTML =
@@ -2411,7 +2416,14 @@ function renderProjectBanner(p, running, done) {
            `the diff first, then .theseus/CRITIQUE.log for what was left open.`;
   } else if (p.status === 'FAILED') {
     kind = 'error';
-    text = p.error || 'The project stopped.';
+    text = (p.error || 'The project stopped.') +
+           ' Everything built so far is on disk — Resume picks up from the ' +
+           'board once you have unstuck it.';
+  } else if (p.pausing) {
+    kind = 'warn';
+    text = 'Pausing. The agent that was running has not exited yet, so the ' +
+           'folder is still being written to — the loop holds as soon as its ' +
+           'turn ends.';
   } else if (p.paused) {
     kind = 'warn';
     text = 'Paused. The agent that was running finished its turn, so the tree ' +
@@ -2490,7 +2502,9 @@ function stepHtml(s) {
  *  misclick into a question. */
 async function startProject(resume) {
   const goal = $('#project-goal').value.trim();
-  const folder = workspacePath();
+  // Resuming carries on in the folder the project on screen was built in, not
+  // in whichever one the picker happens to be pointing at.
+  const folder = (resume && (state.project || {}).workspace) || workspacePath();
   const innovation = Math.max(0, Math.min(5,
     parseInt($('#project-innovation').value, 10) || 0));
   const where = folder || `the scratch workspace (${state.scratchWorkspace || 'app folder'})`;
@@ -2510,7 +2524,9 @@ async function startProject(resume) {
         `did not ask for. Set the slider to zero to stop at the goal.`
       : '') +
     (workspaceIsRepo()
-      ? '\n\nA git snapshot is taken first, so the whole build can be undone.'
+      ? '\n\nA git snapshot is taken first and its commit id is recorded on ' +
+        'the board. There is no Project rollback button — undoing this is a ' +
+        'handful of git commands, and the README spells them out.'
       : '\n\nThis is not a git repository, so nothing is snapshotted and ' +
         'there is no way to undo it.')
   )) return;
@@ -4783,9 +4799,17 @@ function wire() {
     api('/api/project/pause', { method: 'POST' })
       .then(loadProject).catch(e => toast(e.message, 'error')));
 
-  $('#project-resume').addEventListener('click', () =>
-    api('/api/project/resume', { method: 'POST' })
-      .then(loadProject).catch(e => toast(e.message, 'error')));
+  // Two jobs, because the button has two meanings: releasing a pause is a
+  // control on a live loop, and picking a stopped project back up is a fresh
+  // start against the board it left behind.
+  $('#project-resume').addEventListener('click', () => {
+    if (state.projectRunning) {
+      api('/api/project/resume', { method: 'POST' })
+        .then(loadProject).catch(e => toast(e.message, 'error'));
+    } else {
+      startProject(true);
+    }
+  });
 
   $('#project-stop').addEventListener('click', async () => {
     if (!confirm(
@@ -4809,8 +4833,23 @@ function wire() {
   });
 
   // Clearing the tab is what puts the initializer back. The project on disk is
-  // untouched — this is closing the report, not deleting the build.
-  $('#project-new').addEventListener('click', () => {
+  // untouched — this is closing the report, not deleting the build. It has to
+  // go through the server: the engine holds the finished project in memory and
+  // finds its board again on disk, so clearing it here alone lasts exactly
+  // until the next reload.
+  $('#project-new').addEventListener('click', async () => {
+    const p = state.project || {};
+    if (state.projectResumable && !confirm(
+      'Close this project?\n\n' +
+      'It has not finished, so this gives up the offer to resume it. ' +
+      'Nothing in the folder is deleted.'
+    )) return;
+    try {
+      await api('/api/project/dismiss', {
+        method: 'POST',
+        body: { workspace: p.workspace || workspacePath() },
+      });
+    } catch (err) { toast(err.message, 'error'); return; }
     state.project = null;
     state.projectResumable = false;
     renderProject();
