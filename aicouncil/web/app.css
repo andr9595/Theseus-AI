@@ -107,6 +107,22 @@ html, body {
 }
 .brand-mark:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
 
+/* The three glyphs share one cell so they cross-fade in place. Reaching the
+   mark - by pointer or by key - trades the ship for the action it performs,
+   and which action that is depends on which way the rail is going. */
+.brand-mark > svg { grid-area: 1 / 1; transition: opacity .13s ease; }
+.mark-collapse, .mark-expand { opacity: 0; }
+
+.brand-mark:hover .mark-logo,
+.brand-mark:focus-visible .mark-logo { opacity: 0; }
+.brand-mark:hover .mark-collapse,
+.brand-mark:focus-visible .mark-collapse { opacity: 1; }
+
+.app.sidebar-collapsed .brand-mark:hover .mark-collapse,
+.app.sidebar-collapsed .brand-mark:focus-visible .mark-collapse { opacity: 0; }
+.app.sidebar-collapsed .brand-mark:hover .mark-expand,
+.app.sidebar-collapsed .brand-mark:focus-visible .mark-expand { opacity: 1; }
+
 .new-chat {
   display: flex; align-items: center; gap: 9px;
   width: 100%; padding: 10px 13px; flex: 0 0 auto;

@@ -21,10 +21,21 @@
       <button id="sidebar-toggle" class="brand-mark" type="button"
               aria-controls="chat-list" aria-expanded="true"
               aria-label="Collapse chat history" title="Collapse chat history">
-        <svg viewBox="0 0 24 24" width="21" height="21" fill="currentColor" aria-hidden="true">
+        <svg class="mark-logo" viewBox="0 0 24 24" width="21" height="21" fill="currentColor" aria-hidden="true">
           <path d="M11.1 2.6v9.3H5.1z"/>
           <path d="M12.9 5.8v6.1h6z"/>
           <path d="M2.5 13.3h19l-1.8 4a3.6 3.6 0 0 1-3.3 2.1H7.6a3.6 3.6 0 0 1-3.3-2.1z"/>
+        </svg>
+        <!-- Hovered, the ship gives way to the action. Two glyphs rather than
+             one mirrored: flipping the panel would carry its divider across to
+             the right and draw a rail that isn't there. -->
+        <svg class="mark-collapse" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="3" y="3" width="18" height="18" rx="2"/>
+          <path d="M9 3v18M17 16l-4-4 4-4"/>
+        </svg>
+        <svg class="mark-expand" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="3" y="3" width="18" height="18" rx="2"/>
+          <path d="M9 3v18M13 16l4-4-4-4"/>
         </svg>
       </button>
       <h1>Theseus AI</h1>

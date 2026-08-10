@@ -160,6 +160,12 @@ class TestStaticFiles(ServerTestBase):
         self.assertIn('aria-controls="chat-list"', body)
         self.assertIn('<span class="sidebar-label">New chat</span>', body)
 
+        # Hovering the mark has to say what clicking it will do, and say the
+        # right one of the two things it can do.
+        self.assertIn('class="mark-logo"', body)
+        self.assertIn('class="mark-collapse"', body)
+        self.assertIn('class="mark-expand"', body)
+
         with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
             script = res.read().decode()
         self.assertIn("function setSidebarCollapsed(collapsed)", script)
@@ -171,6 +177,7 @@ class TestStaticFiles(ServerTestBase):
             css = res.read().decode()
         self.assertIn(".app.sidebar-collapsed", css)
         self.assertNotIn("background: var(--bg-1);\n  border-right:", css)
+        self.assertIn(".app.sidebar-collapsed .brand-mark:hover .mark-expand", css)
 
     def test_caveman_settings_live_with_the_modes_that_use_them(self):
         # All three modes toggle it from their composer gear, so Settings
