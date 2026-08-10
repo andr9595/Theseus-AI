@@ -1933,6 +1933,10 @@ html, body {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .chair-model { font-size: 11px; color: var(--text-3); font-family: var(--mono); }
+.chair-note {
+  font-size: 11px; color: var(--text-3); font-style: italic;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .chair.unavailable .chair-mark {
   border-style: dashed; color: var(--red); border-color: var(--red);
 }
@@ -1967,7 +1971,10 @@ html, body {
    dispatches on. */
 .project-strip {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  /* Auto-fit rather than a fixed three: the "Now" cell is only there while
+     something is running, so the strip is three cells or four depending on the
+     moment, and a hard column count leaves a hole in one of those. */
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 6px;
 }
 .strip-cell {

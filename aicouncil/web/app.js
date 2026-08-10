@@ -2177,7 +2177,30 @@ function renderProjectSetup() {
     ? `${missing.map(r => ROLE_NAMES[r.id] || r.id).join(' and ')} ` +
       `${missing.length === 1 ? 'has' : 'have'} no CLI installed. ` +
       `A project runs unattended, so it will not start with a seat it cannot fill.`
-    : '';
+    : doubledChairsHint();
+}
+
+/** A warning, never a refusal: two chairs on the same CLI.
+ *
+ *  Allowed, and sometimes what somebody wants — but it costs both of the
+ *  things three seats buy. A hand-off when one agent runs out of context has
+ *  one fewer agent to reach for, and the acceptance turn stops being
+ *  independent of the code it is accepting. */
+function doubledChairsHint() {
+  const seen = {};
+  const doubled = [];
+  for (const role of PROJECT_ROLES) {
+    const p = ((state.config || {}).providers || {})[role] || {};
+    const key = (p.command || []).join(' ');
+    if (!key) continue;
+    if (seen[key]) doubled.push([seen[key], role]);
+    else seen[key] = role;
+  }
+  if (!doubled.length) return '';
+  const [a, b] = doubled[0];
+  return `${ROLE_NAMES[a]} and ${ROLE_NAMES[b]} are the same CLI. It will ` +
+    `run, but one agent checking its own work is not a second opinion, and a ` +
+    `context limit has one fewer chair to hand the turn to.`;
 }
 
 /** The innovation slider: how much the council may invent once the goal is met.
@@ -2218,10 +2241,22 @@ function chairHtml(role) {
   const running = hasProject() && state.projectRunning &&
     state.project.active_agent === role;
 
+  // What the app would put here, and why. Shown only when the chair is on
+  // something else: three "recommended" badges on the three defaults is noise,
+  // and the one case worth a line is the one where the operator has moved a
+  // seat and may want to know what it was picked for.
+  const suggested = info && info.recommended_agent;
+  const offSuggestion = suggested && agentOf(p) !== suggested;
+  const suggestedLabel = offSuggestion
+    ? ((state.agents.find(a => a.id === suggested) || {}).label || suggested)
+    : '';
+
   const title =
     `${ROLE_NAMES[role]} — ${agentLabel} · ${modelDetail(model)}` +
     (p.effort ? ` · ${p.effort}` : '') +
     (available ? '' : ` · ${(p.command || [])[0] || 'CLI'} not found`) +
+    ((info && info.summary) ? `\n${info.summary}` : '') +
+    (offSuggestion ? `\nRecommended for this seat: ${suggestedLabel}.` : '') +
     '\nClick to change CLI, model or effort.';
 
   return (
@@ -2232,6 +2267,8 @@ function chairHtml(role) {
         `<span class="chair-role">${esc(ROLE_NAMES[role])}</span>` +
         `<span class="chair-agent">${esc(available ? agentLabel : agentLabel + ' — missing')}</span>` +
         `<span class="chair-model">${esc(model)}</span>` +
+        (offSuggestion
+          ? `<span class="chair-note">${esc(suggestedLabel)} recommended</span>` : '') +
       `</span>` +
     `</button>`
   );
@@ -2318,6 +2355,18 @@ function renderStatusStrip(p, running, done) {
     UNKNOWN: 'changed since anyone last ran it',
   }[health] || '';
 
+  // The other verdict. A green build is three commands exiting zero; this is
+  // whether anybody got the application to do the thing that was asked for,
+  // which is a different question and the one the operator asked.
+  const accepted = p.release_health || 'UNKNOWN';
+  const acceptedClass =
+    accepted === 'PASSING' ? 'ok' : accepted === 'FAILING' ? 'bad' : 'unknown';
+  const acceptedNote = {
+    PASSING: 'QA ran it and it did what you asked',
+    FAILING: 'QA ran it and it did not',
+    UNKNOWN: 'nobody has used it since the last edit',
+  }[accepted] || '';
+
   const last = (p.steps || [])[(p.steps || []).length - 1];
   const who = done
     ? ''
@@ -2335,6 +2384,11 @@ function renderStatusStrip(p, running, done) {
       `<span class="strip-label">Build</span>` +
       `<span class="strip-value">${esc(health.toLowerCase())}</span>` +
       `<span class="strip-note">${esc(healthNote)}</span>` +
+    `</span>` +
+    `<span class="strip-cell strip-health ${acceptedClass}">` +
+      `<span class="strip-label">Works</span>` +
+      `<span class="strip-value">${esc(accepted.toLowerCase())}</span>` +
+      `<span class="strip-note">${esc(acceptedNote)}</span>` +
     `</span>` +
     (who
       ? `<span class="strip-cell${running && !p.paused ? ' live' : ''}">` +
@@ -2445,6 +2499,11 @@ function renderProjectBanner(p, running, done) {
     kind = '';
     text = 'Reading the workspace. This turn runs read-only — it has no write ' +
            'permission at all, so nothing here can change yet.';
+  } else if (p.status === 'ACCEPTING') {
+    kind = '';
+    text = 'Every card is done and the build is green. QA is now starting the ' +
+           'application and using it against the goal — anything it cannot do ' +
+           'comes back as a bug and the loop reopens.';
   } else if (p.status === 'INNOVATING') {
     kind = 'warn';
     text = 'The goal is met and the build is green. The architect is now ' +

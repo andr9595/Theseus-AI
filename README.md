@@ -642,7 +642,8 @@ next?* — and the answer picks the agent:
   changes unverified ... QA builds and tests it
   cards in review ...... the architect reviews the diff
   cards in backlog ..... the developer claims the top one
-  board clear .......... the architect proposes what is missing
+  board clear .......... QA starts the application and uses it
+  accepted ............. the architect proposes what is missing
   nothing left ......... COMPLETED
 ```
 
@@ -676,6 +677,15 @@ That ordering *is* the design, and it is the part worth arguing about:
 - **An agent that reports `blocked` or `failed` has not done the work**, even
   if its CLI exited zero. Its card stays in progress instead of going to a
   reviewer to read a diff that was never written.
+- **A green build is not a working application.** A project assembled one card
+  at a time can pass every test it wrote for itself while never having been
+  started by anybody. So the last gate before a project may finish is an
+  *acceptance* turn: QA installs it from clean, runs it, walks the journeys the
+  goal describes, tries the unhappy paths, and says whether the thing does what
+  was asked. Anything it cannot do comes back as a bug card, the loop reopens,
+  and writing code clears acceptance exactly as it clears the build — so the
+  gate is only ever passed against the tree as it finally stands. The tracker
+  shows this beside the build as **Works**.
 
 Bugs are cards too. QA raises them off a build failure, and they jump the
 developer's queue ahead of the backlog.
@@ -684,16 +694,28 @@ developer's queue ahead of the backlog.
 
 | Chair | Default CLI | Fires when | What it does |
 |---|---|---|---|
-| **Architect** | `claude` | a goal needs decomposing, cards are in review, or the board is clear | Turns the goal into cards, reviews diffs and approves or bounces them, and proposes enhancements once the goal is met. |
-| **Developer** | `codex` | there are cards in the backlog, or the build is failing | Claims the top card, writes the code and its tests, fixes build failures. One card per turn. |
-| **QA** | `agy` | at startup, and whenever code has changed | Audits the workspace read-only, then runs the project's real build and test commands and captures the output verbatim. |
+| **Architect** | `claude` | a goal needs decomposing, cards are in review, or the board is clear | Reads the goal as a product brief, turns it into cards that each say what "done" looks like, reviews every diff against those criteria, and proposes enhancements once the goal is met. |
+| **Developer** | `codex` | there are cards in the backlog, or the build is failing | Claims the top card, writes the code and its tests, wires it into how the program actually starts, fixes build failures. One card per turn. |
+| **QA** | `agy` | at startup, whenever code has changed, and once the board is clear | Audits the workspace read-only, runs the project's real build and test commands and captures the output verbatim, then finally starts the application and uses it against the goal. |
 
-That pairing follows the work rather than the vendor — judgement to the best
-reasoner, bulk implementation to the most generous quota, build-and-verify to
-the one happiest running commands — and none of it is a rule. Click any chair in
-the matrix to reassign it, exactly as you would a council member. The three are
-ordinary providers under the hood, so the model picker, the reasoning-depth
-picker and the quota chip all work on them unchanged.
+That pairing follows the work rather than the vendor. The architect seat is the
+one where a bad judgement costs the most turns to undo, so it goes to the
+strongest reviewer; the developer seat spends the most turns and the most quota,
+so it goes to the strongest implementer with the most room; and the QA seat is
+an independent read of somebody else's build, which is analysis, not authorship.
+The matrix says which CLI each seat is recommended for and tells you when a
+chair is sitting on something else — but none of it is a rule. Click any chair
+to reassign it, exactly as you would a council member. The three are ordinary
+providers under the hood, so the model picker, the reasoning-depth picker and
+the quota chip all work on them unchanged.
+
+**Three different CLIs is the point, not decoration.** When one runs out of
+context or quota mid-turn, the turn is rebuilt from the board and handed to
+another chair — and a chair pointed at the CLI that just ran out is not a spare
+one, so the engine skips it rather than spending a turn to rediscover that. The
+same goes for judgement: an agent reviewing its own diff, or accepting the
+application it wrote, is not a second opinion. Doubling up is allowed and the
+initializer says what it costs.
 
 If a chair's CLI is not installed, the project **will not start**, and says
 which one. A build that runs unattended for an hour should not discover on its
@@ -897,11 +919,15 @@ nothing downstream may relabel a project that stopped as one that finished.
 build `UNKNOWN` — nobody ever verified it, because nothing was ever flagged as
 needing it. It cannot complete `FAILING`: a red build outranks everything until
 it is green or the fix budget runs out, and running out is a `FAILED` run, not a
-finished one. The completion note is the authoritative reading and states
-the health explicitly — *"Finished: 6 of 7 cards done, build unknown, in 22
-agent turns"* — along with any cards that never reached Done. Read that line,
-or read `build_health` in `.theseus/BOARD.json`, before treating a finished
-project as a working one.
+finished one. Acceptance is the same shape: a project *can* complete having been
+run and found wanting, because refusing to finish would only mean burning the
+step limit on a card the agents have already shown they cannot close. The
+completion note is the authoritative reading and states both verdicts
+explicitly — *"Finished: 6 of 7 cards done, build unknown, in 22 agent turns.
+Note: the build is UNKNOWN; nobody ran the application itself"* — along with any
+cards that never reached Done. Read that line, or read `build_health` and
+`release_health` in `.theseus/BOARD.json`, before treating a finished project as
+a working one.
 
 **`FAILED` is not the end of the project, only of that run.** Everything built
 is on disk, the board says where it got to, and **Resume** picks it up from
@@ -922,9 +948,11 @@ build stays exactly where the agents left it.
 it and the whole decision loop runs for real against a real directory: it audits
 the folder read-only, plans two cards, implements a Python module **with a
 genuine bug in it**, fails its own test suite, is handed the real trace, fixes
-it, gets the cards reviewed and proposes one enhancement before declaring itself
-finished. Nothing in that sequence is faked — the tests really run and really
-fail — which is the only way to know the loop works rather than to believe it.
+it, gets the cards reviewed, runs the finished module the way its user would,
+and proposes one enhancement before declaring itself finished. Nothing in that
+sequence is faked — the tests really run and really fail, and the acceptance
+turn really calls `greet("Ada")` — which is the only way to know the loop works
+rather than to believe it.
 
 ---
 

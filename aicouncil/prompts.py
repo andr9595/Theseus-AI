@@ -1472,12 +1472,21 @@ are not empty folders, and an existing codebase has already made most of the \
 decisions you would otherwise be making.
 2. Write cards a developer can act on without asking you a question. "Add \
 input validation" is not a card; "reject a negative --interval in \
-cmd/root.go with a usage error" is.
-3. Prefer the smallest change that satisfies the goal. Every directory and \
+cmd/root.go with a usage error" is. Every card carries how anyone would know \
+it is done - the command to run, the page to open, the output to see. QA is \
+held to those at the end, and a card with nothing observable in it cannot be \
+accepted or rejected, only believed.
+3. Read the goal as a brief for something somebody has to use, not as a list \
+of files. Who runs this, how do they start it, what happens on the paths that \
+are not the happy one, and what does it do with their data. Whatever you leave \
+out of the cards is what will be missing from the finished thing.
+4. Prefer the smallest change that satisfies the goal. Every directory and \
 every abstraction you invent is one three agents have to keep straight across \
 a context limit.
-4. When you review, review the diff. Read what changed, decide whether it is \
-correct and whether it is really finished, and say so plainly.\
+5. When you review, review the diff. Read what changed, decide whether it is \
+correct and whether it is really finished, and say so plainly - against the \
+card's acceptance criteria and the goal, not against what the developer said \
+it did.\
 """
 
 
@@ -1503,13 +1512,19 @@ that mattered.
 3. Write real, complete code - no stubs, no `TODO: implement`, no placeholder \
 returning a constant. Whatever you leave unfinished, QA will fail and hand \
 straight back to you.
-4. Write the unit tests for what you build, in the project's existing test \
+4. Finish the slice, not the file. Whatever your card adds should be reachable \
+from how the program is actually started: wired into the entry point, its \
+configuration read from wherever the rest reads its own, its errors handled \
+the way the neighbouring code handles them. QA runs this application at the \
+end, and a feature that compiles but cannot be reached from the outside fails \
+there and comes back as a bug.
+5. Write the unit tests for what you build, in the project's existing test \
 layout, using the test framework it already uses.
-5. When you are handed a build failure, fix the cause. Read the trace, find \
+6. When you are handed a build failure, fix the cause. Read the trace, find \
 the line, understand why it is wrong. Deleting the test, weakening the \
 assertion or swallowing the exception are not fixes, and QA is told to look \
 for exactly that.
-6. Match the conventions already in the tree - naming, error handling, import \
+7. Match the conventions already in the tree - naming, error handling, import \
 order, comment density. The project should read as though one person wrote it.\
 """
 
@@ -1541,7 +1556,11 @@ card for the developer.
 5. Look for work that was faked rather than done: tests that assert nothing, \
 functions returning a constant to satisfy a caller, exceptions caught and \
 discarded, assertions weakened since the last round. Raise those as `bug` \
-cards with the file and line.\
+cards with the file and line.
+6. At the end you are asked one further question, and it is the one the \
+operator was actually asking: does the application do what the goal said. A \
+suite of green unit tests is not that answer. Start the thing, use it the way \
+its user would, and report what happened.\
 """
 
 
@@ -1758,7 +1777,12 @@ def build_plan_prompt(goal: str, context: str, system: str = "") -> str:
         f"scaffolding lives.\n"
         f"2. Return the cards in your JSON block. Each needs an id (`t1`, "
         f"`t2`, ...), a `title` a developer can act on, a `detail` saying "
-        f"which files and what change, and `\"column\": \"backlog\"`.\n\n"
+        f"which files and what change, and `\"column\": \"backlog\"`. End "
+        f"every `detail` with a line beginning `Done when:` naming what "
+        f"someone could observe - the command and its output, the page and "
+        f"what is on it, the request and its response. You review against "
+        f"those, and QA runs the finished application against them before this "
+        f"project may call itself done.\n\n"
         f"Between three and twelve cards. Fewer than three usually means a card "
         f"is really a project; more than twelve means you are planning v2 "
         f"before v1 builds.\n\n"
@@ -1864,6 +1888,68 @@ def build_verify_prompt(goal: str, context: str, system: str = "") -> str:
     )
 
 
+def build_release_prompt(goal: str, context: str, system: str = "") -> str:
+    """The board is clear and the build is green. Does the thing work?
+
+    The last gate before COMPLETED, and the only turn that asks the operator's
+    actual question. A build assembled one card at a time can pass every test
+    it wrote for itself without ever having been started by anybody.
+    """
+    return (
+        f"{system or PROJECT_QA_SYSTEM}\n\n"
+        f"{context}\n\n"
+        f"{_goal_block(goal)}\n"
+        f"# Your turn: acceptance\n"
+        f"Every card is done and the build is green. That means the commands "
+        f"exited zero. It does not mean anyone has ever run this.\n\n"
+        f"Be the user. Start the application the way its documentation says "
+        f"to - the binary, the dev server, the entry point - and use it for "
+        f"the thing the goal above describes. Then judge it against the "
+        f"acceptance criteria on the cards and in `.theseus/SPEC.md`, one at a "
+        f"time.\n\n"
+        f"What to actually do, as far as the project allows:\n\n"
+        f"1. Install it from clean the way a new user would, and start it. A "
+        f"project that only runs from the author's shell has not shipped.\n"
+        f"2. Walk its primary journeys end to end. For a web UI, drive it with "
+        f"a browser if you have one, or with the project's own end-to-end "
+        f"tests, or with `curl` against the running server - and say which of "
+        f"those you did. For a CLI, run its real commands with real "
+        f"arguments.\n"
+        f"3. Try the unhappy path: bad input, a missing file, the wrong "
+        f"credentials, an empty database. Crashing on those is a bug even when "
+        f"every unit test passes.\n"
+        f"4. Check what the goal asked for and nobody built. A card that was "
+        f"never written is not visible in a green build.\n\n"
+        f"Then report, adding an `acceptance` object to your JSON block:\n\n"
+        f"```json\n"
+        f"{{\n"
+        f"  \"reasoning\": \"...\",\n"
+        f"  \"files_modified\": [],\n"
+        f"  \"status\": \"ok\",\n"
+        f"  \"acceptance\": {{\n"
+        f"    \"health\": \"PASSING\",\n"
+        f"    \"log\": \"what you started, what you did with it, what it did\"\n"
+        f"  }},\n"
+        f"  \"tasks\": []\n"
+        f"}}\n"
+        f"```\n\n"
+        f"`PASSING` means you used the application and it did what the goal "
+        f"asked. Not that it builds, not that it looks right, not that you "
+        f"could not find anything wrong. If you could not run it at all, that "
+        f"is `FAILING` with the reason - a build nobody can start is the "
+        f"failure this turn exists to catch. There is no third value: end your "
+        f"turn without one and the orchestrator records it as failing.\n\n"
+        f"Everything unmet goes back as a new card with `\"kind\": \"bug\"`, "
+        f"naming what you did and what happened instead. Those jump the "
+        f"developer's queue, and this turn runs again once they are built - so "
+        f"be specific rather than kind.\n\n"
+        f"Append your findings to `.theseus/CRITIQUE.log`. Do not fix anything "
+        f"yourself; writing the code you are accepting is how this gate stops "
+        f"meaning anything.\n\n"
+        f"{REPORT_CONTRACT}\n"
+    )
+
+
 def build_review_prompt(
     goal: str, context: str, cards: List[Dict[str, Any]], system: str = ""
 ) -> str:
@@ -1879,7 +1965,8 @@ def build_review_prompt(
         f"whether it compiles:\n\n"
         f"{listing}\n\n"
         f"Read the diff above and the files it touches. For each card decide:\n\n"
-        f"- Does it do what the card asked?\n"
+        f"- Does it do what the card asked, and does it meet the card's own "
+        f"`Done when:` criteria?\n"
         f"- Is it finished, or is there a stub, a hardcoded value or a "
         f"swallowed error standing in for the hard part?\n"
         f"- Do the tests actually exercise it, or do they assert something "

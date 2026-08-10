@@ -30,10 +30,11 @@ It also speaks Projects Mode. Point the architect, coder and QA chairs at it
 and the whole decision loop runs for real against a real directory: it audits
 the folder read-only, plans two cards, implements a Python module with a
 genuine bug in it, fails its own test suite, is handed the trace, fixes it,
-gets the cards reviewed and proposes one enhancement before declaring itself
-finished. Nothing about that sequence is faked - the tests really run and
-really fail - which is the only way to know the loop works rather than merely
-to believe it.
+gets the cards reviewed, runs the finished module the way its user would, and
+proposes one enhancement before declaring itself finished. Nothing about that
+sequence is faked - the tests really run and really fail, and the acceptance
+turn really calls the code that was written - which is the only way to know the
+loop works rather than merely to believe it.
 """
 
 from __future__ import annotations
@@ -465,6 +466,7 @@ PROJECT_TURNS = [
     ("# Your turn: implement", "implement"),
     ("# Your turn: fix the build", "fix"),
     ("# Your turn: verify", "verify"),
+    ("# Your turn: acceptance", "release"),
     ("# Your turn: review", "review"),
     ("# Your turn: innovate", "innovate"),
 ]
@@ -521,6 +523,18 @@ def run_tests() -> tuple[bool, str]:
     return proc.returncode == 0, (
         f"$ python3 -m unittest discover -s . -q\nexit {proc.returncode}\n{output}"
     )
+
+
+def use_the_greeter() -> tuple[bool, str]:
+    """Run the built module the way its user would. Nothing simulated here."""
+    proc = subprocess.run(
+        [sys.executable, "-c", 'from greeter import greet; print(greet("Ada"))'],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    out = (proc.stdout + proc.stderr).strip()
+    if proc.returncode != 0:
+        return False, f"exit {proc.returncode}\n{out}"
+    return "Ada" in out, f"printed {out!r}"
 
 
 def run_project_turn(turn: str, goal: str) -> int:
@@ -614,6 +628,28 @@ def run_project_turn(turn: str, goal: str) -> int:
                 "health": "PASSING" if passing else "FAILING",
                 "log": "" if passing else output,
             },
+        )
+
+    if turn == "release":
+        # Not the test suite again: the acceptance turn is the one that uses
+        # the thing that was built. This imports the module the developer wrote
+        # and calls it the way the goal describes, which is as close to "start
+        # the application" as a two-file fixture gets - and it really runs, so
+        # a greeter that still ignores its argument really fails here.
+        works, detail = use_the_greeter()
+        emit(f"Used greet('Ada'): {detail}")
+        return report(
+            reasoning=f"Ran the module as its user would. {detail}",
+            acceptance={
+                "health": "PASSING" if works else "FAILING",
+                "log": f"$ python3 -c 'from greeter import greet; "
+                       f"print(greet(\"Ada\"))'\n{detail}",
+            },
+            tasks=[] if works else [
+                {"id": "b_release", "title": "greet() does not use the name",
+                 "detail": detail, "column": "backlog", "kind": "bug",
+                 "assigned_to": "coder"},
+            ],
         )
 
     if turn == "review":

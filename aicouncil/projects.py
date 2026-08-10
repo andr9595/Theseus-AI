@@ -124,6 +124,7 @@ PLANNING = "PLANNING"
 IMPLEMENTING = "IMPLEMENTING"
 TESTING = "TESTING"
 REVIEWING = "REVIEWING"
+ACCEPTING = "ACCEPTING"
 INNOVATING = "INNOVATING"
 COMPLETED = "COMPLETED"
 FAILED = "FAILED"
@@ -448,6 +449,15 @@ def _as_health(value: Any) -> str:
     return HEALTH_UNKNOWN
 
 
+def _cli_identity(provider: Dict[str, Any]) -> tuple:
+    """Which binary a chair really runs, for telling two chairs apart.
+
+    The whole command rather than the agent id, because two custom chairs are
+    two different agents and both report the same one.
+    """
+    return tuple(str(part) for part in (provider.get("command") or ()))
+
+
 def _as_snapshot(value: Any) -> Optional[gitutil.Snapshot]:
     """The safety snapshot back off the board, or None if it is not one.
 
@@ -649,6 +659,16 @@ class Project:
     # turn to find out.
     needs_verification: bool = False
     last_build_log: str = ""
+    # The other verdict, and the one a card-by-card build cannot reach on its
+    # own: whether the *application* does what the goal asked for. A green
+    # build says every command exited zero, which a project can manage while
+    # never starting, never serving a page and never satisfying a single one of
+    # the architect's acceptance criteria. Same shape as the build health and
+    # the same invariant behind it - only an acceptance turn may set PASSING,
+    # and writing code clears it.
+    release_health: str = HEALTH_UNKNOWN
+    needs_release: bool = False
+    last_release_log: str = ""
     ideas: List[Dict[str, Any]] = field(default_factory=list)
     tooling: Dict[str, Any] = field(default_factory=dict)
     audited: bool = False
@@ -715,6 +735,7 @@ class Project:
                     [t.get("id"), t.get("column"), t.get("kind")] for t in self.tasks
                 ],
                 "health": self.build_health,
+                "release": self.release_health,
                 "ideas": len(self.ideas),
                 "audited": self.audited,
             },
@@ -738,6 +759,9 @@ class Project:
             "build_health": self.build_health,
             "needs_verification": self.needs_verification,
             "last_build_log": prompts.clip(self.last_build_log, MAX_BUILD_LOG),
+            "release_health": self.release_health,
+            "needs_release": self.needs_release,
+            "last_release_log": prompts.clip(self.last_release_log, MAX_BUILD_LOG),
             "active_agent": self.active_role,
             "last_run_timestamp": self.last_run_timestamp,
             "continuation_needed": self.continuation_needed,
@@ -823,7 +847,7 @@ class Project:
 
         status = str(data.get("status") or PLANNING).upper()
         if status not in {
-            AUDITING, PLANNING, IMPLEMENTING, TESTING, REVIEWING,
+            AUDITING, PLANNING, IMPLEMENTING, TESTING, REVIEWING, ACCEPTING,
             INNOVATING, COMPLETED, FAILED,
         }:
             status = PLANNING
@@ -842,6 +866,9 @@ class Project:
             build_health=_as_health(data.get("build_health")),
             needs_verification=bool(data.get("needs_verification")),
             last_build_log=str(data.get("last_build_log") or ""),
+            release_health=_as_health(data.get("release_health")),
+            needs_release=bool(data.get("needs_release")),
+            last_release_log=str(data.get("last_release_log") or ""),
             ideas=ideas,
             tooling=tooling if isinstance(tooling, dict) else {},
             audited=bool(data.get("audited")),
@@ -1323,7 +1350,8 @@ class ProjectEngine:
         4. The build is unverified - somebody wrote code and nobody ran it.
         5. Cards are waiting on review - close the loop before opening another.
         6. Cards are waiting to be built - do the work.
-        7. Everything is done and green - propose what is missing.
+        7. The board is clear but nobody has used what was built - accept it.
+        8. Everything is done, green and accepted - propose what is missing.
         """
         settings = project.config.get("project") or {}
         goal = project.goal
@@ -1416,7 +1444,23 @@ class ProjectEngine:
                 build=lambda ctx: prompts.build_implement_prompt(goal, ctx, card),
             )
 
-        # 7. Everything green, nothing left - what did we miss?
+        # 7. The board is clear and the build is green. Nobody has run the
+        #    thing. A build assembled one card at a time can pass every test
+        #    it wrote for itself and still not start, not serve a page, and
+        #    not do what the goal asked for - which is the only question the
+        #    operator was ever asking. This turn is where that is answered,
+        #    and it is the last gate before a project may call itself done.
+        if project.needs_release:
+            return Decision(
+                role="qa",
+                kind="release",
+                heading="Use what was built",
+                trigger="board clear, unaccepted",
+                status=ACCEPTING,
+                build=lambda ctx: prompts.build_release_prompt(goal, ctx),
+            )
+
+        # 8. Everything green and accepted, nothing left - what did we miss?
         if project.innovation_rounds > 0:
             rounds = project.innovation_rounds
             return Decision(
@@ -1456,6 +1500,7 @@ class ProjectEngine:
             "implement": self._apply_implement,
             "fix": self._apply_fix,
             "verify": self._apply_verify,
+            "release": self._apply_release,
             "review": self._apply_review,
             "innovate": self._apply_innovate,
         }[decision.kind]
@@ -1599,6 +1644,78 @@ class ProjectEngine:
             f"## {_stamp()} - Verification by {ROLE_LABELS[step.role]}: {health}\n\n"
             f"{prompts.clip(log, MAX_BUILD_LOG) or '(no detail reported)'}\n"
         )
+
+    def _apply_release(
+        self, project: Project, decision: Decision, step: StepRecord, report: Dict[str, Any]
+    ) -> None:
+        """Fold the acceptance verdict - did the application actually work?
+
+        Fail-closed exactly as verification is, and for a sharper reason: this
+        is the last thing that happens before COMPLETED, so an acceptance turn
+        that said nothing usable must not be the one that lets a project call
+        itself finished.
+
+        Whatever it found that the tests did not comes back as bug cards, which
+        jump the developer's queue like any other. Those reopen the loop -
+        implement, verify, review - and writing code clears acceptance again,
+        so the gate is passed only against the tree as it finally stands.
+        """
+        acceptance = report.get("acceptance")
+        health = HEALTH_UNKNOWN
+        log = ""
+        if isinstance(acceptance, dict):
+            health = _as_health(acceptance.get("health") or acceptance.get("status"))
+            log = str(acceptance.get("log") or acceptance.get("notes") or "").strip()
+        elif acceptance is not None:
+            health = _as_health(acceptance)
+
+        if health == HEALTH_UNKNOWN and not step.ok:
+            project.tasks = merge_tasks(project.tasks, report.get("tasks"), "coder")
+            self._log(
+                "warn",
+                f"The acceptance turn did not run ({step.error or 'no detail'}). "
+                f"Nobody has used this build, so it stays unaccepted rather "
+                f"than being written down as broken.",
+            )
+            return
+
+        if health == HEALTH_UNKNOWN:
+            health = HEALTH_FAILING
+            log = log or (
+                f"QA ({ROLE_LABELS[step.role]}) finished the acceptance turn "
+                f"without saying whether the application works, so it is "
+                f"treated as not working. Run it and report "
+                f"`acceptance.health` explicitly."
+            )
+
+        project.release_health = health
+        project.needs_release = False
+        project.last_release_log = prompts.clip(log, MAX_BUILD_LOG)
+
+        before = len(project.tasks)
+        project.tasks = merge_tasks(project.tasks, report.get("tasks"), "coder")
+        raised = len(project.tasks) - before
+
+        if health == HEALTH_PASSING:
+            self._log("info", "The application does what the goal asked for.")
+        else:
+            self._log(
+                "warn",
+                "The application does not yet do what the goal asked for"
+                + (f", and {raised} card(s) say why." if raised > 0 else ".")
+                + f" {prompts.clip(log, 300)}",
+            )
+
+        Workspace(project.workspace).append_critique(
+            f"## {_stamp()} - Acceptance by {ROLE_LABELS[step.role]}: {health}\n\n"
+            f"{prompts.clip(log, MAX_BUILD_LOG) or '(no detail reported)'}\n"
+        )
+
+        # The same grant every non-audit turn carries. If QA wrote an
+        # end-to-end test to exercise the thing with, the tree it just accepted
+        # is not the tree on disk any more.
+        if step.files_modified:
+            self._mark_dirty(project, f"the {ROLE_LABELS[step.role]} agent wrote code")
 
     def _apply_review(
         self, project: Project, decision: Decision, step: StepRecord, report: Dict[str, Any]
@@ -1746,11 +1863,16 @@ class ProjectEngine:
         This is the invariant that makes PASSING mean something. Only a QA turn
         can set it, and any write clears it - so the board can never claim a
         green build for a tree nobody has tested in its current state.
+
+        Acceptance goes with it, and for the same reason: an application that
+        was used and worked two cards ago has not been used since.
         """
         if project.build_health == HEALTH_PASSING:
             self._log("info", f"Build health back to UNKNOWN: {why}.")
         project.build_health = HEALTH_UNKNOWN
         project.needs_verification = True
+        project.release_health = HEALTH_UNKNOWN
+        project.needs_release = True
 
     def _note_progress(self, project: Project) -> None:
         """Count consecutive turns that changed nothing on the board.
@@ -1785,6 +1907,12 @@ class ProjectEngine:
         caveats = []
         if project.build_health != HEALTH_PASSING:
             caveats.append(f"the build is {project.build_health}")
+        if project.release_health != HEALTH_PASSING:
+            caveats.append(
+                "nobody got the application itself to work"
+                if project.release_health == HEALTH_FAILING
+                else "nobody ran the application itself"
+            )
         stuck = [t for t in project.open_tasks()]
         if stuck:
             caveats.append(f"{len(stuck)} card(s) never reached Done")
@@ -1830,12 +1958,20 @@ class ProjectEngine:
                 forced, self._handoff_role = self._handoff_role, ""
 
         attempted: List[str] = []
+        # And the binaries behind them. A hand-off exists to reach a CLI with
+        # room left in it, so a spare chair pointed at the CLI that just ran
+        # out is not a spare chair - it is the same agent under another name,
+        # handed the same oversized prompt to fail on again. Nothing stops an
+        # operator putting one agent in two seats; this stops that costing a
+        # turn to discover.
+        attempted_clis: set = set()
         runner_role = forced or decision.role
         handoff_from = decision.role if forced and forced != decision.role else ""
 
         while True:
             attempted.append(runner_role)
             provider = self._provider(project, runner_role)
+            attempted_clis.add(_cli_identity(provider))
             step = StepRecord(
                 index=project.steps_used + 1,
                 role=runner_role,
@@ -1890,7 +2026,11 @@ class ProjectEngine:
             )
 
             # Did this agent run out of room rather than run out of ideas?
-            spare = [r for r in ROLES if r not in attempted]
+            spare = [
+                r for r in ROLES
+                if r not in attempted
+                and _cli_identity(self._provider(project, r)) not in attempted_clis
+            ]
             if result.ok or not self._looks_exhausted(result) or not spare:
                 project.continuation_needed = False
                 self._write_board(project)

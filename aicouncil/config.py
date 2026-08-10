@@ -449,6 +449,43 @@ DEFAULT_ARCHITECT = _project_role("architect", "claude", 1800)
 DEFAULT_CODER = _project_role("coder", "codex", 2700)
 DEFAULT_QA = _project_role("qa", "agy", 1800)
 
+# What each chair is for, and which CLI the app would put in it. Kept beside
+# the defaults rather than in the front end because the same three facts are
+# wanted in two places - the chair cards in the matrix and the README - and a
+# seat whose description lives only in the UI drifts from the one the engine
+# dispatches on.
+#
+# `recommended_agent` draws a hint, never a rule: reassigning a chair is one
+# click and stays one click. The reasoning is the capability profile in
+# `router.py` rather than the vendor - judgement and review score highest for
+# Claude, implementation for Codex, and analysis, which is what an independent
+# check of somebody else's build actually is, for Antigravity. Deliberately no
+# `label`: the probe result these are merged into already carries the
+# provider's own, and the seat names live with the rest of the chrome.
+PROJECT_SEATS = {
+    "architect": {
+        "recommended_agent": "claude",
+        "summary": (
+            "Turns the goal into cards with acceptance criteria, then judges "
+            "every diff against them rather than against itself."
+        ),
+    },
+    "coder": {
+        "recommended_agent": "codex",
+        "summary": (
+            "Builds one card per turn, tests included, and clears failing "
+            "builds. The seat that spends the most turns and the most quota."
+        ),
+    },
+    "qa": {
+        "recommended_agent": "agy",
+        "summary": (
+            "Audits the folder, runs the real build and tests, and decides "
+            "at the end whether the thing that was built actually runs."
+        ),
+    },
+}
+
 
 def _council_seat(agent: str) -> Dict[str, Any]:
     """One CLI's standing council configuration.

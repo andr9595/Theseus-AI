@@ -702,7 +702,13 @@ class Handler(BaseHTTPRequestHandler):
         # this, so a missing CLI is visible before the start button is pressed
         # rather than in the error that refuses it.
         providers = self.app.store.get("providers", {})
-        state["roles"] = probe_all(providers, projects.ROLES)
+        # Carrying what each seat is for and which CLI belongs in it, so the
+        # matrix can say why a chair exists rather than only which binary is
+        # currently sitting in it.
+        state["roles"] = [
+            {**role, **cfg.PROJECT_SEATS.get(role["id"], {})}
+            for role in probe_all(providers, projects.ROLES)
+        ]
         state["settings"] = self.app.store.get("project", {})
         return state
 
