@@ -151,6 +151,27 @@ class TestStaticFiles(ServerTestBase):
             body = res.read().decode()
         self.assertIn("Theseus AI", body)
 
+    def test_the_mark_collapses_the_sidebar_to_a_rail(self):
+        # The mark has to be a real button, not a decorative div, or the only
+        # way back to the history is the mouse.
+        with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
+            body = res.read().decode()
+        self.assertIn('<button id="sidebar-toggle" class="brand-mark"', body)
+        self.assertIn('aria-controls="chat-list"', body)
+        self.assertIn('<span class="sidebar-label">New chat</span>', body)
+
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn("function setSidebarCollapsed(collapsed)", script)
+        self.assertIn("$('#sidebar-toggle').addEventListener('click'", script)
+
+        # One surface: the colour lives on the shell, so neither column paints
+        # its own and there is no seam between them.
+        with urllib.request.urlopen(f"{self.base}/app.css", timeout=15) as res:
+            css = res.read().decode()
+        self.assertIn(".app.sidebar-collapsed", css)
+        self.assertNotIn("background: var(--bg-1);\n  border-right:", css)
+
     def test_caveman_settings_live_with_the_modes_that_use_them(self):
         # All three modes toggle it from their composer gear, so Settings
         # carries no checkbox for any of them - including Project, which used

@@ -4732,7 +4732,24 @@ async function startRun() {
   }
 }
 
+// The sidebar collapses to a rail of icons. Held in the page rather than in
+// the config: it is how the window is being looked at right now, not a setting
+// the session should carry to the next one.
+function setSidebarCollapsed(collapsed) {
+  const toggle = $('#sidebar-toggle');
+  const label = collapsed ? 'Expand chat history' : 'Collapse chat history';
+  $('#app').classList.toggle('sidebar-collapsed', collapsed);
+  toggle.setAttribute('aria-expanded', String(!collapsed));
+  toggle.setAttribute('aria-label', label);
+  toggle.title = label;
+}
+
 function wire() {
+  // -- sidebar ----------------------------------------------------------
+  $('#sidebar-toggle').addEventListener('click', () => {
+    setSidebarCollapsed(!$('#app').classList.contains('sidebar-collapsed'));
+  });
+
   // -- mode -------------------------------------------------------------
   $('#mode-switch').addEventListener('click', async (e) => {
     const btn = e.target.closest('[data-mode]');

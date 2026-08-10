@@ -67,11 +67,17 @@ html, body {
    Shell
    ========================================================================== */
 
+/* The background lives on the shell rather than on either column, so the
+   sidebar and the thread read as one surface with no seam down the middle. */
 .app {
   display: grid;
   grid-template-columns: 296px minmax(0, 1fr);
   height: 100vh;
   overflow: hidden;
+  background:
+    radial-gradient(1100px 460px at 78% -12%, rgba(124, 92, 255, .085), transparent 62%),
+    var(--bg);
+  transition: grid-template-columns .18s ease;
 }
 
 /* Everything below the New chat button is history, so the sidebar is a fixed
@@ -81,8 +87,6 @@ html, body {
   flex-direction: column;
   gap: 12px;
   padding: 16px 12px 10px;
-  background: var(--bg-1);
-  border-right: 1px solid var(--line);
   overflow: hidden;
 }
 
@@ -93,11 +97,15 @@ html, body {
   display: grid;
   place-items: center;
   width: 32px; height: 32px; flex: 0 0 auto;
+  padding: 0;
+  border: 0;
   border-radius: 9px;
   color: #fff;
   background: linear-gradient(140deg, var(--accent), #4d7dff);
   box-shadow: 0 5px 16px rgba(124, 92, 255, .38);
+  cursor: pointer;
 }
+.brand-mark:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
 
 .new-chat {
   display: flex; align-items: center; gap: 9px;
@@ -222,6 +230,27 @@ html, body {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
+/* ---- Minimised sidebar ----
+   The mark is the toggle. Collapsed, the column keeps only what is still
+   clickable - the mark, New chat, Settings, the profile - and drops the
+   history and every label beside an icon. */
+
+.app.sidebar-collapsed { grid-template-columns: 64px minmax(0, 1fr); }
+
+.sidebar-collapsed .brand h1,
+.sidebar-collapsed .sidebar-label,
+.sidebar-collapsed .profile-name,
+.sidebar-collapsed .chat-list { display: none; }
+
+.app.sidebar-collapsed .sidebar { padding: 16px 10px 10px; }
+.app.sidebar-collapsed .brand { justify-content: center; padding: 2px 0; }
+.app.sidebar-collapsed .new-chat,
+.app.sidebar-collapsed .foot-btn { justify-content: center; padding: 10px; }
+.app.sidebar-collapsed .profile { justify-content: center; padding: 8px; }
+/* The history was what pushed the footer down, so with it gone the footer has
+   to hold the bottom itself. */
+.app.sidebar-collapsed .sidebar-foot { margin-top: auto; }
+
 /* ---- Main column ---- */
 
 .main {
@@ -229,9 +258,6 @@ html, body {
   flex-direction: column;
   min-width: 0;
   min-height: 0;
-  background:
-    radial-gradient(1100px 460px at 78% -12%, rgba(124, 92, 255, .085), transparent 62%),
-    var(--bg);
 }
 
 /* One measure for everything in the main column, so the composer, the thread
@@ -2154,7 +2180,22 @@ pre.project-file {
   .app { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
   .sidebar {
     max-height: 38vh;
-    border-right: 0; border-bottom: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+  }
+  /* Stacked, there is no column to narrow: collapsing lays the same controls
+     out as a single bar across the top instead. */
+  .app.sidebar-collapsed { grid-template-columns: 1fr; }
+  .app.sidebar-collapsed .sidebar {
+    flex-direction: row; align-items: center;
+    max-height: none; padding: 8px 14px;
+  }
+  .app.sidebar-collapsed .brand { padding: 0; }
+  .app.sidebar-collapsed .new-chat,
+  .app.sidebar-collapsed .foot-btn { width: 40px; height: 40px; padding: 0; }
+  .app.sidebar-collapsed .sidebar-foot {
+    flex-direction: row; align-items: center;
+    margin: 0 0 0 auto; padding-top: 0;
+    border-top: 0;
   }
   .column { padding: 0 14px; }
   .mode-bar { padding: 10px 14px 6px; }
