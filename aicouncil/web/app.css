@@ -232,6 +232,19 @@ html, body {
 }
 .foot-btn:hover { background: var(--bg-2); color: var(--text); }
 
+/* Quota sits with Settings. The dot is the only part of the reading that
+   survives the collapsed rail, so it appears only once a limit is close enough
+   to be worth interrupting for - the numbers themselves are a hover away. */
+.usage-btn { position: relative; }
+.usage-alert {
+  display: none; position: absolute;
+  right: 9px; top: 50%; transform: translateY(-50%);
+  width: 5px; height: 5px;
+  border-radius: 50%;
+  background: var(--yellow);
+}
+.usage-btn.warn .usage-alert { display: block; }
+
 .profile { display: flex; align-items: center; gap: 10px; padding: 8px 10px; min-width: 0; }
 .profile-mark {
   display: grid; place-items: center;
@@ -263,6 +276,8 @@ html, body {
 .app.sidebar-collapsed .new-chat,
 .app.sidebar-collapsed .foot-btn { justify-content: center; padding: 10px; }
 .app.sidebar-collapsed .profile { justify-content: center; padding: 8px; }
+/* No label to sit beside, so the dot moves onto the icon's shoulder. */
+.app.sidebar-collapsed .usage-alert { right: 13px; top: 8px; transform: none; }
 /* The history was what pushed the footer down, so with it gone the footer has
    to hold the bottom itself. */
 .app.sidebar-collapsed .sidebar-foot { margin-top: auto; }
@@ -1068,6 +1083,47 @@ html, body {
 .usage-chip.ok   { color: var(--text-2); }
 .usage-chip.warn { color: var(--yellow); border-color: rgba(234, 179, 8, .32); }
 .usage-chip.crit { color: var(--red);    border-color: rgba(244, 99, 99, .38); }
+
+/* ---- Quota panel from the sidebar ----
+   The menu's own chrome, so it opens like every other panel in the app. What
+   is added is only the shape of a reading: one block per CLI, one row per
+   window the vendor named. */
+
+.usage-menu { width: 268px; }
+
+.usage-agent {
+  display: block;
+  padding: 9px 9px 10px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.usage-agent:last-of-type { border-bottom: 0; }
+.usage-agent-head {
+  margin-bottom: 7px;
+  font-size: 11.5px; font-weight: 650; color: var(--text);
+}
+
+/* Coloured per row rather than per agent: a weekly at 95% has to read as the
+   problem even while the session beside it sits at 10%. The bar takes its fill
+   from the row's own colour. */
+.usage-limit { display: grid; gap: 4px; margin-top: 8px; color: var(--text-2); }
+.usage-limit:first-of-type { margin-top: 0; }
+.usage-limit.warn { color: var(--yellow); }
+.usage-limit.crit { color: var(--red); }
+.usage-limit .usage-bar { width: auto; }
+
+.usage-limit-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  font-size: 11px;
+}
+.usage-limit-head strong {
+  font-family: var(--mono); font-size: 10.5px; font-weight: 500;
+}
+
+.usage-reset,
+.usage-note {
+  font-size: 9.5px; line-height: 1.45; color: var(--text-3);
+}
+.usage-note { margin: 0; }
 
 /* ---- Messages in the thread ---- */
 /* The message is a bubble and the answer is not: one is a line of input, the

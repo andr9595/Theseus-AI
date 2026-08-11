@@ -236,6 +236,24 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError(f"Malformed JSON body: {exc}") from exc
         return data if isinstance(data, dict) else {}
 
+    def _workspace_from(self, body: Dict[str, Any]) -> str:
+        """The folder a request names, with an empty one taken at its word.
+
+        Blank is an answer - the scratch workspace - and not the same as not
+        asking, so the saved folder only fills in when the key is absent
+        altogether. Read with ``or`` instead, an explicit "no folder" would be
+        replaced by whatever the picker was last pointed at, and a run the
+        operator confirmed for scratch would write into that repository.
+        """
+        if "workspace" not in body:
+            return str(self.app.store.get("workspace") or "")
+        value = body["workspace"]
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            raise ValueError("`workspace` must be a folder path.")
+        return value
+
     # -- dispatch ----------------------------------------------------------
 
     def do_GET(self) -> None:  # noqa: N802 - name fixed by the base class
@@ -605,7 +623,7 @@ class Handler(BaseHTTPRequestHandler):
         task = body.get("task") or ""
         # No folder is a legitimate answer, in either mode: the pipeline runs
         # in the scratch workspace instead of refusing to start.
-        workspace = body.get("workspace") or self.app.store.get("workspace") or ""
+        workspace = self._workspace_from(body)
         continue_from = body.get("continue_from") or ""
         compact_context = body.get("compact_context", False)
         if not isinstance(continue_from, str):
@@ -669,7 +687,7 @@ class Handler(BaseHTTPRequestHandler):
     def _api_commit(self, params: Dict[str, list]) -> Dict[str, Any]:
         """Commit the working tree of the selected folder."""
         body = self._read_body()
-        workspace = str(body.get("workspace") or self.app.store.get("workspace") or "")
+        workspace = self._workspace_from(body)
         if not workspace:
             raise ValueError(
                 "No working folder is selected, so there is nothing to commit."
@@ -719,7 +737,7 @@ class Handler(BaseHTTPRequestHandler):
         # different for a throwaway prototype and somebody's production repo.
         project = self.app.projects.start(
             str(body.get("goal") or body.get("brief") or ""),
-            str(body.get("workspace") or self.app.store.get("workspace") or ""),
+            self._workspace_from(body),
             resume=bool(body.get("resume")),
             innovation=_opt_int(body.get("innovation")),
         )

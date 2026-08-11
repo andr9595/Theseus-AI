@@ -55,6 +55,20 @@
     <div id="chat-list" class="chat-list"></div>
 
     <nav class="sidebar-foot">
+      <!-- Quota belongs with Settings rather than on the composer: it is the
+           same subscription whichever mode is on screen. Hovering names the
+           figures, clicking opens them window by window - a dot on the icon is
+           the only part that survives the collapsed rail, and it appears only
+           once a limit is close enough to be worth interrupting for. -->
+      <button id="usage-btn" class="foot-btn usage-btn" type="button"
+              aria-haspopup="dialog" aria-expanded="false"
+              aria-label="Agent usage" title="Agent usage">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true">
+          <path d="M4 19v-6M10 19V9M16 19V5M3 19h18"/>
+        </svg>
+        <span class="sidebar-label">Usage</span>
+        <span class="usage-alert" aria-hidden="true"></span>
+      </button>
       <button id="settings-btn" class="foot-btn" type="button" aria-label="Settings" title="Settings">
         <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
           <circle cx="12" cy="12" r="3"/>

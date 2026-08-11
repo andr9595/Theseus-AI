@@ -950,13 +950,20 @@ class ProjectEngine:
         *that* folder. A run still in flight is the exception and always wins -
         hiding three agents mid-build because the folder picker moved is worse
         than showing a project the status bar does not currently name.
+
+        No folder is one of the folders. Blank means the scratch workspace here
+        exactly as it does in ``_resolve_root``, so a project built with nothing
+        chosen is found again rather than reported as no project at all - and a
+        project belonging to some other folder stops being shown the moment the
+        picker is cleared.
         """
-        folder = (workspace or "").strip()
+        folder = (workspace or self.store.get("workspace") or "").strip()
+        folder = folder or str(cfg.workspace_dir())
         with self._lock:
             project = self._project
             running = self.is_running()
 
-        if project is not None and not running and folder and folder != project.workspace:
+        if project is not None and not running and folder != project.workspace:
             project = None
 
         if project is not None:
@@ -966,22 +973,20 @@ class ProjectEngine:
                 "project": self._payload(project),
             }
 
-        folder = folder or (self.store.get("workspace") or "").strip()
-        if folder:
-            ws = Workspace(folder)
-            data = ws.read_board()
-            if data.get("project_id") and not data.get("dismissed"):
-                found = Project.from_board(folder, data)
-                found.config = self.store.all()
-                return {
-                    "running": False,
-                    "resumable": _resumable(found),
-                    "found_on_disk": True,
-                    "project": found.to_dict(
-                        critique=ws.critique(MAX_UI_TEXT),
-                        board_json=json.dumps(data, indent=2),
-                    ),
-                }
+        ws = Workspace(folder)
+        data = ws.read_board()
+        if data.get("project_id") and not data.get("dismissed"):
+            found = Project.from_board(folder, data)
+            found.config = self.store.all()
+            return {
+                "running": False,
+                "resumable": _resumable(found),
+                "found_on_disk": True,
+                "project": found.to_dict(
+                    critique=ws.critique(MAX_UI_TEXT),
+                    board_json=json.dumps(data, indent=2),
+                ),
+            }
         return {"running": False, "resumable": False, "project": None}
 
     # -- control -----------------------------------------------------------
@@ -1095,7 +1100,12 @@ class ProjectEngine:
             self._resume.set()
             self._handoff_role = ""
 
-        self.store.remember_workspace(root)
+        # Only a folder the operator actually named. Remembering the scratch
+        # workspace would answer "no folder" by selecting one - an internal
+        # path, in the picker and in the recents list - the moment a project
+        # started there. The council pipeline draws the same line.
+        if chosen:
+            self.store.remember_workspace(root)
         self.bus.publish("project_started", project=self._payload(project))
 
         ignored = ensure_gitignored(root)

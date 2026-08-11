@@ -21,6 +21,7 @@ Three kinds here, deliberately separated:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -1464,12 +1465,21 @@ class TestSnapshotState(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="theseus-snap-"))
+        # "No folder" resolves to `cfg.workspace_dir()`, which is read live -
+        # so it has to land somewhere disposable rather than in the operator's
+        # own scratch workspace.
+        self._previous_xdg = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = str(self.tmp / "xdg")
         self.store = ConfigStore(self.tmp / "config.json")
         self.root = self.tmp / "build"
         self.root.mkdir()
         self.engine = ProjectEngine(self.store, EventBus())
 
     def tearDown(self):
+        if self._previous_xdg is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = self._previous_xdg
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_an_empty_folder_offers_nothing(self):
@@ -1537,6 +1547,69 @@ class TestSnapshotState(unittest.TestCase):
 
         state = self.engine.snapshot_state(str(other))
         self.assertIsNone(state["project"])
+
+    def test_no_folder_finds_the_project_that_was_built_with_no_folder(self):
+        # Blank is the scratch workspace, not "nowhere to look". Read as no
+        # query at all, a build started without a folder could not be found
+        # again after a restart - and starting another one refused, because the
+        # board it could not see was still in progress.
+        from aicouncil import config as cfg
+
+        scratch = Path(cfg.workspace_dir())
+        ws = Workspace(scratch)
+        ws.ensure()
+        ws.write_board({"project_id": "abc", "goal": "g", "status": "IMPLEMENTING"})
+
+        state = self.engine.snapshot_state("")
+        self.assertTrue(state["found_on_disk"])
+        self.assertTrue(state["resumable"])
+        self.assertEqual(state["project"]["workspace"], str(scratch))
+
+    def test_a_finished_project_does_not_follow_you_to_no_folder(self):
+        # Clearing the folder is choosing one. The last build stays on screen
+        # otherwise, and the tab reports a project the status bar does not name.
+        finished = Project(id="abc", goal="g", workspace=str(self.root))
+        finished.status = COMPLETED
+        self.engine._project = finished
+
+        self.assertIsNone(self.engine.snapshot_state("")["project"])
+
+
+class TestNoFolderProject(unittest.TestCase):
+    """Building with nothing chosen. The scratch workspace is a place to work,
+    not a folder the operator picked."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="theseus-noscratch-"))
+        self._previous_xdg = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = str(self.tmp / "xdg")
+        self.store = ConfigStore(self.tmp / "config.json")
+        self.store.update({"providers": {r: mock_provider(r) for r in ROLES}})
+        self.engine = ProjectEngine(self.store, EventBus())
+
+    def tearDown(self):
+        self.engine.stop()
+        self.engine.wait_for_worker(30)
+        if self._previous_xdg is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = self._previous_xdg
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_it_builds_in_the_scratch_workspace(self):
+        from aicouncil import config as cfg
+
+        project = self.engine.start("build it", "")
+        self.assertEqual(project.workspace, str(cfg.workspace_dir()))
+
+    def test_the_scratch_workspace_is_not_remembered_as_a_choice(self):
+        # The line the council pipeline has drawn since scratch runs existed:
+        # answering "no folder" by selecting one - an internal path, in the
+        # picker and in the recents list - undoes the operator's choice behind
+        # their back, and the next run silently writes there.
+        self.engine.start("build it", "")
+        self.assertEqual(self.store.get("workspace"), "")
+        self.assertEqual(self.store.get("recent_workspaces"), [])
 
 
 if __name__ == "__main__":

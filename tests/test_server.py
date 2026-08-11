@@ -179,6 +179,35 @@ class TestStaticFiles(ServerTestBase):
         self.assertNotIn("background: var(--bg-1);\n  border-right:", css)
         self.assertIn(".app.sidebar-collapsed .brand-mark:hover .mark-expand", css)
 
+    def test_the_sidebar_reports_quota_window_by_window(self):
+        # Claude rations a 5-hour session *and* a week; Codex reports whatever
+        # its last run logged. Reducing those to one percentage per agent would
+        # show a number no vendor gave, so the panel lists every limit it has.
+        with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
+            body = res.read().decode()
+        self.assertIn('id="usage-btn"', body)
+        self.assertIn('<span class="sidebar-label">Usage</span>', body)
+
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn("function usageForAgent(agentId)", script)
+        self.assertIn("reading.limits.map(usageLimitHtml)", script)
+        self.assertIn("$('#usage-btn').addEventListener('click'", script)
+        self.assertIn("api('/api/usage/refresh'", script)
+        # An agent with no quota source says so rather than showing a figure
+        # this app inferred for it.
+        self.assertIn("No quota source known for this CLI.", script)
+        # The bars are filled from `data-fill` because the CSP serves no
+        # `unsafe-inline`, so a style attribute in the markup would be dropped
+        # and every bar would sit empty.
+        self.assertNotIn('style="width', script)
+        self.assertIn("function paintUsageBars(root)", script)
+
+        with urllib.request.urlopen(f"{self.base}/app.css", timeout=15) as res:
+            css = res.read().decode()
+        self.assertIn(".usage-menu", css)
+        self.assertIn(".usage-btn.warn .usage-alert", css)
+
     def test_caveman_settings_live_with_the_modes_that_use_them(self):
         # All three modes toggle it from their composer gear, so Settings
         # carries no checkbox for any of them - including Project, which used
@@ -954,6 +983,50 @@ class TestApi(ServerTestBase):
         self.assertEqual(status, 400)
         self.assertIn("no longer exists", data["error"])
 
+    def test_an_explicit_no_folder_is_not_replaced_by_the_saved_one(self):
+        # The browser confirms a Zero-Touch run by naming the folder it will
+        # write in, and sends that same choice as an empty string. Read with
+        # `or`, the empty string is dropped and the run lands in whatever the
+        # picker was last pointed at - a repository nobody confirmed.
+        seen = self._capture_start()
+        self.request("/api/config", method="POST",
+                     body={"workspace": str(Path(__file__).parent.parent)})
+        self.addCleanup(self.request, "/api/config", "POST", {"workspace": ""})
+        self.request("/api/start", method="POST",
+                     body={"task": "hello", "workspace": ""})
+        self.assertEqual(seen["workspace"], "")
+
+    def test_a_start_that_names_no_folder_at_all_uses_the_saved_one(self):
+        # Absent is not the same as empty: an API client that sends only a task
+        # still gets the folder the operator chose.
+        seen = self._capture_start()
+        repo = str(Path(__file__).parent.parent)
+        self.request("/api/config", method="POST", body={"workspace": repo})
+        self.addCleanup(self.request, "/api/config", "POST", {"workspace": ""})
+        self.request("/api/start", method="POST", body={"task": "hello"})
+        self.assertEqual(seen["workspace"], repo)
+
+    def test_start_rejects_a_workspace_that_is_not_a_path(self):
+        status, data = self.request(
+            "/api/start", method="POST",
+            body={"task": "hello", "workspace": ["/tmp", "/var"]},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("workspace", data["error"])
+
+    def _capture_start(self):
+        """Intercept the pipeline so the folder can be read without a run."""
+        seen = {}
+
+        def fake_start(task, workspace="", **kwargs):
+            seen["workspace"] = workspace
+            raise ValueError("stop here - the argument is what is under test")
+
+        real = self.state.pipeline.start
+        self.state.pipeline.start = fake_start
+        self.addCleanup(setattr, self.state.pipeline, "start", real)
+        return seen
+
     def test_approve_without_a_gate_is_a_400(self):
         status, _ = self.request("/api/approve", method="POST", body={})
         self.assertEqual(status, 400)
@@ -1113,6 +1186,29 @@ class TestProjectRoutes(ServerTestBase):
             body={"goal": "build it", "workspace": str(self.folder), "innovation": 0},
         )
         self.assertEqual(seen["innovation"], 0)
+
+    def test_an_explicit_no_folder_reaches_the_engine_as_no_folder(self):
+        # Three agents create, edit and delete files without asking, and the
+        # browser confirms the build by naming the folder. An empty string
+        # quietly swapped for the saved one points them at a repository the
+        # operator never confirmed.
+        seen = {}
+
+        def fake_start(goal, workspace="", resume=False, innovation=None):
+            seen["workspace"] = workspace
+            raise ValueError("stop here - the argument is what is under test")
+
+        real = self.state.projects.start
+        self.state.projects.start = fake_start
+        self.addCleanup(setattr, self.state.projects, "start", real)
+        self.request("/api/config", method="POST",
+                     body={"workspace": str(self.folder)})
+        self.addCleanup(self.request, "/api/config", "POST", {"workspace": ""})
+        self.request(
+            "/api/project/start", method="POST",
+            body={"goal": "build it", "workspace": ""},
+        )
+        self.assertEqual(seen["workspace"], "")
 
     def test_controls_refuse_when_nothing_is_running(self):
         for path in ("/api/project/pause", "/api/project/resume"):

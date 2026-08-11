@@ -1047,6 +1047,7 @@ function renderStrip() {
           `</div>`
         : '') +
     '</div>';
+  paintUsageBars(strip);
 }
 
 /** One seat on the strip. Coloured by which CLI is in it rather than by which
@@ -1440,6 +1441,185 @@ function worstUsageFor(providerIds) {
     }
   }
   return worst;
+}
+
+/** How full each quota bar is drawn. The width is data rather than style, and
+ *  the CSP forbids a `style` attribute, so every bar carries its number as
+ *  `data-fill` and has it applied here once the markup is in the document. */
+function paintUsageBars(root) {
+  (root || document).querySelectorAll('.usage-bar > [data-fill]').forEach(bar => {
+    const pct = Math.max(0, Math.min(100, Number(bar.dataset.fill) || 0));
+    bar.style.width = `${pct}%`;
+  });
+}
+
+/* --------------------------------------------------------------------------
+   The usage panel
+
+   The chip on a member reports one chair mid-run. This reports the
+   subscription: one section per installed CLI, one row per window the vendor
+   named. The windows are not the same shape - Claude rations a 5-hour session
+   *and* a week, Codex reports whatever its last run's log recorded - so they
+   are listed rather than reduced to a single figure, which would be a number
+   no vendor gave.
+   -------------------------------------------------------------------------- */
+
+/** Every agent the panel has a row for: the catalogued CLIs, minus the custom
+ *  entry, which is a blank template rather than a program with a quota. */
+function usageAgents() {
+  return (state.agents || []).filter(a => (a.command || []).length);
+}
+
+/** The reading for one agent, whichever chair happens to hold it. The council
+ *  seat is the canonical one - every chair pointed at the same binary gets the
+ *  same answer, which is why the poller probes each binary once - but a bench
+ *  that has never been configured still has a chat or project chair to read. */
+function usageForAgent(agentId) {
+  const usage = state.usage || {};
+  const seat = usage[`council_${agentId}`];
+  if (seat) return seat;
+  const providers = (state.config || {}).providers || {};
+  const other = Object.keys(providers)
+    .find(id => usage[id] && agentOf(providers[id]) === agentId);
+  return other ? usage[other] : null;
+}
+
+/** What to call one window. The vendor's own wording, because it is the only
+ *  thing separating two limits of the same length - Claude reports a week for
+ *  all models and can report a second for one of them. The length is used only
+ *  when there is no label to use. */
+function usageWindowLabel(limit) {
+  const label = String(limit.label || '').trim();
+  if (label) return label.charAt(0).toUpperCase() + label.slice(1);
+  const mins = Number(limit.window_minutes);
+  if (!mins) return 'Quota';
+  if (mins >= 10000) return 'Week';
+  if (mins >= 1400) return 'Day';
+  return mins >= 60 ? `${Math.round(mins / 60)}-hour` : `${Math.round(mins)}-minute`;
+}
+
+function usageLimitHtml(limit) {
+  const pct = Math.max(0, Math.min(100, Math.round(Number(limit.percent) || 0)));
+  // Per row rather than per agent: a weekly at 95% has to read as the problem
+  // even while the session beside it sits at 10%.
+  const level = pct >= 90 ? 'crit' : pct >= 75 ? 'warn' : 'ok';
+  const name = usageWindowLabel(limit);
+  return (
+    `<div class="usage-limit ${level}">` +
+      `<div class="usage-limit-head">` +
+        `<span>${esc(name)}</span><strong>${pct}%</strong>` +
+      `</div>` +
+      `<span class="usage-bar" role="progressbar" aria-valuemin="0" ` +
+        `aria-valuemax="100" aria-valuenow="${pct}" ` +
+        `aria-label="${esc(name)} used">` +
+        `<span data-fill="${pct}"></span>` +
+      `</span>` +
+      (limit.resets ? `<span class="usage-reset">resets ${esc(limit.resets)}</span>` : '') +
+    `</div>`
+  );
+}
+
+function usageAgentHtml(agent) {
+  const reading = usageForAgent(agent.id);
+  const head = `<div class="usage-agent-head">${esc(agent.label)}</div>`;
+  const said = text => `<p class="usage-note">${esc(text)}</p>`;
+
+  // Before the first poll there is no entry at all, which is not the same as
+  // an agent that cannot be asked - and neither is a number invented to fill
+  // the gap, which would look exactly like the ones that are real.
+  if (!reading) {
+    return `<section class="usage-agent">${head}` +
+      said('Not checked yet.') + `</section>`;
+  }
+  if (!reading.supported) {
+    return `<section class="usage-agent">${head}` +
+      said(reading.note || 'No quota source known for this CLI.') + `</section>`;
+  }
+  if (!(reading.limits || []).length) {
+    return `<section class="usage-agent">${head}` +
+      said(reading.error || 'Not checked yet.') + `</section>`;
+  }
+
+  // Codex's figure comes from its last run's log rather than a live query, so
+  // it is dated. Say how old once it is old enough to mislead.
+  const asOf = Math.max(...reading.limits.map(l => Number(l.as_of) || 0));
+  const ageMin = asOf ? (Date.now() / 1000 - asOf) / 60 : 0;
+  return (
+    `<section class="usage-agent">` + head +
+      reading.limits.map(usageLimitHtml).join('') +
+      (ageMin > 30 ? said(`measured ${fmtAge(ageMin)} ago`) : '') +
+      (reading.error ? said(`last poll failed: ${reading.error}`) : '') +
+    `</section>`
+  );
+}
+
+function drawUsageMenu(menu) {
+  menu.innerHTML =
+    `<div class="model-menu-head">Agent usage</div>` +
+    usageAgents().map(usageAgentHtml).join('') +
+    `<div class="model-menu-foot">` +
+      `<span class="model-menu-source">Each vendor's own figure — nothing here is estimated.</span>` +
+      `<button class="btn btn-quiet btn-sm model-menu-refresh usage-refresh" type="button">` +
+        `Refresh</button>` +
+    `</div>`;
+  paintUsageBars(menu);
+}
+
+/** The footer button. Its tooltip carries the numbers so the panel is only
+ *  needed for the reset times and the bars — hovering is the cheap look. */
+function renderUsageButton() {
+  const button = $('#usage-btn');
+  if (!button) return;
+
+  const threshold = Number((state.config || {}).usage_warn_percent ?? 85);
+  let low = false;
+  const lines = usageAgents().map(agent => {
+    const reading = usageForAgent(agent.id);
+    if (!reading) return `${agent.label}: not checked yet`;
+    if (!reading.supported) return `${agent.label}: no quota source`;
+    if (!reading.worst) return `${agent.label}: ${reading.error || 'not checked yet'}`;
+    if (reading.worst.percent >= threshold) low = true;
+    return `${agent.label}: ` + reading.limits
+      .map(l => `${usageWindowLabel(l)} ${Math.round(l.percent)}%`).join(' · ');
+  });
+
+  button.classList.toggle('warn', low);
+  button.title = ['Agent usage'].concat(lines).join('\n');
+}
+
+function openUsageMenu(anchor) {
+  closeModelMenu();
+  const menu = document.createElement('div');
+  menu.className = 'model-menu usage-menu';
+  menu.setAttribute('role', 'dialog');
+  menu.setAttribute('aria-label', 'Agent usage');
+  document.body.appendChild(menu);
+  drawUsageMenu(menu);
+  // Anchored below like every other menu, which then flips it above: the
+  // button it hangs off is at the bottom of the column.
+  positionModelMenu(menu, anchor);
+  anchor.setAttribute('aria-expanded', 'true');
+
+  menu.addEventListener('click', (e) => {
+    const again = e.target.closest('.usage-refresh');
+    if (!again) return;
+    again.disabled = true;
+    again.textContent = 'Checking…';
+    api('/api/usage/refresh', { method: 'POST' })
+      .then(d => {
+        state.usage = d.usage || {};
+        renderStrip();
+        renderUsageButton();
+        // Only if it is still open: a poll can take the better part of a
+        // minute, and the operator may have clicked away.
+        if (menu.isConnected) { drawUsageMenu(menu); positionModelMenu(menu, anchor); }
+      })
+      .catch(err => toast(err.message, 'error'));
+  });
+
+  setTimeout(() => {
+    document.addEventListener('click', onDocClickCloseModel, { once: true });
+  }, 0);
 }
 
 
@@ -2681,6 +2861,7 @@ function renderAll() {
   renderStatus();
   renderMode();
   renderProfile();
+  renderUsageButton();
   renderStrip();
   renderCouncilSteps();
   renderComposerChips();
@@ -2749,6 +2930,11 @@ function clearStream() {
 function closeModelMenu() {
   const open = $('.model-menu');
   if (open) open.remove();
+  // The usage button is the one trigger that advertises whether its panel is
+  // open, so it has to be told when the panel goes - including when it goes
+  // because something else opened.
+  const usage = $('#usage-btn');
+  if (usage) usage.setAttribute('aria-expanded', 'false');
 }
 
 /** Keep what the CLI said an alias resolves to, so the chips and the council
@@ -3430,7 +3616,7 @@ async function setAgent(providerId, agentId) {
   const now = ((state.config || {}).providers || {})[providerId] || {};
   toast(`${provider.label || providerId} → ${now.label || agentId}`, 'ok', 2600);
   api('/api/usage/refresh', { method: 'POST' })
-    .then(d => { state.usage = d.usage || {}; renderStrip(); })
+    .then(d => { state.usage = d.usage || {}; renderStrip(); renderUsageButton(); })
     .catch(() => {});
 }
 
@@ -4610,6 +4796,11 @@ function connect() {
   on('usage', (d) => {
     state.usage = d.usage || {};
     renderStrip();
+    renderUsageButton();
+    // Redrawn in place rather than closed: a poll landing while the panel is
+    // open is the one moment its numbers are worth watching.
+    const panel = $('.usage-menu');
+    if (panel) drawUsageMenu(panel);
   });
 
   on('config', (d) => {
@@ -5021,7 +5212,7 @@ function wire() {
       e.stopPropagation();
       chip.classList.add('checking');
       api('/api/usage/refresh', { method: 'POST' })
-        .then(d => { state.usage = d.usage || {}; renderStrip(); })
+        .then(d => { state.usage = d.usage || {}; renderStrip(); renderUsageButton(); })
         .catch(err => toast(err.message, 'error'));
       return;
     }
@@ -5089,6 +5280,16 @@ function wire() {
   $('#recent-workspaces').addEventListener('click', (e) => {
     const btn = e.target.closest('.recent-item');
     if (btn) selectWorkspace(btn.dataset.workspace);
+  });
+
+  // -- usage --------------------------------------------------------------
+  // Click rather than hover: the panel carries a Refresh button and reset
+  // times worth reading, and a card that vanishes when the pointer leaves the
+  // button is neither reachable by keyboard nor usable on a touchscreen. The
+  // hover answer is the button's own tooltip, which already has the numbers.
+  $('#usage-btn').addEventListener('click', (e) => {
+    if ($('.model-menu')) { closeModelMenu(); return; }  // toggle
+    openUsageMenu(e.currentTarget);
   });
 
   // -- settings ---------------------------------------------------------
