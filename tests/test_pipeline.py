@@ -655,7 +655,100 @@ class TestWorkingFolderIsOptional(PipelineTestBase):
 
         self.assertEqual(run.state, "complete", run.error)
         self.assertEqual(run.workspace, str(cfg.workspace_dir()))
-        self.assertTrue((cfg.workspace_dir() / "AI_COUNCIL_DEMO.md").exists())
+        self.assertTrue(run.stages["chair"].output.strip())
+
+    def test_no_folder_chosen_means_nothing_is_written(self):
+        # The choice the operator actually made: ask the council a question,
+        # get an answer. Zero-Touch grants permission to write in the folder
+        # they picked, and they picked none - so there is nothing to grant.
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("add a demo artifact")
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertTrue(run.read_only)
+        self.assertFalse((cfg.workspace_dir() / "AI_COUNCIL_DEMO.md").exists())
+        self.assertIn("--read-only", run.stages["chair"].command)
+        self.assertNotIn(
+            "--dangerously-skip-permissions", run.stages["chair"].command
+        )
+        # No permission means no delivery state either: a diff, a snapshot or a
+        # rollback offer would all describe work that did not happen.
+        self.assertEqual(run.diff, "")
+        self.assertIsNone(run.snapshot)
+        self.assertFalse(run.snapshot_planned)
+        self.assertFalse(run.to_dict()["can_rollback"])
+
+    def test_a_no_folder_run_is_not_stopped_at_the_gate(self):
+        # The gate exists to stand between the deliberation and the only stage
+        # that writes. Nothing writes here, so asking would be asking the
+        # operator to approve nothing.
+        self.store.update({"zero_touch": False})
+        run = self.pipeline.start("add a demo artifact")
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertFalse(run.approved)
+        self.assertFalse((cfg.workspace_dir() / "AI_COUNCIL_DEMO.md").exists())
+
+    def test_a_conversation_writes_nothing_with_no_folder_and_zero_touch(self):
+        # Chat's only grant is Zero-Touch, and it is a grant over a folder.
+        # Without one there is nothing it can be a grant over.
+        self.store.update({"mode": "solo", "zero_touch": True})
+        run = self.pipeline.start("add a demo artifact")
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertTrue(run.read_only)
+        self.assertIn("--read-only", run.stages["solo"].command)
+        self.assertNotIn(
+            "--dangerously-skip-permissions", run.stages["solo"].command
+        )
+        self.assertFalse((cfg.workspace_dir() / "AI_COUNCIL_DEMO.md").exists())
+
+    def test_continuing_a_no_folder_run_after_a_restart_still_writes_nothing(self):
+        # The run is rebuilt from its transcript, and a rebuilt run that came
+        # back with write permission would apply, after a restart, work the
+        # operator never asked to have applied anywhere.
+        self.store.update({"zero_touch": True})
+        self.pin_chair("claude", mock_council("claude", ["--fail"]))
+        run = self.pipeline.start("add a demo artifact")
+        self.wait_terminal()
+        self.assertEqual(run.state, "failed")
+        self.store.update({
+            "providers": {cfg.council_provider_id("claude"): mock_council("claude")},
+        })
+
+        restarted = Pipeline(self.store, self.bus, runs_dir=self.runs_dir)
+        self.addCleanup(restarted.wait_for_worker)
+        revived = restarted.revive(run.transcript_name)
+        self.wait_for(
+            lambda: not restarted.is_busy(), what="the revived run to finish"
+        )
+        restarted.wait_for_worker()
+
+        self.assertEqual(revived.state, "complete", revived.error)
+        self.assertTrue(revived.read_only)
+        self.assertIn("--read-only", revived.stages["chair"].command)
+        self.assertFalse((cfg.workspace_dir() / "AI_COUNCIL_DEMO.md").exists())
+
+    def test_a_transcript_written_before_the_flag_is_still_read_only(self):
+        # Transcripts on disk predate the rule. The scratch workspace stands in
+        # for the missing flag: it is the folder nobody chose.
+        self.store.update({"zero_touch": True})
+        self.pin_chair("claude", mock_council("claude", ["--fail"]))
+        run = self.pipeline.start("add a demo artifact")
+        self.wait_terminal()
+        path = self.runs_dir / run.transcript_name
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.pop("read_only", None)
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        restarted = Pipeline(self.store, self.bus, runs_dir=self.runs_dir)
+        self.addCleanup(restarted.wait_for_worker)
+        revived = restarted.revive(run.transcript_name, start=False)
+
+        self.assertTrue(revived.read_only)
 
     def test_a_conversation_needs_no_folder(self):
         self.store.update({"mode": "solo"})
@@ -2504,6 +2597,56 @@ class TestSoloPrompt(unittest.TestCase):
         prompt = prompts.build_chat_prompt("and now?", TestConversationPrompt.TURNS)
         self.assertIn("add a login route", prompt)
         self.assertLess(prompt.index("add a login route"), prompt.index("and now?"))
+
+
+class TestReadOnlyChairmanPrompt(unittest.TestCase):
+    """A run with no folder asks the chairman for the answer, not for edits.
+
+    The shipped chairman text is a write-mode contract - apply the outcome,
+    then report what changed - and it arrives from the role catalogue rather
+    than from a default, so the swap has to be made on the text that is handed
+    in.
+    """
+
+    def chairman(self, **kwargs):
+        from aicouncil import prompts
+
+        return prompts.build_chairman_prompt(
+            "add a demo artifact", [{"alias": "Agent A", "output": "do it"}],
+            [], "/tmp", **kwargs,
+        )
+
+    def test_the_write_mode_contract_is_the_default(self):
+        from aicouncil import prompts
+
+        prompt = self.chairman(system=prompts.CHAIRMAN_SYSTEM)
+        self.assertIn("Apply the edits to the working tree", prompt)
+
+    def test_a_read_only_run_swaps_the_shipped_chairman(self):
+        from aicouncil import prompts
+
+        prompt = self.chairman(system=prompts.CHAIRMAN_SYSTEM, read_only=True)
+        self.assertNotIn("Apply the edits to the working tree", prompt)
+        self.assertIn("Nothing on this run writes to disk", prompt)
+        self.assertIn("a fenced block per file", prompt)
+
+    def test_an_edited_chairman_is_kept_and_overruled(self):
+        # The operator's wording is theirs. What it says about applying the
+        # outcome cannot stand, because there is nothing to apply it to.
+        prompt = self.chairman(
+            system="You are the CHAIRMAN. Apply the edits yourself.",
+            read_only=True,
+        )
+        self.assertIn("Apply the edits yourself.", prompt)
+        self.assertIn("# This run writes nothing", prompt)
+
+    def test_the_deliberation_still_reaches_the_chairman(self):
+        # The read-only chairman is the same stage with a different
+        # deliverable, and the mock council fixture identifies it by this
+        # heading - a swap that lost it would silently reseat the stage.
+        prompt = self.chairman(read_only=True)
+        self.assertIn("# Stage 1 - independent positions", prompt)
+        self.assertIn("CONSENSUS: <integer 0-100>", prompt)
 
 
 class TestCavemanPrompt(unittest.TestCase):

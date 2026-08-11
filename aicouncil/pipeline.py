@@ -486,6 +486,11 @@ class Run:
     # records where the work actually happened.
     workspace: str
     zero_touch: bool
+    # Whether this run may change files at all, decided once at start. A run
+    # with no folder chosen is an answer rather than a piece of work: there is
+    # nowhere the operator asked for it to be applied, so nothing is, and the
+    # code comes back in the reply instead.
+    read_only: bool = False
     mode: str = "council"  # "council" | "solo"
     # Pull-request delivery. The branch is named at start but only created
     # after write permission is granted, so a rejected run leaves no trace.
@@ -625,6 +630,10 @@ class Run:
             # only knew the folder as a repository.
             "repo": self.workspace,
             "zero_touch": self.zero_touch,
+            # On the transcript because a run is rebuilt from it: continuing a
+            # no-folder run after a restart must not hand the chairman write
+            # permission the first attempt never had.
+            "read_only": self.read_only,
             "mode": self.mode,
             # Kept alongside `mode` for transcripts written by, and read by,
             # a version that only knew the boolean.
@@ -826,7 +835,12 @@ class Pipeline:
         # folder at the same time would interleave their edits, and the diff
         # afterwards could not say which agent wrote which line.
         multi_agent = mode == "solo" and bool(conf.get("multi_agent"))
-        writes = (mode == "council" or zero_touch) and not multi_agent
+        # `chosen` is the last term for the reason the operator gave: asking
+        # the council a question with no folder picked is asking for an answer,
+        # not for work applied to the scratch directory. Nothing writes, the
+        # gate has nothing to gate, and the chairman is told to put whatever
+        # code it decided on into its reply.
+        writes = (mode == "council" or zero_touch) and not multi_agent and bool(chosen)
         # Delivery protects a run that writes. On a read-only conversation
         # there is nothing to branch, nothing to commit, and refusing to start
         # because the tree is dirty would be absurd.
@@ -898,6 +912,7 @@ class Pipeline:
                 task=task,
                 workspace=root,
                 zero_touch=zero_touch,
+                read_only=not writes,
                 mode=mode,
                 pull_request_mode=pull_request_mode,
                 # Whatever is checked out is what the pull request targets, so
@@ -1181,6 +1196,7 @@ class Pipeline:
             raise ValueError(
                 f"The folder that run worked in is gone: {workspace}"
             )
+        root = resolve_workspace(workspace)
 
         with self._lock:
             if self._run is not None and self._run.state not in TERMINAL_STATES:
@@ -1189,8 +1205,16 @@ class Pipeline:
             run = Run(
                 id=str(data.get("id") or ""),
                 task=str(data.get("task") or ""),
-                workspace=resolve_workspace(workspace),
+                workspace=root,
                 zero_touch=bool(data.get("zero_touch")),
+                # A transcript written before a no-folder run meant "answer
+                # only" carries no flag, so the scratch workspace stands in for
+                # one: it is the folder nobody chose, and a revived run that
+                # lands there is held to the rule as it stands now rather than
+                # the one it was recorded under.
+                read_only=bool(
+                    data.get("read_only") or root == str(cfg.workspace_dir())
+                ),
                 mode=mode,
                 snapshot_planned=bool(data.get("snapshot_planned")),
                 state=FAILED,
@@ -1668,13 +1692,16 @@ class Pipeline:
         There is no gate here - nothing stands between the message and the
         reply for a human to review - so whether it may write is settled before
         it starts. Zero-Touch grants it, exactly as it does for the council;
-        without it the provider is invoked with its read-only arguments and
-        there is nothing to recover from either.
+        without it, or with no folder to write in, the provider is invoked with
+        its read-only arguments and there is nothing to recover from either.
         """
         provider = (run.config.get("providers") or {}).get("solo", {})
         # Read off the run, not the store: the toggle can be flipped mid-run,
         # and what this conversation was granted was decided when it started.
-        writes = run.zero_touch
+        # `read_only` rather than `zero_touch` because Zero-Touch is only one
+        # of the two questions - a conversation with no folder chosen answers
+        # and writes nothing however the toggle is set.
+        writes = not run.read_only
 
         if writes:
             self._prepare_branch(run)
@@ -1852,7 +1879,7 @@ class Pipeline:
 
         # Zero-Touch grants it up front; `approved` is a grant a human already
         # made at the gate on an earlier attempt at this same run.
-        execute_approved = run.zero_touch or run.approved
+        execute_approved = (run.zero_touch or run.approved) and not run.read_only
         # Set when the deliberation produced too little to synthesise from,
         # which forces the gate back on even under Zero-Touch.
         degraded = False
@@ -1871,14 +1898,31 @@ class Pipeline:
         for note in seating.notes:
             self.bus.publish("log", level="warn", message=note)
 
+        # Why there will be no gate, no diff and no files afterwards, said at
+        # the top rather than left to be inferred from their absence.
+        if run.read_only:
+            self.bus.publish(
+                "log",
+                level="info",
+                message=(
+                    "No working folder, so this run answers rather than "
+                    "builds: every stage is read-only, there is nothing to "
+                    "approve, and the chairman writes any code into its reply."
+                ),
+            )
+
         # Read-only is a role here, enforced by what the CLI is invoked with.
         # A provider that declares no `read_only_args` - the Custom command
         # preset ships with none - is held to it by the prompt alone, which is
         # a weaker promise than the one the stage makes and is worth saying out
-        # loud rather than implying.
+        # loud rather than implying. The chairman is on the list only when the
+        # run itself writes nothing; otherwise writing is its job.
+        read_only_seats = [
+            *seating.members, *([seating.chair] if run.read_only else [])
+        ]
         unguarded = sorted({
             str(self._seat_provider(run, seat).get("label") or seat.agent)
-            for seat in seating.members
+            for seat in read_only_seats
             if not (self._seat_provider(run, seat).get("read_only_args") or [])
         })
         if unguarded:
@@ -1888,8 +1932,9 @@ class Pipeline:
                 message=(
                     f"{', '.join(unguarded)} has no read-only arguments "
                     f"configured, so nothing but the prompt stops it writing "
-                    f"during the deliberation. Set them under Agents in "
-                    f"Settings."
+                    + ("on a run that is meant to write nothing. "
+                       if run.read_only else "during the deliberation. ")
+                    + "Set them under Agents in Settings."
                 ),
             )
 
@@ -2055,7 +2100,7 @@ class Pipeline:
         # positions have already been through the gate once, and re-asking
         # would make the operator approve the identical deliberation twice to
         # get one chairman answer.
-        if (not run.zero_touch or degraded) and not run.approved:
+        if (not run.zero_touch or degraded) and not run.approved and not run.read_only:
             self._set_state(run, AWAITING_APPROVAL)
             self.bus.publish(
                 "log",
@@ -2100,9 +2145,13 @@ class Pipeline:
 
         # ---- Delivery branch and safety snapshot ------------------------
         # Both happen here, after permission to write has been granted, so
-        # rejecting at the gate still leaves the repository untouched.
-        self._prepare_branch(run)
-        self._take_snapshot(run)
+        # rejecting at the gate still leaves the repository untouched. A
+        # read-only run never gets that permission, and anchoring a tree that
+        # nothing is going to touch would only produce a rollback offer for a
+        # run that changed nothing.
+        if not run.read_only:
+            self._prepare_branch(run)
+            self._take_snapshot(run)
 
         if self._is_cancelled():
             self._finish_cancelled(run)
@@ -2133,19 +2182,25 @@ class Pipeline:
                 run.conversation,
                 strictness_level=run.strictness,
                 system=str(chair_role.get("system") or ""),
+                read_only=run.read_only,
                 **styles,
             ),
             auto_approve=execute_approved,
+            read_only=run.read_only,
         )
 
         # ---- Collect the diff -------------------------------------------
-        try:
-            run.diff = gitutil.working_diff(run.workspace)
-            run.diff_stat = gitutil.diff_stat(run.workspace)
-        except (gitutil.GitError, OSError) as exc:
-            self.bus.publish(
-                "log", level="warn", message=f"Could not read the diff: {exc}"
-            )
+        # Only when the chairman could have written. Asking git for a diff
+        # after a read-only run would report whatever the operator had already
+        # left in the tree as though the council had done it.
+        if not run.read_only:
+            try:
+                run.diff = gitutil.working_diff(run.workspace)
+                run.diff_stat = gitutil.diff_stat(run.workspace)
+            except (gitutil.GitError, OSError) as exc:
+                self.bus.publish(
+                    "log", level="warn", message=f"Could not read the diff: {exc}"
+                )
 
         if self._is_cancelled():
             self._finish_cancelled(run)

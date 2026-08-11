@@ -1951,14 +1951,22 @@ function renderMode() {
   // plainly, and worth colouring, rather than leaving to a toggle elsewhere.
   const armed = !!(state.config || {}).zero_touch;
   const sub = $('#hero-sub');
-  sub.textContent = mode === 'solo'
-    ? (armed
-      ? 'One agent, one conversation — and Zero-Touch is on, so it can change files in your working folder.'
-      : 'One agent, one conversation. Read-only: turn Zero-Touch on to let it change files.')
-    : (armed
-      ? 'Several agents answer, review each other, and a chairman applies the outcome — and Zero-Touch is on, so it will not stop to ask.'
-      : 'Several agents answer, review each other, you approve, and a chairman applies the outcome.');
-  sub.classList.toggle('armed', armed);
+  // With no folder chosen neither mode writes anything, whatever Zero-Touch
+  // says — a supported way to work rather than a setting left unfinished, so
+  // the strip says what such a run does do: answer. The gear stays armed
+  // below, because the toggle itself is still on for the next folder.
+  sub.textContent = !workspacePath()
+    ? (mode === 'solo'
+      ? 'One agent, one conversation. No working folder, so nothing is written — code comes back in the reply.'
+      : 'Several agents answer, review each other, and a chairman decides. No working folder, so nothing is written — code comes back in the reply.')
+    : (mode === 'solo'
+      ? (armed
+        ? 'One agent, one conversation — and Zero-Touch is on, so it can change files in your working folder.'
+        : 'One agent, one conversation. Read-only: turn Zero-Touch on to let it change files.')
+      : (armed
+        ? 'Several agents answer, review each other, and a chairman applies the outcome — and Zero-Touch is on, so it will not stop to ask.'
+        : 'Several agents answer, review each other, you approve, and a chairman applies the outcome.'));
+  sub.classList.toggle('armed', armed && !!workspacePath());
   $('#gear-btn').classList.toggle('armed', armed);
 
   $('#continue-copy').textContent = mode === 'solo'
@@ -4880,12 +4888,15 @@ async function startRun() {
     if (!ok) return;
   }
 
-  if (!solo && conf.zero_touch) {
+  // Only when there is a folder to modify. With none chosen the run writes
+  // nothing whatever Zero-Touch says, so warning about files it will change
+  // would be asking the operator to approve something that cannot happen.
+  if (!solo && conf.zero_touch && workspacePath()) {
     const ok = confirm(
       'Zero-Touch Mode is ON.\n\n' +
       'The pipeline will run to completion without pausing, and the senior ' +
       'stage will modify files in:\n\n' +
-      (workspacePath() || `${state.scratchWorkspace} (scratch workspace)`) +
+      workspacePath() +
       (workspaceIsRepo() ? '' :
         '\n\nThat folder is not a git repository, so this run cannot be ' +
         'rolled back.') +

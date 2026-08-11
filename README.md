@@ -192,11 +192,11 @@ the same command works whichever seat it lands in.
 
 1. **Optionally pick a working folder.** Click it in the status bar along the
    bottom, which also shows the branch and whether the tree is clean. Any
-   folder will do, and none is a fine answer too: with nothing chosen, runs
-   happen in a scratch folder of the app's own
-   (`~/.config/ai-council/workspace`), which is what makes "just ask it
-   something" work before you have configured anything. See
-   [The working folder](#the-working-folder).
+   folder will do, and none is a fine answer too: with nothing chosen the
+   council still seats, deliberates, critiques and delivers a verdict, but
+   nothing is written anywhere — code comes back in the reply instead. That is
+   what makes "just ask it something" work before you have configured
+   anything. See [The working folder](#the-working-folder).
 2. **Describe the task.** Be specific about files, behaviour and edge cases —
    every seat answers the brief you wrote, and no council is better than it.
 3. **Send it** with <kbd>Enter</kbd>, or the arrow button.
@@ -248,7 +248,17 @@ What the folder decides is which half of the safety model is available:
 |---|---|---|
 | A git repository | Everything below | — |
 | Any other folder | Deliberation, critique, approval gate, console, conversations, and a chairman that can still write to it | Diff, safety snapshot, rollback, commit bar, pull-request mode |
-| None chosen | The same, in `~/.config/ai-council/workspace` | The same |
+| None chosen | Deliberation, critique, console, conversations, and a verdict with its code written into the reply | Anything that touches a file: the chairman's edits, the approval gate, and all of the row above |
+
+**No folder chosen means nothing is written.** Not by the council, not by Chat,
+and not by Zero-Touch — that is the point of the choice, and it is what makes
+"what would you three do about X?" a question you can ask without picking a
+directory first. The council still runs in full; the chairman is invoked
+read-only and asked for the answer, with any code in fenced blocks per file.
+There is no approval gate on such a run, because there is nothing to approve.
+Runs happen in a scratch folder of the app's own
+(`~/.config/ai-council/workspace`) purely because a process has to start
+somewhere; it is not the subject of the task and the agents are told so.
 
 None of that is enforced by refusing to start. The status bar says which
 features the current folder is buying, a run with no diff to show names the
@@ -257,10 +267,11 @@ before you approve whether a rollback point will exist. The one thing that *is* 
 front is pull-request mode without a repository to branch from — checked before
 either agent spends any quota.
 
-The scratch workspace is a real directory you can open, not a temporary one:
-whatever a run writes with no folder chosen is still there afterwards. It is
-deliberately not a git repository, which is why a run there cannot be rolled
-back.
+The scratch workspace is a real directory you can open, not a temporary one.
+Projects is the one mode that still builds in it with no folder chosen — a
+project has to put a codebase somewhere — and whatever it writes there is still
+there afterwards. It is deliberately not a git repository, which is why work
+done there cannot be rolled back.
 
 > A folder inside a repository resolves to that repository's root, because the
 > diff, the snapshot and the delivery branch all operate on the root. Picking

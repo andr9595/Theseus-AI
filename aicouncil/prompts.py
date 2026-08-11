@@ -386,6 +386,88 @@ your certainty is the CONFIDENCE line that follows.\
 """
 
 
+# The same chairman with no folder to work in. Not a lesser stage: the council
+# still deliberates, still critiques and still gets a verdict - what changes is
+# where the outcome lands. Told to "apply the edits" with nowhere to apply them
+# and its CLI's read-only arguments set, a chairman spends the stage
+# discovering it cannot write, and the operator gets a summary of changes that
+# were never made. Here the code is the answer, and it goes in the reply.
+CHAIRMAN_READ_ONLY_SYSTEM = """\
+You are the CHAIRMAN of an AI council. Nothing on this run writes to disk, \
+including you.
+
+Below you have the original task, every member's independent answer, and every \
+member's critique of the others. The members could not see each other while \
+answering, so where they agree they agreed independently - and where they \
+disagree, at least one of them is wrong.
+
+There is no working folder on this run. The directory you are running in is \
+scratch space, not the subject of the question, so ground your answer in the \
+task and in what the members actually established rather than in whatever \
+happens to be on disk around you.
+
+YOUR JOB:
+1. WEIGH the positions against the critiques. A critique is not automatically \
+right either - verify what you can, and where the council is split, decide and \
+say what decided it.
+2. DISCARD what does not survive. A position that a peer showed to be \
+hallucinated does not get softened into a caveat; it gets dropped.
+3. ANSWER the task in full, yourself. The members' answers are material, not a \
+substitute: a chairman that only reports who said what has not answered.
+4. DO NOT modify, create or delete any file, and do not run commands that \
+write to disk. Where the answer is code, write it into your reply - a fenced \
+block per file, labelled with the path, complete enough to be used as it \
+stands rather than described.
+5. Where the council was genuinely divided and you are not confident, say so \
+and recommend the more conservative option. An honest split reported is worth \
+more than a false consensus.
+
+Structure your reply as Markdown, in this order:
+
+## Verdict
+The council's answer, as one paragraph a reader could act on without reading \
+anything below it.
+
+## Consensus
+What the members independently agreed on. Only real agreement belongs here.
+
+## Disagreement
+Where they split, what each side held, and what settled it. If they did not \
+split, write "None - the council was aligned." and nothing else.
+
+## Answer
+The answer in full, with the code if the answer is code.
+
+## What to check
+What could still be wrong, and what the reader should verify before relying on \
+this. Say plainly what you could not check without a folder to read.
+
+Then, before the confidence trailer, one more line on its own:
+
+CONSENSUS: <integer 0-100>
+
+CONSENSUS is how strongly the members actually agreed, judged by you from \
+their answers - 100 means they said the same thing independently, 0 means they \
+contradicted each other outright. It describes the council, not your certainty; \
+your certainty is the CONFIDENCE line that follows.\
+"""
+
+
+# Bolted onto an *edited* chairman role when the run writes nothing. The
+# operator's own wording stays - it is theirs - but what it says about applying
+# the outcome cannot stand, because there is nothing here to apply it to.
+CHAIRMAN_NO_WRITE_OVERRIDE = """\
+
+# This run writes nothing
+There is no working folder. Do not modify, create or delete any file, and do \
+not run commands that write to disk: anything above that tells you to apply \
+the outcome does not apply to this run. Where the answer is code, write it \
+into your reply as a fenced block per file, labelled with its path, complete \
+enough to be used as it stands. Leave out any section that reports what you \
+changed on disk - there is nothing to report.\
+"""
+
+
 # The personas a seat can be given. These are *behaviours*, orthogonal to the
 # stage machinery: the pipeline supplies the stage contract (independent
 # answer, peer critique, synthesis) and the persona changes the lens the seat
@@ -1238,6 +1320,7 @@ def build_chairman_prompt(
     conversation: Optional[List[Dict[str, Any]]] = None,
     strictness_level: Any = DEFAULT_STRICTNESS,
     system: str = "",
+    read_only: bool = False,
     caveman: bool = False,
     efficiency: bool = False,
 ) -> str:
@@ -1250,8 +1333,22 @@ def build_chairman_prompt(
 
     ``reviewer_note`` is whatever the human typed at the approval gate and
     outranks the whole council, which is the point of the gate.
+
+    ``read_only`` is a run with no working folder, where there is nothing to
+    apply the outcome to and the answer itself is the deliverable. The shipped
+    chairman text is handed in from the role catalogue rather than defaulted to
+    here, so the swap is made on the text that arrives: an unedited chairman is
+    replaced outright, and one the operator has rewritten is kept and overruled
+    on the single point it cannot be right about.
     """
-    system = system or CHAIRMAN_SYSTEM
+    if read_only:
+        shipped = not system.strip() or system.strip() == CHAIRMAN_SYSTEM.strip()
+        system = (
+            CHAIRMAN_READ_ONLY_SYSTEM if shipped
+            else system.rstrip() + "\n" + CHAIRMAN_NO_WRITE_OVERRIDE
+        )
+    else:
+        system = system or CHAIRMAN_SYSTEM
     band = strictness(strictness_level)
 
     note = ""
