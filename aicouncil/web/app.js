@@ -600,6 +600,11 @@ const state = {
   // from the prompt and a strip showing last run's council would be worse
   // than one showing none. Null until the first answer arrives.
   seating: null,
+  // Whether the next run is private: nothing written to the conversation
+  // history, nothing left in the CLIs' own. Held for the tab rather than in
+  // the config, the way a browser's own private window is - a mode you are
+  // currently in, not a setting the next launch should inherit.
+  incognito: sessionStorage.getItem('ac_incognito') === '1',
   // Which stepper cell is opened out into a per-agent breakdown, by step key.
   // Held here rather than on the DOM because the stepper is re-rendered on
   // every event of a live run, which would otherwise close it as you read.
@@ -672,6 +677,27 @@ function runWorkspace(run) {
   return (run && (run.workspace || run.repo)) || '';
 }
 
+/** The incognito control: bright when on, dim when off, and off the limits
+ *  while a run is in flight — the run it would change has already been given
+ *  its answer, and a toggle that appeared to work mid-run would be a lie about
+ *  what was being recorded. Projects are excluded for a reason of their own:
+ *  a build's board, spec and critique log are the state it resumes from. */
+function renderIncognito() {
+  const btn = $('#incognito-btn');
+  const project = uiMode() === 'project';
+  btn.setAttribute('aria-pressed', String(state.incognito && !project));
+  btn.disabled = state.busy || project;
+  btn.setAttribute(
+    'aria-label', state.incognito ? 'Turn incognito off' : 'Turn incognito on'
+  );
+  btn.title = project
+    ? 'A project keeps its board on disk, so it cannot run incognito.'
+    : state.incognito
+      ? 'Incognito is ON. This conversation is not saved here or in the ' +
+        'agents’ own history, and disappears when Theseus closes.'
+      : 'Incognito is off. Conversations are saved to the Chats list.';
+}
+
 function renderStatus() {
   const run = runOnScreen();
   const s = run ? run.state : 'idle';
@@ -685,6 +711,10 @@ function renderStatus() {
       meta.push(STATE_LABELS[s] || s);
     }
     if (run.zero_touch) meta.push('ZERO-TOUCH');
+    // Off the run rather than off the button: what matters when reading a
+    // conversation back is whether *it* was private, not what the toggle says
+    // now. A run started incognito stays labelled after the toggle goes off.
+    if (run.incognito) meta.push('INCOGNITO');
     // Which writing styles this run was answered under, off the run rather
     // than off the gear: an archived answer that reads strangely should say
     // why, and the switch that did it may since have been turned off.
@@ -699,6 +729,7 @@ function renderStatus() {
   $('#topbar-meta').textContent = meta.join('  ·  ');
 
   $('#cancel-btn').classList.toggle('hidden', !state.busy);
+  renderIncognito();
   // On the live run, and on a failed one opened from history: that second case
   // is the app having been restarted since it failed, which is exactly when
   // the answers already paid for are worth most.
@@ -1315,7 +1346,7 @@ async function refreshSeating() {
   const seq = ++seatingSeq;
   try {
     const res = await api('/api/council/route', {
-      method: 'POST', body: { task },
+      method: 'POST', body: { task, incognito: state.incognito },
     });
     if (seq !== seatingSeq) return;
     state.seating = res.seating;
@@ -4912,6 +4943,7 @@ async function startRun() {
         workspace: workspacePath(),
         continue_from: state.continueFrom,
         compact_context: state.compactContext,
+        incognito: state.incognito,
       },
     });
     state.freshChat = false;
@@ -5149,6 +5181,22 @@ function wire() {
     try {
       await api('/api/rollback', { method: 'POST' });
     } catch (err) { toast(err.message, 'error', 9000); }
+  });
+
+  $('#incognito-btn').addEventListener('click', () => {
+    state.incognito = !state.incognito;
+    sessionStorage.setItem('ac_incognito', state.incognito ? '1' : '0');
+    renderIncognito();
+    // The bench narrows to the CLIs that can be told not to save, so the strip
+    // has to be asked again or it would keep showing a seat this run cannot use.
+    refreshSeating();
+    toast(
+      state.incognito
+        ? 'Incognito on. Nothing from here is written to the Chats list or the ' +
+          'agents’ own history.'
+        : 'Incognito off. Conversations are saved again.',
+      'ok',
+    );
   });
 
   $('#pr-btn').addEventListener('click', () => {

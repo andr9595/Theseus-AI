@@ -179,6 +179,32 @@ class TestStaticFiles(ServerTestBase):
         self.assertNotIn("background: var(--bg-1);\n  border-right:", css)
         self.assertIn(".app.sidebar-collapsed .brand-mark:hover .mark-expand", css)
 
+    def test_incognito_sits_top_right_and_says_which_way_it_is_set(self):
+        # The one control whose state has to be readable before the message is
+        # sent rather than after: colour carries it for the eye, `aria-pressed`
+        # for everything else.
+        with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
+            body = res.read().decode()
+        self.assertIn('<button id="incognito-btn" class="incognito-btn"', body)
+        self.assertIn('aria-pressed="false"', body)
+        # Last in the row, so it holds the corner whether or not the run
+        # controls beside it are showing.
+        self.assertLess(body.index('id="pr-btn"'), body.index('id="incognito-btn"'))
+
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn("function renderIncognito()", script)
+        self.assertIn("$('#incognito-btn').addEventListener('click'", script)
+        self.assertIn("sessionStorage.setItem('ac_incognito'", script)
+        # The choice has to reach both the run and the seating preview, or the
+        # strip would show a bench the run will not seat.
+        self.assertIn("incognito: state.incognito,", script)
+        self.assertIn("body: { task, incognito: state.incognito }", script)
+
+        with urllib.request.urlopen(f"{self.base}/app.css", timeout=15) as res:
+            css = res.read().decode()
+        self.assertIn('.incognito-btn[aria-pressed="true"]', css)
+
     def test_the_sidebar_reports_quota_window_by_window(self):
         # Claude rations a 5-hour session *and* a week; Codex reports whatever
         # its last run logged. Reducing those to one percentage per agent would
@@ -817,6 +843,36 @@ class TestSoloConfigMigration(unittest.TestCase):
             conf["providers"]["council_claude"]["read_only_args"], ["--mode", "plan"]
         )
 
+    def test_a_swapped_assistant_gets_its_own_cli_s_no_save_flag(self):
+        # The merge fills a key absent from the file with the default for that
+        # provider *id*, which is the right CLI only where nobody swapped one
+        # in. A chat assistant pointed at Antigravity would otherwise inherit
+        # Claude's flag - and `supports_incognito` would then seat a CLI that
+        # cannot honour the promise.
+        conf = self.load({"providers": {
+            "solo": {
+                "command": ["agy", "--print-timeout", "60m", "--prompt={prompt}"],
+            },
+            "council_codex": {"command": ["codex", "exec", "{prompt}"]},
+            "qa": {"command": ["/home/x/.local/bin/my-wrapper", "{prompt}"]},
+        }})
+        self.assertEqual(conf["providers"]["solo"]["incognito_args"], [])
+        self.assertEqual(
+            conf["providers"]["council_codex"]["incognito_args"], ["--ephemeral"]
+        )
+        # A hand-written command is nobody's catalogued agent, so it declares
+        # nothing rather than borrowing whatever sat in that slot before.
+        self.assertEqual(conf["providers"]["qa"]["incognito_args"], [])
+
+    def test_incognito_flags_the_operator_wrote_are_left_alone(self):
+        conf = self.load({"providers": {"solo": {
+            "command": ["/usr/local/bin/private-claude", "{prompt}"],
+            "incognito_args": ["--no-history"],
+        }}})
+        self.assertEqual(
+            conf["providers"]["solo"]["incognito_args"], ["--no-history"]
+        )
+
 
 class TestApi(ServerTestBase):
     def test_the_page_explains_an_engine_too_old_to_offer_continue(self):
@@ -1015,17 +1071,47 @@ class TestApi(ServerTestBase):
         self.assertIn("workspace", data["error"])
 
     def _capture_start(self):
-        """Intercept the pipeline so the folder can be read without a run."""
+        """Intercept the pipeline so the arguments can be read without a run."""
         seen = {}
 
         def fake_start(task, workspace="", **kwargs):
             seen["workspace"] = workspace
+            seen.update(kwargs)
             raise ValueError("stop here - the argument is what is under test")
 
         real = self.state.pipeline.start
         self.state.pipeline.start = fake_start
         self.addCleanup(setattr, self.state.pipeline, "start", real)
         return seen
+
+    def test_start_carries_the_incognito_choice_through(self):
+        seen = self._capture_start()
+        self.request("/api/start", method="POST",
+                     body={"task": "hello", "incognito": True})
+        self.assertIs(seen["incognito"], True)
+
+    def test_start_is_not_incognito_unless_asked(self):
+        seen = self._capture_start()
+        self.request("/api/start", method="POST", body={"task": "hello"})
+        self.assertIs(seen["incognito"], False)
+
+    def test_start_rejects_an_incognito_flag_that_is_not_a_boolean(self):
+        # `"false"` is true in Python, so a client that sent one would be told
+        # its run was private while every stage was recorded as usual.
+        status, data = self.request(
+            "/api/start", method="POST",
+            body={"task": "hello", "incognito": "false"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("incognito", data["error"])
+
+    def test_the_routing_preview_rejects_a_non_boolean_too(self):
+        status, data = self.request(
+            "/api/council/route", method="POST",
+            body={"task": "hello", "incognito": "yes"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("incognito", data["error"])
 
     def test_approve_without_a_gate_is_a_400(self):
         status, _ = self.request("/api/approve", method="POST", body={})
@@ -1172,6 +1258,26 @@ class TestProjectRoutes(ServerTestBase):
         # A JSON `true` is not a count, and int(True) == 1 would be a silent
         # round of invented work.
         self.assertIsNone(_opt_int(True))
+
+    def test_a_project_asked_to_run_incognito_is_refused(self):
+        # Refused rather than ignored. The board, spec and critique log are the
+        # state a build pauses and resumes from, and a request answered with
+        # the opposite of what it asked for is the one failure mode a privacy
+        # control cannot have. The tab disables the button; this is the half
+        # that holds for a client that does not.
+        def fake_start(*a, **kw):
+            self.fail("the engine was reached despite the refusal")
+
+        real = self.state.projects.start
+        self.state.projects.start = fake_start
+        self.addCleanup(setattr, self.state.projects, "start", real)
+        status, data = self.request(
+            "/api/project/start", method="POST",
+            body={"goal": "build it", "workspace": str(self.folder),
+                  "incognito": True},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("incognito", data["error"])
 
     def test_starting_with_innovation_off_reaches_the_engine(self):
         seen = {}

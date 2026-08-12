@@ -24,7 +24,12 @@ from aicouncil import gitutil  # noqa: E402
 from aicouncil import router  # noqa: E402
 from aicouncil.config import ConfigStore  # noqa: E402
 from aicouncil.events import EventBus  # noqa: E402
-from aicouncil.pipeline import Pipeline, PipelineBusy  # noqa: E402
+from aicouncil.pipeline import (  # noqa: E402
+    Pipeline,
+    PipelineBusy,
+    Run,
+    VOLATILE_RUN_LIMIT,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MOCK = str(REPO_ROOT / "scripts" / "mock-agent.py")
@@ -797,6 +802,175 @@ class TestWorkingFolderIsOptional(PipelineTestBase):
         )
         self.assertIn(f"Working folder: {self.plain}", prompt)
         self.assertIn("not a git repository", prompt)
+
+
+class TestIncognito(PipelineTestBase):
+    """A private conversation leaves no record in either place it could.
+
+    Two records exist: this app's own transcripts, and the history each CLI
+    keeps of its own sessions. A mode that suppressed one and not the other
+    would be worth less than nothing, because the operator would believe it had
+    suppressed both.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # The mock stands in for a CLI that can be told not to save. It ignores
+        # the flag itself; what is under test is that the flag is passed, and
+        # that an agent without one is left out rather than run anyway.
+        self.store.update({
+            "providers": {
+                cfg.council_provider_id(a): dict(
+                    mock_council(a), incognito_args=["--incognito"]
+                )
+                for a in cfg.AGENTS
+            },
+        })
+
+    def transcripts(self):
+        return sorted(p.name for p in self.runs_dir.glob("*.json"))
+
+    def test_a_private_run_writes_no_transcript(self):
+        run = self.pipeline.start("what is a monad?", incognito=True)
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertTrue(run.incognito)
+        self.assertEqual(self.transcripts(), [])
+
+    def test_an_ordinary_run_still_writes_one(self):
+        # The control. Without it "no transcript" could mean the engine had
+        # stopped writing them at all.
+        run = self.pipeline.start("what is a monad?")
+        self.wait_terminal()
+
+        self.assertEqual(self.transcripts(), [run.transcript_name])
+
+    def test_every_stage_is_told_not_to_save(self):
+        run = self.pipeline.start("what is a monad?", incognito=True)
+        self.wait_terminal()
+
+        for stage in run.stages.values():
+            self.assertIn(
+                "--incognito", stage.command,
+                f"{stage.id} was run without its no-save flag",
+            )
+
+    def test_a_private_conversation_is_not_listed(self):
+        self.pipeline.start("what is a monad?", incognito=True)
+        self.wait_terminal()
+
+        self.assertEqual(self.pipeline.history(), [])
+
+    def test_a_private_conversation_can_still_be_continued(self):
+        # Continuing is how a conversation works at all: the browser attaches
+        # the last run by the name its transcript would have had. Held in
+        # memory rather than on disk, so it survives the session and nothing
+        # else.
+        first = self.pipeline.start("what is a monad?", incognito=True)
+        self.wait_terminal()
+        second = self.pipeline.start(
+            "and a functor?", continue_from=first.transcript_name
+        )
+        self.wait_terminal()
+
+        self.assertEqual(second.state, "complete", second.error)
+        self.assertEqual(len(second.conversation), 1)
+        self.assertEqual(second.conversation[0]["task"], "what is a monad?")
+        # The follow-up asked for no privacy of its own and gets it anyway: it
+        # carries the earlier turns of a conversation that was promised none.
+        self.assertTrue(second.incognito)
+        self.assertEqual(self.transcripts(), [])
+
+    def test_the_router_learns_nothing_from_a_private_run(self):
+        # The seating history is a persistent record of who sat and how it
+        # went, which is the record this run was told not to leave.
+        before = self.store.get("council", {}).get("stats", {})
+        self.pipeline.start("what is a monad?", incognito=True)
+        self.wait_terminal()
+
+        self.assertEqual(self.store.get("council", {}).get("stats", {}), before)
+
+    def test_an_ordinary_run_still_teaches_the_router(self):
+        self.pipeline.start("what is a monad?")
+        self.wait_terminal()
+
+        self.assertTrue(self.store.get("council", {}).get("stats"))
+
+    def test_an_agent_that_cannot_run_incognito_is_not_seated(self):
+        # Left out for this run only, and for a reason of the run rather than
+        # of the agent: its binary is installed, enabled and working.
+        self.store.update({
+            "providers": {
+                cfg.council_provider_id("agy"): dict(
+                    mock_council("agy"), incognito_args=[]
+                ),
+            },
+            "council": {"seat_count": 3, "chair_deliberates": True},
+        })
+        seating = self.pipeline.seat_council(
+            "what is a monad?", self.store.all(), incognito=True
+        )
+
+        seated = {s.agent for s in seating.seats}
+        self.assertNotIn("agy", seated)
+        self.assertTrue(seated)
+
+    def test_the_same_agent_is_seated_when_the_run_is_not_private(self):
+        self.store.update({
+            "providers": {
+                cfg.council_provider_id("agy"): dict(
+                    mock_council("agy"), incognito_args=[]
+                ),
+            },
+        })
+        seating = self.pipeline.seat_council("what is a monad?", self.store.all())
+
+        self.assertIn("agy", {s.agent for s in seating.seats})
+
+    def test_a_bench_with_nobody_left_says_why(self):
+        # Rather than the router's "check the agents in Settings", which would
+        # send the operator looking for a CLI that is working perfectly well.
+        self.store.update({
+            "providers": {
+                cfg.council_provider_id(a): dict(mock_council(a), incognito_args=[])
+                for a in cfg.AGENTS
+            },
+        })
+        with self.assertRaises(ValueError) as ctx:
+            self.pipeline.start("what is a monad?", incognito=True)
+        self.assertIn("incognito", str(ctx.exception))
+
+    def test_a_private_chat_turn_is_private_too(self):
+        assistant = mock_provider("solo", "Assistant")
+        assistant["read_only_args"] = ["--read-only"]
+        assistant["incognito_args"] = ["--incognito"]
+        self.store.update({"mode": "solo", "providers": {"solo": assistant}})
+
+        run = self.pipeline.start("what is a monad?", incognito=True)
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertIn("--incognito", run.stages["solo"].command)
+        self.assertEqual(self.transcripts(), [])
+
+    def test_only_the_newest_private_runs_are_held_in_memory(self):
+        # Nothing on disk exists to clean these up later, so the map is bounded
+        # rather than left to grow for as long as the app is open.
+        made = []
+        for i in range(VOLATILE_RUN_LIMIT + 3):
+            run = Run(
+                id=f"{i:04d}", task="private", workspace=str(self.repo),
+                zero_touch=False, incognito=True,
+            )
+            made.append(run.transcript_name)
+            self.pipeline._persist(run)
+
+        held = list(self.pipeline._volatile_runs)
+        self.assertEqual(len(held), VOLATILE_RUN_LIMIT)
+        self.assertEqual(held, made[-VOLATILE_RUN_LIMIT:])
+        self.assertIsNone(self.pipeline.load_run(made[0]))
+        self.assertIsNotNone(self.pipeline.load_run(made[-1]))
 
 
 class TestDiffStat(PipelineTestBase):
@@ -2119,6 +2293,31 @@ class TestConversationList(PipelineTestBase):
         self.assertEqual([c["file"] for c in self.pipeline.history()],
                          [run.transcript_name])
 
+    def test_an_edited_transcript_is_read_again(self):
+        # The rows are cached against each file's mtime and size, so listing a
+        # year of runs does not reparse every diff in them. A transcript that
+        # changed on disk has to defeat that, or the sidebar would keep showing
+        # a title the file no longer carries.
+        run = self.run_once("the first title")
+        self.assertEqual(self.pipeline.history()[0]["title"], "the first title")
+
+        path = self.pipeline.runs_dir / run.transcript_name
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["task"] = "an entirely different title"
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        self.assertEqual(
+            self.pipeline.history()[0]["title"], "an entirely different title"
+        )
+
+    def test_a_deleted_transcript_is_forgotten_rather_than_cached(self):
+        run = self.run_once("do the thing")
+        self.pipeline.history()
+        self.pipeline.delete_run(run.transcript_name)
+
+        self.assertEqual(self.pipeline.history(), [])
+        self.assertEqual(self.pipeline._summary_cache, {})
+
 
 class TestEventStream(PipelineTestBase):
     def test_terminal_event_is_published_after_transcript_exists(self):
@@ -2133,6 +2332,28 @@ class TestEventStream(PipelineTestBase):
             ):
                 break
 
+        self.assertTrue((self.pipeline.runs_dir / run.transcript_name).is_file())
+
+    def test_the_transcript_is_written_once_rather_than_twice(self):
+        # The worker used to persist again on its way out, after `_set_state`
+        # had already written the same file on the way into the terminal state.
+        # A transcript carries every stage's output and the whole diff, so the
+        # second dump was the largest write in the run and changed nothing.
+        writes = []
+        real = self.pipeline._persist
+
+        def counted(run):
+            writes.append(run.state)
+            real(run)
+
+        self.pipeline._persist = counted
+        self.addCleanup(setattr, self.pipeline, "_persist", real)
+
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("write me once", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(writes, ["complete"], run.error)
         self.assertTrue((self.pipeline.runs_dir / run.transcript_name).is_file())
 
     def test_subscribers_observe_the_whole_run(self):

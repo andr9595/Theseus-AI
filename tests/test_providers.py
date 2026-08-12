@@ -202,6 +202,63 @@ class TestBuildArgv(unittest.TestCase):
         self.assertIn("plan", argv)
         self.assertNotIn("--dangerously-skip-permissions", argv)
 
+    def test_incognito_flags_are_absent_unless_asked_for(self):
+        provider = dict(CODEX, incognito_args=["--ephemeral"])
+        argv, _ = build_argv(provider, "explain this", auto_approve=False)
+        self.assertNotIn("--ephemeral", argv)
+
+    def test_incognito_flags_precede_the_prompt(self):
+        provider = dict(CODEX, incognito_args=["--ephemeral"])
+        argv, _ = build_argv(
+            provider, "explain this", auto_approve=False, incognito=True
+        )
+        self.assertEqual(argv, ["codex", "exec", "--ephemeral", "explain this"])
+
+    def test_incognito_and_read_only_are_independent_grants(self):
+        # What a run may write to the working folder and what the CLI writes to
+        # its own history are different questions, and a private run is not
+        # thereby a read-only one.
+        provider = dict(
+            CODEX,
+            incognito_args=["--ephemeral"],
+            read_only_args=["--sandbox", "read-only"],
+        )
+        argv, _ = build_argv(
+            provider, "hi", auto_approve=False, read_only=True, incognito=True
+        )
+        self.assertIn("--ephemeral", argv)
+        self.assertIn("read-only", argv)
+
+    def test_a_provider_with_no_incognito_flags_is_refused(self):
+        # Not run without them: the operator was told nothing would be saved,
+        # and the trace would land in the CLI's own history where this app
+        # could not even find it afterwards.
+        provider = dict(AGY, label="Antigravity")
+        with self.assertRaises(ProviderUnavailable) as ctx:
+            build_argv(provider, "hi", auto_approve=False, incognito=True)
+        self.assertIn("Antigravity", str(ctx.exception))
+        self.assertIn("incognito", str(ctx.exception))
+
+    def test_blank_incognito_entries_do_not_count_as_support(self):
+        # The same rule the appender uses: an empty entry is not a flag, so a
+        # provider carrying only empty ones has declared nothing.
+        provider = dict(CLAUDE, incognito_args=["", ""])
+        self.assertFalse(providers.supports_incognito(provider))
+        with self.assertRaises(ProviderUnavailable):
+            build_argv(provider, "hi", auto_approve=False, incognito=True)
+
+    def test_the_catalogue_carries_each_cli_s_own_no_save_flag(self):
+        # Read off the shipped presets rather than a local copy: these are the
+        # flags the installed binaries document, and one that drifts fails the
+        # run instead of protecting it.
+        self.assertEqual(AGENTS["codex"]["incognito_args"], ["--ephemeral"])
+        self.assertEqual(
+            AGENTS["claude"]["incognito_args"], ["--no-session-persistence"]
+        )
+        # Antigravity has no such flag, and declaring one it does not know
+        # would be worse than declaring none.
+        self.assertEqual(AGENTS["agy"]["incognito_args"], [])
+
     def test_blank_auto_approve_entries_are_dropped(self):
         provider = dict(CLAUDE, auto_approve_args=["", "  ", "--yes"])
         argv, _ = build_argv(provider, "hi", auto_approve=True)

@@ -16,6 +16,8 @@ Design notes
   starting pairing, not a rule.
 * ``auto_approve_args`` are appended only when Zero-Touch Mode is enabled, so
   the dangerous flags are impossible to pass by accident.
+* ``incognito_args`` are appended only when Incognito is on, and an agent that
+  declares none is not run incognito at all - see ``providers.build_argv``.
 * Nothing here ever holds an API key. The CLIs carry their own subscription
   auth; we only shell out to them.
 """
@@ -150,6 +152,12 @@ AGENTS: Dict[str, Dict[str, Any]] = {
         # halfway through a task stalls on a prompt nothing here can answer.
         # Saying so up front turns that into an answer instead.
         "read_only_args": ["--sandbox", "read-only"],
+        # Incognito's half of the bargain on the CLI's side: `--ephemeral` runs
+        # without persisting session files to disk, so the turn leaves nothing
+        # in `~/.codex` for `codex resume` to find. Read off the installed
+        # binary's own help rather than assumed - a flag a CLI does not know
+        # fails the run instead of protecting it.
+        "incognito_args": ["--ephemeral"],
     },
     "claude": {
         "label": "Claude",
@@ -170,6 +178,10 @@ AGENTS: Dict[str, Dict[str, Any]] = {
         # answers; what it will not do is edit, which is the whole difference
         # between a conversation and a run.
         "read_only_args": ["--permission-mode", "plan"],
+        # Claude's own no-save flag. Its help says it only works with
+        # `--print`, which the command above already is - the same reason
+        # `stream_args` can ask for stream-json here and nowhere else.
+        "incognito_args": ["--no-session-persistence"],
     },
     # Google's Antigravity CLI, which replaced Gemini CLI for personal accounts
     # on 18 June 2026. Its binary is `agy`, and the key has to stay a substring
@@ -220,6 +232,13 @@ AGENTS: Dict[str, Dict[str, Any]] = {
         # stage. Verified against agy 1.1.10: with both flags a write, whether
         # by edit tool or by a shell redirect, is still refused by plan mode.
         "read_only_args": ["--mode", "plan", "--dangerously-skip-permissions"],
+        # Empty, and not an omission. `agy --help` on 1.1.10 offers
+        # `--continue` and `--conversation` to *resume* a saved conversation
+        # and nothing at all to stop it being saved, so there is no flag here
+        # that would make the promise true. An agent with no incognito
+        # arguments is left off an incognito run rather than run and quietly
+        # recorded - see `providers.supports_incognito`.
+        "incognito_args": [],
     },
 }
 
@@ -291,6 +310,11 @@ def agent_catalog() -> List[Dict[str, Any]]:
         "effort_args": [],
         "stream_args": [],
         "read_only_args": [],
+        # Blank like the rest, and load-bearing: a hand-written command is
+        # nobody's catalogued agent, so this app cannot know whether it saves
+        # its conversations. It is left off incognito runs until the operator
+        # fills this in with whatever their wrapper takes.
+        "incognito_args": [],
     })
     return catalog
 
@@ -837,6 +861,7 @@ def _migrate(merged: Dict[str, Any], raw: Dict[str, Any]) -> Dict[str, Any]:
     if merged.get("mode") not in ("council", "solo"):
         merged["mode"] = "council"
     _repair_agy_read_only(merged)
+    _repair_incognito_args(merged, raw)
     _adopt_agent_settings(merged, raw)
     _apply_agent_settings(merged)
     return merged
@@ -957,6 +982,32 @@ def _repair_agy_read_only(merged: Dict[str, Any]) -> None:
             continue
         if list(provider.get("read_only_args") or []) == _BROKEN_AGY_READ_ONLY:
             provider["read_only_args"] = list(AGENTS["agy"]["read_only_args"])
+
+
+def _repair_incognito_args(merged: Dict[str, Any], raw: Dict[str, Any]) -> None:
+    """Give a provider written before Incognito the flags of its own CLI.
+
+    ``_deep_merge`` fills the missing key from the default for that *provider
+    id*, which names the right CLI only where the operator never swapped one
+    in. A chat assistant pointed at Antigravity would otherwise inherit
+    Claude's ``--no-session-persistence`` - the exact mixing of one agent's
+    flags into another's binary that ``agent_for`` exists to prevent. Here it
+    is worse than a failed launch: ``providers.supports_incognito`` would read
+    that inherited flag and seat a CLI that cannot honour it.
+
+    Only providers the stored file wrote without the key are repaired, so a
+    hand-written wrapper's own arguments are the operator's and stay.
+    """
+    stored = raw.get("providers")
+    stored = stored if isinstance(stored, dict) else {}
+    for pid, provider in (merged.get("providers") or {}).items():
+        if not isinstance(provider, dict):
+            continue
+        before = stored.get(pid)
+        if isinstance(before, dict) and "incognito_args" in before:
+            continue
+        preset = AGENTS.get(agent_for(provider)) or {}
+        provider["incognito_args"] = list(preset.get("incognito_args") or [])
 
 
 def _resolve_agent_choices(

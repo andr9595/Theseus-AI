@@ -84,7 +84,13 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from . import config as cfg
 from . import gitutil, prompts, router
 from .events import EventBus
-from .providers import ProviderResult, ProviderRunner, probe_all, resolve_binary
+from .providers import (
+    ProviderResult,
+    ProviderRunner,
+    probe_all,
+    resolve_binary,
+    supports_incognito,
+)
 
 # Pipeline states
 IDLE = "idle"
@@ -117,6 +123,13 @@ MAX_TURN_CHARS = 12_000
 # newest files holds every thread whose latest run is in it. The cap is what
 # keeps opening the sidebar cheap for someone with a year of runs on disk.
 HISTORY_SCAN_LIMIT = 200
+
+# How many incognito transcripts are held in memory. They are what lets a
+# private thread be continued while the app is open, and they are the one thing
+# in this engine that nothing on disk will ever clean up - so the oldest is
+# dropped rather than kept forever. Continuing the conversation on screen only
+# ever needs the newest.
+VOLATILE_RUN_LIMIT = 20
 
 # How much of the senior stage's own summary is quoted into the pull request
 # body. It is the description a reviewer reads first, but it is not the review
@@ -491,6 +504,11 @@ class Run:
     # nowhere the operator asked for it to be applied, so nothing is, and the
     # code comes back in the reply instead.
     read_only: bool = False
+    # Whether this conversation is private: no transcript on disk, no router
+    # feedback, and every agent invoked with its own no-save flag. Decided once
+    # at start and carried, never re-read from the browser - a toggle switched
+    # off midway must not retrospectively record a run that promised not to be.
+    incognito: bool = False
     mode: str = "council"  # "council" | "solo"
     # Pull-request delivery. The branch is named at start but only created
     # after write permission is granted, so a rejected run leaves no trace.
@@ -634,6 +652,10 @@ class Run:
             # no-folder run after a restart must not hand the chairman write
             # permission the first attempt never had.
             "read_only": self.read_only,
+            # Carried for the same reason, and read by the browser so a page
+            # reloaded mid-run shows the private thread as private rather than
+            # as an ordinary one whose transcript has gone missing.
+            "incognito": self.incognito,
             "mode": self.mode,
             # Kept alongside `mode` for transcripts written by, and read by,
             # a version that only knew the boolean.
@@ -737,6 +759,18 @@ class Pipeline:
         # A single slot would leave the other seats running after the run had
         # gone terminal, still writing to the event bus.
         self._runners: Dict[str, ProviderRunner] = {}
+        # Incognito transcripts, keyed by the filename they would have had.
+        # Held so a private conversation can be continued the same way every
+        # other one is - the browser attaches the last run by that name - and
+        # gone the moment the process is. Trimmed to VOLATILE_RUN_LIMIT, since
+        # nothing on disk exists to clean these up later.
+        self._volatile_runs: Dict[str, str] = {}
+        # `history()` reads whole transcripts to build one-line summaries, and
+        # a transcript is written once and then only read. Keyed by filename,
+        # invalidated on mtime and size.
+        self._summary_cache: Dict[
+            str, Tuple[Tuple[int, int], Dict[str, Any]]
+        ] = {}
         # Signalled when the human resolves the approval gate.
         self._gate = threading.Event()
         self._gate_decision = ""  # "approve" | "reject"
@@ -789,6 +823,7 @@ class Pipeline:
         workspace: str = "",
         continue_from: str = "",
         compact_context: bool = False,
+        incognito: bool = False,
     ) -> Run:
         """Kick off a new run. Raises PipelineBusy if one is already active.
 
@@ -808,6 +843,11 @@ class Pipeline:
         ``compact_context`` summarises every earlier turn up front instead of
         waiting for the thread to reach the budget. A long thread is compacted
         either way; this is the operator asking for it sooner.
+
+        ``incognito`` keeps the conversation out of both records: no transcript
+        is written under ``runs/``, the router learns nothing from it, and every
+        agent is invoked with its own no-save flag - or is not seated at all,
+        if it has none.
         """
         task = (task or "").strip()
         if not task:
@@ -894,6 +934,11 @@ class Pipeline:
                 conversation.extend(t for t in earlier if isinstance(t, dict))
             conversation.append(_conversation_turn(previous))
             parent_run_id = str(previous.get("id") or "")
+            # A private thread does not become public because the toggle was
+            # switched off before the follow-up: this run carries the earlier
+            # turns of a conversation that was promised no record, and writing
+            # them into a transcript now would keep the promise for neither.
+            incognito = incognito or bool(previous.get("incognito"))
 
         # Fit the thread before the run is built, so what is stored on it is
         # what the prompts will render rather than an ideal it never used.
@@ -913,6 +958,7 @@ class Pipeline:
                 workspace=root,
                 zero_touch=zero_touch,
                 read_only=not writes,
+                incognito=incognito,
                 mode=mode,
                 pull_request_mode=pull_request_mode,
                 # Whatever is checked out is what the pull request targets, so
@@ -935,7 +981,10 @@ class Pipeline:
                 config=conf,
             )
             if mode == "solo":
-                bench = self.available_agents(providers) if multi_agent else []
+                bench = (
+                    self.available_agents(providers, incognito=incognito)
+                    if multi_agent else []
+                )
                 if len(bench) > 1:
                     # One stage per installed CLI, each reading that CLI's own
                     # card in Settings. Built here rather than in the worker so
@@ -974,7 +1023,9 @@ class Pipeline:
                 run.strictness = prompts.strictness(
                     (conf.get("council") or {}).get("strictness")
                 )["level"]
-                run.seating = self.seat_council(run.task, conf, run_id=run_id)
+                run.seating = self.seat_council(
+                    run.task, conf, run_id=run_id, incognito=incognito
+                )
                 self._build_council_stages(run, providers, conf.get("roles", {}))
 
             self._run = run
@@ -997,24 +1048,37 @@ class Pipeline:
 
     # -- seating -----------------------------------------------------------
 
-    def available_agents(self, providers: Dict[str, Any]) -> List[str]:
+    def available_agents(
+        self, providers: Dict[str, Any], incognito: bool = False
+    ) -> List[str]:
         """The catalogued CLIs that are actually installed and enabled.
 
         Returned in the catalogue's own order, which is what the router breaks
         ties on. Seating an agent whose binary does not resolve would cost a
         member per run for nothing - the seat would fail at launch every time.
+
+        ``incognito`` narrows it further to the CLIs that can be told not to
+        save the conversation. An agent without that flag is not unavailable in
+        general, only for this run, and leaving it out is the whole difference
+        between a private council and one that quietly kept a copy.
         """
         out: List[str] = []
         for agent in cfg.AGENTS:
             provider = providers.get(cfg.council_provider_id(agent)) or {}
             if not provider.get("enabled", True):
                 continue
+            if incognito and not supports_incognito(provider):
+                continue
             if resolve_binary(provider.get("command") or []):
                 out.append(agent)
         return out
 
     def seat_council(
-        self, task: str, conf: Dict[str, Any], run_id: str = ""
+        self,
+        task: str,
+        conf: Dict[str, Any],
+        run_id: str = "",
+        incognito: bool = False,
     ) -> router.Seating:
         """Route the bench for a task against a frozen configuration.
 
@@ -1024,7 +1088,15 @@ class Pipeline:
         """
         council = conf.get("council") or {}
         providers = conf.get("providers") or {}
-        available = self.available_agents(providers)
+        available = self.available_agents(providers, incognito=incognito)
+        if incognito and not available:
+            # Said here rather than left to the router's "check the agents in
+            # Settings", which would send the operator looking for a CLI that
+            # is installed, enabled and working perfectly well.
+            raise ValueError(
+                "No installed agent can run incognito. Turn Incognito off, or "
+                "give an agent its CLI's no-save flag in Settings."
+            )
 
         quota: Dict[str, Optional[float]] = {}
         if self.quota_source:
@@ -1215,6 +1287,11 @@ class Pipeline:
                 read_only=bool(
                     data.get("read_only") or root == str(cfg.workspace_dir())
                 ),
+                # Only an in-memory transcript can carry this, since an
+                # incognito run writes no other kind - but it is read back the
+                # same way, so continuing one after a Cancel keeps both halves
+                # of the promise rather than starting to record halfway.
+                incognito=bool(data.get("incognito")),
                 mode=mode,
                 snapshot_planned=bool(data.get("snapshot_planned")),
                 state=FAILED,
@@ -1563,7 +1640,14 @@ class Pipeline:
 
         try:
             result = runner.run(
-                prompt, cwd=run.workspace, auto_approve=auto_approve, read_only=read_only
+                prompt,
+                cwd=run.workspace,
+                auto_approve=auto_approve,
+                read_only=read_only,
+                # Off the run, so every stage of a private conversation is
+                # invoked the same way - including a continuation started after
+                # the toggle was switched back off.
+                incognito=run.incognito,
             )
         finally:
             # Always deregistered, including on the way out of an exception. A
@@ -1626,7 +1710,14 @@ class Pipeline:
         finally:
             if not run.solo:
                 self._record_router_feedback(run)
-            self._persist(run)
+            if run.state not in TERMINAL_STATES:
+                # Every path above ends by transitioning into a terminal state,
+                # and `_set_state` writes the transcript there so a follow-up
+                # cannot race this thread. This is the belt to those braces: a
+                # run that somehow ended non-terminal is still recorded, and
+                # the ordinary case no longer writes the same file twice - a
+                # second dump of every stage's output and the whole diff.
+                self._persist(run)
 
     def _chat_prompt(self, run: Run, behavior: str = "") -> str:
         """The prompt for one Chat turn, in either shape.
@@ -2394,8 +2485,9 @@ class Pipeline:
                 run.diff_stat = gitutil.diff_stat(run.workspace)
             except (gitutil.GitError, OSError):
                 pass
+        # `_set_state` has already written the transcript on the way into a
+        # terminal state, and nothing here changes the run after it.
         self._set_state(run, CANCELLED)
-        self._persist(run)
 
     def _record_router_feedback(self, run: Run, rolled_back: bool = False) -> None:
         """Fold this run's seats back into the router's history.
@@ -2417,6 +2509,12 @@ class Pipeline:
         was good"; the only judgement in here is the operator's rollback.
         """
         if not run.seating:
+            return
+        if run.incognito:
+            # The stats are a persistent record of who was seated and how it
+            # went, which is the record this run was told not to leave. One
+            # lost sample is cheaper than a private council showing up in the
+            # config file.
             return
         try:
             council = dict(self.store.get("council") or {})
@@ -2452,7 +2550,26 @@ class Pipeline:
             pass
 
     def _persist(self, run: Run) -> None:
-        """Write the run transcript to disk for later inspection."""
+        """Write the run transcript to disk for later inspection.
+
+        An incognito run is held in memory instead. It has to be held
+        somewhere: the browser continues a conversation by naming the
+        transcript the last run wrote, so a private run that stored nothing at
+        all could be read once and never followed up on. What it does not get
+        is a file, a place in the sidebar, or any life beyond this process.
+        """
+        if run.incognito:
+            # Kept as the same JSON text the disk path would have written, so
+            # what `load_run` hands back is the same shape either way - a
+            # tuple that became a list, a stray object that became a string.
+            # A private run must not be the one that behaves differently.
+            text = json.dumps(run.to_dict(), indent=2, default=str)
+            with self._lock:
+                self._volatile_runs.pop(run.transcript_name, None)
+                self._volatile_runs[run.transcript_name] = text
+                for name in list(self._volatile_runs)[:-VOLATILE_RUN_LIMIT]:
+                    del self._volatile_runs[name]
+            return
         try:
             path = self._runs_dir / run.transcript_name
             # Owner-only: a transcript carries the task, every stage's output
@@ -2488,67 +2605,106 @@ class Pipeline:
         except OSError:
             return []
 
-        # Read the whole window before picking leaves out of it. Two runs can
-        # share a timestamp, so the filename sort alone does not guarantee a
-        # child is seen before its parent, and a parent mistaken for a leaf
+        # Summarise the whole window before picking leaves out of it. Two runs
+        # can share a timestamp, so the filename sort alone does not guarantee
+        # a child is seen before its parent, and a parent mistaken for a leaf
         # would list the same conversation twice.
-        loaded: List[Tuple[str, Dict[str, Any]]] = []
-        parents: set = set()
-        for f in files:
-            try:
-                data = json.loads(f.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                continue
-            if not isinstance(data, dict):
-                continue
-            loaded.append((f.name, data))
-            parent = str(data.get("parent_run_id") or "")
-            if parent:
-                parents.add(parent)
+        rows = [r for r in (self._summary_of(f) for f in files) if r is not None]
+        parents = {r["parent_run_id"] for r in rows if r["parent_run_id"]}
+        self._prune_summary_cache({f.name for f in files})
 
         out: List[Dict[str, Any]] = []
-        for name, data in loaded:
-            if str(data.get("id") or "") in parents:
+        for row in rows:
+            if row["id"] in parents:
                 continue
-            # `solo` covers transcripts written before `mode` existed.
-            run_mode = str(data.get("mode") or "") or (
-                "solo" if data.get("solo") else "council"
-            )
-            if mode and run_mode != mode:
+            if mode and row["mode"] != mode:
                 continue
-            conversation = [
-                t for t in (data.get("conversation") or []) if isinstance(t, dict)
-            ]
-            first = conversation[0] if conversation else data
-            out.append(
-                {
-                    "id": data.get("id"),
-                    # A conversation is named for what it was opened about, so
-                    # the title is its first message and not its latest.
-                    "title": str(first.get("task") or "")[:200],
-                    "task": (data.get("task") or "")[:200],
-                    "workspace": _transcript_workspace(data),
-                    "state": data.get("state"),
-                    "created_at": data.get("created_at"),
-                    # Served so the browser can switch to the right mode before
-                    # continuing, rather than let the server refuse it after.
-                    "mode": run_mode,
-                    "zero_touch": data.get("zero_touch"),
-                    # So the row itself can say a run stopped halfway and can
-                    # still be finished. Discoverability is the whole problem
-                    # here: the operator who needs this is looking at a list of
-                    # conversations, not at the run they gave up on.
-                    "can_resume": _with_resumability(data)["can_resume"],
-                    "diff_stat": data.get("diff_stat") or {},
-                    # Every earlier turn, plus this run's own message.
-                    "messages": len(conversation) + 1,
-                    "context": data.get("context") or {},
-                    "file": name,
-                }
-            )
+            summary = dict(row)
+            # Lineage is how the leaves were picked, not something the sidebar
+            # has any use for.
+            del summary["parent_run_id"]
+            out.append(summary)
             if len(out) >= limit:
                 break
         return out
+
+    def _summary_of(self, path: Path) -> Optional[Dict[str, Any]]:
+        """One conversation row, read from the transcript or from the cache.
+
+        A transcript is written when its run reaches a terminal state and then
+        only ever read, while the sidebar is rebuilt after every run, every
+        mode switch and every delete. Parsing a window of two hundred of them -
+        each carrying every stage's full output and the run's whole diff - to
+        produce a dozen short fields is the one part of listing conversations
+        that costs anything, so the answer is kept against the file's own mtime
+        and size. Both, rather than mtime alone: a same-second rewrite of the
+        same run is exactly what `_persist` does.
+        """
+        try:
+            st = path.stat()
+            stamp = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+        with self._lock:
+            cached = self._summary_cache.get(path.name)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        if not isinstance(data, dict):
+            return None
+
+        # `solo` covers transcripts written before `mode` existed.
+        run_mode = str(data.get("mode") or "") or (
+            "solo" if data.get("solo") else "council"
+        )
+        conversation = [
+            t for t in (data.get("conversation") or []) if isinstance(t, dict)
+        ]
+        first = conversation[0] if conversation else data
+        row = {
+            "id": str(data.get("id") or ""),
+            # A conversation is named for what it was opened about, so the
+            # title is its first message and not its latest.
+            "title": str(first.get("task") or "")[:200],
+            "task": (data.get("task") or "")[:200],
+            "workspace": _transcript_workspace(data),
+            "state": data.get("state"),
+            "created_at": data.get("created_at"),
+            # Served so the browser can switch to the right mode before
+            # continuing, rather than let the server refuse it after.
+            "mode": run_mode,
+            "zero_touch": data.get("zero_touch"),
+            # So the row itself can say a run stopped halfway and can still be
+            # finished. Discoverability is the whole problem here: the operator
+            # who needs this is looking at a list of conversations, not at the
+            # run they gave up on.
+            "can_resume": _with_resumability(data)["can_resume"],
+            "diff_stat": data.get("diff_stat") or {},
+            # Every earlier turn, plus this run's own message.
+            "messages": len(conversation) + 1,
+            "context": data.get("context") or {},
+            "file": path.name,
+            "parent_run_id": str(data.get("parent_run_id") or ""),
+        }
+        with self._lock:
+            self._summary_cache[path.name] = (stamp, row)
+        return row
+
+    def _prune_summary_cache(self, keep: set) -> None:
+        """Forget summaries of transcripts that are no longer in the window.
+
+        Deleted runs and runs that have aged out of `HISTORY_SCAN_LIMIT` both
+        land here; without it the cache would be a second, unbounded copy of
+        every conversation the app had ever listed.
+        """
+        with self._lock:
+            for name in [n for n in self._summary_cache if n not in keep]:
+                del self._summary_cache[name]
 
     def context_preview(self, name: str) -> Dict[str, Any]:
         """What continuing a persisted transcript would replay, and what it costs.
@@ -2633,7 +2789,18 @@ class Pipeline:
         return removed
 
     def load_run(self, name: str) -> Optional[Dict[str, Any]]:
-        """Load a persisted transcript by filename."""
+        """Load a run transcript by filename, from memory or from disk.
+
+        The in-memory half is where an incognito conversation lives. Checked
+        first, and by exact name: these are names this engine generated, not
+        names a client can steer, and a private run must be continuable by
+        exactly the call that continues a public one.
+        """
+        with self._lock:
+            text = self._volatile_runs.get(name)
+        if text is not None:
+            return _with_resumability(json.loads(text))
+
         path = self._transcript_path(name)
         if path is None or not path.exists():
             return None

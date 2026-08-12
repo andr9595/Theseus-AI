@@ -17,6 +17,11 @@ Three behaviours are worth calling out:
   neither does Chat until Zero-Touch is switched on, being invoked with
   ``read_only_args`` instead.
 
+* **Incognito is a capability, not a preference.** ``incognito_args`` carries
+  the CLI's own no-save flag, and a provider that declares none is *refused*
+  rather than run without one - a run that promised to leave no trace and then
+  left one in the agent's own history would be worse than no promise at all.
+
 * **No shell.** Commands are executed as argv lists with ``shell=False``, so a
   prompt containing backticks, ``$(...)`` or a semicolon is inert data rather
   than something the shell will interpret.
@@ -103,11 +108,23 @@ def resolve_binary(command: List[str]) -> Optional[str]:
     return shutil.which(exe)
 
 
+def supports_incognito(provider: Dict) -> bool:
+    """Whether this provider can be asked not to save its own conversation.
+
+    Judged by the flags it declares rather than by a stored capability field,
+    for the reason ``config.agent_for`` derives the agent from the command: a
+    second field can disagree with the first, and here the disagreement would
+    be a privacy promise the CLI never received.
+    """
+    return any(a for a in (provider.get("incognito_args") or []))
+
+
 def build_argv(
     provider: Dict,
     prompt: str,
     auto_approve: bool,
     read_only: bool = False,
+    incognito: bool = False,
 ) -> tuple[List[str], Optional[str]]:
     """Assemble the argv for a provider invocation.
 
@@ -118,6 +135,10 @@ def build_argv(
     the first is what the pipeline hands a stage the human approved, the second
     is what Solo Mode hands an assistant that will never be approved at all.
 
+    ``incognito`` is orthogonal to both - what a run may write to the working
+    folder and what the CLI writes to its own history are different questions -
+    and is refused outright on a provider with no flags for it.
+
     The ``{prompt}`` token may appear anywhere in the template, including
     embedded in a larger string (e.g. ``--message={prompt}``) - the one
     exception being a prompt too large for argv, which has to move to stdin
@@ -126,6 +147,17 @@ def build_argv(
     template: List[str] = list(provider.get("command") or [])
     if not template:
         raise ProviderUnavailable("No command configured for this provider")
+
+    if incognito and not supports_incognito(provider):
+        # Before anything else is assembled: the alternative to refusing is
+        # launching this CLI normally under a run that has told the operator
+        # nothing is being saved, and the trace would be in the agent's own
+        # history where this app cannot even find it to apologise for it.
+        raise ProviderUnavailable(
+            f"{provider.get('label') or provider.get('id') or 'This provider'} "
+            f"has no incognito arguments configured, so it cannot be asked to "
+            f"leave the conversation out of its own history."
+        )
 
     placeholders = [t for t in template if PROMPT_TOKEN in t]
     configured_stdin = bool(provider.get("prompt_on_stdin"))
@@ -222,6 +254,10 @@ def build_argv(
             if not token:
                 continue
             extra.append(token.replace(EFFORT_TOKEN, effort))
+
+    if incognito:
+        # Checked for support above, so this is only the appending.
+        extra.extend(a for a in (provider.get("incognito_args") or []) if a)
 
     if read_only:
         # Stated rather than assumed. Withholding the auto-approve flags is
@@ -497,6 +533,7 @@ class ProviderRunner:
         cwd: str,
         auto_approve: bool,
         read_only: bool = False,
+        incognito: bool = False,
     ) -> ProviderResult:
         pid = str(self.provider.get("id", "provider"))
         started = time.monotonic()
@@ -507,7 +544,11 @@ class ProviderRunner:
         # exception here leaves the stage running forever with no error on it.
         try:
             argv, stdin_text = build_argv(
-                self.provider, prompt, auto_approve, read_only=read_only
+                self.provider,
+                prompt,
+                auto_approve,
+                read_only=read_only,
+                incognito=incognito,
             )
             timeout = int(self.provider.get("timeout_seconds") or 900)
             if timeout <= 0:

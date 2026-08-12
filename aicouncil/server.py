@@ -254,6 +254,18 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("`workspace` must be a folder path.")
         return value
 
+    def _incognito_from(self, body: Dict[str, Any]) -> bool:
+        """Whether this request asked for a private run.
+
+        Typed strictly rather than read for truthiness: the string ``"false"``
+        is true in Python, and a client that sent one would be told its run was
+        private while every stage was recorded as usual.
+        """
+        value = body.get("incognito", False)
+        if not isinstance(value, bool):
+            raise ValueError("`incognito` must be true or false.")
+        return value
+
     # -- dispatch ----------------------------------------------------------
 
     def do_GET(self) -> None:  # noqa: N802 - name fixed by the base class
@@ -639,6 +651,7 @@ class Handler(BaseHTTPRequestHandler):
             workspace,
             continue_from=continue_from,
             compact_context=compact_context,
+            incognito=self._incognito_from(body),
         )
         return {"ok": True, "run": run.to_dict()}
 
@@ -732,6 +745,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_project_start(self, params: Dict[str, list]) -> Dict[str, Any]:
         body = self._read_body()
+        if self._incognito_from(body):
+            # Refused rather than ignored. A build's board, spec and critique
+            # log are the state it pauses, resumes and is audited from, so a
+            # project that kept none of them would not be a project - and a
+            # request quietly answered with the opposite of what it asked for
+            # is the one failure mode a privacy control cannot have.
+            raise ValueError(
+                "A project keeps its board and spec on disk, so it cannot run "
+                "incognito."
+            )
         # `innovation` is per-run, not a saved setting: it is the slider on the
         # initializer, and the answer to "how much may it invent this time" is
         # different for a throwaway prototype and somebody's production repo.
@@ -825,7 +848,12 @@ class Handler(BaseHTTPRequestHandler):
         """
         body = self._read_body()
         task = str(body.get("task") or "")
-        seating = self.app.pipeline.seat_council(task, self.app.store.all())
+        # Incognito narrows the field to the CLIs that can be told not to save
+        # the conversation, so a preview that ignored it would show a bench the
+        # run would not seat.
+        seating = self.app.pipeline.seat_council(
+            task, self.app.store.all(), incognito=self._incognito_from(body)
+        )
         return {"ok": True, "seating": seating.to_dict()}
 
     def _api_save_role(self, params: Dict[str, list]) -> Dict[str, Any]:

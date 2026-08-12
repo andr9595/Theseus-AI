@@ -217,6 +217,10 @@ the same command works whichever seat it lands in.
 9. **Or keep going.** Just type again — the composer stays attached to the
    conversation. See [Continuing a run](#continuing-a-run).
 
+None of that has to be kept. The hat-and-glasses button at the top right starts
+an [incognito](#incognito) conversation, which is written neither to the Chats
+list nor to the agents' own session history.
+
 ### The three tabs
 
 | Tab | What it is |
@@ -517,6 +521,13 @@ does not refuse that seat; it publishes a warning naming each unguarded provider
 when the run starts. Give a custom command its own read-only flag in Settings,
 or don't seat it.
 
+[Incognito](#incognito) is the same kind of promise made the other way round,
+and takes the opposite decision: a provider with no `incognito_args` is *not*
+seated on a private run. The difference is what a broken promise costs. A
+read-only seat that writes leaves the evidence in your working folder, where the
+diff and the snapshot will show it; a private seat that saves leaves it in that
+CLI's own history, where this app cannot see it, warn about it or delete it.
+
 > **Zero-Touch means what it says.** An agent will create, modify and delete
 > files in your working folder with no further confirmation. Use it on a
 > branch, keep Safety Snapshot on, and don't point it at anything you can't
@@ -584,6 +595,53 @@ no gate and no branch for them to decide anything about.
 | **Pull request** | Delivery | Deliver the run on a branch of its own and open a GitHub PR instead of writing to the checked-out branch. See below. |
 | **Require clean tree** | Delivery | Refuse to start if the repo has uncommitted changes. Pull-request mode enforces this itself, on or off. |
 | **Safety snapshot** | Delivery | Capture the worktree before the chairman writes so **Roll back** works. Leave on. |
+
+---
+
+## Incognito
+
+The hat-and-glasses button at the **top right** starts a conversation that is
+not recorded. Dim is off; bright — accent-coloured, with a halo — is on. Click
+it before you send, and the run it starts carries that choice for its whole
+life. A live run is on the record it was started under: the button is disabled
+while one is going, and a run started incognito stays labelled `INCOGNITO` in
+the status line after the toggle is switched back off.
+
+An incognito conversation:
+
+- **is never written to `~/.config/ai-council/runs/`**, so it is not in the
+  **Chats** sidebar and is not there after a restart;
+- **does not teach the router.** The seating history in `config.json` is a
+  persistent record of who sat and how it went, so an incognito run contributes
+  no sample to it;
+- **passes each CLI its own no-save flag** — `--ephemeral` to Codex,
+  `--no-session-persistence` to Claude — so the turn is absent from that agent's
+  own history too, not merely from this app's;
+- **can still be continued** for as long as Theseus is open. It is held in
+  memory, so the composer stays attached and follow-ups work exactly as they
+  otherwise would. A follow-up to a private conversation is private whatever
+  the button says at the time — it carries the earlier turns with it. Closing
+  the app is what ends it.
+
+**Antigravity is not seated on an incognito run.** Its CLI offers `--continue`
+and `--conversation` to resume a saved conversation and nothing at all to stop
+one being saved, so there is no flag that would make the promise true. A CLI
+with no way to keep its own history clean is left off rather than run and
+quietly recorded, and the same applies to a hand-written **Custom command**
+until you give it `incognito_args` in Settings. If nothing installed can run
+incognito, the run is refused with that reason rather than started.
+
+What it is not: incognito does not anonymise you to the model provider. The
+prompt still goes to the same subscription over the same account, and whatever
+that vendor retains server-side is between you and them. Nor does it change
+what a run may write — a folder chosen is still a folder written to, under the
+same gate and the same snapshot.
+
+**Projects cannot run incognito.** The button is disabled on that tab, and a
+start that asks for it anyway is refused rather than quietly given the opposite.
+A build's `.theseus/BOARD.json`, `SPEC.md` and `CRITIQUE.log` are the state it
+resumes from; a project that kept none of them could not be paused, resumed or
+audited, which is most of what a project is.
 
 ---
 
@@ -1101,10 +1159,10 @@ The defaults:
 prompt — a good place for "use tabs", "never add a dependency without
 asking", "all new code needs tests".
 
-Config lives at `~/.config/ai-council/config.json`. Run transcripts are written
-to `~/.config/ai-council/runs/` and grouped into threads under the **Chats**
-tab, where a conversation can be read in full or
-[continued](#continuing-a-run).
+Config lives at `~/.config/ai-council/config.json`. Every run transcript except
+an [incognito](#incognito) one is written to `~/.config/ai-council/runs/` and
+grouped into threads under the **Chats** tab, where a conversation can be read
+in full or [continued](#continuing-a-run).
 
 ### Assigning agents to seats
 
@@ -1130,6 +1188,9 @@ differs from the other two in three ways worth knowing:
   read as the plain text it is.
 - **No quota reading.** It publishes no equivalent of `claude /usage`, so its
   member shows *no quota data* rather than a number this app made up.
+- **No no-save flag.** `agy` offers `--continue` and `--conversation` to resume
+  a saved conversation and nothing to stop one being saved, so it is left off
+  [incognito](#incognito) runs rather than run and quietly recorded.
 
 Editing a CLI's command by hand still works and simply reads back as
 **Custom command**; the command is the source of truth, and the card is
@@ -1485,6 +1546,9 @@ than loopback is refused outright. Everything written under
 `~/.config/ai-council` — the config, the workspace and every run transcript,
 which holds the task, each stage's output and the full diff — is created
 owner-only (`0700`/`0600`) rather than at whatever the ambient umask allows.
+[Incognito](#incognito) writes no transcript at all and passes each CLI its own
+no-save flag, which keeps a conversation off this disk; it is not an anonymity
+feature, and says nothing about what the model provider retains.
 
 What this does **not** defend against: a coding agent granted write permission
 runs unsandboxed, as you, with your whole environment. In Projects Mode the QA
