@@ -1268,24 +1268,38 @@ class ProjectEngine:
         return str(path.resolve())
 
     def _unavailable_roles(self, conf: Dict[str, Any]) -> List[str]:
-        """Which of the three chairs is pointed at a binary that is not there."""
+        """Which of the three chairs cannot be filled, and for either reason.
+
+        A chair pointed at a CLI the operator has not added is as unfillable as
+        one pointed at a missing binary, and until this asked, a project would
+        start on an agent that had been removed everywhere else.
+        """
         providers = conf.get("providers") or {}
         missing = []
         for role in ROLES:
             provider = providers.get(role) or {}
-            if not probe(provider).get("available"):
+            if not cfg.provider_enabled(conf, provider):
+                missing.append(role)
+            elif not probe(provider).get("available"):
                 missing.append(role)
         return missing
 
     def _missing_message(self, missing: List[str]) -> str:
-        providers = self.store.get("providers", {}) or {}
+        conf = self.store.all()
+        providers = conf.get("providers") or {}
         lines = []
         for role in missing:
-            command = (providers.get(role) or {}).get("command") or ["?"]
-            lines.append(f"{ROLE_LABELS[role]} is set to `{command[0]}`")
+            provider = providers.get(role) or {}
+            command = provider.get("command") or ["?"]
+            why = (
+                "is not connected"
+                if not cfg.provider_enabled(conf, provider)
+                else "is not installed or not on PATH"
+            )
+            lines.append(f"{ROLE_LABELS[role]}'s `{command[0]}` {why}")
         return (
-            f"{'; '.join(lines)}, which is not installed or not on PATH. "
-            f"Install it, or assign that chair to another CLI in the agent "
+            f"{'; '.join(lines)}. Add or install it in Settings → Agents, or "
+            f"assign that chair to a CLI you have connected in the agent "
             f"matrix. A project runs unattended, so it will not start with a "
             f"seat it cannot fill."
         )

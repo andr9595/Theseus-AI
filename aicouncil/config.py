@@ -19,7 +19,12 @@ Design notes
 * ``incognito_args`` are appended only when Incognito is on, and an agent that
   declares none is not run incognito at all - see ``providers.build_argv``.
 * Nothing here ever holds an API key. The CLIs carry their own subscription
-  auth; we only shell out to them.
+  auth; we only shell out to them - see ``AGENT_SETUP`` for the install and
+  sign-in commands Settings offers, all of which hand the credential to the
+  vendor's own CLI and none of which pass through this app.
+* No agent is required and none is preferred. ``agent_settings.<cli>.selected``
+  is the operator's answer to "use this one", it starts false, and it is what
+  decides whether a CLI is seated - not whether its binary happens to exist.
 """
 
 from __future__ import annotations
@@ -246,6 +251,71 @@ AGENTS: Dict[str, Dict[str, Any]] = {
 # template, or the bundled mock agent.
 CUSTOM_AGENT = "custom"
 
+# How each catalogued CLI is installed and signed in, so Settings can offer
+# both without the operator leaving the app.
+#
+# Deliberately *not* part of `AGENTS`. Those entries are copied wholesale onto
+# every provider record (see `_council_seat`), which means they are saved to
+# config.json, editable by hand in the Command line disclosure, and spliced
+# into argv by `build_argv`. A login command sitting there is one hand edit
+# away from being launched with a prompt appended to it. Here it is reachable
+# only by agent id, and every argv is fixed at import time - the setup
+# endpoints take an id and an action and never an executable.
+#
+# `status_command` must be non-interactive and must not open a browser: it runs
+# on an ordinary state refresh. `login_command` is the opposite - it is
+# expected to want a terminal, and `login_tui` says it wants a *whole* one, in
+# which case Settings hands the command over to be pasted rather than pretends
+# a scrollback pane is a terminal emulator.
+AGENT_SETUP: Dict[str, Dict[str, Any]] = {
+    "codex": {
+        # Prints a URL and waits on the browser callback, so it reads fine as
+        # streamed lines.
+        "login_command": ["codex", "login"],
+        "login_tui": False,
+        "status_command": ["codex", "login", "status"],
+        "docs_url": "https://chatgpt.com/codex",
+        "account": "a ChatGPT Plus, Pro or Business subscription",
+    },
+    "claude": {
+        # `--claudeai` is the subscription flow and is not a default worth
+        # leaving to the CLI: the alternative it offers is `--console`, which
+        # is API-key billing, and picking that by accident is the one outcome
+        # this app exists to avoid.
+        "login_command": ["claude", "auth", "login", "--claudeai"],
+        "login_tui": False,
+        # Answers with a JSON object carrying `loggedIn`, so the reply is read
+        # rather than pattern-matched.
+        "status_command": ["claude", "auth", "status"],
+        "docs_url": "https://claude.ai/download",
+        "account": "a Claude Pro or Max subscription",
+    },
+    "agy": {
+        # Antigravity 1.1.12 has no auth subcommand at all: signing in happens
+        # inside the interactive session, which is a full-screen TUI. Said so
+        # here rather than discovered by an operator watching a pane fill with
+        # escape sequences.
+        "login_command": ["agy"],
+        "login_tui": True,
+        "status_command": [],
+        "docs_url": "https://antigravity.google/cli",
+        "account": "a Google account",
+    },
+}
+
+
+def install_command(agent: str) -> List[str]:
+    """The argv that installs one CLI, or an empty list for an unknown agent.
+
+    Routed through the bundled script rather than naming a vendor URL here:
+    those URLs are piped to `bash`, and one file that names them is one file to
+    read before trusting them. The script is also what a terminal user runs, so
+    the button and the documented command cannot drift apart.
+    """
+    if agent not in AGENT_SETUP:
+        return []
+    return [str(REPO_ROOT / "scripts" / "install-deps.sh"), "--agent", agent]
+
 # The council seats are configured per *CLI* rather than per chair, because
 # which chair a CLI takes is decided per run by the router - there is no
 # standing "seat 2" to configure. What an operator sets here is how Codex
@@ -300,7 +370,24 @@ def agent_catalog() -> List[Dict[str, Any]]:
     Served to the UI so the browser never carries its own copy of a command
     or a permission flag - one source of truth, in Python.
     """
-    catalog = [dict(copy.deepcopy(preset), id=name) for name, preset in AGENTS.items()]
+    catalog = []
+    for name, preset in AGENTS.items():
+        setup = AGENT_SETUP.get(name) or {}
+        catalog.append(dict(
+            copy.deepcopy(preset),
+            id=name,
+            # What the connection card needs to describe this CLI, and no argv:
+            # the browser never sends a command back, so it has no reason to
+            # hold one. It asks for an agent id and an action instead.
+            setup={
+                "login_tui": bool(setup.get("login_tui")),
+                "can_check": bool(setup.get("status_command")),
+                "docs_url": str(setup.get("docs_url") or ""),
+                "account": str(setup.get("account") or ""),
+                "login_hint": " ".join(setup.get("login_command") or []),
+                "install_hint": " ".join(install_command(name)),
+            },
+        ))
     catalog.append({
         "id": CUSTOM_AGENT,
         "label": "Custom command",
@@ -340,11 +427,57 @@ def agent_catalog() -> List[Dict[str, Any]]:
 # A provider running a hand-written command is nobody's agent and keeps its own.
 AGENT_SETTING_KEYS = ("model", "models", "effort")
 
+# `selected` sits beside them and is not one of them: the three above are
+# lifted *off* a provider the pickers patched, and this one is never on a
+# provider in the first place. What it produces there is `enabled`, written by
+# `_apply_agent_settings` in the same sweep.
+#
+# False by default, for every agent, and that is the design rather than a
+# cautious default. This app has no opinion about which vendor an operator
+# should use and no way to know which they pay for, so a fresh install seats
+# nobody until asked. A CLI found on PATH is evidence of nothing except that it
+# is installed - plenty of machines carry all three and a subscription for one.
+AGENT_SELECTED_KEY = "selected"
+
 
 def _default_agent_settings() -> Dict[str, Any]:
     return {
-        agent: {"model": "", "models": [], "effort": ""} for agent in AGENTS
+        agent: {"selected": False, "model": "", "models": [], "effort": ""}
+        for agent in AGENTS
     }
+
+
+def selected_agents(conf: Dict[str, Any]) -> List[str]:
+    """The catalogued CLIs the operator has added, in catalogue order."""
+    settings = conf.get("agent_settings") or {}
+    out: List[str] = []
+    for agent in AGENTS:
+        entry = settings.get(agent)
+        if isinstance(entry, dict) and entry.get(AGENT_SELECTED_KEY):
+            out.append(agent)
+    return out
+
+
+def provider_enabled(conf: Dict[str, Any], provider: Dict[str, Any]) -> bool:
+    """Whether a chair may run at all - the one question every caller asks.
+
+    Read here rather than projected onto the provider records the way the model
+    and the reasoning level are. Those are settings of a CLI that a chair
+    displays; this is a *fact about two things at once*, and writing it down
+    would put a copy of the answer on a record whose command can change under
+    it. A chair repointed at a hand-written command would keep the derived
+    "off" of whichever CLI used to hold it, and read back as a wrapper the
+    operator had disabled - which nobody did.
+
+    So: a catalogued CLI runs where it was added in Settings, and a
+    hand-written command answers to nobody's selection and keeps its own flag.
+    The second half is what lets the bundled mock agent exercise the whole
+    pipeline with no vendor CLI added at all.
+    """
+    if not provider.get("enabled", True):
+        return False
+    agent = agent_for(provider)
+    return agent not in AGENTS or agent in selected_agents(conf)
 
 
 # --------------------------------------------------------------------------
@@ -863,8 +996,35 @@ def _migrate(merged: Dict[str, Any], raw: Dict[str, Any]) -> Dict[str, Any]:
     _repair_agy_read_only(merged)
     _repair_incognito_args(merged, raw)
     _adopt_agent_settings(merged, raw)
+    _adopt_agent_selection(merged, raw)
     _apply_agent_settings(merged)
     return merged
+
+
+def _adopt_agent_selection(merged: Dict[str, Any], raw: Dict[str, Any]) -> None:
+    """Carry a config written before agents were opt-in forward unchanged.
+
+    Selection defaults to off, and applying that default to an existing
+    installation would empty its bench at the next launch - the operator would
+    open a working app and find nobody seated and nothing saying why. So a
+    stored config that never had the key answers it from what it was already
+    doing: an agent whose council seat was enabled was in use, and stays.
+
+    Only agents the file is silent about are decided here. An explicit
+    `"selected": false` written by the panel is an answer, not an absence, and
+    survives a reload.
+    """
+    stored = raw.get("agent_settings")
+    stored = stored if isinstance(stored, dict) else {}
+    providers = raw.get("providers") or {}
+    settings = merged.setdefault("agent_settings", _default_agent_settings())
+    for agent in AGENTS:
+        entry = stored.get(agent)
+        if isinstance(entry, dict) and AGENT_SELECTED_KEY in entry:
+            continue
+        seat = providers.get(council_provider_id(agent))
+        was_on = bool((seat or {}).get("enabled", True)) if isinstance(seat, dict) else True
+        settings.setdefault(agent, {})[AGENT_SELECTED_KEY] = was_on
 
 
 def _adopt_agent_settings(merged: Dict[str, Any], raw: Dict[str, Any]) -> None:

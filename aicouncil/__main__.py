@@ -121,7 +121,13 @@ def _print_doctor(store: cfg.ConfigStore) -> int:
         if not provider:
             continue
         info = probe(provider)
-        mark = "OK  " if info["available"] else "MISS"
+        # Three marks rather than two. A CLI that is installed but not added is
+        # not a problem to fix by installing something, and reporting it as
+        # missing would send the operator looking for a binary that is there.
+        if not cfg.provider_enabled(store.all(), provider):
+            mark = "OFF "
+        else:
+            mark = "OK  " if info["available"] else "MISS"
         version = f"  [{info['version']}]" if info["version"] else ""
         location = info["path"] or "not found on PATH"
         # The job comes first: either agent can be assigned to either job, so
@@ -131,12 +137,18 @@ def _print_doctor(store: cfg.ConfigStore) -> int:
             f"  [{mark}] {job:<14} {info['label']:<8} "
             f"{info['executable']:<10} -> {location}{version}"
         )
-        if not info["available"]:
+        if mark == "MISS":
             missing.append(info["executable"])
+    added = cfg.selected_agents(store.all())
+    print(
+        f"\n  Agents added: {', '.join(added) if added else 'none yet'}."
+        f"\n  Add, install or sign in to one in Settings -> Agents."
+    )
     if missing:
         print(
-            f"\n  {len(missing)} CLI(s) missing: {', '.join(missing)}."
-            f"\n  Run scripts/install-deps.sh, or repoint the command in Settings."
+            f"\n  {len(missing)} added CLI(s) missing: {', '.join(missing)}."
+            f"\n  Install it from Settings -> Agents, run"
+            f" scripts/install-deps.sh --agent <name>, or repoint the command."
         )
     return 0
 

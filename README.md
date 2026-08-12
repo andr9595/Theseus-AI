@@ -17,7 +17,7 @@ across your existing AI subscriptions — with **zero per-token API cost**.
                                                                    └── approval gate (unless Zero-Touch is on)
 ```
 
-Every installed agent CLI gets its own seat. Each member shells out to its CLI
+Every agent you have added gets its own seat. Each member shells out to its CLI
 (your ChatGPT Plus/Pro, Claude Pro, or other existing subscription) to answer
 the task independently and read-only. Each then critiques the others'
 anonymised answers. A chairman — one of the same agents, routed by the council
@@ -34,8 +34,16 @@ Settings, including the same agent in more than one seat. See
 [Assigning agents to seats](#assigning-agents-to-seats).
 
 **Nothing in this application reads, stores or transmits an API key.** It
-drives the CLIs you have already authenticated, so the marginal cost of a run
-is zero.
+drives the CLIs you have authenticated, so the marginal cost of a run is zero.
+Signing in from Settings → Agents runs the vendor's own login command and the
+account stays with their CLI — there is no field anywhere in this app that
+takes a key or a password.
+
+**No agent is required, and none is preferred.** Which AI you use is your
+choice: add one, two or all three in [Settings → Agents](#connecting-your-agents),
+in whatever combination you have access to. Installing a CLI does not add it —
+a machine that carries all three binaries and a subscription for one still runs
+only what you chose.
 
 There is also a third tab. **[Projects](#projects)** points three agents — an
 architect, a developer and a QA specialist — at one folder and lets them work a
@@ -55,14 +63,18 @@ folder before it starts.
 | Python **3.9+** | Standard library only — no `pip install`, no virtualenv, no build step |
 | `git` | Optional — powers the diff viewer, safety snapshot and rollback when the working folder is a repository |
 | A browser | Chromium-family gets a frameless app window; Firefox gets a plain window |
-| `codex` CLI | Optional — a council seat. See [Installing the agent CLIs](#installing-the-agent-clis) |
-| `claude` CLI | Optional — a council seat |
-| `agy` CLI | Optional — Google's Antigravity, assignable to any seat or to Chat |
+| At least one agent | To do AI work. **Which one is entirely your choice** — see [Connecting your agents](#connecting-your-agents) |
 | `gh` CLI | Optional — only for [Pull-request mode](#pull-request-mode). `./scripts/install-deps.sh --extras` installs it |
 
-The app itself has **no dependencies at all**. If no agent CLI is installed
-yet, everything still runs — point the providers at the bundled mock
-agent (below) and the full pipeline is exercisable end to end.
+The app itself has **no dependencies at all**, and it ships configured for
+nobody: on a fresh install no agent is added, so the first thing the dashboard
+asks is which ones you want. Three are catalogued — Codex, Claude and
+Antigravity — and adding one, two or all three is the same amount of work.
+Nothing here treats any of them as the default.
+
+Everything that is not an AI run works before you add anything, and the full
+pipeline is exercisable end to end without a vendor CLI at all: point a chair at
+the [bundled mock agent](#trying-it-without-the-clis).
 
 ---
 
@@ -76,6 +88,11 @@ cd ai-council
 
 That is the whole install. `run.sh` locates a Python 3.9+ interpreter, starts a
 loopback-only server on port 8760, and opens the dashboard in a browser window.
+
+Then open **Settings → Agents** and add whichever AI you have access to. The
+panel installs the CLI and signs it in for you if you have not already — see
+[Connecting your agents](#connecting-your-agents). Nothing else needs
+configuring to start.
 
 Check what the app can see:
 
@@ -104,15 +121,26 @@ Providers:
   [MISS] Project: dev   Codex    codex      -> not found on PATH
   [MISS] Project: QA    Antigravity agy        -> not found on PATH
 
-  9 CLI(s) missing: codex, claude, agy, codex, claude, claude, claude, codex, agy.
-  Run scripts/install-deps.sh, or repoint the command in Settings.
+  Agents added: none yet.
+  Add, install or sign in to one in Settings -> Agents.
 ```
 
 Every configured provider gets a row, not only the three council seats: the two
 retired stages, the Chat assistant and the three project chairs are all listed,
 because a project that cannot start for want of `agy` is exactly what this
-command exists to find first. The trailing count and install hint are printed
-only when at least one CLI is missing.
+command exists to find first.
+
+There are three marks, not two, because there are two separate ways for a chair
+to be unfillable:
+
+| Mark | Meaning |
+|---|---|
+| `[OK  ]` | Added, installed and ready to be seated |
+| `[OFF ]` | Not added. The binary may well be installed — you have not asked to use it |
+| `[MISS]` | Added, but its executable is not on `PATH` |
+
+The trailing count is printed only when an *added* agent is missing its CLI:
+one you never added is not a problem to fix by installing something.
 
 ### Launcher flags
 
@@ -127,55 +155,116 @@ only when at least one CLI is missing.
 
 ---
 
-## Installing the agent CLIs
+## Connecting your agents
 
-The pipeline needs at least one agent CLI on your `PATH` — `codex` and `claude`
-by default, with Google's `agy` a third option. All three vendors ship a
-first-party installer that drops a standalone binary into `~/.local/bin` — **no
-Node, no npm, no sudo**:
+**Settings → Agents** is where you say which AI this install uses. There is one
+card per catalogued CLI, each with four states that are deliberately kept
+apart — because a setup screen that reports "ready" on the strength of
+`--version` succeeding is how you end up with a run that fails at launch:
+
+| State | What it means |
+|---|---|
+| **Not added** | Theseus will not seat it. This is where every agent starts |
+| **CLI not installed** | You added it; its binary is not on `PATH` yet. The card offers **Install the CLI** |
+| **Not signed in** | Installed, and the vendor says there is no account behind it. The card offers **Sign in** |
+| **Signed in** | Ready. The card offers **Choose a model**, listing what *your account* may actually run |
+
+Adding is the only thing that seats an agent. Installing a CLI does not, and
+neither does having installed it years ago for something else.
+
+### Add, install, sign in
+
+1. Run `./run.sh` and open **Settings → Agents**.
+2. Press **Add** on each agent you have access to. Any combination is fine, and
+   so is one.
+3. If its CLI is missing, press **Install the CLI**. That runs
+   `scripts/install-deps.sh --agent <name>`, which pipes the vendor's own
+   first-party installer to `bash` — a standalone binary into `~/.local/bin`,
+   **no Node, no npm, no sudo**. The output is shown as it runs.
+4. Press **Sign in**. That runs the vendor's own login command in a terminal the
+   app owns and surfaces the URL it prints as a button. The browser flow is
+   theirs, the account is theirs, and the token it writes is theirs.
+5. Optionally press **Choose a model**. The list is read from the CLI, so it
+   reflects your account's entitlements rather than a catalogue this README
+   would have to keep in step.
+
+**No API keys, ever.** There is no field in this app that takes one. These are
+**subscription logins**, which is what keeps runs at zero per-token cost —
+setting an API key instead would put every run on metered billing. Theseus
+stores only which agents you added, each one's model and reasoning depth, and
+the command templates. Credentials live in each vendor's own config directory.
+
+> Antigravity is the exception to step 4: `agy` 1.1.12 has no `auth` subcommand
+> and signs in inside its full-screen session, which a scrollback pane cannot
+> honestly draw. Its card hands you the command to paste into a terminal
+> instead of pretending otherwise.
+
+### Or from the terminal
+
+Nothing above is required. The same work is three commands, and the app reads
+the result either way:
+
+```bash
+./scripts/install-deps.sh --agent codex    # ChatGPT Plus/Pro/Business
+./scripts/install-deps.sh --agent claude   # Claude Pro/Max
+./scripts/install-deps.sh --agent agy      # Google account (~190 MB)
+source ~/.bashrc
+```
+
+Passing no `--agent` installs no agent — it prints the choices and stops. Other
+flags:
+
+```bash
+./scripts/install-deps.sh --check        # report what's present, install nothing
+./scripts/install-deps.sh --extras       # also gh + python3-pip/venv (needs sudo)
+./scripts/install-deps.sh --vscode       # also VS Code (implies --extras)
+```
+
+Or skip the script entirely and use each vendor's installer directly:
 
 ```bash
 curl -fsSL https://chatgpt.com/codex/install.sh | bash
 curl -fsSL https://claude.ai/install.sh | bash
-curl -fsSL https://antigravity.google/cli/install.sh | bash   # optional
-source ~/.bashrc
-```
-
-Or let the bundled script do it, which is the same thing plus a PATH check:
-
-```bash
-./scripts/install-deps.sh                # codex + claude, no sudo
-./scripts/install-deps.sh --check        # report what's present, install nothing
-./scripts/install-deps.sh --antigravity  # also agy (~190 MB, opt-in)
-./scripts/install-deps.sh --extras       # also gh + python3-pip/venv (needs sudo)
-./scripts/install-deps.sh --vscode       # also VS Code (implies --extras)
+curl -fsSL https://antigravity.google/cli/install.sh | bash
 ```
 
 > Each installer pipes a remote script to `bash`. They are the official
 > sources, but you can read them first:
 > `curl -fsSL https://chatgpt.com/codex/install.sh | less`
 
-Then authenticate each CLI once, interactively:
+Then sign in once, interactively:
 
 ```bash
-codex login     # browser login for ChatGPT Plus/Pro
-claude          # browser login for Claude Pro
-agy             # browser login with a Google account
+codex login                     # browser login for ChatGPT Plus/Pro
+claude auth login --claudeai    # browser login for Claude Pro/Max
+agy                             # sign in inside the session, Google account
 ```
 
-These are **subscription logins, not API keys** — that is what keeps runs at
-zero per-token cost. Setting an API key instead would put every run on metered
-billing.
+You still have to **add** each one in Settings → Agents afterwards: a CLI on
+`PATH` is not a request to use it. Confirm with `./run.sh --doctor`.
 
-Confirm the app can see them with `./run.sh --doctor`.
+### Removing an agent
+
+Press **Remove**. Nothing is destroyed — the CLI, its login, and that agent's
+model and reasoning depth all stay exactly where they were, and adding it back
+restores it. What changes is that it stops being seated on the council, stops
+appearing in Chat's multi-agent answer, and stops being offered in the pickers.
+If it was holding the Chat assistant or a project chair, that chair moves to an
+agent you kept, and the app says which.
+
+If you remove the last one, nothing is broken — the dashboard, history, diffs
+and the working folder all still work. What refuses is starting an AI run, and
+it refuses by saying so before spending anything.
 
 ### Trying it without the CLIs
 
 A mock agent ships in `scripts/`. It streams realistic Markdown and writes a
 real file, so the full Deliberate → Critique → Approve → Synthesize → Diff →
-Rollback loop works:
+Rollback loop works with no vendor CLI and no account at all.
 
-Settings → Agents → each card, set the command to (one argument per line):
+In Settings → Agents, **Add** any agent — its CLI does not have to be installed
+and you do not have to sign in. Then under **How each CLI is run**, open that
+card's **Command line** and replace the command with (one argument per line):
 
 ```text
 python3
@@ -183,8 +272,10 @@ python3
 {prompt}
 ```
 
-A council turn is recognised by what its prompt asks for, not by a flag, so
-the same command works whichever seat it lands in.
+A hand-written command is nobody's catalogued agent, so it answers to nobody's
+selection and runs on its own terms. A council turn is recognised by what its
+prompt asks for, not by a flag, so the same command works whichever seat it
+lands in.
 
 ---
 
@@ -786,11 +877,12 @@ same goes for judgement: an agent reviewing its own diff, or accepting the
 application it wrote, is not a second opinion. Doubling up is allowed and the
 initializer says what it costs.
 
-If a chair's CLI is not installed, the project **will not start**, and says
-which one. A build that runs unattended for an hour should not discover on its
-fourth turn that its QA binary was never there. `agy` in particular is opt-in —
-install it with `scripts/install-deps.sh --antigravity`, or move QA to a CLI you
-already have.
+If a chair is pointed at an agent you have not added, or at a CLI that is not
+installed, the project **will not start**, and says which one and which of the
+two it is. A build that runs unattended for an hour should not discover on its
+fourth turn that its QA seat was never fillable. QA ships pointed at `agy`, so
+if that is not one of the agents you added, move QA to one that is — the matrix
+only offers agents you have connected.
 
 ### Pointing it at code that already exists
 
@@ -1167,18 +1259,19 @@ in full or [continued](#continuing-a-run).
 ### Assigning agents to seats
 
 The *agent* (which CLI) and the *seat* (member, or chairman) are separate
-settings. Settings → **Agents** has one card per installed CLI — Codex,
-Claude, Antigravity, or Custom command — with its command, auto-approve
-argument, model and streaming flags. Settings → **Council → Seating** is where
-each seat is pinned to one of those CLIs, or left on **Auto** for the router
-to pick per run from what the task looks like; the same pin-or-auto choice is
-one click away on any seat in the bench above the composer.
+settings. Under Settings → **Agents → How each CLI is run** there is one card
+per agent *you added* — with its command, auto-approve argument, model and
+streaming flags. An agent you have not added has no card there, because it has
+no job to configure. Settings → **Council → Seating** is where each seat is
+pinned to one of your agents, or left on **Auto** for the router to pick per
+run from what the task looks like; the same pin-or-auto choice is one click
+away on any seat in the bench above the composer. Every one of those pickers
+offers only the agents you connected.
 
 **Antigravity** is Google's `agy`, which replaced Gemini CLI for personal
-accounts on 18 June 2026. Install it with
-`curl -fsSL https://antigravity.google/cli/install.sh | bash` and run `agy`
-once to sign in with a Google account; the binary lands in `~/.local/bin`. It
-differs from the other two in three ways worth knowing:
+accounts on 18 June 2026. Add it like any other agent — its card will install
+the binary into `~/.local/bin` for you — and sign in by running `agy` once with
+a Google account. It differs from the other two in four ways worth knowing:
 
 - **The prompt is a flag's value**, not an argument of its own — hence the
   `--prompt={prompt}` template. Do not rewrite it as `--print {prompt}`: the
@@ -1468,7 +1561,7 @@ So there are two knobs, and they are meant to be used together:
   to buy a cheaper bench without demoting the only stage that writes. Blank —
   the default — leaves every seat on its own setting.
 - **Chair deliberates** (Settings → Council) benches the chair for Stage 1.
-  With three CLIs installed that costs a position: the member pool excludes the
+  With three agents added that costs a position: the member pool excludes the
   chair, so a bench of three becomes a bench of two. The seating says so when
   it happens. It is the bigger single saving and the bigger single loss.
 
@@ -1633,7 +1726,9 @@ Coverage focuses on the properties that matter if they're wrong:
 
 | Symptom | Cause / fix |
 |---|---|
-| `codex`/`claude` shows **not found** | Not on `PATH`. Run `./scripts/install-deps.sh`, or set an absolute path in Settings. |
+| An agent shows **not added** | It is installed but you have not asked to use it. Press **Add** on its card in Settings → Agents. |
+| An added agent shows **not found** | Its CLI is not on `PATH`. Press **Install the CLI** on its card, run `./scripts/install-deps.sh --agent <name>`, or set an absolute path in Settings. |
+| An agent shows **not signed in** | Press **Sign in** on its card, or run the vendor's login command yourself. Theseus never asks for an API key. |
 | The chairman finishes but the diff is empty | The CLI ran without write permission. With Zero-Touch off, you must click **Approve & execute** — that's what grants it. |
 | "Missing session token" | The dashboard was opened without the launcher's URL, or with one whose one-time ticket has already been claimed by another window. Restart with `./run.sh`. |
 | Pull-request mode refuses to start | It says which precondition failed — a dirty tree, no `origin`, no git identity, or `gh` missing or logged out. Fix that one thing. |

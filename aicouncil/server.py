@@ -38,13 +38,14 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from . import APP_NAME, __version__
 from . import config as cfg
+from . import connections
 from . import gitutil
 from .events import EventBus, drain, sse_comment, sse_format
 from .pipeline import Pipeline, PipelineBusy
 from . import prompts
 from . import projects
 from .projects import ProjectBusy, ProjectEngine
-from .providers import discover_efforts, discover_models, probe_all
+from .providers import discover_efforts, discover_models, probe_all, resolve_binary
 from .usage import UsagePoller
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
@@ -68,6 +69,11 @@ class AppState:
         # object owns both, so it is what knows, and each is handed a callable
         # that refuses on the other's behalf.
         self.projects = ProjectEngine(store, self.bus, busy_check=self._refuse_if_busy)
+        # Installs and sign-ins started from Settings. One at a time, and owned
+        # here rather than by a request handler: the browser polls a session it
+        # started on an earlier request, and a handler-scoped one would be a
+        # process nothing could reach a second later.
+        self.setup = connections.SetupManager()
         self.token = secrets.token_urlsafe(24)
         # The launcher has no way to hand a browser a secret except on its
         # command line, where every other user on the machine can read it out
@@ -354,6 +360,16 @@ class Handler(BaseHTTPRequestHandler):
             },
             ("POST", "/api/roles"): self._api_save_role,
             ("POST", "/api/roles/delete"): self._api_delete_role,
+            ("GET", "/api/agents"): self._api_agents,
+            ("POST", "/api/agents/select"): self._api_agents_select,
+            ("POST", "/api/agents/setup"): self._api_agent_setup,
+            ("GET", "/api/agents/setup"): lambda p: {
+                "ok": True, "session": self.app.setup.status()
+            },
+            ("POST", "/api/agents/setup/input"): self._api_agent_setup_input,
+            ("POST", "/api/agents/setup/cancel"): lambda p: {
+                "ok": True, "session": self.app.setup.cancel()
+            },
         }
 
         handler = routes.get((method, path))
@@ -578,14 +594,13 @@ class Handler(BaseHTTPRequestHandler):
         return {"ok": True, "context": self.app.pipeline.context_preview(name)}
 
     def _api_doctor(self, params: Dict[str, list]) -> Dict[str, Any]:
-        providers = self.app.store.get("providers", {})
         return {
             "ok": True,
             "version": __version__,
             "config_path": str(self.app.store.path),
             "runs_path": str(self.app.pipeline.runs_dir),
             "uptime": round(time.time() - self.app.started_at, 1),
-            "providers": probe_all(providers, cfg.PROVIDER_ORDER),
+            "providers": probe_all(self.app.store.all(), cfg.PROVIDER_ORDER),
         }
 
     @staticmethod
@@ -625,6 +640,73 @@ class Handler(BaseHTTPRequestHandler):
         # assumption that it is universal.
         result["model"] = provider.get("model", "")
         return result
+
+    # -- agents ------------------------------------------------------------
+
+    def _api_agents(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Which CLIs are added, which are installed, which are signed in.
+
+        Its own endpoint rather than part of `/api/state` for the reason the
+        doctor report is: answering it means shelling out to every catalogued
+        CLI twice, and the dashboard must paint before that finishes. The
+        Agents panel opens on what `/api/state` already knows - which agents
+        the operator added - and fills the rest in when this lands.
+        """
+        conf = self.app.store.all()
+        return {
+            "ok": True,
+            "agents": connections.agent_statuses(conf),
+            "session": self.app.setup.status(),
+        }
+
+    def _api_agents_select(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Add or remove one CLI. The only thing that decides who is seated.
+
+        Removing the CLI a chair was holding moves that chair to one still
+        added, rather than leaving Chat or a project pointed at an agent the
+        operator has just said they do not use. Council seats are not touched:
+        there is one per CLI and `enabled` is what takes them off the bench.
+        """
+        body = self._read_body()
+        agent = str(body.get("agent") or "")
+        if agent not in cfg.AGENTS:
+            raise ValueError(f"No such agent: {agent!r}")
+        selected = bool(body.get("selected"))
+
+        conf = self.app.store.all()
+        patch: Dict[str, Any] = {"agent_settings": {agent: {"selected": selected}}}
+        moved: Dict[str, str] = {}
+        if not selected:
+            remaining = [a for a in cfg.selected_agents(conf) if a != agent]
+            successor = next(
+                (a for a in remaining if resolve_binary(
+                    (cfg.AGENTS[a].get("command") or [])
+                )),
+                remaining[0] if remaining else "",
+            )
+            if successor:
+                providers = conf.get("providers") or {}
+                for pid in ("solo", *projects.ROLES):
+                    if cfg.agent_for(providers.get(pid) or {}) != agent:
+                        continue
+                    patch.setdefault("providers", {})[pid] = {"agent": successor}
+                    moved[pid] = successor
+
+        conf = self.app.store.update(patch)
+        self.app.bus.publish("config", config=conf)
+        return {"ok": True, "config": conf, "moved": moved}
+
+    def _api_agent_setup(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Start an install or a sign-in. Never given a command, only an id."""
+        body = self._read_body()
+        session = self.app.setup.start(
+            str(body.get("agent") or ""), str(body.get("action") or "")
+        )
+        return {"ok": True, "session": session}
+
+    def _api_agent_setup_input(self, params: Dict[str, list]) -> Dict[str, Any]:
+        body = self._read_body()
+        return {"ok": True, "session": self.app.setup.write(str(body.get("text") or ""))}
 
     def _api_usage_refresh(self, params: Dict[str, list]) -> Dict[str, Any]:
         self.app.usage.poll_once()
@@ -730,15 +812,15 @@ class Handler(BaseHTTPRequestHandler):
         state = self.app.projects.snapshot_state(workspace)
         state["ok"] = True
         # Which chairs can actually be filled. The matrix draws its dots from
-        # this, so a missing CLI is visible before the start button is pressed
-        # rather than in the error that refuses it.
-        providers = self.app.store.get("providers", {})
+        # this, so a chair the operator has not connected - or whose CLI is
+        # missing - is visible before the start button is pressed rather than
+        # in the error that refuses it.
         # Carrying what each seat is for and which CLI belongs in it, so the
         # matrix can say why a chair exists rather than only which binary is
         # currently sitting in it.
         state["roles"] = [
             {**role, **cfg.PROJECT_SEATS.get(role["id"], {})}
-            for role in probe_all(providers, projects.ROLES)
+            for role in probe_all(self.app.store.all(), projects.ROLES)
         ]
         state["settings"] = self.app.store.get("project", {})
         return state

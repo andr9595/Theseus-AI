@@ -1421,7 +1421,7 @@ def _discover_codex_efforts(model: str) -> Dict:
     }
 
 
-def probe_all(providers: Dict[str, Dict], order: tuple) -> List[Dict]:
+def probe_all(conf: Dict[str, Any], order: tuple) -> List[Dict]:
     """Probe several chairs, launching each distinct binary once.
 
     Six providers are usually two or three binaries: the council's two stages,
@@ -1430,7 +1430,15 @@ def probe_all(providers: Dict[str, Dict], order: tuple) -> List[Dict]:
     fifteen seconds for it, and this runs on every `/api/state`, so probing per
     provider would have the dashboard launch six processes to learn three
     things - and would stall the first paint behind all of them.
+
+    Each row carries `connected` beside `available`, because there are two
+    separate ways for a chair to be unfillable and the one thing worse than
+    refusing a run is refusing one the screen said was ready. `available` is
+    whether the binary resolves; `connected` is whether the operator added that
+    CLI in Settings. Takes the whole configuration for the second of those -
+    see `config.provider_enabled`.
     """
+    providers = conf.get("providers") or {}
     cache: Dict[str, Dict] = {}
     out: List[Dict] = []
     for pid in order:
@@ -1446,7 +1454,12 @@ def probe_all(providers: Dict[str, Dict], order: tuple) -> List[Dict]:
         if found is None:
             found = probe(provider)
             cache[key] = found
-        out.append({**found, "id": pid, "label": provider.get("label")})
+        out.append({
+            **found,
+            "id": pid,
+            "label": provider.get("label"),
+            "connected": cfg.provider_enabled(conf, provider),
+        })
     return out
 
 

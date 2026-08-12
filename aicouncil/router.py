@@ -628,8 +628,8 @@ def route(
     field_agents = [a for a in available if a]
     if not field_agents:
         raise ValueError(
-            "No agent CLI is available, so there is nobody to seat. Check the "
-            "agents in Settings."
+            "No agent is connected, so there is nobody to seat. Open Settings "
+            "→ Agents and add one you have access to."
         )
 
     scored: Dict[str, Tuple[float, List[str]]] = {

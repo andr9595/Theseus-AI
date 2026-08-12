@@ -621,6 +621,59 @@ class TestMultiAgentChat(PipelineTestBase):
         self.assertEqual(list(run.stages), ["solo"])
 
 
+class TestAgentsAreOptIn(PipelineTestBase):
+    """An installed CLI is not a seated one.
+
+    Every other test in this file drives hand-written commands, which answer to
+    nobody's selection by design - that is what keeps the mock agent usable
+    with no vendor CLI added at all. These point the bench at the shipped
+    catalogued commands instead, over stand-in binaries, because the question
+    here is exactly whether being on PATH is enough. It is not: the operator
+    saying so in Settings is.
+    """
+
+    def setUp(self):
+        super().setUp()
+        bindir = self.tmp / "bin"
+        bindir.mkdir()
+        for agent in cfg.AGENTS:
+            fake = bindir / agent
+            fake.write_text(f"#!{sys.executable}\nprint('ok')\n", encoding="utf-8")
+            fake.chmod(0o755)
+        previous = os.environ["PATH"]
+        self.addCleanup(lambda: os.environ.__setitem__("PATH", previous))
+        os.environ["PATH"] = f"{bindir}{os.pathsep}{previous}"
+        # Back to the shipped commands: `agent_for` reads the CLI off the
+        # command, and the mock's `python3` is nobody's.
+        self.store.update({
+            "providers": {
+                pid: {"command": list(seat["command"])}
+                for pid, seat in cfg.DEFAULT_COUNCIL_PROVIDERS.items()
+            },
+        })
+
+    def test_an_installed_agent_nobody_added_is_not_seated(self):
+        self.assertEqual(self.pipeline.available_agents(self.store.all()), [])
+
+    def test_one_added_agent_is_the_whole_bench(self):
+        conf = self.store.update({"agent_settings": {"claude": {"selected": True}}})
+        self.assertEqual(self.pipeline.available_agents(conf), ["claude"])
+
+    def test_a_council_with_nobody_added_says_what_to_do_about_it(self):
+        with self.assertRaises(ValueError) as caught:
+            self.pipeline.seat_council("what is a monad?", self.store.all())
+        self.assertIn("Settings", str(caught.exception))
+
+    def test_chat_refuses_before_launching_an_agent_nobody_added(self):
+        # Said up front rather than after the CLI fails: "not connected" is a
+        # different problem from "not installed", and only one of them is
+        # fixed by installing something.
+        self.store.update({"mode": "solo"})
+        with self.assertRaises(ValueError) as caught:
+            self.pipeline.start("hello", str(self.repo))
+        self.assertIn("not connected", str(caught.exception))
+
+
 class TestWorkingFolderIsOptional(PipelineTestBase):
     """A repository is what makes a run reviewable, not what makes it possible.
 

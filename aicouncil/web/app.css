@@ -1696,6 +1696,54 @@ html, body {
   border-radius: 4px;
 }
 
+/* ---- Agent connections, at the top of the Agents panel ---- */
+
+.agent-connections {
+  display: grid; gap: 10px; margin-bottom: 22px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+.agent-conn {
+  padding: 12px 13px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--line);
+  border-radius: var(--radius);
+}
+/* The left edge carries the one fact the card is about: whether this agent is
+   in use. Colour is never the only carrier - the state text says it too. */
+.agent-conn[data-state="on"]      { border-left-color: var(--green); }
+.agent-conn[data-state="missing"] { border-left-color: var(--amber); }
+.agent-conn[data-state="off"]     { opacity: .72; }
+.agent-conn-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 8px; margin-bottom: 6px; font-size: 12.5px;
+}
+.agent-conn-state {
+  font-family: var(--mono); font-size: 10px; color: var(--text-3);
+}
+.agent-conn[data-state="on"] .agent-conn-state { color: var(--green); }
+.agent-conn[data-state="missing"] .agent-conn-state { color: var(--amber); }
+.agent-conn-note {
+  margin: 0 0 10px; font-size: 11px; line-height: 1.55; color: var(--text-3);
+}
+.agent-conn-note code {
+  font-family: var(--mono); font-size: 10.5px; color: #ffd9a8;
+}
+.agent-conn-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+
+/* The setup pane. Terminal output with the escapes taken out, not a terminal:
+   see the dialog's own comment in index.html. */
+.setup-output {
+  max-height: 22rem; margin: 0 0 12px; padding: 11px 13px; overflow: auto;
+  font-family: var(--mono); font-size: 11px; line-height: 1.6;
+  color: var(--text-2);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  white-space: pre-wrap; word-break: break-word;
+}
+#agent-setup-url { display: inline-block; margin-bottom: 12px; }
+
 .provider-form {
   margin-bottom: 16px; padding: 14px;
   background: var(--bg-2);

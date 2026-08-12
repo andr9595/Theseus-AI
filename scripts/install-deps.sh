@@ -4,14 +4,16 @@
 # The application itself needs none of this - it is pure Python 3 standard
 # library and runs with `./run.sh` on a stock install.
 #
-# By default this installs only the two agent CLIs the pipeline drives, using
-# each vendor's first-party installer. Those drop a standalone binary into
-# ~/.local/bin, so no Node, no npm and no sudo are involved.
+# No agent is installed unless you name one. Which AI you use is your choice
+# and this script has no opinion about it: pass --agent once per CLI you want,
+# and nothing at all is installed if you pass none. Settings -> Agents does the
+# same thing with buttons, and calls this script to do it.
 #
-# Google's Antigravity CLI (`agy`) is a third option the app can drive, behind
-# --antigravity: it is a ~190 MB binary and not one of the defaults. Projects
-# Mode does assign it the QA chair out of the box, so install it if you intend
-# to use that tab - or reassign QA to codex or claude in the agent matrix.
+#   ./install-deps.sh --agent codex --agent claude
+#
+# Each uses that vendor's first-party installer, which drops a standalone
+# binary into ~/.local/bin - no Node, no npm and no sudo. Antigravity (`agy`)
+# is a ~190 MB binary, which is worth knowing before you ask for it.
 #
 # Everything else (gh, python3-pip/venv, VS Code) is optional, needs root, and
 # is skipped unless you pass --extras or --vscode.
@@ -37,27 +39,38 @@ have() { command -v "$1" >/dev/null 2>&1; }
 WANT_ALL=1
 WANT_VSCODE=0
 WANT_EXTRAS=0
-WANT_AGY=0
-for arg in "$@"; do
-  case "$arg" in
+AGENTS=()
+
+usage() {
+  # Print the header comment block, stopping at the first non-comment line
+  # so the help text cannot drift out of sync with the file again.
+  awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"
+  echo
+  echo "Usage: $0 [--agent NAME]... [--check] [--extras] [--vscode]"
+  echo "  --agent NAME  install one agent CLI: codex, claude or agy (repeatable)"
+  echo "  --check       report what is present, install nothing"
+  echo "  --extras      also install gh and the missing system python packages (needs sudo)"
+  echo "  --vscode      also install Visual Studio Code (implies --extras)"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
     --vscode)   WANT_VSCODE=1; WANT_EXTRAS=1 ;;
     --extras)   WANT_EXTRAS=1 ;;
-    --antigravity) WANT_AGY=1 ;;
+    --agent)
+      shift
+      case "${1:-}" in
+        codex|claude|agy) AGENTS+=("$1") ;;
+        *) bad "unknown agent: ${1:-(none)} - expected codex, claude or agy"
+           exit 2 ;;
+      esac ;;
+    # The old spelling, kept working because it is in a released README.
+    --antigravity) AGENTS+=("agy") ;;
     --check)    WANT_ALL=0 ;;
-    -h|--help)
-      # Print the header comment block, stopping at the first non-comment line
-      # so the help text cannot drift out of sync with the file again.
-      awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"
-      echo
-      echo "Usage: $0 [--check] [--extras] [--vscode] [--antigravity]"
-      echo "  (default) install the codex and claude CLIs only - no sudo needed"
-      echo "  --check   report what is present, install nothing"
-      echo "  --extras  also install gh and the missing system python packages (needs sudo)"
-      echo "  --vscode  also install Visual Studio Code (implies --extras)"
-      echo "  --antigravity  also install Google's agy CLI (~190 MB, opt-in; Projects' QA chair)"
-      exit 0 ;;
-    *) warn "unknown option: $arg" ;;
+    -h|--help)  usage; exit 0 ;;
+    *) warn "unknown option: $1" ;;
   esac
+  shift
 done
 
 # --------------------------------------------------------------------------
@@ -82,36 +95,42 @@ say "Agent CLIs"
 # These are what make the pipeline free at the point of use: each authenticates
 # against your existing subscription rather than a metered API key.
 #
-# Both vendors ship first-party installers that drop a standalone binary into
-# ~/.local/bin and wire up PATH. That is preferred over `npm install -g` here
-# for two reasons: it needs neither Node nor sudo, and the npm build of
+# All three vendors ship first-party installers that drop a standalone binary
+# into ~/.local/bin and wire up PATH. That is preferred over `npm install -g`
+# here for two reasons: it needs neither Node nor sudo, and the npm build of
 # claude-code now requires Node >= 22, which would drag in a whole toolchain
 # for no benefit. The Codex installer also places `codex-code-mode-host`
 # alongside the main binary, which a hand-rolled release download misses.
 export PATH="$HOME/.local/bin:$PATH"
 
-if have claude; then
-  ok "claude already installed: $(command -v claude)"
-else
-  curl -fsSL https://claude.ai/install.sh | bash || warn "claude CLI install failed"
-fi
-
-if have codex; then
-  ok "codex already installed: $(command -v codex)"
-else
-  curl -fsSL https://chatgpt.com/codex/install.sh | bash || warn "codex CLI install failed"
-fi
-
-# Google's Antigravity CLI, which replaced Gemini CLI for personal accounts in
-# June 2026. Opt-in rather than default: the two above are what the pipeline
-# ships configured for, and this one is a ~190 MB binary nobody should get by
-# accident. Its installer verifies a SHA-512 against the release manifest.
-if [[ $WANT_AGY -eq 1 ]]; then
-  if have agy; then
-    ok "agy already installed: $(command -v agy)"
-  else
-    curl -fsSL https://antigravity.google/cli/install.sh | bash || warn "Antigravity CLI install failed"
+install_agent() {
+  local agent="$1" url=""
+  case "$agent" in
+    codex)  url=https://chatgpt.com/codex/install.sh ;;
+    claude) url=https://claude.ai/install.sh ;;
+    # Google's Antigravity CLI, which replaced Gemini CLI for personal accounts
+    # in June 2026. Its installer verifies a SHA-512 against the manifest.
+    agy)    url=https://antigravity.google/cli/install.sh ;;
+  esac
+  if have "$agent"; then
+    ok "$agent already installed: $(command -v "$agent")"
+    return 0
   fi
+  curl -fsSL "$url" | bash || warn "$agent CLI install failed"
+}
+
+if [[ ${#AGENTS[@]} -eq 0 ]]; then
+  echo "No agent named, so none installed. Pick whichever you have access to:"
+  echo "  $0 --agent codex     # ChatGPT Plus/Pro/Business"
+  echo "  $0 --agent claude    # Claude Pro/Max"
+  echo "  $0 --agent agy       # Google account (~190 MB)"
+  echo
+  echo "${DIM}Or add them in the app: Settings -> Agents.${RESET}"
+  echo
+else
+  for agent in "${AGENTS[@]}"; do
+    install_agent "$agent"
+  done
 fi
 
 SHELL_RC="$HOME/.bashrc"
@@ -135,7 +154,7 @@ else
     warn "sudo not available; skipping the optional system packages."
   else
     echo "${DIM}The remaining steps need your password. Ctrl-C to stop here -${RESET}"
-    echo "${DIM}the agent CLIs above are already installed and sufficient.${RESET}"
+    echo "${DIM}whichever agent CLIs you asked for are already installed.${RESET}"
     echo
 
     # ----------------------------------------------------------------------
@@ -197,18 +216,23 @@ Next steps:
   1. Reload your shell so the PATH change takes effect:
        source ~/.bashrc
 
-  2. Authenticate each CLI against your subscription (one time, interactive):
-       claude          # then follow the browser login for Claude Pro
+  2. Sign each CLI you installed in to your subscription (one time):
        codex login     # then follow the browser login for ChatGPT Plus/Pro
+       claude auth login --claudeai   # browser login for Claude Pro/Max
+       agy             # sign in inside the session, with a Google account
 
-     These are SUBSCRIPTION logins, not API keys. That is what keeps AI
-     Council at zero per-token cost - setting an API key instead would put
-     every run on metered billing.
+     These are SUBSCRIPTION logins, not API keys. That is what keeps Theseus
+     AI at zero per-token cost - setting an API key instead would put every
+     run on metered billing.
 
-  3. Confirm Theseus AI can see both CLIs:
-       ./run.sh --doctor
-
-  4. Launch:
+  3. Launch, and add the agents you installed in Settings -> Agents:
        ./run.sh
+
+     Adding is the step that seats one. Installing a CLI does not, so a
+     machine that happens to carry all three still runs only what you chose.
+     That screen can also do steps 1 and 2 for you.
+
+  4. Or check from the terminal instead:
+       ./run.sh --doctor
 
 EOF

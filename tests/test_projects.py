@@ -1184,6 +1184,16 @@ class TestPreflight(unittest.TestCase):
         self.assertIn("QA", str(ctx.exception))
         self.assertIn("definitely-not-installed", str(ctx.exception))
 
+    def test_a_chair_on_an_agent_nobody_added_is_refused_by_name(self):
+        # As unfillable as a missing binary, and for a reason the operator can
+        # act on: the CLI is there, they just have not added it. A project runs
+        # unattended, so it will not start on a seat it cannot fill.
+        self.store.update({"providers": {"qa": {"enabled": False}}})
+        with self.assertRaises(ValueError) as ctx:
+            self.engine.start("build it", str(self.root))
+        self.assertIn("QA", str(ctx.exception))
+        self.assertIn("not connected", str(ctx.exception))
+
     def test_a_council_run_blocks_a_project(self):
         def busy():
             raise RuntimeError("A run is in progress.")

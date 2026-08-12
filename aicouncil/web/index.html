@@ -494,18 +494,30 @@
       <section class="settings-panel active" data-settings-panel="agents"
         id="settings-panel-agents" role="tabpanel" aria-labelledby="settings-tab-agents">
         <h4 class="settings-head">
-          Agents
-          <button id="run-doctor" class="btn btn-quiet btn-sm" type="button">
-            Re-check CLIs
+          Your agents
+          <button id="agents-refresh" class="btn btn-quiet btn-sm" type="button">
+            Re-check
           </button>
         </h4>
         <p class="settings-note">
-          Each one shells out to a locally installed CLI that carries your own
-          subscription auth. No API keys are stored or sent. One card per CLI
-          the council can seat, plus the Chat assistant and the three project
-          chairs. What a council seat is <em>told to be</em> is not here: that
-          travels with the seat, on the <b>Council</b> tab or on the bench
-          above the composer.
+          Add the agents you have access to &mdash; one, two or all three, in
+          any combination. None is required and none is preferred: what you add
+          here is the whole bench, and nothing is seated because it happens to
+          be installed. Signing in runs the vendor's own command and the account
+          stays with their CLI; <b>no API key is ever asked for, stored or
+          sent</b>, which is what keeps a run free at the point of use.
+        </p>
+        <div id="agent-connections" class="agent-connections"></div>
+
+        <h4 class="settings-head">How each CLI is run</h4>
+        <p class="settings-note">
+          One card per agent you have added, plus the Chat assistant and the
+          three project chairs. What a council seat is <em>told to be</em> is
+          not here: that travels with the seat, on the <b>Council</b> tab or on
+          the bench above the composer.
+          <button id="run-doctor" class="btn btn-quiet btn-sm" type="button">
+            Re-check CLIs
+          </button>
         </p>
         <div id="provider-forms"></div>
         <div id="doctor-out" class="doctor"></div>
@@ -775,6 +787,40 @@
       <span class="modal-foot-spacer"></span>
       <button class="btn btn-quiet" data-close="settings" type="button">Cancel</button>
       <button id="save-settings" class="btn btn-primary" type="button">Save</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ================= Agent setup ================= -->
+<!-- The vendor's own install or sign-in command, running on a terminal this
+     app owns. What is shown is its output with the colour taken out, not a
+     terminal emulator: a flow that needs one is offered as a command to paste
+     instead, because a pane that half-draws a menu is worse than a line of
+     text that says what to type. -->
+<div id="agent-setup" class="modal hidden" role="dialog" aria-modal="true"
+  aria-label="Agent setup">
+  <div class="modal-card">
+    <header class="modal-head">
+      <h3 id="agent-setup-title">Setting up</h3>
+      <button class="icon-btn" data-close="agent-setup" type="button" aria-label="Close">&times;</button>
+    </header>
+    <div class="modal-body">
+      <p class="settings-note" id="agent-setup-note"></p>
+      <a id="agent-setup-url" class="btn btn-primary hidden" target="_blank" rel="noopener">
+        Open the sign-in page
+      </a>
+      <pre id="agent-setup-output" class="setup-output" aria-live="polite"></pre>
+      <div class="field">
+        <label for="agent-setup-input">
+          Type an answer <span class="field-hint">&mdash; only if it asks for one</span>
+        </label>
+        <input id="agent-setup-input" type="text" autocomplete="off" spellcheck="false">
+      </div>
+    </div>
+    <footer class="modal-foot">
+      <span class="modal-foot-spacer"></span>
+      <button id="agent-setup-cancel" class="btn btn-quiet" type="button">Stop</button>
+      <button class="btn btn-primary" data-close="agent-setup" type="button">Done</button>
     </footer>
   </div>
 </div>

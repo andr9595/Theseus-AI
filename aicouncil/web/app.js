@@ -1495,10 +1495,21 @@ function paintUsageBars(root) {
    no vendor gave.
    -------------------------------------------------------------------------- */
 
-/** Every agent the panel has a row for: the catalogued CLIs, minus the custom
+/** The CLIs this install actually uses: the ones added in Settings → Agents.
+ *
+ *  Every picker in the app filters on this rather than on "has a command",
+ *  which was only ever a way of dropping the custom template from a menu. What
+ *  an agent is *installed* is not the question a picker asks — plenty of
+ *  machines carry all three binaries and a subscription for one, and offering
+ *  a seat to an agent the operator never added is offering a run that fails. */
+function connectedAgents() {
+  return (state.agents || []).filter(a => (a.command || []).length && a.selected);
+}
+
+/** Every agent the panel has a row for: the connected CLIs, minus the custom
  *  entry, which is a blank template rather than a program with a quota. */
 function usageAgents() {
-  return (state.agents || []).filter(a => (a.command || []).length);
+  return connectedAgents();
 }
 
 /** The reading for one agent, whichever chair happens to hold it. The council
@@ -2007,9 +2018,14 @@ function renderMode() {
   // where the routing is *driven from*: the bench above changes as this box is
   // typed into. Saying it on the empty strip instead put the sentence in the
   // one place it could not be acted on.
-  $('#task-input').placeholder = mode === 'solo'
-    ? 'Ask Theseus AI…'
-    : 'Describe the task and the council seats itself…';
+  // Before anything else, the first-run answer: with no agent added there is
+  // nobody to ask, and the composer is where that is discovered. Said here
+  // rather than left to the refusal that arrives after the message is sent.
+  $('#task-input').placeholder = !connectedAgents().length
+    ? 'Add an agent first — Settings → Agents…'
+    : mode === 'solo'
+      ? 'Ask Theseus AI…'
+      : 'Describe the task and the council seats itself…';
 }
 
 function renderToggles() {
@@ -2390,13 +2406,29 @@ function renderProjectSetup() {
   const resumable = state.projectResumable && !hasProject();
   $('#project-resume-found').classList.toggle('hidden', !resumable);
 
-  const missing = (state.projectRoles || []).filter(r => !r.available);
-  $('#project-start').disabled = missing.length > 0;
-  $('#project-start-hint').textContent = missing.length
-    ? `${missing.map(r => ROLE_NAMES[r.id] || r.id).join(' and ')} ` +
-      `${missing.length === 1 ? 'has' : 'have'} no CLI installed. ` +
+  // Two ways for a chair to be unfillable, and the server refuses on both, so
+  // the button has to disable on both - a Start that looks pressable and then
+  // refuses is worse than one that says why up front.
+  const unfilled = (state.projectRoles || []).filter(r => !chairFillable(r));
+  const unadded = unfilled.filter(r => r.connected === false);
+  $('#project-start').disabled = unfilled.length > 0;
+  $('#project-start-hint').textContent = unfilled.length
+    ? `${unfilled.map(r => ROLE_NAMES[r.id] || r.id).join(' and ')} ` +
+      `${unfilled.length === 1 ? 'is' : 'are'} on an agent ` +
+      `${unadded.length === unfilled.length ? 'you have not added'
+        : unadded.length ? 'you have not added, or whose CLI is not installed'
+        : 'whose CLI is not installed'}. ` +
       `A project runs unattended, so it will not start with a seat it cannot fill.`
     : doubledChairsHint();
+}
+
+/** Whether one project chair can actually be filled, on the server's terms.
+ *
+ *  Both halves of `probe_all`'s answer: the agent has to be one the operator
+ *  added, and its binary has to resolve. A row the server has not sent yet is
+ *  treated as fillable rather than flashing a refusal at first paint. */
+function chairFillable(info) {
+  return !info || (info.available && info.connected !== false);
 }
 
 /** A warning, never a refusal: two chairs on the same CLI.
@@ -2453,7 +2485,8 @@ function renderInnovation() {
 function chairHtml(role) {
   const p = ((state.config || {}).providers || {})[role] || {};
   const info = (state.projectRoles || []).find(r => r.id === role);
-  const available = !info || info.available;
+  const available = chairFillable(info);
+  const why = !info || info.connected !== false ? 'not found' : 'not added';
   const agent = state.agents.find(a => a.id === agentOf(p));
   const agentLabel = agent && (agent.command || []).length ? agent.label : 'custom command';
   const model = p.model || 'default model';
@@ -2473,7 +2506,7 @@ function chairHtml(role) {
   const title =
     `${ROLE_NAMES[role]} — ${agentLabel} · ${modelDetail(model)}` +
     (p.effort ? ` · ${p.effort}` : '') +
-    (available ? '' : ` · ${(p.command || [])[0] || 'CLI'} not found`) +
+    (available ? '' : ` · ${(p.command || [])[0] || 'CLI'} ${why}`) +
     ((info && info.summary) ? `\n${info.summary}` : '') +
     (offSuggestion ? `\nRecommended for this seat: ${suggestedLabel}.` : '') +
     '\nClick to change CLI, model or effort.';
@@ -2484,7 +2517,7 @@ function chairHtml(role) {
       `<span class="chair-mark">${esc(ROLE_NAMES[role].slice(0, 2).toUpperCase())}</span>` +
       `<span class="chair-body">` +
         `<span class="chair-role">${esc(ROLE_NAMES[role])}</span>` +
-        `<span class="chair-agent">${esc(available ? agentLabel : agentLabel + ' — missing')}</span>` +
+        `<span class="chair-agent">${esc(available ? agentLabel : `${agentLabel} — ${why}`)}</span>` +
         `<span class="chair-model">${esc(model)}</span>` +
         (offSuggestion
           ? `<span class="chair-note">${esc(suggestedLabel)} recommended</span>` : '') +
@@ -3394,7 +3427,7 @@ function openSeatMenu(anchor, seatId) {
   const council = (state.config || {}).council || {};
   const current = (council.pins || {})[seatId] || '';
   const manual = String(council.routing || 'auto') === 'manual';
-  const agents = (state.agents || []).filter(a => (a.command || []).length);
+  const agents = connectedAgents();
 
   const menu = document.createElement('div');
   menu.className = 'model-menu';
@@ -3614,7 +3647,7 @@ function openAgentMenu(anchor, providerId) {
     // "Custom command" is what a hand-edited template reads back as, not
     // something this menu can apply: there is no preset behind it. Writing one
     // stays in Settings, where the command itself is.
-    state.agents.filter(a => (a.command || []).length).map(a =>
+    connectedAgents().map(a =>
       `<button class="model-opt${a.id === current ? ' active' : ''}" ` +
         `data-value="${esc(a.id)}">` +
         `<span class="model-opt-name">${esc(a.label)}</span>` +
@@ -3852,6 +3885,188 @@ function switchSettingsTab(name) {
   });
 }
 
+/* --------------------------------------------------------------------------
+   Agent connections
+   --------------------------------------------------------------------------
+   Adding an agent, installing its CLI and signing it in, without leaving the
+   app. Three separate facts per card and never collapsed into one badge:
+   *added* is the operator's answer and the only one that seats anything,
+   *installed* is whether the binary resolves, and *signed in* is what the
+   vendor's own status command says. A setup screen that reports "ready"
+   because `--version` worked is the failure this shape exists to avoid.
+
+   Nothing here handles a credential. Install and Sign in run the vendor's own
+   commands on a terminal the server owns, and the token they produce is
+   written by that CLI into that vendor's config directory.
+   -------------------------------------------------------------------------- */
+
+/** What `/api/agents` last reported, keyed by agent id. Empty until it lands,
+ *  which is why every card renders from `state.agents` first. */
+let agentStatus = {};
+
+function renderAgentConnections() {
+  const host = $('#agent-connections');
+  if (!host) return;
+  const cards = (state.agents || []).filter(a => (a.command || []).length);
+
+  host.innerHTML = cards.map(a => {
+    const info = agentStatus[a.id] || {};
+    const setup = a.setup || {};
+    const known = Object.keys(info).length > 0;
+    const added = info.selected !== undefined ? info.selected : a.selected;
+    const installed = info.installed;
+    // Three-valued on purpose: `null` is "could not be asked", which is what
+    // Antigravity always answers, and rendering that as a cross would claim
+    // the CLI is signed out when nothing knows either way.
+    const signedIn = info.signed_in;
+
+    const cardState =
+      !added ? 'off' : (!known ? 'checking' : (!installed ? 'missing' : 'on'));
+    const label =
+      !added ? 'Not added'
+      : !known ? 'Checking…'
+      : !installed ? 'CLI not installed'
+      : signedIn === true ? 'Signed in'
+      : signedIn === false ? 'Not signed in'
+      : 'CLI found';
+
+    return (
+      `<article class="agent-conn" data-agent="${esc(a.id)}" data-state="${cardState}">` +
+        `<div class="agent-conn-head">` +
+          `<b>${esc(a.label)}</b>` +
+          `<span class="agent-conn-state">${esc(label)}</span>` +
+        `</div>` +
+        `<p class="agent-conn-note">` +
+          (info.detail ? esc(info.detail) + ' · ' : '') +
+          `Uses ${esc(setup.account || 'your own account')}, through ` +
+          `<code>${esc((a.command || [])[0] || a.id)}</code>.` +
+        `</p>` +
+        `<div class="agent-conn-actions">` +
+          `<button class="btn btn-sm ${added ? 'btn-quiet' : 'btn-primary'}" ` +
+            `data-agent-toggle="${esc(a.id)}">${added ? 'Remove' : 'Add'}</button>` +
+          (added && known && !installed
+            ? `<button class="btn btn-quiet btn-sm" data-agent-setup="install" ` +
+              `data-agent="${esc(a.id)}">Install the CLI</button>`
+            : '') +
+          (added && known && installed && signedIn !== true
+            ? (setup.login_tui
+                // No pane pretends to draw a full-screen session. What it can
+                // do is say exactly what to type, which is what a README would
+                // have said anyway.
+                ? `<button class="btn btn-quiet btn-sm" data-agent-copy=` +
+                  `"${esc(setup.login_hint)}">Copy the sign-in command</button>`
+                : `<button class="btn btn-quiet btn-sm" data-agent-setup="login" ` +
+                  `data-agent="${esc(a.id)}">Sign in</button>`)
+            : '') +
+          (added && installed && signedIn === true
+            ? `<button class="btn btn-quiet btn-sm" data-agent-models=` +
+              `"${esc(a.id)}">Choose a model</button>`
+            : '') +
+        `</div>` +
+      `</article>`
+    );
+  }).join('') || `<p class="settings-note">No agents are catalogued.</p>`;
+}
+
+async function refreshAgents() {
+  try {
+    const data = await api('/api/agents');
+    agentStatus = {};
+    (data.agents || []).forEach(a => { agentStatus[a.id] = a; });
+    renderAgentConnections();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+/** Add or remove one CLI. The server moves any chair that was holding a
+ *  removed agent, so the whole config comes back rather than one key. */
+async function toggleAgent(id, selected) {
+  try {
+    const data = await api('/api/agents/select', {
+      method: 'POST', body: { agent: id, selected },
+    });
+    const moved = Object.keys(data.moved || {});
+    await loadState();
+    renderSettings();
+    renderAgentConnections();
+    refreshAgents();
+    if (moved.length) {
+      toast(`Reassigned ${moved.join(', ')} to another agent.`, 'info');
+    }
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+/* -- the setup session ---------------------------------------------------- */
+
+let setupTimer = null;
+
+async function startAgentSetup(id, action) {
+  const agent = (state.agents || []).find(a => a.id === id) || {};
+  $('#agent-setup-title').textContent =
+    `${action === 'install' ? 'Installing' : 'Signing in to'} ${agent.label || id}`;
+  $('#agent-setup-note').textContent = action === 'install'
+    ? 'Runs the bundled installer, which fetches the vendor’s own install ' +
+      'script. Nothing is installed system-wide and no password is needed.'
+    : 'Runs the vendor’s own sign-in command. Your account details go to them, ' +
+      'not to this app — it never sees the token that comes back.';
+  $('#agent-setup-output').textContent = '';
+  $('#agent-setup-url').classList.add('hidden');
+  $('#agent-setup-input').value = '';
+  openModal('agent-setup');
+  try {
+    const data = await api('/api/agents/setup', {
+      method: 'POST', body: { agent: id, action },
+    });
+    renderSetupSession(data.session || {});
+    pollAgentSetup();
+  } catch (err) {
+    closeModal('agent-setup');
+    toast(err.message, 'error', 9000);
+  }
+}
+
+function renderSetupSession(session) {
+  const out = $('#agent-setup-output');
+  const wasAtEnd = out.scrollTop + out.clientHeight >= out.scrollHeight - 24;
+  out.textContent = session.output || '';
+  if (wasAtEnd) out.scrollTop = out.scrollHeight;
+  const link = $('#agent-setup-url');
+  // The URL is the one line of a sign-in that has to be acted on, and it is
+  // rarely the last one printed — so it is lifted out of the scrollback.
+  link.classList.toggle('hidden', !session.url);
+  if (session.url) link.href = session.url;
+  $('#agent-setup-cancel').disabled = !session.running;
+  $('#agent-setup-input').disabled = !session.running;
+}
+
+function pollAgentSetup() {
+  clearTimeout(setupTimer);
+  setupTimer = setTimeout(async () => {
+    if ($('#agent-setup').classList.contains('hidden')) return;
+    try {
+      const data = await api('/api/agents/setup');
+      const session = data.session || {};
+      renderSetupSession(session);
+      if (session.running) return pollAgentSetup();
+      // Finished: what changed is on the far side of a subprocess, so ask
+      // rather than assume it worked.
+      refreshAgents();
+      refreshDoctor();
+      toast(
+        session.exit_code === 0
+          ? 'Setup finished. Re-checking the agent…'
+          : `Setup exited with status ${session.exit_code}.`,
+        session.exit_code === 0 ? 'ok' : 'error'
+      );
+    } catch (err) {
+      toast(err.message, 'error');
+    }
+  }, 1200);
+}
+
 /** Whatever opened the dialog, so closing it puts the keyboard back there
  *  rather than at the top of the document. */
 let settingsOpener = null;
@@ -3867,8 +4082,10 @@ function openSettings(tab = 'agents') {
   switchSettingsTab(tab);
   openModal('settings');
   $('.settings-tab.active').focus();
-  // The CLI probe shells out once per agent, so it is slower than the dialog
-  // needs to be: show the settings, fill the report in when it lands.
+  // Both of these shell out once per agent, so they are slower than the dialog
+  // needs to be: show the settings, fill the reports in when they land.
+  renderAgentConnections();
+  refreshAgents();
   refreshDoctor(true);
 }
 
@@ -3912,7 +4129,7 @@ function renderSettings() {
     // One card per CLI, not per chair. It is labelled "Agent" rather than
     // "Council" because two things read it now: the council when it seats
     // this CLI, and Chat's multi-agent answer when it asks every CLI at once.
-    ...(state.agents || []).filter(a => (a.command || []).length).map(a => ({
+    ...connectedAgents().map(a => ({
       id: `council_${a.id}`, num: 'Agent', kind: 'seat', name: a.label,
     })),
     { id: 'solo', num: 'Chat', kind: 'chat' },
@@ -4155,7 +4372,7 @@ function renderCouncilSettings() {
   for (let i = 1; i <= (Number(council.seat_count) || 3); i++) seats.push(`seat${i}`);
   const pins = council.pins || {};
   const personas = council.personas || {};
-  const agents = (state.agents || []).filter(a => (a.command || []).length);
+  const agents = connectedAgents();
   const behaviours = (state.roles || []).filter(r => r.id !== 'chairman');
 
   $('#council-pins').innerHTML = seats.map(id => {
@@ -4373,8 +4590,13 @@ async function refreshDoctor(show = false) {
     const data = await api('/api/doctor');
     state.providers = data.providers || [];
     if (show) {
+      // Three marks, matching `./run.sh --doctor`: an agent that is installed
+      // but not added is not a problem to fix by installing something, and
+      // reporting it as missing would send the operator looking for a binary
+      // that is already there.
       const lines = data.providers.map(p =>
-        `${p.available ? '[ OK ]' : '[MISS]'} ${p.label.padEnd(8)} ${p.executable.padEnd(10)} ` +
+        `${p.connected === false ? '[OFF ]' : p.available ? '[ OK ]' : '[MISS]'} ` +
+        `${p.label.padEnd(8)} ${p.executable.padEnd(10)} ` +
         `${p.path || 'not on PATH'}${p.version ? '  ' + p.version : ''}`
       );
       lines.push('', `config: ${data.config_path}`, `runs:   ${data.runs_path}`);
@@ -5395,6 +5617,51 @@ function wire() {
 
   // The button sits in the Agents panel, beside the report it prints into.
   $('#run-doctor').addEventListener('click', () => refreshDoctor(true));
+
+  // -- agent connections -------------------------------------------------
+  // Delegated: the cards are rebuilt every time a status lands.
+  $('#agents-refresh').addEventListener('click', refreshAgents);
+  $('#agent-connections').addEventListener('click', (e) => {
+    const toggle = e.target.closest('[data-agent-toggle]');
+    if (toggle) {
+      const id = toggle.dataset.agentToggle;
+      const added = (agentStatus[id] || {}).selected
+        ?? ((state.agents || []).find(a => a.id === id) || {}).selected;
+      // Removing is not destructive — the CLI, its login and this agent's
+      // model and effort all stay — so it does not ask twice.
+      return toggleAgent(id, !added);
+    }
+    const setup = e.target.closest('[data-agent-setup]');
+    if (setup) return startAgentSetup(setup.dataset.agent, setup.dataset.agentSetup);
+    const copy = e.target.closest('[data-agent-copy]');
+    if (copy) {
+      return navigator.clipboard.writeText(copy.dataset.agentCopy).then(
+        () => toast(`Copied — run \`${copy.dataset.agentCopy}\` in a terminal.`, 'ok', 9000),
+        () => toast(`Run \`${copy.dataset.agentCopy}\` in a terminal.`, 'info', 9000)
+      );
+    }
+    const models = e.target.closest('[data-agent-models]');
+    // The account-scoped list the CLI itself reports, which is the whole point
+    // of asking after a sign-in rather than shipping a catalogue.
+    if (models) openModelMenu(models, `council_${models.dataset.agentModels}`, true);
+  });
+
+  $('#agent-setup-cancel').addEventListener('click', async () => {
+    try {
+      renderSetupSession((await api('/api/agents/setup/cancel', { method: 'POST' })).session || {});
+    } catch (err) { toast(err.message, 'error'); }
+  });
+  $('#agent-setup-input').addEventListener('keydown', async (e) => {
+    if (e.key !== 'Enter') return;
+    const field = e.currentTarget;
+    const text = field.value;
+    field.value = '';
+    try {
+      renderSetupSession((await api('/api/agents/setup/input', {
+        method: 'POST', body: { text },
+      })).session || {});
+    } catch (err) { toast(err.message, 'error'); }
+  });
   $('#reset-config').addEventListener('click', async () => {
     if (!confirm('Reset every setting to its default?')) return;
     try {

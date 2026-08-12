@@ -797,18 +797,28 @@ class Pipeline:
         """Full UI state: current run plus provider availability."""
         with self._lock:
             run = self._run.to_dict() if self._run else None
-        providers = self.store.get("providers", {})
+        conf = self.store.all()
+        chosen = set(cfg.selected_agents(conf))
         return {
             "run": run,
             "busy": self.is_busy(),
-            "config": self.store.all(),
+            "config": conf,
             # The agents assignable to either job. Served rather than hardcoded
             # in the browser so commands and permission flags have one home.
-            "agents": cfg.agent_catalog(),
+            #
+            # `selected` rides along because every picker in the UI filters on
+            # it and none of them can afford to wait for `/api/agents`, which
+            # shells out to each CLI to find out whether it is signed in. A
+            # hand-written command is nobody's catalogued agent and is always
+            # offered - it is how the mock agent is reachable.
+            "agents": [
+                dict(a, selected=a["id"] in chosen or a["id"] == cfg.CUSTOM_AGENT)
+                for a in cfg.agent_catalog()
+            ],
             # The role behaviours a stage can be assigned. Served rather than
             # duplicated in the browser, so the shipped text has one home.
             "roles": prompts.role_catalog(self.store.get("roles", {})),
-            "providers_status": probe_all(providers, cfg.PROVIDER_ORDER),
+            "providers_status": probe_all(conf, cfg.PROVIDER_ORDER),
         }
 
     def is_busy(self) -> bool:
@@ -982,7 +992,7 @@ class Pipeline:
             )
             if mode == "solo":
                 bench = (
-                    self.available_agents(providers, incognito=incognito)
+                    self.available_agents(conf, incognito=incognito)
                     if multi_agent else []
                 )
                 if len(bench) > 1:
@@ -1008,9 +1018,20 @@ class Pipeline:
                     # echo are carried to the UI - not because it is one.
                     #
                     # Also where a multi-agent turn lands when only one CLI is
-                    # installed: a bench of one is the ordinary Chat assistant,
+                    # connected: a bench of one is the ordinary Chat assistant,
                     # and refusing to answer would be worse than answering.
                     p = providers.get("solo", {})
+                    # Said before the turn starts rather than after the CLI
+                    # refuses to launch. The assistant keeps whichever agent it
+                    # was assigned when one is removed and nothing is left to
+                    # move it to, and "claude is not connected" is a different
+                    # problem from "claude is not installed".
+                    if not cfg.provider_enabled(conf, p):
+                        raise ValueError(
+                            f"{p.get('label') or 'The assistant'} is not "
+                            f"connected. Open Settings → Agents and add an "
+                            f"agent, or assign Chat to one you have added."
+                        )
                     run.stages["solo"] = StageRecord(
                         id="solo",
                         label=p.get("label", "Assistant"),
@@ -1049,23 +1070,32 @@ class Pipeline:
     # -- seating -----------------------------------------------------------
 
     def available_agents(
-        self, providers: Dict[str, Any], incognito: bool = False
+        self, conf: Dict[str, Any], incognito: bool = False
     ) -> List[str]:
-        """The catalogued CLIs that are actually installed and enabled.
+        """The catalogued CLIs the operator added that are actually installed.
+
+        Two conditions, not one. Being added in Settings is what puts a CLI on
+        this bench - no agent is seated because its binary happens to be on
+        PATH - and the binary still has to resolve, because seating one whose
+        executable is missing would cost a member per run for nothing.
+
+        Takes the whole configuration rather than its providers because the
+        first of those conditions lives in ``agent_settings``: one answer per
+        CLI, wherever it sits. See ``config.provider_enabled``.
 
         Returned in the catalogue's own order, which is what the router breaks
-        ties on. Seating an agent whose binary does not resolve would cost a
-        member per run for nothing - the seat would fail at launch every time.
+        ties on.
 
         ``incognito`` narrows it further to the CLIs that can be told not to
         save the conversation. An agent without that flag is not unavailable in
         general, only for this run, and leaving it out is the whole difference
         between a private council and one that quietly kept a copy.
         """
+        providers = conf.get("providers") or {}
         out: List[str] = []
         for agent in cfg.AGENTS:
             provider = providers.get(cfg.council_provider_id(agent)) or {}
-            if not provider.get("enabled", True):
+            if not cfg.provider_enabled(conf, provider):
                 continue
             if incognito and not supports_incognito(provider):
                 continue
@@ -1088,7 +1118,7 @@ class Pipeline:
         """
         council = conf.get("council") or {}
         providers = conf.get("providers") or {}
-        available = self.available_agents(providers, incognito=incognito)
+        available = self.available_agents(conf, incognito=incognito)
         if incognito and not available:
             # Said here rather than left to the router's "check the agents in
             # Settings", which would send the operator looking for a CLI that

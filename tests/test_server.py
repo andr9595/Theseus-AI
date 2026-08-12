@@ -874,6 +874,172 @@ class TestSoloConfigMigration(unittest.TestCase):
         )
 
 
+class TestAgentSelection(unittest.TestCase):
+    """No agent is required, none is preferred, and the operator says which.
+
+    Installation is not the answer to that question: a machine can carry all
+    three binaries and a subscription for one, so what decides whether a CLI is
+    seated is `agent_settings.<cli>.selected` and nothing else.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-select-"))
+        self.path = self.tmp / "config.json"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def load(self, raw):
+        self.path.write_text(json.dumps(raw))
+        return ConfigStore(self.path).all()
+
+    def seats(self, conf):
+        return {
+            agent: cfg.provider_enabled(
+                conf, conf["providers"][cfg.council_provider_id(agent)]
+            )
+            for agent in cfg.AGENTS
+        }
+
+    def test_a_fresh_install_has_added_nobody(self):
+        conf = ConfigStore(self.path).all()
+        self.assertEqual(cfg.selected_agents(conf), [])
+        self.assertEqual(self.seats(conf), {a: False for a in cfg.AGENTS})
+
+    def test_adding_one_agent_seats_only_that_one(self):
+        store = ConfigStore(self.path)
+        conf = store.update({"agent_settings": {"claude": {"selected": True}}})
+        self.assertEqual(cfg.selected_agents(conf), ["claude"])
+        self.assertEqual(self.seats(conf)["claude"], True)
+        self.assertEqual(self.seats(conf)["codex"], False)
+
+    def test_selection_reaches_every_chair_the_cli_holds(self):
+        # One CLI, one answer. Chat and the project chairs run the same binary
+        # as the council seat, and three places to write "removed" is three
+        # places to forget it.
+        conf = ConfigStore(self.path).update(
+            {"agent_settings": {"claude": {"selected": True}}}
+        )
+        for provider in conf["providers"].values():
+            if agent_for(provider) == "claude":
+                self.assertTrue(cfg.provider_enabled(conf, provider), provider["id"])
+            elif agent_for(provider) in cfg.AGENTS:
+                self.assertFalse(cfg.provider_enabled(conf, provider), provider["id"])
+
+    def test_a_config_written_before_selection_keeps_its_bench(self):
+        # The one migration that matters: applying the new default to an
+        # existing install would empty its council at the next launch.
+        conf = self.load({
+            "version": 1,
+            "providers": {
+                cfg.council_provider_id("codex"): {"enabled": True},
+                cfg.council_provider_id("claude"): {"enabled": False},
+                cfg.council_provider_id("agy"): {"enabled": True},
+            },
+        })
+        self.assertEqual(cfg.selected_agents(conf), ["codex", "agy"])
+
+    def test_removing_an_agent_survives_a_reload(self):
+        # `false` written by the panel is an answer, not an absence, and the
+        # migration above must not read it back as "never asked".
+        store = ConfigStore(self.path)
+        store.update({"agent_settings": {"agy": {"selected": True}}})
+        store.update({"agent_settings": {"agy": {"selected": False}}})
+        self.assertEqual(cfg.selected_agents(store.reload()), [])
+
+    def test_a_hand_written_command_answers_to_nobody(self):
+        # What keeps the mock agent - and any wrapper - usable with no vendor
+        # CLI added at all. It also must not inherit the "off" of whichever
+        # catalogued CLI used to hold the chair.
+        conf = self.load({
+            "agent_settings": {a: {"selected": False} for a in cfg.AGENTS},
+            "providers": {"solo": {
+                "command": ["python3", "/tmp/mock-agent.py", "{prompt}"],
+            }},
+        })
+        self.assertEqual(cfg.selected_agents(conf), [])
+        self.assertTrue(cfg.provider_enabled(conf, conf["providers"]["solo"]))
+
+    def test_a_wrapper_the_file_disabled_stays_disabled(self):
+        conf = self.load({"providers": {"solo": {
+            "command": ["python3", "/tmp/mock-agent.py", "{prompt}"],
+            "enabled": False,
+        }}})
+        self.assertFalse(cfg.provider_enabled(conf, conf["providers"]["solo"]))
+
+
+class TestAgentEndpoints(ServerTestBase):
+    """The Settings → Agents panel's half of the contract."""
+
+    def tearDown(self):
+        for agent in cfg.AGENTS:
+            self.request(
+                "/api/agents/select", method="POST",
+                body={"agent": agent, "selected": False},
+            )
+
+    def test_state_says_which_agents_are_added(self):
+        _, data = self.request("/api/state")
+        catalogued = {a["id"]: a for a in data["agents"]}
+        self.assertIn("selected", catalogued["codex"])
+        # The custom template is always offered: it is a blank command rather
+        # than a vendor, and it is how the mock agent is reached.
+        self.assertTrue(catalogued["custom"]["selected"])
+
+    def test_adding_an_agent_enables_its_seat(self):
+        status, data = self.request(
+            "/api/agents/select", method="POST",
+            body={"agent": "codex", "selected": True},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(cfg.provider_enabled(
+            data["config"], data["config"]["providers"]["council_codex"]
+        ))
+
+    def test_removing_the_cli_a_chair_held_moves_that_chair(self):
+        # Chat pointed at an agent the operator has just removed is a message
+        # that fails at launch; the chair goes to one they kept.
+        for agent in ("codex", "claude"):
+            self.request(
+                "/api/agents/select", method="POST",
+                body={"agent": agent, "selected": True},
+            )
+        _, data = self.request(
+            "/api/agents/select", method="POST",
+            body={"agent": "claude", "selected": False},
+        )
+        self.assertEqual(data["moved"].get("solo"), "codex")
+        self.assertEqual(
+            agent_for(data["config"]["providers"]["solo"]), "codex"
+        )
+
+    def test_an_unknown_agent_is_refused(self):
+        status, data = self.request(
+            "/api/agents/select", method="POST",
+            body={"agent": "gpt-5-via-curl", "selected": True},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("No such agent", data["error"])
+
+    def test_setup_takes_an_id_and_an_action_and_nothing_else(self):
+        # The endpoint that runs a process must never be handed one.
+        for body in (
+            {"agent": "codex", "action": "rm -rf /"},
+            {"agent": "/bin/sh", "action": "login"},
+            {"agent": "codex", "action": ""},
+        ):
+            status, _ = self.request("/api/agents/setup", method="POST", body=body)
+            self.assertEqual(status, 400, body)
+
+    def test_a_full_screen_sign_in_is_offered_as_a_command_instead(self):
+        status, data = self.request(
+            "/api/agents/setup", method="POST",
+            body={"agent": "agy", "action": "login"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("terminal", data["error"])
+
+
 class TestApi(ServerTestBase):
     def test_the_page_explains_an_engine_too_old_to_offer_continue(self):
         # The browser reloads app.js by itself; the engine only reloads when
@@ -994,6 +1160,12 @@ class TestApi(ServerTestBase):
         self.assertLessEqual({"architect", "coder", "qa"}, ids)
         for p in data["providers"]:
             self.assertIn("available", p)
+            # Beside it, never folded into it. Every screen that draws a chair
+            # from this row - the doctor pane, the Projects matrix - has to be
+            # able to tell "you have not added this" from "the binary is not
+            # there", because only one of those is fixed by installing
+            # something and the pipeline refuses on both.
+            self.assertIn("connected", p)
 
     def test_filesystem_listing_returns_directories(self):
         status, data = self.request(f"/api/fs?path={Path.home()}")
@@ -1215,6 +1387,11 @@ class TestProjectRoutes(ServerTestBase):
         # The matrix draws its availability dots from this.
         self.assertEqual({r["id"] for r in data["roles"]}, {"architect", "coder", "qa"})
         self.assertIn("max_steps", data["settings"])
+        # And disables Start from it. A chair on an agent nobody added is
+        # refused by the engine, so the matrix has to know before the button
+        # is pressed rather than after.
+        for role in data["roles"]:
+            self.assertIn("connected", role)
 
     def test_a_project_on_disk_is_reported(self):
         theseus = self.folder / ".theseus"
