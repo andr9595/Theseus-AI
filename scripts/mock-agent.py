@@ -748,6 +748,8 @@ def main() -> int:
         emit("[mock-agent] caveman mode requested")
     if "[SYSTEM INSTRUCTION: EFFICIENCY MODE]" in prompt:
         emit("[mock-agent] efficiency mode requested")
+    if "# Earlier chairman attempts on this run" in prompt:
+        emit("[mock-agent] earlier chairman attempts carried")
     emit()
 
     if args.fail:

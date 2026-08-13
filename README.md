@@ -444,6 +444,15 @@ What continuing does and does not carry over:
 
 - **Answers already given are reused, not re-asked.** A stage that produced an
   answer is replayed from the transcript. Only what failed is dispatched again.
+- **A failed chairman's own half-answer is carried into the next attempt.**
+  The one it lost is the one that was applying the outcome, so what it had
+  written — and the reason it stopped — is quoted to the chairman that
+  continues, labelled as an attempt that did not finish. That is what stops the
+  second one redoing work the first had already started or contradicting it.
+  The folder is still the authority: the attempt is recollection, and the new
+  chairman is told to check it against the tree rather than trust it. A verdict
+  that *answered* is never quoted this way — a chair re-run because a member it
+  quoted changed is stale, not failed.
 - **The approval gate is not asked twice.** If you already approved this run,
   the chairman keeps the write permission you granted — the bench and the
   positions it was approving are exactly the ones being reused. A run that

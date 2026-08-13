@@ -540,6 +540,14 @@ class Run:
     # How many times this run has been continued. Kept because a transcript
     # showing one chairman answer that took three attempts should say so.
     resumed: int = 0
+    # What the chairmen that did not finish had written when they stopped, one
+    # entry per attempt, oldest first. Held on the run rather than on the stage
+    # because the stage is wiped to `pending` before it runs again - and it is
+    # wiped for a good reason, so the attempt is lifted out first instead. The
+    # next chairman is shown these: a seat that hit its quota wall halfway
+    # through applying a patch left half a patch behind, and continuing without
+    # saying so asks the new one to work that out from the diff alone.
+    chairman_attempts: List[Dict[str, str]] = field(default_factory=list)
     # Continuation lineage. A follow-up run is a new, independently auditable
     # run that carries the earlier turns of its thread rather than reopening
     # the transcript it came from.
@@ -704,6 +712,9 @@ class Run:
             "rollback_note": self.rollback_note,
             "approved": self.approved,
             "resumed": self.resumed,
+            # On the transcript so a continuation started after a restart shows
+            # the next chairman the same failed attempt an in-memory one would.
+            "chairman_attempts": self.chairman_attempts,
             # What Continue would cost, decided here rather than in the browser
             # so the button and the engine cannot disagree about whether there
             # is anything left to do.
@@ -1342,6 +1353,14 @@ class Pipeline:
                 error=str(data.get("error") or ""),
                 approved=bool(data.get("approved")),
                 resumed=int(data.get("resumed") or 0),
+                chairman_attempts=[
+                    {
+                        "output": str(attempt.get("output") or ""),
+                        "error": str(attempt.get("error") or ""),
+                    }
+                    for attempt in (data.get("chairman_attempts") or [])
+                    if isinstance(attempt, dict)
+                ],
                 seating=seating,
                 strictness=int(
                     data.get("strictness") or prompts.DEFAULT_STRICTNESS
@@ -1399,6 +1418,7 @@ class Pipeline:
             todo = set(failed)
             for stage_id in failed:
                 todo |= set(dependent_stages(run, stage_id))
+            self._keep_chair_attempt(run, failed)
             self._reset_stages(run, todo)
 
             # Providers and roles are re-read from Settings; everything else
@@ -1445,6 +1465,12 @@ class Pipeline:
                     f"asked again because they quoted one that did not."
                     if cascaded else ""
                 )
+                + (
+                    f" The chairman is being shown its "
+                    f"{len(run.chairman_attempts)} unfinished attempt(s), so "
+                    f"it knows what was already started."
+                    if run.chairman_attempts else ""
+                )
             ),
         )
         self.bus.publish("state", state=run.state, run=run.to_dict())
@@ -1456,6 +1482,30 @@ class Pipeline:
             self._thread = thread
         thread.start()
         return run
+
+    def _keep_chair_attempt(self, run: Run, failed: Iterable[str]) -> None:
+        """Lift a failed chairman's half-written answer off the stage it dies on.
+
+        The stage itself is about to be wiped, and rightly: one attempt's error
+        beside another attempt's answer is a record nobody can read. But the
+        text is worth keeping once, somewhere else, because a chairman that got
+        halfway through applying the outcome before it fell over has already
+        changed the folder the next one will open. The next chairman is shown
+        it as an unfinished attempt, and reads the folder to find out how much
+        of it actually landed.
+
+        Only a chairman that *failed*. One that answered and is running again
+        because a member it quoted was re-run is not a failed attempt, and
+        labelling a stale verdict as one would be a lie in the prompt.
+        """
+        if "chair" not in set(failed):
+            return
+        chair = run.stages.get("chair")
+        if chair is None or not (chair.output.strip() or chair.error.strip()):
+            return
+        run.chairman_attempts.append(
+            {"output": chair.output, "error": chair.error}
+        )
 
     def _reset_stages(self, run: Run, stage_ids: Iterable[str]) -> None:
         """Put stages back to `pending` so the next execution runs them.
@@ -2301,6 +2351,7 @@ class Pipeline:
                 house_rules,
                 run.reviewer_note,
                 run.conversation,
+                run.chairman_attempts,
                 strictness_level=run.strictness,
                 system=str(chair_role.get("system") or ""),
                 read_only=run.read_only,

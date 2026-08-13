@@ -1608,6 +1608,42 @@ class TestContinuingAFailedRun(PipelineTestBase):
         self.assertEqual(run.stages["chair"].state, "done")
         self.assertTrue(run.stages["chair"].output.strip())
 
+    def test_the_failed_chairs_own_answer_is_carried_into_the_retry(self):
+        # The half of the saving the members do not cover. A chairman that fell
+        # over partway through applying the outcome left the folder half
+        # changed, and the one that continues is told what it was doing rather
+        # than left to work it out from the diff.
+        run = self.fail_the_chair()
+        attempt = run.stages["chair"].output
+        self.assertTrue(attempt.strip(), "the failed chair printed nothing")
+        self.mend_the_chair()
+
+        self.pipeline.resume()
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(run.chairman_attempts[-1]["output"], attempt)
+        self.assertIn("simulated failure", run.chairman_attempts[-1]["error"])
+        # And it reached the CLI, which is the only claim worth making: the
+        # recorded command redacts the prompt to a character count, so the
+        # agent's own echo is the evidence.
+        self.assertIn(
+            "earlier chairman attempts carried", run.stages["chair"].output
+        )
+
+    def test_every_unfinished_attempt_is_kept(self):
+        run = self.fail_the_chair()
+        self.pipeline.resume()
+        self.wait_terminal()
+        self.assertEqual(run.state, "failed")
+
+        self.mend_the_chair()
+        self.pipeline.resume()
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(len(run.chairman_attempts), 2)
+
     def test_a_continued_run_keeps_its_identity(self):
         # One run, one id, one transcript. Two half-runs the operator has to
         # line up by hand would lose the thing the transcript is for.
@@ -1715,6 +1751,29 @@ class TestContinuingAFailedRun(PipelineTestBase):
             {s.id: s.output for s in self.member_stages(revived)}, members
         )
         self.assertTrue(revived.stages["chair"].output.strip())
+
+    def test_the_failed_chairs_answer_survives_a_restart_too(self):
+        # It is on the transcript for the same reason the members' answers are:
+        # the app being closed between the failure and the decision to continue
+        # must not cost the next chairman what it already knew.
+        run = self.fail_the_chair()
+        name = run.transcript_name
+        attempt = run.stages["chair"].output
+        self.mend_the_chair()
+
+        restarted = Pipeline(self.store, self.bus, runs_dir=self.runs_dir)
+        self.addCleanup(restarted.wait_for_worker)
+        revived = restarted.revive(name)
+        self.wait_for(
+            lambda: not restarted.is_busy(), what="the revived run to finish"
+        )
+        restarted.wait_for_worker()
+
+        self.assertEqual(revived.state, "complete", revived.error)
+        self.assertEqual(revived.chairman_attempts[-1]["output"], attempt)
+        self.assertIn(
+            "earlier chairman attempts carried", revived.stages["chair"].output
+        )
 
     def test_a_finished_transcript_is_not_revived(self):
         self.store.update({"zero_touch": True})
@@ -1851,6 +1910,21 @@ class TestRunningOneSeatAgain(PipelineTestBase):
     def test_re_running_the_chair_takes_nothing_else(self):
         run = self.council()
         self.assertEqual(run.to_dict()["retry_plan"]["chair"], ["chair"])
+
+    def test_a_verdict_that_answered_is_not_called_an_unfinished_attempt(self):
+        # The chair re-runs here because the position it quoted changed, not
+        # because it failed. Handing the next one the old verdict labelled as
+        # an attempt that fell over would put a lie in the prompt.
+        run = self.council()
+
+        self.pipeline.retry(run.seating.members[0].id)
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(run.chairman_attempts, [])
+        self.assertNotIn(
+            "earlier chairman attempts carried", run.stages["chair"].output
+        )
 
     def test_the_kept_answers_are_not_asked_again(self):
         run = self.council()
@@ -2921,6 +2995,73 @@ class TestReadOnlyChairmanPrompt(unittest.TestCase):
         prompt = self.chairman(read_only=True)
         self.assertIn("# Stage 1 - independent positions", prompt)
         self.assertIn("CONSENSUS: <integer 0-100>", prompt)
+
+
+class TestContinuedChairmanPrompt(unittest.TestCase):
+    """What a continued run tells the chairman about the one before it.
+
+    The deliberation is replayed either way. This is the part that was being
+    thrown away: a chairman that failed partway through applying the outcome
+    had already changed the folder, and the next one arrived knowing nothing
+    about it.
+    """
+
+    def chairman(self, attempts, **kwargs):
+        from aicouncil import prompts
+
+        return prompts.build_chairman_prompt(
+            "finish the work", [{"alias": "Agent A", "output": "do it"}],
+            [], "/tmp", previous_attempts=attempts, **kwargs,
+        )
+
+    def test_nothing_is_added_on_a_first_attempt(self):
+        self.assertNotIn("Earlier chairman attempts", self.chairman(None))
+        self.assertNotIn("Earlier chairman attempts", self.chairman([]))
+
+    def test_the_attempt_is_quoted_and_labelled_as_unfinished(self):
+        prompt = self.chairman([
+            {"output": "PARTIAL-VERDICT", "error": "Timed out after 900s."},
+        ])
+        self.assertIn("PARTIAL-VERDICT", prompt)
+        self.assertIn("Timed out after 900s.", prompt)
+        self.assertIn("did not finish", prompt)
+        # The folder, not the recollection, is what says how much of it landed.
+        self.assertIn("only authority on what actually landed", prompt)
+
+    def test_the_attempts_are_oldest_first(self):
+        prompt = self.chairman([
+            {"output": "FIRST-TRY", "error": ""},
+            {"output": "SECOND-TRY", "error": ""},
+        ])
+        self.assertLess(prompt.index("FIRST-TRY"), prompt.index("SECOND-TRY"))
+
+    def test_a_chair_that_printed_nothing_still_says_why(self):
+        prompt = self.chairman([{"output": "   ", "error": "Quota exhausted."}])
+        self.assertIn("Nothing usable was written.", prompt)
+        self.assertIn("Quota exhausted.", prompt)
+
+    def test_the_attempts_cannot_push_the_prompt_past_its_ceiling(self):
+        # Three failed attempts at 200,000 characters each is not a plausible
+        # run, which is the point: the bound holds without being reasoned about.
+        from aicouncil import prompts
+        from aicouncil.providers import ARGV_PROMPT_LIMIT
+
+        big = "x" * 200_000
+        prompt = self.chairman(
+            [{"output": big, "error": big} for _ in range(3)],
+            house_rules=big,
+            conversation=[{"task": big, "replies": []}],
+        )
+        self.assertLessEqual(len(prompt), prompts.MAX_CHAIRMAN_PROMPT)
+        self.assertLess(len(prompt), ARGV_PROMPT_LIMIT)
+
+    def test_the_deliberation_is_not_crowded_out_by_them(self):
+        # The attempts are context; the positions are what is being decided
+        # between, and they still have to arrive.
+        big = "x" * 200_000
+        prompt = self.chairman([{"output": big, "error": ""} for _ in range(3)])
+        self.assertIn("# Stage 1 - independent positions", prompt)
+        self.assertIn("do it", prompt)
 
 
 class TestCavemanPrompt(unittest.TestCase):

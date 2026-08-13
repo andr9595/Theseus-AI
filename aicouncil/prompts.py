@@ -1051,6 +1051,11 @@ MAX_CHAIRMAN_PROMPT = 88_000
 # certain point a "position" is too short to be one, and it is better to seat
 # fewer members than to show the chairman six stubs.
 MIN_MEMBER_CHARS = 4_000
+# What a continued run's earlier chairman attempts are allowed to cost, in
+# total rather than each. It is deliberately a fraction of what the
+# deliberation gets: the attempt is context for what may already be on disk,
+# and the positions are still what is being decided between.
+MAX_CHAIR_ATTEMPTS_TOTAL = 12_000
 
 
 def _share(total: int, count: int) -> int:
@@ -1309,6 +1314,46 @@ def build_critique_prompt(
     )
 
 
+def _chair_attempts_block(attempts: Optional[List[Dict[str, str]]]) -> str:
+    """What earlier chairmen on this same run wrote before they fell over.
+
+    Continuing a run that lost its chairman replays the deliberation, and until
+    this block existed it threw away the one thing the new chairman most needed:
+    what the failed one had already done to the folder before it died. A
+    chairman that hit its quota wall halfway through applying a patch leaves
+    half a patch, and the next one arriving with no knowledge of it either
+    duplicates the work or contradicts it.
+
+    It is *recollection*, not instruction, and it is labelled as an attempt that
+    did not finish - the folder is the authority on what actually landed. The
+    seat is not addressed as "you" either: continuing re-reads providers from
+    Settings, so the chairman reading this may be a different CLI from the one
+    that wrote it.
+    """
+    if not attempts:
+        return ""
+
+    budget = _share(MAX_CHAIR_ATTEMPTS_TOTAL, len(attempts))
+    rendered = "\n\n---\n\n".join(
+        f"## Attempt {number}\n\n"
+        + (clip(str(attempt.get("output") or "").strip(), budget)
+           or "(Nothing usable was written.)")
+        + "\n\nHow it ended: "
+        + (str(attempt.get("error") or "").strip() or "(not recorded)")
+        for number, attempt in enumerate(attempts, 1)
+    )
+    return (
+        "\n# Earlier chairman attempts on this run\n"
+        "This run has been chaired before and the attempt did not finish. What "
+        "it wrote is below, oldest first. Read it to see what has already been "
+        "started and what is still missing - then verify it against the working "
+        "folder, which is the only authority on what actually landed. Do not "
+        "carry on mid-sentence: answer the task in full, as if for the first "
+        "time.\n\n"
+        f"{clip(rendered, MAX_CHAIR_ATTEMPTS_TOTAL)}\n"
+    )
+
+
 def build_chairman_prompt(
     task: str,
     positions: List[Dict[str, str]],
@@ -1318,6 +1363,7 @@ def build_chairman_prompt(
     house_rules: str = "",
     reviewer_note: str = "",
     conversation: Optional[List[Dict[str, Any]]] = None,
+    previous_attempts: Optional[List[Dict[str, str]]] = None,
     strictness_level: Any = DEFAULT_STRICTNESS,
     system: str = "",
     read_only: bool = False,
@@ -1333,6 +1379,11 @@ def build_chairman_prompt(
 
     ``reviewer_note`` is whatever the human typed at the approval gate and
     outranks the whole council, which is the point of the gate.
+
+    ``previous_attempts`` is what earlier chairmen on this same run wrote before
+    they failed. A continued run replays the deliberation; this is the other
+    half of not paying twice, since the failed attempt may already have changed
+    the folder the new one is about to work in.
 
     ``read_only`` is a run with no working folder, where there is nothing to
     apply the outcome to and the answer itself is the deliverable. The shipped
@@ -1378,6 +1429,7 @@ def build_chairman_prompt(
         f"# Context\n{_workspace_block(workspace, workspace_status)}\n"
         f"{_history_block(conversation)}\n"
         f"{_task_block(task)}"
+        f"{_chair_attempts_block(previous_attempts)}"
         f"{note}\n"
     )
     tail = f"\n{CONFIDENCE_CONTRACT}\n"
@@ -1423,7 +1475,8 @@ def build_chairman_prompt(
     # already large stops shrinking it and the total walks past the argv limit
     # - which is a failed run, and a failed run *after* the gate, the branch
     # and the snapshot. Every part of the head is bounded now (the rules, the
-    # task, the note and the thread each have a cap), so this clip should never
+    # task, the note, the thread and the earlier chairman attempts each have a
+    # cap), so this clip should never
     # fire; it is here so the sentence above is true rather than nearly true.
     # The trailer is kept outside it because it is the only thing that makes
     # the reply parseable and must never be the part that gets cut.
