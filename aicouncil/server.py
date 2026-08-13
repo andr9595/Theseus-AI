@@ -811,7 +811,13 @@ class Handler(BaseHTTPRequestHandler):
         return {"ok": True, "run": pipeline.retry(stage).to_dict()}
 
     def _api_commit(self, params: Dict[str, list]) -> Dict[str, Any]:
-        """Commit the working tree of the selected folder."""
+        """Commit the working tree of the selected folder, and publish it.
+
+        Commit and push are two calls, in that order, and a failed push is
+        reported rather than raised: by the time it fails the commit exists,
+        and turning that into an error would tell the operator their work did
+        not land when it did. ``push: false`` in the body keeps it local.
+        """
         body = self._read_body()
         workspace = self._workspace_from(body)
         if not workspace:
@@ -827,8 +833,26 @@ class Handler(BaseHTTPRequestHandler):
                 "A run or project is in progress. Wait for it to finish."
             )
         result = gitutil.commit_all(workspace, str(body.get("message") or ""))
+        result["push"] = self._push_after_commit(workspace, body)
         self.app.bus.publish("committed", commit=result, workspace=workspace)
         return {"ok": True, "commit": result}
+
+    def _push_after_commit(
+        self, workspace: str, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Push what was just committed, describing the outcome either way.
+
+        A repository with no remote is not a failure to report - plenty of
+        working folders are local-only, and the operator who picked one knows
+        that. It is reported as "not pushed" with the reason, and the commit
+        summary is what the toast leads with.
+        """
+        if body.get("push") is False:
+            return {"pushed": False, "skipped": True, "error": ""}
+        try:
+            return gitutil.push_head(workspace)
+        except gitutil.GitError as exc:
+            return {"pushed": False, "skipped": False, "error": str(exc)}
 
     # -- Projects ----------------------------------------------------------
 

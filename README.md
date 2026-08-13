@@ -384,6 +384,28 @@ done there cannot be rolled back.
 > diff, the snapshot and the delivery branch all operate on the root. Picking
 > `project/src` and picking `project` are the same choice.
 
+### Commit &amp; push
+
+The commit bar under a run's diff, and the **N uncommitted** chip in the status
+bar, both do the same thing: stage everything (`git add -A`, so `.gitignore`
+still applies), commit it with the message you typed, and push the checked-out
+branch to `origin`, setting the upstream the first time. The link back to
+GitHub's compare page is offered afterwards, so the branch can be merged from
+there.
+
+The two halves are reported separately, because they fail separately:
+
+- **No `origin`.** The commit still happens and the summary says the work
+  stayed local. Plenty of working folders have no remote.
+- **The push is rejected** (someone pushed first) **or has no credentials.**
+  The commit still happened — it says so — and the message names the fix.
+  Credentials come from [Connect GitHub](#connecting-github) for an https
+  remote, or from an ssh-agent for an ssh one; a key passphrase cannot be
+  typed from the browser, so an unloaded key fails fast instead of hanging.
+
+Nothing is pushed underneath a running agent: committing mid-run captures a
+tree the agent is still editing, so the bar hides and the endpoint refuses.
+
 ---
 
 ## Continuing a run

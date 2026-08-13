@@ -1972,6 +1972,10 @@ html, body {
   margin: 0; padding: 0 18px 14px;
   font-size: 11px; color: var(--text-3);
 }
+/* The push outcome under the commit note: amber when nothing reached GitHub,
+   because that one needs an action rather than only reading. */
+.changes-note.warn { color: var(--amber); }
+.changes-note a { color: var(--accent); }
 
 /* ---- Role manager ---- */
 

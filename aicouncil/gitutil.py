@@ -52,6 +52,13 @@ def _child_env() -> Dict[str, str]:
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_EDITOR"] = "true"
     env["GIT_PAGER"] = "cat"
+    # GIT_TERMINAL_PROMPT only muzzles git itself. A push over ssh hands off to
+    # ssh, which will happily sit there asking for a key passphrase on whatever
+    # terminal the app was launched from - invisible to the browser and holding
+    # a request thread until the timeout. BatchMode turns that into an
+    # immediate, explainable failure. setdefault: an operator who has set their
+    # own GIT_SSH_COMMAND meant it.
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
     env.pop("GIT_DIR", None)
     env.pop("GIT_WORK_TREE", None)
     return env
@@ -848,9 +855,10 @@ def commit_all(path: str | Path, message: str) -> Dict[str, Any]:
     thing they approved. Ignored files stay ignored - `add -A` honours
     .gitignore, which is what keeps build output and virtualenvs out.
 
-    Nothing is pushed. Publishing is a separate, outward-facing act and it has
-    its own path through pull-request mode; a button labelled "commit" that
-    also pushed would be a surprise the first time it mattered.
+    This commits and nothing more. Pushing is a separate call - ``push_head``
+    - so that a rejected push cannot lose a commit that already succeeded: the
+    caller reports the two outcomes separately and the work is on disk either
+    way.
     """
     message = (message or "").strip()
     if not message:
@@ -900,4 +908,161 @@ def commit_all(path: str | Path, message: str) -> Dict[str, Any]:
         "deletions": stat.get("deletions", 0),
         "branch": _run(["rev-parse", "--abbrev-ref", "HEAD"], root,
                        check=False).stdout.strip(),
+    }
+
+
+# --------------------------------------------------------------------------
+# Publishing what was committed
+# --------------------------------------------------------------------------
+
+# A remote URL can carry credentials in its userinfo - `https://x:ghp_...@` is
+# how a token-authenticated clone is written on disk. Any URL that reaches the
+# browser, a toast or the console goes through this first.
+_URL_USERINFO = re.compile(r"(://)[^/@\s]+@")
+
+
+def _scrub(text: str) -> str:
+    """Strip credentials out of anything quoted back from git."""
+    return _URL_USERINFO.sub(r"\1", text or "")
+
+
+def remote_web_url(path: str | Path, remote: str = "origin") -> str:
+    """The browsable https URL for ``remote``, or "" if it has none.
+
+    Covers the three ways the same GitHub repository gets written into a
+    config - scp-style ssh, ssh:// and https - because which one is there
+    depends on how the operator cloned, and the link is the whole point of
+    reporting a push at all.
+    """
+    root = repo_root(path)
+    if root is None:
+        return ""
+    proc = _run(["remote", "get-url", remote], root, check=False)
+    if proc.returncode != 0:
+        return ""
+    url = _scrub(proc.stdout.strip())
+    if not url:
+        return ""
+
+    if url.startswith("git@") or (
+        "@" in url.split("/")[0] and "://" not in url
+    ):
+        # scp-style: git@host:owner/repo.git
+        host, _, tail = url.partition(":")
+        url = f"https://{host.split('@')[-1]}/{tail}"
+    elif url.startswith(("ssh://", "git://")):
+        url = "https://" + url.split("://", 1)[1]
+    elif not url.startswith(("http://", "https://")):
+        # A local path used as a remote - a bare repo next door, or a test
+        # fixture. There is nothing to browse.
+        return ""
+
+    return re.sub(r"\.git/?$", "", url).rstrip("/")
+
+
+def _push_failure(proc: subprocess.CompletedProcess, branch: str) -> str:
+    """Turn a failed push into something worth reading.
+
+    git's own output for the two failures that actually happen - no
+    credentials, and someone else pushed first - is either a wall of advice or
+    a single word ("rejected") with the reason three lines away. Both are
+    recoverable, and both need a different next step, so they are named.
+    """
+    detail = _scrub((proc.stderr or proc.stdout or "").strip())
+    low = detail.lower()
+
+    if (
+        "authentication failed" in low
+        or "could not read username" in low
+        or "permission denied" in low
+        or "invalid username or token" in low
+        or "403" in low
+    ):
+        return (
+            "The commit is safe locally, but the push had no usable "
+            "credentials. For an https remote, use Connect GitHub in Settings "
+            "- it runs `gh auth setup-git`, which is what teaches git to push. "
+            "For an ssh remote the key has to be loaded in an ssh-agent, "
+            "because a passphrase cannot be typed from here."
+        )
+    if "host key verification failed" in low:
+        return (
+            "The commit is safe locally, but ssh does not recognise this host "
+            "and cannot ask you about it from here. Run `ssh -T git@github.com` "
+            "once in a terminal to accept the host key, then push again."
+        )
+    if "non-fast-forward" in low or "fetch first" in low or "rejected" in low:
+        return (
+            f"The commit is safe locally, but origin/{branch} has commits this "
+            f"branch does not, so the push was rejected. Pull or rebase, then "
+            f"push again."
+        )
+    if "protected branch" in low or "pre-receive hook declined" in low:
+        return (
+            f"The commit is safe locally, but GitHub declined the push to "
+            f"{branch}: {detail.splitlines()[-1] if detail else 'the branch is protected'}"
+        )
+    return (
+        "The commit is safe locally, but the push failed: "
+        + (detail.splitlines()[-1] if detail else "git push failed.")
+    )
+
+
+def push_head(path: str | Path, remote: str = "origin") -> Dict[str, Any]:
+    """Push the checked-out branch to ``remote``, setting upstream if needed.
+
+    Only ever pushes the current branch by name, never ``--all`` and never
+    with a refspec the caller supplies: the thing that gets published is
+    exactly the branch the operator was looking at when they pressed the
+    button.
+
+    Raises GitError with a recoverable message. Callers commit first and push
+    second precisely so that this raising does not undo anything.
+    """
+    root = repo_root(path)
+    if root is None:
+        raise GitError(f"{path!r} is not a git repository.")
+
+    st = status(root)
+    if not st.branch or st.branch == "HEAD":
+        raise GitError(
+            "The commit is safe locally, but this repository is on a detached "
+            "HEAD, so there is no branch to push. Check out a branch first."
+        )
+    if not st.remote:
+        raise GitError(
+            f"The commit is safe locally, but this repository has no remote "
+            f"named {remote!r}, so there is nowhere to push it. Add one with "
+            f"`git remote add {remote} <url>`."
+        )
+
+    branch = st.branch
+    tracking = _run(
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        root, check=False,
+    )
+    has_upstream = tracking.returncode == 0 and tracking.stdout.strip()
+    args = ["push", remote, branch] if has_upstream else [
+        "push", "--set-upstream", remote, branch
+    ]
+
+    proc = _run(args, root, check=False, timeout=REMOTE_TIMEOUT)
+    if proc.returncode != 0:
+        raise GitError(_push_failure(proc, branch))
+
+    web = remote_web_url(root, remote)
+    return {
+        "pushed": True,
+        "remote": remote,
+        "branch": branch,
+        "upstream": f"{remote}/{branch}",
+        "tracked": bool(has_upstream),
+        # Where a human goes to turn this into a pull request. GitHub's
+        # compare page with ?expand=1 opens the PR form pre-filled; on the
+        # default branch there is nothing to compare against, so the commit
+        # list is the honest destination. Which branch is default is a
+        # question for the remote, so this uses the local guess and lets
+        # GitHub redirect rather than making a network call to find out.
+        "url": f"{web}/compare/{branch}?expand=1" if web else "",
+        "repo_url": web,
     }

@@ -410,7 +410,7 @@
     <div id="commit-bar" class="commit-bar hidden">
       <input id="commit-message" class="commit-message" spellcheck="false"
         placeholder="Commit message&hellip;">
-      <button id="commit-btn" class="btn btn-primary btn-sm" type="button">Commit</button>
+      <button id="commit-btn" class="btn btn-primary btn-sm" type="button">Commit &amp; push</button>
       <span id="commit-hint" class="commit-hint"></span>
     </div>
     <div id="diff-view" class="diff-view"></div>
@@ -457,10 +457,13 @@
       <input id="changes-message" class="commit-message" spellcheck="false"
         placeholder="Commit message&hellip;" aria-label="Commit message">
       <button id="changes-commit" class="btn btn-primary" type="button">
-        Commit everything
+        Commit &amp; push everything
       </button>
     </footer>
     <p id="changes-note" class="changes-note"></p>
+    <!-- Filled in after a push that succeeded: the compare page for the branch
+         that was just published, which is where the merge happens. -->
+    <p id="changes-pushed" class="changes-note hidden"></p>
   </div>
 </div>
 

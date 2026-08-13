@@ -1691,7 +1691,10 @@ function renderCommitBar() {
   if (!show) return;
 
   $('#commit-hint').textContent =
-    `${dirty} uncommitted change${dirty === 1 ? '' : 's'} on ${st.branch || '?'}`;
+    `${dirty} uncommitted change${dirty === 1 ? '' : 's'} on ${st.branch || '?'}` +
+    (st.remote
+      ? ` — pushes to origin/${st.branch || '?'}`
+      : ' — no origin remote, so this stays local');
   const box = $('#commit-message');
   if (!box.value && state.run && state.run.task) {
     // The task is a reasonable first draft of the subject; the operator can
@@ -1700,25 +1703,37 @@ function renderCommitBar() {
   }
 }
 
-/** Commit the whole working tree. Shared by the bar under a run's diff and by
- *  the status bar's chip so the two cannot drift: same refusal on an empty
- *  message, same summary afterwards, same reload of what the folder now is. */
+/** Commit the whole working tree and push it. Shared by the bar under a run's
+ *  diff and by the status bar's chip so the two cannot drift: same refusal on
+ *  an empty message, same summary afterwards, same reload of what the folder
+ *  now is.
+ *
+ *  Returns the commit (with its `push` outcome) on success, null on failure.
+ *  A commit that landed but could not be pushed is a *success* here - the work
+ *  is in git - reported with a second, longer-lived warning, because the two
+ *  halves need different reactions from the operator. */
 async function commitWorkingTree(message, btn) {
-  if (!message) { toast('A commit message is required.', 'warn'); return false; }
+  if (!message) { toast('A commit message is required.', 'warn'); return null; }
   if (btn) btn.disabled = true;
   try {
     const { commit } = await api('/api/commit', {
       method: 'POST',
       body: { message, workspace: workspacePath() },
     });
-    toast(
+    const push = commit.push || {};
+    const summary =
       `Committed ${commit.short} on ${commit.branch} — ${commit.files} file(s), ` +
-      `+${commit.insertions}/-${commit.deletions}`, 'ok', 6000);
+      `+${commit.insertions}/-${commit.deletions}`;
+    toast(push.pushed ? `${summary} — pushed to ${push.upstream}` : summary,
+          'ok', 6000);
+    if (!push.pushed && !push.skipped && push.error) {
+      toast(push.error, 'warn', 12000);
+    }
     await loadState();
-    return true;
+    return commit;
   } catch (err) {
     toast(err.message, 'error', 9000);
-    return false;
+    return null;
   } finally {
     if (btn) btn.disabled = false;
   }
@@ -1763,6 +1778,7 @@ async function openChanges() {
   $('#changes-diff').innerHTML =
     '<div class="empty-state">Reading the working tree…</div>';
   renderChangesFoot();
+  renderPushOutcome(null);
   $('#changes-message').focus();
 
   try {
@@ -1790,20 +1806,55 @@ async function openChanges() {
  *  read before the button is pressed rather than after. */
 function renderChangesFoot() {
   const busy = !!state.busy;
+  const st = state.workspaceStatus || {};
   $('#changes-commit').disabled = busy;
   $('#changes-note').textContent = busy
     ? 'A run is in progress. Committing now would capture a tree it is still ' +
       'editing, so wait for it to finish.'
-    : 'Commits everything the list shows, including new files. Nothing is ' +
-      'pushed.';
+    : 'Commits everything the list shows, including new files, then pushes ' +
+      (st.remote
+        ? `the current branch to origin/${st.branch || '?'} so it can be ` +
+          'merged on GitHub.'
+        : 'it — except this folder has no origin remote, so the commit stays ' +
+          'local.');
+}
+
+/** What happened to the push, left on screen rather than in a toast that
+ *  expires: a failed push needs an action, and a successful one has a link
+ *  worth clicking. */
+function renderPushOutcome(push) {
+  const host = $('#changes-pushed');
+  if (!host) return;
+  if (!push || push.skipped || (!push.pushed && !push.error)) {
+    host.classList.add('hidden');
+    host.innerHTML = '';
+    return;
+  }
+  host.classList.remove('hidden');
+  host.classList.toggle('warn', !push.pushed);
+  host.innerHTML = push.pushed
+    ? `Pushed to ${esc(push.upstream)}.` + (push.url
+        ? ` <a href="${esc(push.url)}" target="_blank" rel="noopener">` +
+          `Open it on GitHub</a> to merge it.`
+        : '')
+    : esc(push.error);
 }
 
 async function doChangesCommit() {
   const box = $('#changes-message');
-  const ok = await commitWorkingTree(box.value.trim(), $('#changes-commit'));
-  if (!ok) return;
+  const commit = await commitWorkingTree(box.value.trim(), $('#changes-commit'));
+  if (!commit) return;
   box.value = '';
-  closeModal('changes');
+  const push = commit.push || {};
+  if (push.skipped || (!push.pushed && !push.error)) {
+    closeModal('changes');
+    return;
+  }
+  // Something was said about GitHub - a link to merge through, or a reason
+  // nothing got there. Re-read the folder so the list matches the tree that
+  // now exists, then say it, instead of closing over it.
+  await openChanges();
+  renderPushOutcome(push);
 }
 
 /* ==========================================================================
@@ -5320,7 +5371,14 @@ function connect() {
   });
 
   on('committed', (d) => {
+    const push = d.commit.push || {};
     pushLine('sys', 'git', `committed ${d.commit.short} — ${d.commit.message}`);
+    if (push.pushed) {
+      pushLine('sys', 'git',
+        `pushed to ${push.upstream}${push.url ? ` — ${push.url}` : ''}`);
+    } else if (push.error) {
+      pushLine('err', 'git', push.error);
+    }
     loadState();
   });
 

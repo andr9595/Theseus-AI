@@ -3713,6 +3713,130 @@ class TestCommitFromTheApp(PipelineTestBase):
         self.assertIn("identity", str(ctx.exception).lower())
 
 
+class TestPushFromTheApp(PipelineTestBase):
+    """The other half of the commit button: getting it onto the remote.
+
+    Origin is a bare repository next door, so these exercise real pushes -
+    including the two that fail - without a network or a GitHub account.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.origin = self.tmp / "origin.git"
+
+    def _add_origin(self):
+        # -b main so the bare repo's HEAD matches the branch that gets pushed;
+        # otherwise a clone of it has nothing to check out.
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main",
+                        str(self.origin)], check=True, capture_output=True)
+        git(["remote", "add", "origin", str(self.origin)], self.repo)
+
+    def _origin_head(self, branch="main"):
+        return subprocess.run(
+            ["git", "rev-parse", branch], cwd=self.origin,
+            capture_output=True, text=True, check=False).stdout.strip()
+
+    def test_push_publishes_the_commit_and_sets_upstream(self):
+        self._add_origin()
+        (self.repo / "new.txt").write_text("added\n")
+        commit = gitutil.commit_all(self.repo, "publish me")
+
+        result = gitutil.push_head(self.repo)
+        self.assertTrue(result["pushed"])
+        self.assertEqual(result["upstream"], "origin/main")
+        # Not previously tracked, so the push had to create the upstream.
+        self.assertFalse(result["tracked"])
+        self.assertEqual(self._origin_head(), commit["commit"])
+
+    def test_a_second_push_reuses_the_upstream(self):
+        self._add_origin()
+        (self.repo / "a.txt").write_text("1\n")
+        gitutil.commit_all(self.repo, "first")
+        gitutil.push_head(self.repo)
+
+        (self.repo / "b.txt").write_text("2\n")
+        second = gitutil.commit_all(self.repo, "second")
+        result = gitutil.push_head(self.repo)
+        self.assertTrue(result["tracked"])
+        self.assertEqual(self._origin_head(), second["commit"])
+
+    def test_no_remote_is_explained_rather_than_dumped(self):
+        (self.repo / "x.txt").write_text("y\n")
+        gitutil.commit_all(self.repo, "local only")
+        with self.assertRaises(gitutil.GitError) as ctx:
+            gitutil.push_head(self.repo)
+        message = str(ctx.exception)
+        self.assertIn("no remote named 'origin'", message)
+        # The operator has to be told the work is not lost, whatever failed.
+        self.assertIn("safe locally", message)
+
+    def test_a_rejected_push_says_what_to_do_and_keeps_the_commit(self):
+        self._add_origin()
+        (self.repo / "a.txt").write_text("1\n")
+        gitutil.commit_all(self.repo, "first")
+        gitutil.push_head(self.repo)
+
+        # Someone else pushed meanwhile: a clone commits on top and publishes,
+        # leaving this repo's next push non-fast-forward.
+        other = self.tmp / "other"
+        subprocess.run(["git", "clone", "-q", str(self.origin), str(other)],
+                       check=True, capture_output=True)
+        git(["config", "user.email", "other@example.com"], other)
+        git(["config", "user.name", "Other"], other)
+        (other / "theirs.txt").write_text("theirs\n")
+        git(["add", "-A"], other)
+        git(["commit", "-qm", "theirs"], other)
+        git(["push", "-q", "origin", "main"], other)
+
+        (self.repo / "b.txt").write_text("2\n")
+        mine = gitutil.commit_all(self.repo, "mine")
+        with self.assertRaises(gitutil.GitError) as ctx:
+            gitutil.push_head(self.repo)
+        self.assertIn("rejected", str(ctx.exception))
+        self.assertIn("Pull or rebase", str(ctx.exception))
+        # The commit is still there - the point of pushing separately.
+        self.assertEqual(gitutil.status(self.repo).head, mine["commit"])
+
+    def test_a_detached_head_has_no_branch_to_push(self):
+        self._add_origin()
+        head = gitutil.status(self.repo).head
+        git(["checkout", "-q", head], self.repo)
+        with self.assertRaises(gitutil.GitError) as ctx:
+            gitutil.push_head(self.repo)
+        self.assertIn("detached", str(ctx.exception))
+
+    def test_the_web_url_is_derived_from_however_origin_was_written(self):
+        cases = {
+            "git@github.com:andr9595/AI-Council.git":
+                "https://github.com/andr9595/AI-Council",
+            "ssh://git@github.com/andr9595/AI-Council.git":
+                "https://github.com/andr9595/AI-Council",
+            "https://github.com/andr9595/AI-Council.git":
+                "https://github.com/andr9595/AI-Council",
+            "https://github.com/andr9595/AI-Council":
+                "https://github.com/andr9595/AI-Council",
+        }
+        for url, expected in cases.items():
+            subprocess.run(["git", "remote", "remove", "origin"], cwd=self.repo,
+                           capture_output=True)
+            git(["remote", "add", "origin", url], self.repo)
+            self.assertEqual(gitutil.remote_web_url(self.repo), expected, url)
+
+    def test_a_token_in_the_remote_url_is_never_handed_back(self):
+        # How a token-authenticated clone is written into .git/config. The URL
+        # is quoted back in links and messages, so the credential comes out.
+        git(["remote", "add", "origin",
+             "https://x-access-token:ghp_secretsecretsecret@github.com/a/b.git"],
+            self.repo)
+        url = gitutil.remote_web_url(self.repo)
+        self.assertEqual(url, "https://github.com/a/b")
+        self.assertNotIn("ghp_", url)
+
+    def test_a_local_remote_has_nothing_to_browse(self):
+        self._add_origin()
+        self.assertEqual(gitutil.remote_web_url(self.repo), "")
+
+
 class TestWorkspaceMigration(unittest.TestCase):
     """A config written when the folder was a mandatory repository still works.
 

@@ -1457,6 +1457,74 @@ class TestPickerEndpoints(ServerTestBase):
         self.assertEqual(self._calls(), 2)
 
 
+class TestCommitRoute(ServerTestBase):
+    """The commit button, end to end: commit, then publish.
+
+    Origin is a bare repository next door, so the push is a real one.
+    """
+
+    def setUp(self):
+        self.work = Path(tempfile.mkdtemp(prefix="aicouncil-commit-", dir=self.tmp))
+        self.repo = self.work / "repo"
+        self.origin = self.work / "origin.git"
+        self.repo.mkdir()
+        self._git(["init", "-q", "-b", "main"], self.repo)
+        self._git(["config", "user.email", "test@example.com"], self.repo)
+        self._git(["config", "user.name", "Test"], self.repo)
+        (self.repo / "README.md").write_text("# fixture\n")
+        self._git(["add", "-A"], self.repo)
+        self._git(["commit", "-qm", "initial"], self.repo)
+
+    def _git(self, args, cwd):
+        subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+    def _add_origin(self):
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main",
+                        str(self.origin)], check=True, capture_output=True)
+        self._git(["remote", "add", "origin", str(self.origin)], self.repo)
+
+    def test_committing_also_pushes(self):
+        self._add_origin()
+        (self.repo / "new.txt").write_text("added\n")
+        status, data = self.request("/api/commit", method="POST", body={
+            "message": "publish me", "workspace": str(self.repo),
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(data["commit"]["push"]["pushed"])
+        self.assertEqual(data["commit"]["push"]["upstream"], "origin/main")
+        on_origin = subprocess.run(
+            ["git", "rev-parse", "main"], cwd=self.origin,
+            capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(on_origin, data["commit"]["commit"])
+
+    def test_a_failed_push_is_reported_not_raised(self):
+        # No origin at all. The commit landed, and answering 400 here would
+        # tell the operator their work did not - so it is a 200 carrying the
+        # reason nothing reached GitHub.
+        (self.repo / "local.txt").write_text("only here\n")
+        status, data = self.request("/api/commit", method="POST", body={
+            "message": "local only", "workspace": str(self.repo),
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(data["commit"]["short"])
+        self.assertFalse(data["commit"]["push"]["pushed"])
+        self.assertIn("no remote named 'origin'", data["commit"]["push"]["error"])
+
+    def test_push_can_be_declined(self):
+        self._add_origin()
+        (self.repo / "held.txt").write_text("not yet\n")
+        status, data = self.request("/api/commit", method="POST", body={
+            "message": "keep it local", "workspace": str(self.repo),
+            "push": False,
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(data["commit"]["push"]["skipped"])
+        branches = subprocess.run(
+            ["git", "branch", "--list"], cwd=self.origin,
+            capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(branches, "")
+
+
 class TestProjectRoutes(ServerTestBase):
     """The Projects tab's endpoints, over the same real socket."""
 
