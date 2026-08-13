@@ -269,9 +269,17 @@ CUSTOM_AGENT = "custom"
 # a scrollback pane is a terminal emulator.
 AGENT_SETUP: Dict[str, Dict[str, Any]] = {
     "codex": {
-        # Prints a URL and waits on the browser callback, so it reads fine as
-        # streamed lines.
-        "login_command": ["codex", "login"],
+        # Plain `codex login` starts a local HTTP server and asks the OAuth
+        # provider to redirect the browser to it - fine when the browser and
+        # this process share a machine, broken whenever they do not, which is
+        # every browser-hosted or Docker deployment and not only the ones an
+        # operator would think to call "headless". `--device-auth` prints a
+        # URL and a short code instead: completed on any device, nothing
+        # calls back to this host, so it is unconditionally the safer
+        # default rather than something switched on for a detected
+        # environment. Codex's own CLI suggests exactly this when a plain
+        # login is attempted somewhere it cannot complete.
+        "login_command": ["codex", "login", "--device-auth"],
         "login_tui": False,
         "status_command": ["codex", "login", "status"],
         "docs_url": "https://chatgpt.com/codex",
@@ -281,7 +289,12 @@ AGENT_SETUP: Dict[str, Dict[str, Any]] = {
         # `--claudeai` is the subscription flow and is not a default worth
         # leaving to the CLI: the alternative it offers is `--console`, which
         # is API-key billing, and picking that by accident is the one outcome
-        # this app exists to avoid.
+        # this app exists to avoid. Unlike Codex's plain `login`, this one
+        # already redirects to https://platform.claude.com/oauth/code/callback
+        # rather than to a local port - completed on any device, then the
+        # code that page shows is typed back into this session's "Type an
+        # answer" box. No flag needed to make it deployment-agnostic; it
+        # already is.
         "login_command": ["claude", "auth", "login", "--claudeai"],
         "login_tui": False,
         # Answers with a JSON object carrying `loggedIn`, so the reply is read

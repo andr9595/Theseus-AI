@@ -22,9 +22,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from aicouncil import config as cfg  # noqa: E402
 from aicouncil import connections  # noqa: E402
 
-# `codex login status` answers in prose and by exit code; `codex login` prints
-# the URL, waits for the browser, and is the one flow that has to survive being
-# read through a terminal this app owns.
+# `codex login status` answers in prose and by exit code; `codex login
+# --device-auth` prints a URL and a short code and is the one flow that has to
+# survive being read through a terminal this app owns. `--device-auth` is what
+# the configured login_command actually passes - see AGENT_SETUP in config.py
+# - because plain `codex login` waits on a local browser callback that a
+# browser-hosted or Docker deployment can never receive.
 FAKE_CODEX = '''#!/usr/bin/env python3
 import sys
 
@@ -35,7 +38,7 @@ if sys.argv[1:] == ["login", "status"]:
         sys.exit(1)
     print("Logged in using ChatGPT")
     sys.exit(0)
-if sys.argv[1:] == ["login"]:
+if sys.argv[1:] == ["login", "--device-auth"]:
     print("\\x1b[1mSign in\\x1b[0m at https://example.test/auth?code=42")
     answer = sys.stdin.readline().strip()
     print(f"got {answer}")
@@ -179,6 +182,18 @@ class TestSetupSessions(ConnectionsTestBase):
                 return session
             time.sleep(0.05)
         self.fail("the setup session never finished")
+
+    def test_codex_signs_in_with_device_auth_not_a_local_callback(self):
+        # Plain `codex login` redirects an OAuth provider to a server on this
+        # host's loopback interface - fine when the browser sharing that
+        # loopback is on the same machine, broken for every browser-hosted or
+        # Docker deployment. --device-auth is what makes signing in from
+        # anywhere possible, so it has to be what actually gets run, not just
+        # what the docs recommend.
+        self.assertEqual(
+            cfg.AGENT_SETUP["codex"]["login_command"],
+            ["codex", "login", "--device-auth"],
+        )
 
     def test_a_sign_in_streams_its_output_and_takes_an_answer(self):
         self.setup.start("codex", "login")

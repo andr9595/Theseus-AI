@@ -4255,7 +4255,11 @@ async function startAgentSetup(id, action) {
     ? 'Runs the bundled installer, which fetches the vendor’s own install ' +
       'script. Nothing is installed system-wide and no password is needed.'
     : 'Runs the vendor’s own sign-in command. Your account details go to them, ' +
-      'not to this app — it never sees the token that comes back.';
+      'not to this app — it never sees the token that comes back. Open the ' +
+      'link below on any device; some CLIs then show a short code on that ' +
+      'page to type back into it, others show a code here to type on that ' +
+      'page instead — either way, this pane is not where an account ' +
+      'password goes.';
   $('#agent-setup-output').textContent = '';
   $('#agent-setup-url').classList.add('hidden');
   $('#agent-setup-input').value = '';
@@ -4267,9 +4271,41 @@ async function startAgentSetup(id, action) {
     renderSetupSession(data.session || {});
     pollAgentSetup();
   } catch (err) {
+    // Only one setup session runs at a time, server-wide - so "already
+    // running" is not a dead end, it is a pointer to a session this pane can
+    // still show. Closing the modal here (the old behaviour) was the bug: the
+    // only button that can Stop a session lives inside it, and every retry
+    // hit this same catch, so a session an operator lost track of - a closed
+    // tab, a refresh mid-login - could never be reached again short of
+    // restarting the container.
+    if (await showRunningSetupSession()) return;
     closeModal('agent-setup');
     toast(err.message, 'error', 9000);
   }
+}
+
+/** If some agent's install or sign-in is already running, adopt it into the
+ *  open pane instead of leaving the operator with only a toast and no way
+ *  back to its Stop button. Returns whether one was found. */
+async function showRunningSetupSession() {
+  let data;
+  try {
+    data = await api('/api/agents/setup');
+  } catch {
+    return false;
+  }
+  const session = data.session || {};
+  if (!session.running) return false;
+  const owner = (state.agents || []).find(a => a.id === session.agent);
+  $('#agent-setup-title').textContent =
+    `${session.action === 'install' ? 'Installing' : 'Signing in to'} ` +
+    `${owner ? owner.label : session.agent} — already running`;
+  $('#agent-setup-note').textContent =
+    'This was started earlier and is still going. Stop it here if you want ' +
+    'to try something else, or wait for it to finish.';
+  renderSetupSession(session);
+  pollAgentSetup();
+  return true;
 }
 
 function renderSetupSession(session) {
