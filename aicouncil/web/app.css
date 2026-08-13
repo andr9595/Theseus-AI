@@ -1742,6 +1742,22 @@ html, body {
   font-family: var(--mono); font-size: 10.5px; color: #ffd9a8;
 }
 .agent-conn-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.agent-conn-note.warn { color: var(--amber); }
+/* The token row. The field takes the slack so a long `github_pat_` token is
+   readable end to end rather than scrolling inside a stub of a box. Styled
+   here rather than borrowing `.field input`, which is scoped to the labelled
+   settings rows and would drag their margins onto a card. */
+.github-connect-row { align-items: center; }
+.github-token {
+  flex: 1 1 260px; min-width: 0;
+  padding: 7px 9px;
+  font-family: var(--mono); font-size: 11px;
+  color: var(--text);
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.github-token:focus { outline: none; border-color: var(--accent); }
 
 /* The setup pane. Terminal output with the escapes taken out, not a terminal:
    see the dialog's own comment in index.html. */

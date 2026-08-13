@@ -39,6 +39,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 WANT_ALL=1
 WANT_VSCODE=0
 WANT_EXTRAS=0
+WANT_GH=0
 AGENTS=()
 
 usage() {
@@ -46,8 +47,9 @@ usage() {
   # so the help text cannot drift out of sync with the file again.
   awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"
   echo
-  echo "Usage: $0 [--agent NAME]... [--check] [--extras] [--vscode]"
+  echo "Usage: $0 [--agent NAME]... [--gh] [--check] [--extras] [--vscode]"
   echo "  --agent NAME  install one agent CLI: codex, claude or agy (repeatable)"
+  echo "  --gh          install the GitHub CLI into ~/.local/bin (no sudo)"
   echo "  --check       report what is present, install nothing"
   echo "  --extras      also install gh and the missing system python packages (needs sudo)"
   echo "  --vscode      also install Visual Studio Code (implies --extras)"
@@ -57,6 +59,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --vscode)   WANT_VSCODE=1; WANT_EXTRAS=1 ;;
     --extras)   WANT_EXTRAS=1 ;;
+    --gh)       WANT_GH=1 ;;
     --agent)
       shift
       case "${1:-}" in
@@ -131,6 +134,67 @@ else
   for agent in "${AGENTS[@]}"; do
     install_agent "$agent"
   done
+fi
+
+# --------------------------------------------------------------------------
+# The GitHub CLI, rootless
+# --------------------------------------------------------------------------
+# `--extras` installs gh with apt, which needs sudo. This does not: gh ships a
+# static binary in its release tarballs, so it can live in ~/.local/bin beside
+# the agent CLIs. That matters because Settings -> Agents offers the install as
+# a button, and a button that stops to ask for a password in a pane that cannot
+# accept one is worse than no button.
+install_gh() {
+  if have gh; then
+    ok "gh already installed: $(command -v gh)"
+    return 0
+  fi
+  local arch tag version url tmp
+  case "$(uname -m)" in
+    x86_64)  arch=amd64 ;;
+    aarch64) arch=arm64 ;;
+    *) warn "no rootless gh build for $(uname -m); try: sudo apt install gh"
+       return 1 ;;
+  esac
+
+  # Resolve "latest" through the release redirect rather than the API: no
+  # token is needed for it, and it does not count against an unauthenticated
+  # rate limit the way api.github.com does.
+  tag="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+        https://github.com/cli/cli/releases/latest 2>/dev/null \
+        | sed 's#.*/tag/##')"
+  if [[ -z "$tag" || "$tag" != v* ]]; then
+    warn "could not work out the latest gh release; try: sudo apt install gh"
+    return 1
+  fi
+  version="${tag#v}"
+  url="https://github.com/cli/cli/releases/download/${tag}/gh_${version}_linux_${arch}.tar.gz"
+
+  tmp="$(mktemp -d)"
+  # shellcheck disable=SC2064 - expand tmp now, not at trap time
+  trap "rm -rf '$tmp'" RETURN
+  say "Fetching gh ${version} (${arch})"
+  if ! curl -fsSL "$url" -o "$tmp/gh.tar.gz"; then
+    warn "gh download failed: $url"
+    return 1
+  fi
+  if ! tar xzf "$tmp/gh.tar.gz" -C "$tmp"; then
+    warn "gh archive could not be unpacked"
+    return 1
+  fi
+  mkdir -p "$HOME/.local/bin"
+  if ! install -m 0755 "$tmp/gh_${version}_linux_${arch}/bin/gh" \
+       "$HOME/.local/bin/gh"; then
+    warn "could not place gh in ~/.local/bin"
+    return 1
+  fi
+  ok "gh ${version} installed: $HOME/.local/bin/gh"
+}
+
+if [[ "$WANT_GH" -eq 1 ]]; then
+  say "GitHub CLI"
+  install_gh || true
+  echo
 fi
 
 SHELL_RC="$HOME/.bashrc"

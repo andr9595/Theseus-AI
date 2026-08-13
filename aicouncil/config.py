@@ -316,6 +316,52 @@ def install_command(agent: str) -> List[str]:
         return []
     return [str(REPO_ROOT / "scripts" / "install-deps.sh"), "--agent", agent]
 
+
+# How the GitHub connection is made, checked and broken. Catalogued here for
+# the same reason `AGENT_SETUP` is: the endpoints take an action name and never
+# an argv, so nothing the browser sends can become a command.
+#
+# The important part of this design is what is *absent*. There is no config key
+# for a token and no file this app writes one to. A token pasted into Settings
+# is piped to `gh auth login --with-token` on stdin and then dropped; from that
+# point `gh` owns the credential and this app can only ask `gh` about it. That
+# is what lets the agent CLIs use GitHub too - they shell out to the same `gh`
+# and inherit the same login - without a secret ever appearing in an argv, an
+# environment variable or a config file belonging to this app.
+#
+# Honesty about where it does land: `gh` stores the token in its own config
+# (`~/.config/gh/hosts.yml`, mode 0600) unless a system keyring is available,
+# in which case it uses that. Neither is this app's to promise, so the UI says
+# which one happened rather than claiming the token is encrypted.
+GITHUB_SETUP: Dict[str, Any] = {
+    # Non-interactive and safe to run on an ordinary refresh.
+    "status_command": ["gh", "auth", "status", "--hostname", "github.com"],
+    # `--with-token` reads stdin. The token never becomes an argument, because
+    # arguments are world-readable in `ps` for as long as the process lives.
+    "login_command": ["gh", "auth", "login", "--hostname", "github.com", "--with-token"],
+    # Teaches git to authenticate as `gh` over HTTPS, so a push from a run - or
+    # from an agent working in the folder - uses the same login.
+    "setup_git_command": ["gh", "auth", "setup-git"],
+    "logout_command": ["gh", "auth", "logout", "--hostname", "github.com"],
+    "docs_url": "https://github.com/settings/tokens",
+    # What a token has to carry for pull-request mode to work end to end.
+    # `repo` alone is enough to push and open a PR; `workflow` is only needed if
+    # a run touches `.github/workflows`, and is requested because a run that
+    # edits CI and then cannot push is a confusing way to find out.
+    "scopes": ("repo", "workflow", "read:org"),
+}
+
+
+def github_install_command() -> List[str]:
+    """The argv that installs the GitHub CLI, rootless, into ``~/.local/bin``.
+
+    Same reasoning as `install_command`: one script names the download so there
+    is one file to read before trusting it, and the button cannot drift away
+    from the documented command.
+    """
+    return [str(REPO_ROOT / "scripts" / "install-deps.sh"), "--gh"]
+
+
 # The council seats are configured per *CLI* rather than per chair, because
 # which chair a CLI takes is decided per run by the router - there is no
 # standing "seat 2" to configure. What an operator sets here is how Codex

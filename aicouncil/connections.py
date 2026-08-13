@@ -1,20 +1,25 @@
 """Adding, installing and signing in to the agent CLIs, from Settings.
 
-What this module does *not* do is hold a credential. There is no field
-anywhere in this app that takes an API key, and there is no OAuth flow
-implemented here. What it does is run the vendor's own commands - `codex
-login`, `claude auth login --claudeai`, the bundled installer - on the
-operator's behalf and show their output, so that adding an agent is a button
-rather than a paragraph in a README. The token that comes out the far end is
-written by the vendor's CLI into the vendor's own config directory, exactly as
-it would be if the same command were typed in a terminal, and this app never
-sees it.
+What this module does *not* do is hold a credential. **No agent LLM API key is
+asked for, stored or sent** - and that is the boundary that matters, because it
+is what keeps a run free at the point of use: a subscription login costs
+nothing per token, and an API key would put every stage on metered billing.
+Signing an agent in runs the vendor's own commands - `codex login`, `claude
+auth login --claudeai`, the bundled installer - on the operator's behalf and
+shows their output, so that adding an agent is a button rather than a paragraph
+in a README. The token that comes out the far end is written by the vendor's
+CLI into the vendor's own config directory, exactly as it would be if the same
+command were typed in a terminal, and this app never sees it.
 
-That boundary is what keeps a run free at the point of use: a subscription
-login costs nothing per token, and an API key would put every stage on metered
-billing. It is also why the sign-in commands are catalogued in `config.py`
-rather than accepted from the browser - see `AGENT_SETUP`. An endpoint that
-took an argv would be a local HTTP endpoint that runs anything.
+There is exactly one credential this app will accept, and it is not an LLM key:
+a GitHub token, pasted in Settings so that pull-request mode and the agent CLIs
+can work with GitHub. It is handled by handing it straight to `gh` on stdin and
+forgetting it - see the GitHub section below for why that is the shape, and for
+the one thing this app cannot promise about where `gh` then puts it.
+
+Sign-in commands are catalogued in `config.py` rather than accepted from the
+browser - see `AGENT_SETUP` and `GITHUB_SETUP`. An endpoint that took an argv
+would be a local HTTP endpoint that runs anything.
 
 One session runs at a time. These are interactive processes attached to a
 pseudo-terminal, and two of them racing for the same vendor config directory is
@@ -186,6 +191,213 @@ def agent_statuses(conf: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------
+# GitHub
+# --------------------------------------------------------------------------
+#
+# The one credential this app will carry, and it carries it for milliseconds:
+# `github_connect` pipes the token to `gh` on stdin and returns. Nothing here
+# writes it down, echoes it, or puts it in an argv. Everything afterwards is a
+# question asked of `gh`.
+#
+# Why that also serves the agents: once `gh` holds the login, a CLI agent that
+# runs `gh pr create` in the working folder is authenticated, and `gh auth
+# setup-git` means a plain `git push` over HTTPS is too. Handing every agent a
+# `GH_TOKEN` environment variable would have achieved the same thing while
+# leaving the secret readable in `/proc/<pid>/environ` for the life of every
+# run, and recoverable from any transcript that captured an environment dump.
+
+# Anything shaped like a GitHub credential, so it can be scrubbed from text on
+# its way to a browser or a log. `gh` already redacts its own output; this is
+# the belt to that pair of braces, and it also covers a token pasted into the
+# wrong box and echoed back inside an error message.
+_TOKEN_LIKE = re.compile(
+    r"\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,})\b"
+)
+
+# `gh auth status` phrases the account line differently across releases -
+# "account NAME" since 2.40ish, "as NAME" before it - so both are read.
+_GH_ACCOUNT = re.compile(r"Logged in to \S+ (?:account|as) (\S+)")
+_GH_SCOPES = re.compile(r"Token scopes:\s*(.+)")
+# The parenthetical on the account line says where the token actually lives:
+# "(keyring)" when a secret store was available, otherwise a path.
+_GH_STORE = re.compile(r"Logged in to \S+ (?:account|as) \S+\s*\(([^)]+)\)")
+
+
+def redact(text: str) -> str:
+    """Text with anything token-shaped replaced, for display or logging."""
+    return _TOKEN_LIKE.sub("[redacted]", text or "")
+
+
+def _gh_binary() -> Optional[str]:
+    return resolve_binary(["gh"])
+
+
+def _run_gh(
+    args: List[str],
+    stdin_text: Optional[str] = None,
+    timeout: float = STATUS_TIMEOUT,
+) -> subprocess.CompletedProcess:
+    """Run `gh` non-interactively, optionally feeding it stdin.
+
+    ``stdin_text`` is the token path. It is passed through ``input=`` so it
+    reaches the child on a pipe and never touches the command line or the disk.
+    """
+    path = _gh_binary()
+    if not path:
+        raise ValueError(
+            "The GitHub CLI (`gh`) is not installed. Install it first - the "
+            "button above does it without sudo."
+        )
+    env = dict(os.environ)
+    env["NO_COLOR"] = "1"
+    env["GH_PAGER"] = "cat"
+    env["GH_PROMPT_DISABLED"] = "1"
+    # A stale GH_TOKEN in the environment silently outranks the stored login,
+    # which would make a "connected" card describe a credential this app did
+    # not set and cannot clear.
+    env.pop("GH_TOKEN", None)
+    env.pop("GITHUB_TOKEN", None)
+    return subprocess.run(
+        [path, *args],
+        input=stdin_text,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def github_status() -> Dict[str, Any]:
+    """Whether `gh` has a GitHub login, and what it is good for.
+
+    Shaped like `agent_status`: *installed* and *connected* are separate facts,
+    and "could not ask" is not reported as "signed out".
+    """
+    out: Dict[str, Any] = {
+        "installed": False,
+        "connected": False,
+        "account": "",
+        "scopes": [],
+        "storage": "",
+        "detail": "",
+        "docs_url": str(cfg.GITHUB_SETUP.get("docs_url") or ""),
+        "wanted_scopes": list(cfg.GITHUB_SETUP.get("scopes") or ()),
+        "install_hint": " ".join(cfg.github_install_command()),
+    }
+    path = _gh_binary()
+    if not path:
+        out["detail"] = "The GitHub CLI (`gh`) is not installed."
+        return out
+    out["installed"] = True
+    out["path"] = path
+
+    command = list(cfg.GITHUB_SETUP["status_command"])[1:]
+    try:
+        proc = _run_gh(command)
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        out["detail"] = redact(f"Could not ask gh: {exc}")
+        return out
+
+    # gh writes the status report to stderr and has done for several majors,
+    # but not consistently enough to read only one of the two.
+    text = _sanitize(f"{proc.stdout or ''}\n{proc.stderr or ''}").strip()
+    out["connected"] = proc.returncode == 0
+    account = _GH_ACCOUNT.search(text)
+    if account:
+        out["account"] = account.group(1)
+    store = _GH_STORE.search(text)
+    if store:
+        out["storage"] = store.group(1).strip()
+    scopes = _GH_SCOPES.search(text)
+    if scopes:
+        out["scopes"] = [
+            s.strip().strip("'\"") for s in scopes.group(1).split(",") if s.strip()
+        ]
+    if not out["connected"]:
+        out["detail"] = redact(text.splitlines()[0][:160]) if text else "Not connected."
+        return out
+
+    missing = [
+        s for s in out["wanted_scopes"]
+        if s not in out["scopes"] and out["scopes"]
+    ]
+    out["missing_scopes"] = missing
+    return out
+
+
+def github_connect(token: str) -> Dict[str, Any]:
+    """Hand one token to `gh`, then forget it.
+
+    The token is not returned, stored, logged or echoed. If `gh` rejects it the
+    reason is passed back with anything token-shaped scrubbed, because the most
+    likely reason is that the wrong string was pasted and the most likely place
+    for it to end up is a screenshot of the error.
+    """
+    token = (token or "").strip()
+    if not token:
+        raise ValueError("Paste a GitHub token first.")
+    # Checked before spending a round trip, and phrased as a hint rather than a
+    # hard rule: GitHub has changed its token prefixes before and an enterprise
+    # host may not use them at all.
+    if "\n" in token or "\r" in token or " " in token:
+        raise ValueError(
+            "That does not look like a token - it has whitespace in it. Copy "
+            "just the token, with no surrounding quotes or line breaks."
+        )
+
+    login = list(cfg.GITHUB_SETUP["login_command"])[1:]
+    try:
+        proc = _run_gh(login, stdin_text=token + "\n", timeout=STATUS_TIMEOUT * 2)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(redact(f"Could not run gh: {exc}")) from exc
+    finally:
+        # Not security theatre against a memory dump - CPython interns and
+        # copies strings and this cannot be guaranteed - but it does stop the
+        # value being reachable from a traceback frame if what follows raises.
+        token = ""
+
+    if proc.returncode != 0:
+        detail = _sanitize(
+            (proc.stderr or "").strip() or (proc.stdout or "").strip()
+        )
+        raise ValueError(
+            redact(detail) or "GitHub rejected that token."
+        )
+
+    # Best effort, and deliberately not fatal: the login is what the card
+    # reports, and a working login with git left unconfigured is still better
+    # than reporting failure and leaving the token installed anyway.
+    git_note = ""
+    try:
+        setup = _run_gh(list(cfg.GITHUB_SETUP["setup_git_command"])[1:])
+        if setup.returncode != 0:
+            git_note = _sanitize((setup.stderr or "").strip())[:160]
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        git_note = f"{type(exc).__name__}: {exc}"
+
+    status = github_status()
+    if git_note:
+        status["git_warning"] = redact(git_note)
+    return status
+
+
+def github_disconnect() -> Dict[str, Any]:
+    """Ask `gh` to forget the login. This app has nothing of its own to clear."""
+    try:
+        proc = _run_gh(list(cfg.GITHUB_SETUP["logout_command"])[1:])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(redact(f"Could not run gh: {exc}")) from exc
+    if proc.returncode != 0:
+        detail = _sanitize((proc.stderr or "").strip() or (proc.stdout or "").strip())
+        # gh exits non-zero when there was nothing to log out of, which is the
+        # state the caller asked for rather than a failure.
+        if "not logged" not in detail.lower():
+            raise ValueError(redact(detail) or "gh could not log out.")
+    return github_status()
+
+
+# --------------------------------------------------------------------------
 # Setup sessions
 # --------------------------------------------------------------------------
 
@@ -353,6 +565,22 @@ class SetupManager:
         row of `AGENT_SETUP`, the action selects a column, and an id or action
         that is not in the table is an error rather than a fallback.
         """
+        # GitHub is not an agent and has no login *session*: its token arrives
+        # through its own endpoint, in one request, and never on a terminal.
+        # Installing `gh` is the one thing it shares with the agents, because
+        # that is a long download worth watching.
+        if agent == "github":
+            if action != "install":
+                raise ValueError(
+                    "GitHub connects with a token rather than a terminal "
+                    "session. Use the Connect button on its card."
+                )
+            if not shutil.which("bash"):
+                raise ValueError(
+                    "The installer needs bash. Install `gh` with your package "
+                    "manager instead."
+                )
+            return ["bash", *cfg.github_install_command()]
         if agent not in cfg.AGENT_SETUP:
             raise ValueError(f"No such agent: {agent!r}")
         if action == "install":

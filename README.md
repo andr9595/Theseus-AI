@@ -64,7 +64,7 @@ folder before it starts.
 | `git` | Optional — powers the diff viewer, safety snapshot and rollback when the working folder is a repository |
 | A browser | Chromium-family gets a frameless app window; Firefox gets a plain window |
 | At least one agent | To do AI work. **Which one is entirely your choice** — see [Connecting your agents](#connecting-your-agents) |
-| `gh` CLI | Optional — only for [Pull-request mode](#pull-request-mode). `./scripts/install-deps.sh --extras` installs it |
+| `gh` CLI | Optional — only for [Pull-request mode](#pull-request-mode). Settings → Agents → GitHub installs and connects it, or `./scripts/install-deps.sh --gh` (rootless, into `~/.local/bin`) |
 
 The app itself has **no dependencies at all**, and it ships configured for
 nobody: on a fresh install no agent is added, so the first thing the dashboard
@@ -1158,6 +1158,10 @@ main (untouched)  ────────────────────�
    to commit with, an `origin` remote, `gh` on `PATH`, and `gh auth status`
    passing. Failing late — after the chairman has spent its quota — would
    strand the work on a branch nobody asked for.
+
+   The last two are what **Settings → Agents → GitHub** is for: it installs
+   `gh` into `~/.local/bin` without sudo, and connects it. See
+   [Connecting GitHub](#connecting-github) below.
 2. **The branch is created after the approval gate**, so rejecting still leaves
    the repository completely untouched.
 3. The chairman works on that branch as it normally would.
@@ -1198,6 +1202,32 @@ An agent that commits its own work is fine: the run commits whatever is left
 outstanding and then judges success on whether the branch is actually ahead of
 its base. The Diff tab shows `base...branch`, which is what the reviewer will
 see.
+
+### Connecting GitHub
+
+**Settings → Agents → GitHub.** Two buttons: one installs the GitHub CLI into
+`~/.local/bin` (a static binary — no sudo and no package manager), the other
+takes a [personal access token](https://github.com/settings/tokens) with the
+`repo` scope. Add `workflow` too if you expect a run to edit anything under
+`.github/workflows`; the card names any scope you are missing rather than
+letting a run discover it at the push.
+
+**This app does not store the token.** It is piped to `gh auth login
+--with-token` on standard input and then dropped — it is never written to
+`config.json`, never placed in an argument (arguments are readable in `ps`),
+and never put into an agent's environment. After that `gh` owns the
+credential, which is also what makes it work for the agents: a CLI that runs
+`gh pr create` in the working folder is already authenticated, and `gh auth
+setup-git` means a plain `git push` over HTTPS is too. One login, no copies.
+
+Where it does land is `gh`'s business, and the card says which happened: your
+system keyring if one is available, otherwise `~/.config/gh/hosts.yml` at mode
+`0600`. That is the same place `gh auth login` in a terminal would have put it.
+**Disconnect** runs `gh auth logout`; this app has nothing of its own to clear.
+
+> This is the one credential the app accepts, and it is deliberately not an LLM
+> key. No agent API key is ever asked for, stored or sent — that boundary is
+> what keeps a run free at the point of use.
 
 Branch protection itself lives on GitHub, not here. This mode keeps the app off
 your base branch; enabling a ruleset is what stops everything else.

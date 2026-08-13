@@ -4021,6 +4021,155 @@ async function refreshAgents() {
   }
 }
 
+/* -- GitHub ---------------------------------------------------------------
+   The one card that takes a credential, and the only one that has to explain
+   where it goes. The token is posted once and never comes back: everything
+   rendered here is what `gh` says about itself afterwards.
+
+   Deliberately not a stored setting. There is no "saved" state to show and no
+   masked value to re-display, because after Connect returns, no part of this
+   app - browser or server - still holds the token. That is also why there is
+   no Edit button: reconnecting means pasting a new one.
+   ------------------------------------------------------------------------ */
+
+let githubStatus = {};
+
+function renderGithubConnection() {
+  const host = $('#github-connection');
+  if (!host) return;
+  const g = githubStatus;
+  const known = Object.keys(g).length > 0;
+  const missing = g.missing_scopes || [];
+
+  const cardState =
+    !known ? 'checking' : (!g.installed ? 'missing' : (g.connected ? 'on' : 'off'));
+  const label =
+    !known ? 'Checking…'
+    : !g.installed ? 'GitHub CLI not installed'
+    : g.connected ? 'Connected'
+    : 'Not connected';
+
+  // Where the token actually ended up, said plainly. `gh` uses the system
+  // keyring when there is one and its own 0600 config file when there is not,
+  // and which of those happened is not something this app gets to promise.
+  const where =
+    g.storage === 'keyring' ? 'Stored in your system keyring by the GitHub CLI.'
+    : g.storage ? `Stored by the GitHub CLI in ${esc(g.storage)}.`
+    : 'Stored by the GitHub CLI, not by this app.';
+
+  let body;
+  if (!known) {
+    body = `<p class="agent-conn-note">Asking the GitHub CLI…</p>`;
+  } else if (!g.installed) {
+    body =
+      `<p class="agent-conn-note">` +
+        `Pull-request mode and any GitHub work the agents do go through the ` +
+        `GitHub CLI (<code>gh</code>), which is not installed. This installs ` +
+        `it into <code>~/.local/bin</code> &mdash; no sudo, no package manager.` +
+      `</p>` +
+      `<div class="agent-conn-actions">` +
+        `<button class="btn btn-primary btn-sm" data-agent-setup="install" ` +
+          `data-agent="github">Install the GitHub CLI</button>` +
+      `</div>`;
+  } else if (g.connected) {
+    body =
+      `<p class="agent-conn-note">` +
+        (g.account ? `Signed in as <b>${esc(g.account)}</b>. ` : '') +
+        where +
+        (g.scopes && g.scopes.length
+          ? ` Scopes: <code>${esc(g.scopes.join(', '))}</code>.` : '') +
+      `</p>` +
+      (missing.length
+        // Worth saying out loud: a token that can push but not open a PR fails
+        // at the very end of a run, which is the worst moment to find out.
+        ? `<p class="agent-conn-note warn">This token is missing ` +
+          `<code>${esc(missing.join(', '))}</code>. Pull-request mode needs ` +
+          `<code>repo</code>; <code>workflow</code> is only needed if a run ` +
+          `edits files under <code>.github/workflows</code>.</p>`
+        : '') +
+      `<div class="agent-conn-actions">` +
+        `<button class="btn btn-quiet btn-sm" id="github-disconnect">Disconnect</button>` +
+      `</div>`;
+  } else {
+    body =
+      `<p class="agent-conn-note">` +
+        (g.detail ? esc(g.detail) + ' ' : '') +
+        `Paste a personal access token. It is handed to the GitHub CLI and ` +
+        `not kept by this app. ` +
+        `<a href="${esc(g.docs_url || 'https://github.com/settings/tokens')}" ` +
+          `target="_blank" rel="noopener noreferrer">Create one</a> with the ` +
+        `<code>${esc((g.wanted_scopes || ['repo']).join(', '))}</code> scopes.` +
+      `</p>` +
+      `<div class="agent-conn-actions github-connect-row">` +
+        `<input type="password" id="github-token" class="github-token" ` +
+          `placeholder="ghp_… or github_pat_…" autocomplete="off" ` +
+          `spellcheck="false" aria-label="GitHub personal access token">` +
+        `<button class="btn btn-primary btn-sm" id="github-connect">Connect</button>` +
+      `</div>`;
+  }
+
+  host.innerHTML =
+    `<article class="agent-conn" data-agent="github" data-state="${cardState}">` +
+      `<div class="agent-conn-head">` +
+        `<b>GitHub</b>` +
+        `<span class="agent-conn-state">${esc(label)}</span>` +
+      `</div>` +
+      body +
+    `</article>`;
+}
+
+async function refreshGithub() {
+  try {
+    githubStatus = (await api('/api/github')).github || {};
+  } catch (err) {
+    githubStatus = { installed: false, connected: false, detail: err.message };
+  }
+  renderGithubConnection();
+}
+
+async function connectGithub() {
+  const field = $('#github-token');
+  const token = field ? field.value : '';
+  if (!token.trim()) { toast('Paste a token first.', 'error'); return; }
+  const btn = $('#github-connect');
+  if (btn) { btn.disabled = true; btn.textContent = 'Connecting…'; }
+  try {
+    const data = await api('/api/github/connect', {
+      method: 'POST', body: { token },
+    });
+    githubStatus = data.github || {};
+    // Clear the field before anything can re-render around it, so the token is
+    // not sitting in the DOM of a settings panel left open on a desk.
+    if (field) field.value = '';
+    renderGithubConnection();
+    toast(
+      githubStatus.account
+        ? `Connected to GitHub as ${githubStatus.account}.`
+        : 'Connected to GitHub.',
+      'ok',
+    );
+    if (githubStatus.git_warning) {
+      toast(`git was not reconfigured: ${githubStatus.git_warning}`, 'info');
+    }
+  } catch (err) {
+    if (field) field.value = '';
+    toast(err.message, 'error');
+    renderGithubConnection();
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Connect'; }
+  }
+}
+
+async function disconnectGithub() {
+  try {
+    githubStatus = (await api('/api/github/disconnect', { method: 'POST' })).github || {};
+    renderGithubConnection();
+    toast('Disconnected from GitHub.', 'info');
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
 /** Add or remove one CLI. The server moves any chair that was holding a
  *  removed agent, so the whole config comes back rather than one key. */
 async function toggleAgent(id, selected) {
@@ -4097,6 +4246,9 @@ function pollAgentSetup() {
       // rather than assume it worked.
       refreshAgents();
       refreshDoctor();
+      // The same pane installs `gh`, and its card is the one that would still
+      // be claiming the CLI is missing.
+      refreshGithub();
       toast(
         session.exit_code === 0
           ? 'Setup finished. Re-checking the agent…'
@@ -4128,6 +4280,8 @@ function openSettings(tab = 'agents') {
   // needs to be: show the settings, fill the reports in when they land.
   renderAgentConnections();
   refreshAgents();
+  renderGithubConnection();
+  refreshGithub();
   refreshDoctor(true);
 }
 
@@ -5840,6 +5994,26 @@ function wire() {
         () => toast(`Copied — run \`${copy.dataset.agentCopy}\` in a terminal.`, 'ok', 9000),
         () => toast(`Run \`${copy.dataset.agentCopy}\` in a terminal.`, 'info', 9000)
       );
+    }
+  });
+
+  // -- GitHub ------------------------------------------------------------
+  // Same delegated shape as the agent cards, and it shares their install path:
+  // a `data-agent-setup` button on this card starts the ordinary setup session
+  // with the id `github`, which is how `gh` gets installed in a pane.
+  $('#github-refresh').addEventListener('click', refreshGithub);
+  $('#github-connection').addEventListener('click', (e) => {
+    if (e.target.closest('#github-connect')) return connectGithub();
+    if (e.target.closest('#github-disconnect')) return disconnectGithub();
+    const setup = e.target.closest('[data-agent-setup]');
+    if (setup) return startAgentSetup(setup.dataset.agent, setup.dataset.agentSetup);
+  });
+  // Enter in the token field connects, because a password box that ignores
+  // Enter is the kind of small wrongness that makes a screen feel broken.
+  $('#github-connection').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && e.target.id === 'github-token') {
+      e.preventDefault();
+      connectGithub();
     }
   });
 

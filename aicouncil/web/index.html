@@ -509,6 +509,22 @@
         </p>
         <div id="agent-connections" class="agent-connections"></div>
 
+        <h4 class="settings-head">
+          GitHub
+          <button id="github-refresh" class="btn btn-quiet btn-sm" type="button">
+            Re-check
+          </button>
+        </h4>
+        <p class="settings-note">
+          Optional, and only needed if you want runs to open pull requests or
+          the agents to work with GitHub from inside the folder. Connecting
+          hands your token straight to the GitHub CLI and then forgets it &mdash;
+          <b>this app never stores it</b>. Every agent that runs <code>gh</code>
+          or pushes over HTTPS then uses that same login, so no token is put
+          into any agent's environment.
+        </p>
+        <div id="github-connection" class="agent-connections"></div>
+
         <h4 class="settings-head">How each CLI is run</h4>
         <p class="settings-note">
           One card per agent you have added, plus the Chat assistant and the

@@ -370,6 +370,13 @@ class Handler(BaseHTTPRequestHandler):
             ("POST", "/api/agents/setup/cancel"): lambda p: {
                 "ok": True, "session": self.app.setup.cancel()
             },
+            ("GET", "/api/github"): lambda p: {
+                "ok": True, "github": connections.github_status()
+            },
+            ("POST", "/api/github/connect"): self._api_github_connect,
+            ("POST", "/api/github/disconnect"): lambda p: {
+                "ok": True, "github": connections.github_disconnect()
+            },
         }
 
         handler = routes.get((method, path))
@@ -716,6 +723,21 @@ class Handler(BaseHTTPRequestHandler):
     def _api_agent_setup_input(self, params: Dict[str, list]) -> Dict[str, Any]:
         body = self._read_body()
         return {"ok": True, "session": self.app.setup.write(str(body.get("text") or ""))}
+
+    def _api_github_connect(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Hand a pasted token to `gh`. The only request that carries a secret.
+
+        POST-only and body-only, so the token cannot end up in a query string,
+        a server access log or the browser's history. What comes back is the
+        same status object `GET /api/github` returns - an account name and a
+        scope list, never the token, because after this call nothing in this
+        process still has it.
+        """
+        body = self._read_body()
+        return {
+            "ok": True,
+            "github": connections.github_connect(str(body.get("token") or "")),
+        }
 
     def _api_usage_refresh(self, params: Dict[str, list]) -> Dict[str, Any]:
         self.app.usage.poll_once()
