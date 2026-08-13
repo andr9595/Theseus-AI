@@ -228,6 +228,65 @@ def redact(text: str) -> str:
     return _TOKEN_LIKE.sub("[redacted]", text or "")
 
 
+# GitHub's OAuth scopes are a hierarchy, not a set of flags: granting `repo`
+# grants `public_repo`, and granting `admin:org` grants `write:org` and with it
+# `read:org`. A token is never issued carrying the implied children - `gh auth
+# status` lists only what was actually checked - so comparing the wanted list
+# against that raw list reports scopes as missing that the token demonstrably
+# has. Only the parents this app might ask for are listed; the map does not
+# need to be GitHub's whole catalogue to be correct about them.
+_SCOPE_IMPLIES: Dict[str, tuple] = {
+    "repo": (
+        "repo:status", "repo_deployment", "public_repo", "repo:invite",
+        "security_events",
+    ),
+    "admin:org": ("write:org",),
+    "write:org": ("read:org",),
+    "admin:public_key": ("write:public_key",),
+    "write:public_key": ("read:public_key",),
+    "admin:repo_hook": ("write:repo_hook",),
+    "write:repo_hook": ("read:repo_hook",),
+    "admin:gpg_key": ("write:gpg_key",),
+    "write:gpg_key": ("read:gpg_key",),
+    "user": ("read:user", "user:email", "user:follow"),
+    "project": ("read:project",),
+    "write:packages": ("read:packages",),
+    "write:discussion": ("read:discussion",),
+    "admin:enterprise": ("manage_billing:enterprise", "read:enterprise"),
+}
+
+
+def expand_scopes(granted) -> set:
+    """Every scope a token holds, including the ones it implies.
+
+    Transitive, so `admin:org` reaches `read:org` through `write:org` without
+    the map having to state that edge itself.
+    """
+    seen = set()
+    queue = list(granted or ())
+    while queue:
+        scope = queue.pop()
+        if scope in seen:
+            continue
+        seen.add(scope)
+        queue.extend(_SCOPE_IMPLIES.get(scope, ()))
+    return seen
+
+
+def missing_scopes(wanted, granted) -> List[str]:
+    """Which of ``wanted`` the token genuinely lacks.
+
+    Empty when nothing is granted, which is not the same claim: a fine-grained
+    token reports no classic scopes at all, and listing every wanted scope as
+    "missing" for one would be telling the operator to fix a token that is
+    probably fine. Its permissions are simply not knowable from here.
+    """
+    if not granted:
+        return []
+    held = expand_scopes(granted)
+    return [s for s in wanted if s not in held]
+
+
 def _gh_binary() -> Optional[str]:
     return resolve_binary(["gh"])
 
@@ -318,11 +377,7 @@ def github_status() -> Dict[str, Any]:
         out["detail"] = redact(text.splitlines()[0][:160]) if text else "Not connected."
         return out
 
-    missing = [
-        s for s in out["wanted_scopes"]
-        if s not in out["scopes"] and out["scopes"]
-    ]
-    out["missing_scopes"] = missing
+    out["missing_scopes"] = missing_scopes(out["wanted_scopes"], out["scopes"])
     return out
 
 

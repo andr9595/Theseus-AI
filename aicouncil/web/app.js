@@ -4083,9 +4083,11 @@ function renderGithubConnection() {
         // Worth saying out loud: a token that can push but not open a PR fails
         // at the very end of a run, which is the worst moment to find out.
         ? `<p class="agent-conn-note warn">This token is missing ` +
-          `<code>${esc(missing.join(', '))}</code>. Pull-request mode needs ` +
-          `<code>repo</code>; <code>workflow</code> is only needed if a run ` +
-          `edits files under <code>.github/workflows</code>.</p>`
+          `<code>${esc(missing.join(', '))}</code>. Only <code>repo</code> is ` +
+          `required: <code>workflow</code> matters if a run edits files under ` +
+          `<code>.github/workflows</code>, and <code>read:org</code> if the ` +
+          `repository belongs to an organisation. A broader scope counts &mdash; ` +
+          `<code>admin:org</code> covers <code>read:org</code>.</p>`
         : '') +
       `<div class="agent-conn-actions">` +
         `<button class="btn btn-quiet btn-sm" id="github-disconnect">Disconnect</button>` +

@@ -349,6 +349,42 @@ class TestGitHubConnection(ConnectionsTestBase):
         finally:
             os.environ.pop("GH_TOKEN", None)
 
+    def test_a_parent_scope_satisfies_the_child_it_implies(self):
+        # GitHub never issues a token carrying the implied children, so a flat
+        # membership test reports `read:org` missing from a token holding
+        # `admin:org` - which is a scope it demonstrably has.
+        wanted = ["repo", "workflow", "read:org"]
+        self.assertEqual(
+            connections.missing_scopes(wanted, ["repo", "workflow", "admin:org"]),
+            [],
+        )
+        self.assertEqual(
+            connections.missing_scopes(wanted, ["repo", "workflow", "write:org"]),
+            [],
+        )
+
+    def test_implication_is_transitive(self):
+        # admin:org -> write:org -> read:org, without the map stating that edge.
+        self.assertIn("read:org", connections.expand_scopes(["admin:org"]))
+        self.assertIn("public_repo", connections.expand_scopes(["repo"]))
+
+    def test_a_genuinely_absent_scope_is_still_reported(self):
+        # The fix must not turn the check into one that never fires.
+        self.assertEqual(
+            connections.missing_scopes(
+                ["repo", "workflow", "read:org"], ["repo", "read:org"],
+            ),
+            ["workflow"],
+        )
+
+    def test_a_token_reporting_no_scopes_is_not_called_deficient(self):
+        # A fine-grained token lists no classic scopes at all. Naming every
+        # wanted scope as missing would send the operator to fix a token that
+        # is most likely correct.
+        self.assertEqual(
+            connections.missing_scopes(["repo", "workflow"], []), [],
+        )
+
     def test_redact_covers_both_token_shapes(self):
         text = (
             "classic ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa and "
