@@ -2410,14 +2410,15 @@ function renderProjectSetup() {
   // the button has to disable on both - a Start that looks pressable and then
   // refuses is worse than one that says why up front.
   const unfilled = (state.projectRoles || []).filter(r => !chairFillable(r));
-  const unadded = unfilled.filter(r => r.connected === false);
+  const unadded = unfilled.filter(r => r.connected === false).length;
+  const why =
+    unadded === unfilled.length ? 'you have not added'
+    : unadded ? 'you have not added, or whose CLI is not installed'
+    : 'whose CLI is not installed';
   $('#project-start').disabled = unfilled.length > 0;
   $('#project-start-hint').textContent = unfilled.length
     ? `${unfilled.map(r => ROLE_NAMES[r.id] || r.id).join(' and ')} ` +
-      `${unfilled.length === 1 ? 'is' : 'are'} on an agent ` +
-      `${unadded.length === unfilled.length ? 'you have not added'
-        : unadded.length ? 'you have not added, or whose CLI is not installed'
-        : 'whose CLI is not installed'}. ` +
+      `${unfilled.length === 1 ? 'is' : 'are'} on an agent ${why}. ` +
       `A project runs unattended, so it will not start with a seat it cannot fill.`
     : doubledChairsHint();
 }
