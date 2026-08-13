@@ -3959,7 +3959,11 @@ function renderAgentConnections() {
                 : `<button class="btn btn-quiet btn-sm" data-agent-setup="login" ` +
                   `data-agent="${esc(a.id)}">Sign in</button>`)
             : '') +
-          (added && installed && signedIn === true
+          // `!== false` rather than `=== true`: Antigravity has no way to be
+          // asked, and gating the picker on a yes would leave the one agent
+          // that can never answer as the one that can never choose a model.
+          // The list is read from the CLI, so a signed-out one says so there.
+          (added && known && installed && signedIn !== false
             ? `<button class="btn btn-quiet btn-sm" data-agent-models=` +
               `"${esc(a.id)}">Choose a model</button>`
             : '') +

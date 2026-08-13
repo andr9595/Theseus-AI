@@ -167,6 +167,7 @@ apart — because a setup screen that reports "ready" on the strength of
 | **Not added** | Theseus will not seat it. This is where every agent starts |
 | **CLI not installed** | You added it; its binary is not on `PATH` yet. The card offers **Install the CLI** |
 | **Not signed in** | Installed, and the vendor says there is no account behind it. The card offers **Sign in** |
+| **CLI found** | Installed, and its vendor offers no way to ask — Antigravity is the only one. Treated as maybe-signed-in rather than as a red cross |
 | **Signed in** | Ready. The card offers **Choose a model**, listing what *your account* may actually run |
 
 Adding is the only thing that seats an agent. Installing a CLI does not, and
@@ -193,6 +194,13 @@ neither does having installed it years ago for something else.
 setting an API key instead would put every run on metered billing. Theseus
 stores only which agents you added, each one's model and reasoning depth, and
 the command templates. Credentials live in each vendor's own config directory.
+
+The one thing that is yours to check: a CLI is launched with your environment,
+so an `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` already exported in your shell is
+one the CLI can decide to bill against. Theseus never reads, sets or asks for
+one — but it does not unset yours either, because a key you exported on purpose
+is not this app's to remove. Sign in through the panel and leave those unset if
+zero per-token cost is the point.
 
 > Antigravity is the exception to step 4: `agy` 1.1.12 has no `auth` subcommand
 > and signs in inside its full-screen session, which a scrollback pane cannot
