@@ -1121,25 +1121,33 @@ function seatHtml(seat, run, providers) {
     ? `${seat.alias}${p.model ? ` · ${p.model}` : ''}`
     : model;
 
+  // The seat itself is a wrapper, not a button: the quota chip in its tail is
+  // a button of its own, and a button inside a button is markup no browser
+  // accepts - the parser lifts the inner one back out, the strip's grid hands
+  // it a square of its own, and the bench gains a phantom seat. That only
+  // showed once quota crossed the warning threshold, which is the one moment
+  // the reading matters. Both controls are siblings here instead.
   return (
-    `<button class="member ${st}${available ? '' : ' unavailable'}` +
-      `${seat.chairman ? ' is-chair' : ''}" type="button" ` +
+    `<div class="member ${st}${available ? '' : ' unavailable'}` +
+      `${seat.chairman ? ' is-chair' : ''}" ` +
       `data-member="${esc(seat.provider_id)}" data-agent="${esc(seat.agent)}" ` +
       `data-seat="${esc(seat.id)}" data-seat-label="${esc(role)}" ` +
       `title="${esc(title)}">` +
-      `<span class="member-mark">${esc(String(who).slice(0, 2).toUpperCase())}</span>` +
-      `<span class="member-body">` +
-        `<span class="member-role">${esc(seatTag(role))}</span>` +
-        `<span class="member-name">${esc(who)}` +
-          (seat.pinned ? '<span class="member-pin" title="pinned">·</span>' : '') +
+      `<button class="member-main" type="button">` +
+        `<span class="member-mark">${esc(String(who).slice(0, 2).toUpperCase())}</span>` +
+        `<span class="member-body">` +
+          `<span class="member-role">${esc(seatTag(role))}</span>` +
+          `<span class="member-name">${esc(who)}` +
+            (seat.pinned ? '<span class="member-pin" title="pinned">·</span>' : '') +
+          `</span>` +
+          `<span class="member-model">${esc(detail)}</span>` +
         `</span>` +
-        `<span class="member-model">${esc(detail)}</span>` +
-      `</span>` +
+      `</button>` +
       `<span class="member-tail">` +
         memberQuotaHtml(seat.provider_id) +
         `<span class="member-dot"></span>` +
       `</span>` +
-    `</button>`
+    `</div>`
   );
 }
 

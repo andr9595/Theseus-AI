@@ -375,7 +375,6 @@ html, body {
   --agent-color: var(--accent-2);
   display: flex; align-items: center; gap: 9px;
   min-width: 0; padding: 6px 9px 6px 7px;
-  font: inherit; text-align: left;
   color: var(--text);
   background: transparent;
   border: 1px solid transparent;
@@ -383,8 +382,21 @@ html, body {
   cursor: pointer;
   transition: background .13s, border-color .13s;
 }
+/* The seat carries the quota chip, which is a control of its own, so the seat
+   cannot itself be the button - it wraps one. The ring follows whichever of
+   the two the keyboard is on, and the whole square still styles as one seat. */
+.member-main {
+  display: flex; align-items: center; gap: 9px;
+  flex: 1 1 auto; min-width: 0; padding: 0;
+  font: inherit; text-align: left;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
 .member:hover { background: var(--bg-3); border-color: var(--line); }
-.member:focus-visible { outline: 2px solid var(--agent-color); outline-offset: 1px; }
+.member:has(:focus-visible) { outline: 2px solid var(--agent-color); outline-offset: 1px; }
+.member-main:focus-visible { outline: none; }
 /* Coloured by which CLI is in the seat rather than by which chair it is. The
    chair moves between runs now that the bench is routed, and a colour that
    followed the chair would repaint the strip every time the prompt changed. */

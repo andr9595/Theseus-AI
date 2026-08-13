@@ -234,6 +234,28 @@ class TestStaticFiles(ServerTestBase):
         self.assertIn(".usage-menu", css)
         self.assertIn(".usage-btn.warn .usage-alert", css)
 
+    def test_a_seat_holds_its_quota_chip_rather_than_losing_it_to_the_grid(self):
+        # The chip is a refresh button, so the seat around it cannot be one
+        # too: the parser lifts a nested button back out, and the strip's grid
+        # then hands it a square of its own beside the agent it belongs to.
+        # Only high usage renders the chip, so the bench broke exactly when the
+        # reading mattered.
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn('<div class="member ', script)
+        self.assertIn('<button class="member-main" type="button">', script)
+        self.assertNotIn('<button class="member ', script)
+        # Both controls still answer: the chip refreshes, and anything else in
+        # the seat opens the seat's menu.
+        self.assertIn("const chip = e.target.closest('[data-usage-for]');", script)
+        self.assertIn("const member = e.target.closest('.member');", script)
+
+        with urllib.request.urlopen(f"{self.base}/app.css", timeout=15) as res:
+            css = res.read().decode()
+        self.assertIn(".member-main {", css)
+        # The focus ring moved to the wrapper with the button it now contains.
+        self.assertIn(".member:has(:focus-visible)", css)
+
     def test_caveman_settings_live_with_the_modes_that_use_them(self):
         # All three modes toggle it from their composer gear, so Settings
         # carries no checkbox for any of them - including Project, which used
