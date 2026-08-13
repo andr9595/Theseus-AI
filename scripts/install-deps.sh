@@ -42,6 +42,10 @@ WANT_EXTRAS=0
 WANT_GH=0
 AGENTS=()
 
+# Used only when the "latest release" redirect cannot be followed - see
+# `install_gh`. Bump it when convenient; nothing depends on it being current.
+GH_FALLBACK_TAG="v2.97.0"
+
 usage() {
   # Print the header comment block, stopping at the first non-comment line
   # so the help text cannot drift out of sync with the file again.
@@ -144,28 +148,69 @@ fi
 # the agent CLIs. That matters because Settings -> Agents offers the install as
 # a button, and a button that stops to ask for a password in a pane that cannot
 # accept one is worse than no button.
+# A slim container has neither curl nor wget as often as it has one of them,
+# so both are accepted and the *absence of both* is reported as itself. The
+# failure this replaces said "could not work out the latest gh release", which
+# blamed the network for a missing package.
+fetch_to() {  # url, destination
+  if have curl; then
+    curl -fsSL "$1" -o "$2"
+  elif have wget; then
+    wget -qO "$2" "$1"
+  else
+    return 127
+  fi
+}
+
+# The tag of the newest release, without spending an API call. The redirect on
+# /releases/latest needs no token and is not rate-limited the way
+# api.github.com is for an unauthenticated caller.
+latest_gh_tag() {
+  if have curl; then
+    curl -fsSLI -o /dev/null -w '%{url_effective}' \
+      https://github.com/cli/cli/releases/latest 2>/dev/null | sed 's#.*/tag/##'
+  elif have wget; then
+    # wget prints the redirect chain to stderr under -S; the last Location is
+    # the resolved tag.
+    wget -S --spider --max-redirect=10 \
+      https://github.com/cli/cli/releases/latest 2>&1 \
+      | sed -n 's#.*Location: .*/tag/\([^ ]*\).*#\1#p' | tail -1
+  fi
+}
+
 install_gh() {
   if have gh; then
     ok "gh already installed: $(command -v gh)"
     return 0
   fi
+
+  # Preflight, so a missing tool is named as a missing tool. In a container
+  # this is the difference between one `apt-get install` and an afternoon.
+  local missing=()
+  have curl || have wget || missing+=("curl or wget")
+  have tar || missing+=("tar")
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    bad "cannot install gh: this system has no ${missing[*]}"
+    echo "     Install ${missing[*]} first, or install gh yourself and"
+    echo "     put it on PATH - the app only needs it to be findable."
+    return 1
+  fi
+
   local arch tag version url tmp
   case "$(uname -m)" in
     x86_64)  arch=amd64 ;;
     aarch64) arch=arm64 ;;
-    *) warn "no rootless gh build for $(uname -m); try: sudo apt install gh"
+    *) bad "no prebuilt gh for $(uname -m); install gh from your package manager"
        return 1 ;;
   esac
 
-  # Resolve "latest" through the release redirect rather than the API: no
-  # token is needed for it, and it does not count against an unauthenticated
-  # rate limit the way api.github.com does.
-  tag="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
-        https://github.com/cli/cli/releases/latest 2>/dev/null \
-        | sed 's#.*/tag/##')"
+  tag="$(latest_gh_tag)"
   if [[ -z "$tag" || "$tag" != v* ]]; then
-    warn "could not work out the latest gh release; try: sudo apt install gh"
-    return 1
+    # Pinned so a blocked redirect, a proxy that rewrites it, or a rate limit
+    # does not turn into "no GitHub for you". The version only decides which
+    # tarball is fetched; a newer one is picked up next time.
+    tag="$GH_FALLBACK_TAG"
+    warn "could not resolve the latest gh release; falling back to $tag"
   fi
   version="${tag#v}"
   url="https://github.com/cli/cli/releases/download/${tag}/gh_${version}_linux_${arch}.tar.gz"
@@ -174,19 +219,26 @@ install_gh() {
   # shellcheck disable=SC2064 - expand tmp now, not at trap time
   trap "rm -rf '$tmp'" RETURN
   say "Fetching gh ${version} (${arch})"
-  if ! curl -fsSL "$url" -o "$tmp/gh.tar.gz"; then
+  if ! fetch_to "$url" "$tmp/gh.tar.gz"; then
     warn "gh download failed: $url"
     return 1
   fi
+  # Not preflighted with `have gzip`: GNU tar shells out to it, but busybox tar
+  # decompresses in-process, so checking for it would refuse to run on images
+  # where it would have worked. Named here instead, where it has actually failed.
   if ! tar xzf "$tmp/gh.tar.gz" -C "$tmp"; then
-    warn "gh archive could not be unpacked"
+    warn "gh archive could not be unpacked - if tar reported a missing gzip,"
+    warn "install gzip (or use a tar that decompresses on its own)"
     return 1
   fi
+  # `install` is coreutils and present nearly everywhere, but "nearly" is what
+  # bites in a distroless image, so cp is the fallback.
   mkdir -p "$HOME/.local/bin"
   if ! install -m 0755 "$tmp/gh_${version}_linux_${arch}/bin/gh" \
-       "$HOME/.local/bin/gh"; then
-    warn "could not place gh in ~/.local/bin"
-    return 1
+       "$HOME/.local/bin/gh" 2>/dev/null; then
+    cp "$tmp/gh_${version}_linux_${arch}/bin/gh" "$HOME/.local/bin/gh" \
+      && chmod 0755 "$HOME/.local/bin/gh" \
+      || { warn "could not place gh in ~/.local/bin"; return 1; }
   fi
   ok "gh ${version} installed: $HOME/.local/bin/gh"
 }
