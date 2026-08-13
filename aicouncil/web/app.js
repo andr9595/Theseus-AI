@@ -3030,10 +3030,18 @@ function modelDetail(model) {
  *  this is only what saves the second wait.
  *
  *  `withModel` for the effort menu: which levels are legal depends on which
- *  model is pinned, so one entry per CLI would answer the wrong question. */
-function catalogKey(providerId, withModel = false) {
+ *  model is pinned, so one entry per CLI would answer the wrong question.
+ *
+ *  `modelOverride` for the Settings form, where the model box may hold a
+ *  choice that has not been saved yet: the levels wanted there are the ones
+ *  for the model on screen, not the one still on disk. Blank is a real
+ *  override - "the CLI's default" is a selection like any other - so the
+ *  absent case is `undefined` rather than a falsy check. */
+function catalogKey(providerId, withModel = false, modelOverride = undefined) {
   const provider = ((state.config || {}).providers || {})[providerId] || {};
-  return agentOf(provider) + (withModel ? `|${provider.model || ''}` : '');
+  const model = modelOverride === undefined
+    ? (provider.model || '') : modelOverride;
+  return agentOf(provider) + (withModel ? `|${model}` : '');
 }
 
 /** "asked just now" or how old the stored answer is, for the menu's footer. A
@@ -4169,6 +4177,79 @@ function redrawModelSelects(key) {
   });
 }
 
+/** The options for a card's reasoning-effort box, the same argument as the
+ *  model list beside it: an effort typed by hand is a guess, and the CLI knows
+ *  the answer. Which levels are legal depends on the model, so the list is
+ *  asked for per model - `model` here is the one in the form, which may not be
+ *  the saved one yet.
+ *
+ *  A configured level the CLI does not offer is kept and labelled rather than
+ *  dropped: opening Settings must not silently rewrite a setting, and Codex
+ *  rejects an unknown level at launch, so it is worth saying so here. */
+function effortOptionsHtml(providerId, provider, model) {
+  const data = state.effortLists[catalogKey(providerId, true, model)];
+  const levels = (data && data.levels) || [];
+  const fallback = (data && data.default) || '';
+  const current = provider.effort || '';
+  const offered = levels.some(l => l.effort === current);
+  return (
+    `<option value=""${current ? '' : ' selected'}>` +
+      `the CLI's default${fallback ? ` — ${esc(fallback)}` : ''}</option>` +
+    levels.map(l =>
+      `<option value="${esc(l.effort)}"` +
+        `${l.effort === current ? ' selected' : ''}>${esc(l.effort)}` +
+        `${l.description ? ` — ${esc(l.description)}` : ''}</option>`
+    ).join('') +
+    (current && !offered
+      ? `<option value="${esc(current)}" selected>${esc(current)}` +
+          `${levels.length ? ' — not offered for this model' : ''}</option>`
+      : '')
+  );
+}
+
+/** Refill one effort box from the levels its CLI reports for the model the
+ *  form is currently showing, asking for them if they have not been asked for.
+ *
+ *  Unlike the model list, an empty answer is kept: `agy` refuses `--effort`
+ *  beside a model whose name already carries the level, and asking again on
+ *  every repaint would be asking a question already answered. */
+function hydrateEffortSelect(select) {
+  const form = select.closest('.provider-form');
+  const providerId = form.dataset.provider;
+  const saved = ((state.config || {}).providers || {})[providerId] || {};
+  const model = ($('[data-field="model"]', form) || {}).value || '';
+  const key = catalogKey(providerId, true, model);
+
+  const draw = () => {
+    const chosen = select.value;
+    select.innerHTML = effortOptionsHtml(
+      providerId, { ...saved, effort: chosen }, model
+    );
+    select.value = chosen;
+  };
+
+  draw();
+  if (state.effortLists[key]) return;
+  api(`/api/efforts?provider=${encodeURIComponent(providerId)}` +
+      `&for_model=1&model=${encodeURIComponent(model)}`)
+    .then(data => {
+      state.effortLists[key] = data;
+      // The panel may have been closed, or the model changed again while this
+      // was in flight - either way these levels are no longer the ones this
+      // box is asking about.
+      if (!select.isConnected) return;
+      if ((($('[data-field="model"]', form) || {}).value || '') !== model) return;
+      draw();
+    })
+    // As with the model boxes: one that already offers the CLI default and
+    // what is saved is not worth a toast.
+    .catch(() => {});
+}
+
+function hydrateEffortSelects() {
+  $$('.provider-form select[data-field="effort"]').forEach(hydrateEffortSelect);
+}
+
 function renderSettings() {
   const conf = state.config || {};
   const providers = conf.providers || {};
@@ -4266,8 +4347,8 @@ function renderSettings() {
                 `<label>Reasoning effort ` +
                   `<span class="field-hint">— blank uses the CLI's own</span>` +
                   `</label>` +
-                `<input type="text" data-field="effort" value="${esc(p.effort || '')}" ` +
-                  `placeholder="the CLI's default">` +
+                `<select data-field="effort">` +
+                  `${effortOptionsHtml(id, p, p.model || '')}</select>` +
               `</div>` +
             `</div>`
           : '') +
@@ -4378,6 +4459,7 @@ function renderSettings() {
   // After the forms are in the document, not before: the boxes are refilled in
   // place when the answers land.
   hydrateModelSelects();
+  hydrateEffortSelects();
 
   $('#house-rules').value = conf.house_rules || '';
   $('#display-name').value = conf.display_name || '';
@@ -5680,6 +5762,17 @@ function wire() {
   });
 
   $('#save-settings').addEventListener('click', saveSettings);
+
+  // Delegated, because the forms are rebuilt every time the panel opens.
+  // Which reasoning levels are legal is the chosen model's answer, not the
+  // CLI's, so a model picked here changes what the box beside it may offer -
+  // and it says so before the save rather than after it.
+  $('#provider-forms').addEventListener('change', (e) => {
+    if (!e.target.matches('select[data-field="model"]')) return;
+    const effort = $('select[data-field="effort"]',
+                     e.target.closest('.provider-form'));
+    if (effort) hydrateEffortSelect(effort);
+  });
 
   // No agent picker lives on these forms any more, so there is nothing here to
   // preview a swap for. Every card is one CLI: Chat's is chosen on its card,

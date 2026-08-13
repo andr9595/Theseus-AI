@@ -185,10 +185,11 @@ neither does having installed it years ago for something else.
 4. Press **Sign in**. That runs the vendor's own login command in a terminal the
    app owns and surfaces the URL it prints as a button. The browser flow is
    theirs, the account is theirs, and the token it writes is theirs.
-5. Optionally pick a **Default model**, on that CLI's card under **How each CLI
-   is run** directly below. The list is read from the CLI, so it reflects your
-   account's entitlements rather than a catalogue this README would have to
-   keep in step. A model it does not report — a preview, or one only your org
+5. Optionally pick a **Default model** and a **Reasoning effort**, on that CLI's
+   card under **How each CLI is run** directly below. Both lists are read from
+   the CLI, so they reflect your account's entitlements rather than a catalogue
+   this README would have to keep in step — and the effort list follows the
+   model you pick, because which levels are legal is the model's answer. A model it does not report — a preview, or one only your org
    has — goes in **Selectable models** under **Command line**, and is then
    offered in the same list.
 

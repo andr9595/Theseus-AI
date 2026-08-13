@@ -628,13 +628,22 @@ class Handler(BaseHTTPRequestHandler):
     def _api_efforts(self, params: Dict[str, list]) -> Dict[str, Any]:
         """What reasoning levels the configured CLI accepts for its model."""
         pid = (params.get("provider") or [""])[0]
-        provider = self.app.store.get("providers", {}).get(pid)
-        if not provider:
+        saved = self.app.store.get("providers", {}).get(pid)
+        if not saved:
             raise ValueError(f"No such provider: {pid!r}")
+        provider = dict(saved)
+        # Settings asks about the model in its form, which may not be the saved
+        # one yet - answering for the stored model would offer levels for a
+        # model the operator has just moved off. A copy, never the store: a
+        # question about a model is not a decision to run it. The flag is what
+        # marks the override, because blank is a real answer here ("whatever
+        # the CLI is set to") and a blank query parameter does not survive.
+        if (params.get("for_model") or [""])[0] == "1":
+            provider["model"] = (params.get("model") or [""])[0]
         result = discover_efforts(provider, refresh=self._refresh_asked(params))
         result["ok"] = True
         result["provider"] = pid
-        result["current"] = provider.get("effort", "")
+        result["current"] = saved.get("effort", "")
         # Named so the menu can say which model the levels belong to - they
         # differ between them, and a list with no model attached invites the
         # assumption that it is universal.

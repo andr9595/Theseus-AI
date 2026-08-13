@@ -297,6 +297,45 @@ class TestStaticFiles(ServerTestBase):
         # option, or opening the panel would silently offer to clear it.
         self.assertIn("if (current && !models.includes(current)) models.push(current);", script)
 
+    def test_reasoning_effort_is_chosen_from_a_list_like_the_model(self):
+        # The two boxes sit side by side on the same card and answer the same
+        # kind of question, so one of them being free text was the odd one out:
+        # a level typed by hand is a guess, and Codex fails the run on a level
+        # it does not know rather than ignoring it.
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn('`<select data-field="effort">` +', script)
+        self.assertIn("function hydrateEffortSelects()", script)
+        self.assertNotIn(
+            '`<input type="text" data-field="effort" value="${esc(p.effort || \'\')}" ` +',
+            script,
+        )
+        # A level configured before the list was fetched, or one that stopped
+        # being legal when the model changed, stays on offer and says so.
+        self.assertIn("' — not offered for this model'", script)
+        # The advanced forms keep their text boxes: their model is free text
+        # too, so there is no model to ask the levels for.
+        self.assertIn('`<input type="text" data-field="effort" value="${esc(p.effort || \'\')}">` +', script)
+
+    def test_efforts_can_be_asked_for_an_unsaved_model(self):
+        # The Settings form asks about the model on screen, which is not the
+        # saved one until Save is pressed. Asking must not write it.
+        before = self.store.get("providers", {})["council_codex"].get("model", "")
+        _, data = self.request(
+            "/api/efforts?provider=council_codex&for_model=1&model=not-saved-yet"
+        )
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["model"], "not-saved-yet")
+        self.assertEqual(
+            self.store.get("providers", {})["council_codex"].get("model", ""),
+            before,
+        )
+
+        # Without the flag the saved model is still what answers, because a
+        # blank `model` parameter does not survive the query string.
+        _, plain = self.request("/api/efforts?provider=council_codex")
+        self.assertEqual(plain["model"], before)
+
     def test_deliberation_effort_is_settable_and_saved(self):
         # A knob only reachable by hand-editing the config file is half a
         # setting, so this checks both ends: the control is served, and the
