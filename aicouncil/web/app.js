@@ -3959,14 +3959,10 @@ function renderAgentConnections() {
                 : `<button class="btn btn-quiet btn-sm" data-agent-setup="login" ` +
                   `data-agent="${esc(a.id)}">Sign in</button>`)
             : '') +
-          // `!== false` rather than `=== true`: Antigravity has no way to be
-          // asked, and gating the picker on a yes would leave the one agent
-          // that can never answer as the one that can never choose a model.
-          // The list is read from the CLI, so a signed-out one says so there.
-          (added && known && installed && signedIn !== false
-            ? `<button class="btn btn-quiet btn-sm" data-agent-models=` +
-              `"${esc(a.id)}">Choose a model</button>`
-            : '') +
+          // No model button here. The card answers whether this CLI is added,
+          // installed and signed in; which model it runs is asked for once, on
+          // its own card under "How each CLI is run" directly below, and two
+          // ways to set one setting is one more than it needs.
         `</div>` +
       `</article>`
     );
@@ -4106,6 +4102,73 @@ function efficiencyOn(mode) {
   return !!((state.config || {}).efficiency || {})[mode];
 }
 
+/** The options for a card's model box: everything the CLI reported, then
+ *  anything configured that it did not, then the saved value if it is in
+ *  neither — a model chosen before the catalogue was fetched must not be
+ *  dropped by the form that shows it. Blank first, because "whatever the CLI
+ *  is set to" is a real answer and the one a fresh install gives. */
+function modelOptionsHtml(providerId, provider) {
+  const listed = (state.modelLists[catalogKey(providerId)] || {}).models || [];
+  const models = listed.concat(
+    (provider.models || []).filter(m => !listed.includes(m))
+  );
+  const current = provider.model || '';
+  if (current && !models.includes(current)) models.push(current);
+  return (
+    `<option value=""${current ? '' : ' selected'}>the CLI's default</option>` +
+    models.map(m =>
+      `<option value="${esc(m)}"${m === current ? ' selected' : ''}>` +
+        `${esc(modelDetail(m))}</option>`
+    ).join('')
+  );
+}
+
+/** Ask each CLI what it can run, once, and refill its box in place.
+ *
+ *  The panel paints from whatever the pickers last cached, which on a fresh
+ *  load is nothing — a list is only ever fetched when something asks for it.
+ *  So the boxes go up immediately with the CLI default and what is saved, and
+ *  the account-scoped list lands underneath them a moment later. Nothing is
+ *  catalogued here: the models are the CLI's to name. */
+function hydrateModelSelects() {
+  const asked = new Set();
+  $$('.provider-form select[data-field="model"]').forEach(select => {
+    const providerId = select.closest('.provider-form').dataset.provider;
+    const key = catalogKey(providerId);
+    // An empty answer is not one worth keeping: a CLI that was signed out when
+    // it was asked has a list once it is not, so a catalogue with nothing in
+    // it is asked for again the next time the panel opens.
+    const cached = state.modelLists[key];
+    if (asked.has(key) || (cached && (cached.models || []).length)) return;
+    asked.add(key);
+    api(`/api/models?provider=${encodeURIComponent(providerId)}`)
+      .then(data => {
+        state.modelLists[key] = data;
+        rememberResolved(data.resolved);
+        redrawModelSelects(key);
+      })
+      // A box that already offers the CLI default and the saved model is not
+      // worth a toast for; the command line below says which binary failed.
+      .catch(() => {});
+  });
+}
+
+/** Repaint the boxes fed by one CLI's catalogue, keeping a choice made while
+ *  the request was in flight — the list arriving is not a reason to undo it. */
+function redrawModelSelects(key) {
+  const providers = (state.config || {}).providers || {};
+  $$('.provider-form select[data-field="model"]').forEach(select => {
+    const form = select.closest('.provider-form');
+    const providerId = form.dataset.provider;
+    if (catalogKey(providerId) !== key) return;
+    const chosen = select.value;
+    select.innerHTML = modelOptionsHtml(
+      providerId, { ...(providers[providerId] || {}), model: chosen }
+    );
+    select.value = chosen;
+  });
+}
+
 function renderSettings() {
   const conf = state.config || {};
   const providers = conf.providers || {};
@@ -4194,10 +4257,10 @@ function renderSettings() {
           ? `<div class="field-row">` +
               `<div class="field">` +
                 `<label>Default model ` +
-                  `<span class="field-hint">— blank uses the CLI's own</span>` +
+                  `<span class="field-hint">— what this CLI reports it can ` +
+                  `run for your account</span>` +
                   `</label>` +
-                `<input type="text" data-field="model" value="${esc(p.model || '')}" ` +
-                  `placeholder="the CLI's default">` +
+                `<select data-field="model">${modelOptionsHtml(id, p)}</select>` +
               `</div>` +
               `<div class="field">` +
                 `<label>Reasoning effort ` +
@@ -4278,7 +4341,8 @@ function renderSettings() {
             `</div>` +
             `<div class="field">` +
               `<label>Selectable models, one per line ` +
-                `<span class="field-hint">— shown in the picker on the agent card</span></label>` +
+                `<span class="field-hint">— offered wherever this CLI's model ` +
+                `is chosen, alongside the ones it reports itself</span></label>` +
               `<textarea rows="4" data-field="models">${esc((p.models || []).join('\n'))}</textarea>` +
             `</div>` +
             `<div class="field-row">` +
@@ -4311,6 +4375,9 @@ function renderSettings() {
       `</div>`
     );
   }).join('');
+  // After the forms are in the document, not before: the boxes are refilled in
+  // place when the answers land.
+  hydrateModelSelects();
 
   $('#house-rules').value = conf.house_rules || '';
   $('#display-name').value = conf.display_name || '';
@@ -5645,10 +5712,6 @@ function wire() {
         () => toast(`Run \`${copy.dataset.agentCopy}\` in a terminal.`, 'info', 9000)
       );
     }
-    const models = e.target.closest('[data-agent-models]');
-    // The account-scoped list the CLI itself reports, which is the whole point
-    // of asking after a sign-in rather than shipping a catalogue.
-    if (models) openModelMenu(models, `council_${models.dataset.agentModels}`, true);
   });
 
   $('#agent-setup-cancel').addEventListener('click', async () => {

@@ -168,7 +168,7 @@ apart — because a setup screen that reports "ready" on the strength of
 | **CLI not installed** | You added it; its binary is not on `PATH` yet. The card offers **Install the CLI** |
 | **Not signed in** | Installed, and the vendor says there is no account behind it. The card offers **Sign in** |
 | **CLI found** | Installed, and its vendor offers no way to ask — Antigravity is the only one. Treated as maybe-signed-in rather than as a red cross |
-| **Signed in** | Ready. The card offers **Choose a model**, listing what *your account* may actually run |
+| **Signed in** | Ready. Its model is picked from the card's own **Default model** list, under **How each CLI is run** just below |
 
 Adding is the only thing that seats an agent. Installing a CLI does not, and
 neither does having installed it years ago for something else.
@@ -185,9 +185,12 @@ neither does having installed it years ago for something else.
 4. Press **Sign in**. That runs the vendor's own login command in a terminal the
    app owns and surfaces the URL it prints as a button. The browser flow is
    theirs, the account is theirs, and the token it writes is theirs.
-5. Optionally press **Choose a model**. The list is read from the CLI, so it
-   reflects your account's entitlements rather than a catalogue this README
-   would have to keep in step.
+5. Optionally pick a **Default model**, on that CLI's card under **How each CLI
+   is run** directly below. The list is read from the CLI, so it reflects your
+   account's entitlements rather than a catalogue this README would have to
+   keep in step. A model it does not report — a preview, or one only your org
+   has — goes in **Selectable models** under **Command line**, and is then
+   offered in the same list.
 
 **No API keys, ever.** There is no field in this app that takes one. These are
 **subscription logins**, which is what keeps runs at zero per-token cost —

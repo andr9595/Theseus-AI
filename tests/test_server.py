@@ -271,6 +271,32 @@ class TestStaticFiles(ServerTestBase):
         self.assertIn("patchConfig({", script)
         self.assertIn("efficiency: {", script)
 
+    def test_the_model_is_chosen_in_one_place_and_from_a_list(self):
+        # The connection card says whether an agent is added, installed and
+        # signed in; the model belongs to the card below it, which is the only
+        # place asking for it. A second control for one setting is how a form
+        # ends up saving whichever of the two was read last.
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertNotIn("data-agent-models", script)
+        self.assertNotIn("Choose a model", script)
+
+        # Typed by hand, a model is a guess at what the account may run. The
+        # list is the CLI's own answer, fetched once the panel is up because
+        # nothing has asked for it before the operator opens Settings.
+        self.assertIn(
+            '`<select data-field="model">${modelOptionsHtml(id, p)}</select>`',
+            script,
+        )
+        self.assertIn("function hydrateModelSelects()", script)
+        self.assertIn(
+            "if (asked.has(key) || (cached && (cached.models || []).length)) return;",
+            script,
+        )
+        # A model saved before the catalogue was fetched still has to be an
+        # option, or opening the panel would silently offer to clear it.
+        self.assertIn("if (current && !models.includes(current)) models.push(current);", script)
+
     def test_deliberation_effort_is_settable_and_saved(self):
         # A knob only reachable by hand-editing the config file is half a
         # setting, so this checks both ends: the control is served, and the
