@@ -9,7 +9,9 @@ app's API can execute a coding agent with ``--dangerously-skip-permissions``,
 three defences are layered on:
 
 1. **Session token.** Generated per launch, never persisted. Every ``/api/``
-   request must present it. The launcher puts it in the URL fragment/query.
+   request must present it. The token never reaches a command line: the
+   launcher's URL carries a single-use *ticket*, which the page trades for the
+   token through ``POST /api/session`` before its first real request.
 2. **Origin / Host validation.** Requests whose ``Origin`` is a real remote
    site are rejected, which blocks the drive-by CSRF case, and a non-loopback
    ``Host`` header is rejected, which blocks DNS rebinding.
@@ -36,13 +38,14 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from . import APP_NAME, __version__
 from . import config as cfg
+from . import connections
 from . import gitutil
 from .events import EventBus, drain, sse_comment, sse_format
 from .pipeline import Pipeline, PipelineBusy
 from . import prompts
 from . import projects
 from .projects import ProjectBusy, ProjectEngine
-from .providers import discover_efforts, discover_models, probe_all
+from .providers import discover_efforts, discover_models, probe_all, resolve_binary
 from .usage import UsagePoller
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
@@ -66,13 +69,69 @@ class AppState:
         # object owns both, so it is what knows, and each is handed a callable
         # that refuses on the other's behalf.
         self.projects = ProjectEngine(store, self.bus, busy_check=self._refuse_if_busy)
+        # Installs and sign-ins started from Settings. One at a time, and owned
+        # here rather than by a request handler: the browser polls a session it
+        # started on an earlier request, and a handler-scoped one would be a
+        # process nothing could reach a second later.
+        self.setup = connections.SetupManager()
         self.token = secrets.token_urlsafe(24)
+        # The launcher has no way to hand a browser a secret except on its
+        # command line, where every other user on the machine can read it out
+        # of the process table for as long as the window stays open. So the
+        # URL carries a *ticket* rather than the token: the first page to
+        # present it is given the token in a response body and the ticket dies
+        # on the spot, which narrows the exposure from the whole session to
+        # however long the browser takes to start.
+        self._ticket = secrets.token_urlsafe(24)
+        self._ticket_lock = threading.Lock()
         self.started_at = time.time()
         # Publishing on the bus means every open tab updates together, and a
         # tab opened later replays the last reading instead of showing blank.
         self.usage = UsagePoller(
             store, on_update=lambda snap: self.bus.publish("usage", usage=snap)
         )
+        # Let the seating router see how much quota each CLI has left, so it can
+        # route around one that is nearly out rather than seating it and having
+        # the run die at the first stage. The poller is owned here, not by the
+        # pipeline, so it is handed over as a callable - and the router works
+        # without it, which is why this is wiring rather than a constructor
+        # argument. Readings are the vendor's own; nothing here computes one.
+        self.pipeline.quota_source = self._agent_quota
+
+    @property
+    def ticket(self) -> str:
+        """The unredeemed launch ticket, or "" once it has been spent."""
+        with self._ticket_lock:
+            return self._ticket
+
+    def redeem_ticket(self, supplied: str) -> Optional[str]:
+        """Trade a valid, unspent ticket for the session token.
+
+        Under the lock, so two windows racing to open the same printed URL
+        cannot both win - exactly one gets the token and the other is told to
+        relaunch.
+        """
+        with self._ticket_lock:
+            if not supplied or not self._ticket:
+                return None
+            if not secrets.compare_digest(supplied, self._ticket):
+                return None
+            self._ticket = ""
+            return self.token
+
+    def _agent_quota(self) -> Dict[str, Optional[float]]:
+        """Percent of its window each council CLI has consumed, where known.
+
+        Keyed by agent rather than by provider id, because that is what the
+        router seats. A CLI the poller has no reading for is absent from the
+        map, and the router treats absent as "no signal" rather than as zero.
+        """
+        out: Dict[str, Optional[float]] = {}
+        for agent in cfg.AGENTS:
+            percent = self.usage.worst_percent(cfg.council_provider_id(agent))
+            if percent is not None:
+                out[agent] = percent
+        return out
 
     def _refuse_if_busy(self) -> None:
         """Raise if a council or chat run is working the tree right now."""
@@ -183,6 +242,36 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError(f"Malformed JSON body: {exc}") from exc
         return data if isinstance(data, dict) else {}
 
+    def _workspace_from(self, body: Dict[str, Any]) -> str:
+        """The folder a request names, with an empty one taken at its word.
+
+        Blank is an answer - the scratch workspace - and not the same as not
+        asking, so the saved folder only fills in when the key is absent
+        altogether. Read with ``or`` instead, an explicit "no folder" would be
+        replaced by whatever the picker was last pointed at, and a run the
+        operator confirmed for scratch would write into that repository.
+        """
+        if "workspace" not in body:
+            return str(self.app.store.get("workspace") or "")
+        value = body["workspace"]
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            raise ValueError("`workspace` must be a folder path.")
+        return value
+
+    def _incognito_from(self, body: Dict[str, Any]) -> bool:
+        """Whether this request asked for a private run.
+
+        Typed strictly rather than read for truthiness: the string ``"false"``
+        is true in Python, and a client that sent one would be told its run was
+        private while every stage was recorded as usual.
+        """
+        value = body.get("incognito", False)
+        if not isinstance(value, bool):
+            raise ValueError("`incognito` must be true or false.")
+        return value
+
     # -- dispatch ----------------------------------------------------------
 
     def do_GET(self) -> None:  # noqa: N802 - name fixed by the base class
@@ -208,6 +297,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._error(HTTPStatus.METHOD_NOT_ALLOWED, "Method not allowed.")
             else:
                 self._serve_static(path)
+            return
+
+        # The one API call that cannot present a token: it is how the page
+        # gets one. The Origin and Host checks above still apply to it.
+        if path == "/api/session":
+            self._api_session(method)
             return
 
         if not self._authorized(params):
@@ -246,6 +341,8 @@ class Handler(BaseHTTPRequestHandler):
             ("POST", "/api/approve"): self._api_approve,
             ("POST", "/api/reject"): self._api_reject,
             ("POST", "/api/cancel"): self._api_cancel,
+            ("POST", "/api/resume"): self._api_resume,
+            ("POST", "/api/retry"): self._api_retry,
             ("POST", "/api/rollback"): self._api_rollback,
             ("POST", "/api/commit"): self._api_commit,
             ("GET", "/api/project"): self._api_project,
@@ -254,13 +351,25 @@ class Handler(BaseHTTPRequestHandler):
             ("POST", "/api/project/resume"): self._api_project_resume,
             ("POST", "/api/project/stop"): self._api_project_stop,
             ("POST", "/api/project/handoff"): self._api_project_handoff,
+            ("POST", "/api/project/dismiss"): self._api_project_dismiss,
             ("GET", "/api/project/file"): self._api_project_file,
+            ("POST", "/api/council/route"): self._api_council_route,
             ("GET", "/api/roles"): lambda p: {
                 "ok": True,
                 "roles": prompts.role_catalog(self.app.store.get("roles", {})),
             },
             ("POST", "/api/roles"): self._api_save_role,
             ("POST", "/api/roles/delete"): self._api_delete_role,
+            ("GET", "/api/agents"): self._api_agents,
+            ("POST", "/api/agents/select"): self._api_agents_select,
+            ("POST", "/api/agents/setup"): self._api_agent_setup,
+            ("GET", "/api/agents/setup"): lambda p: {
+                "ok": True, "session": self.app.setup.status()
+            },
+            ("POST", "/api/agents/setup/input"): self._api_agent_setup_input,
+            ("POST", "/api/agents/setup/cancel"): lambda p: {
+                "ok": True, "session": self.app.setup.cancel()
+            },
         }
 
         handler = routes.get((method, path))
@@ -284,6 +393,30 @@ class Handler(BaseHTTPRequestHandler):
             )
         else:
             self._json(HTTPStatus.OK, result)
+
+    # -- session -----------------------------------------------------------
+
+    def _api_session(self, method: str) -> None:
+        """Exchange the launcher's one-time ticket for the session token."""
+        if method != "POST":
+            self._error(HTTPStatus.METHOD_NOT_ALLOWED, "Method not allowed.")
+            return
+        try:
+            body = self._read_body()
+        except ValueError as exc:
+            self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        # Body only, never the query string: a ticket in a URL is a ticket in
+        # a referrer, a history entry and a server log.
+        token = self.app.redeem_ticket(str(body.get("ticket") or "").strip())
+        if token is None:
+            self._error(
+                HTTPStatus.UNAUTHORIZED,
+                "That launch ticket is not valid, or has already been used. "
+                "Restart the app to get a fresh URL.",
+            )
+            return
+        self._json(HTTPStatus.OK, {"ok": True, "token": token})
 
     # -- static ------------------------------------------------------------
 
@@ -403,7 +536,16 @@ class Handler(BaseHTTPRequestHandler):
         path = (params.get("path") or [""])[0]
         if not path:
             raise ValueError("A `path` query parameter is required.")
-        return {"ok": True, "status": gitutil.status(path).to_dict()}
+        out: Dict[str, Any] = {"ok": True, "status": gitutil.status(path).to_dict()}
+        # `?diff=1` is what the status bar's uncommitted chip asks for when it
+        # is opened. Status and patch are read in one request on purpose: two
+        # requests would be two different moments, and a file could be saved
+        # between them, leaving a list and a patch that disagree about what is
+        # in the tree the operator is about to commit.
+        if (params.get("diff") or [""])[0] not in ("", "0", "false"):
+            out["diff"] = gitutil.working_diff(path)
+            out["stat"] = gitutil.diff_stat(path)
+        return out
 
     def _api_history(self, params: Dict[str, list]) -> Dict[str, Any]:
         # Council and Chat conversations are not interchangeable - continuing
@@ -452,15 +594,24 @@ class Handler(BaseHTTPRequestHandler):
         return {"ok": True, "context": self.app.pipeline.context_preview(name)}
 
     def _api_doctor(self, params: Dict[str, list]) -> Dict[str, Any]:
-        providers = self.app.store.get("providers", {})
         return {
             "ok": True,
             "version": __version__,
             "config_path": str(self.app.store.path),
             "runs_path": str(self.app.pipeline.runs_dir),
             "uptime": round(time.time() - self.app.started_at, 1),
-            "providers": probe_all(providers, cfg.PROVIDER_ORDER),
+            "providers": probe_all(self.app.store.all(), cfg.PROVIDER_ORDER),
         }
+
+    @staticmethod
+    def _refresh_asked(params: Dict[str, list]) -> bool:
+        """Whether the menu asked for a fresh probe rather than the catalogue.
+
+        Sent only by its Refresh button. Everything else - opening a picker,
+        the alias prefetch at boot - takes the stored answer, which is the
+        difference between a dropdown that paints and one that waits on `agy`.
+        """
+        return (params.get("refresh") or [""])[0] in ("1", "true")
 
     def _api_models(self, params: Dict[str, list]) -> Dict[str, Any]:
         """What models the configured CLI reports it can actually run."""
@@ -468,7 +619,7 @@ class Handler(BaseHTTPRequestHandler):
         provider = self.app.store.get("providers", {}).get(pid)
         if not provider:
             raise ValueError(f"No such provider: {pid!r}")
-        result = discover_models(provider)
+        result = discover_models(provider, refresh=self._refresh_asked(params))
         result["ok"] = True
         result["provider"] = pid
         result["current"] = provider.get("model", "")
@@ -477,18 +628,94 @@ class Handler(BaseHTTPRequestHandler):
     def _api_efforts(self, params: Dict[str, list]) -> Dict[str, Any]:
         """What reasoning levels the configured CLI accepts for its model."""
         pid = (params.get("provider") or [""])[0]
-        provider = self.app.store.get("providers", {}).get(pid)
-        if not provider:
+        saved = self.app.store.get("providers", {}).get(pid)
+        if not saved:
             raise ValueError(f"No such provider: {pid!r}")
-        result = discover_efforts(provider)
+        provider = dict(saved)
+        # Settings asks about the model in its form, which may not be the saved
+        # one yet - answering for the stored model would offer levels for a
+        # model the operator has just moved off. A copy, never the store: a
+        # question about a model is not a decision to run it. The flag is what
+        # marks the override, because blank is a real answer here ("whatever
+        # the CLI is set to") and a blank query parameter does not survive.
+        if (params.get("for_model") or [""])[0] == "1":
+            provider["model"] = (params.get("model") or [""])[0]
+        result = discover_efforts(provider, refresh=self._refresh_asked(params))
         result["ok"] = True
         result["provider"] = pid
-        result["current"] = provider.get("effort", "")
+        result["current"] = saved.get("effort", "")
         # Named so the menu can say which model the levels belong to - they
         # differ between them, and a list with no model attached invites the
         # assumption that it is universal.
         result["model"] = provider.get("model", "")
         return result
+
+    # -- agents ------------------------------------------------------------
+
+    def _api_agents(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Which CLIs are added, which are installed, which are signed in.
+
+        Its own endpoint rather than part of `/api/state` for the reason the
+        doctor report is: answering it means shelling out to every catalogued
+        CLI twice, and the dashboard must paint before that finishes. The
+        Agents panel opens on what `/api/state` already knows - which agents
+        the operator added - and fills the rest in when this lands.
+        """
+        conf = self.app.store.all()
+        return {
+            "ok": True,
+            "agents": connections.agent_statuses(conf),
+            "session": self.app.setup.status(),
+        }
+
+    def _api_agents_select(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Add or remove one CLI. The only thing that decides who is seated.
+
+        Removing the CLI a chair was holding moves that chair to one still
+        added, rather than leaving Chat or a project pointed at an agent the
+        operator has just said they do not use. Council seats are not touched:
+        there is one per CLI and `enabled` is what takes them off the bench.
+        """
+        body = self._read_body()
+        agent = str(body.get("agent") or "")
+        if agent not in cfg.AGENTS:
+            raise ValueError(f"No such agent: {agent!r}")
+        selected = bool(body.get("selected"))
+
+        conf = self.app.store.all()
+        patch: Dict[str, Any] = {"agent_settings": {agent: {"selected": selected}}}
+        moved: Dict[str, str] = {}
+        if not selected:
+            remaining = [a for a in cfg.selected_agents(conf) if a != agent]
+            successor = next(
+                (a for a in remaining if resolve_binary(
+                    (cfg.AGENTS[a].get("command") or [])
+                )),
+                remaining[0] if remaining else "",
+            )
+            if successor:
+                providers = conf.get("providers") or {}
+                for pid in ("solo", *projects.ROLES):
+                    if cfg.agent_for(providers.get(pid) or {}) != agent:
+                        continue
+                    patch.setdefault("providers", {})[pid] = {"agent": successor}
+                    moved[pid] = successor
+
+        conf = self.app.store.update(patch)
+        self.app.bus.publish("config", config=conf)
+        return {"ok": True, "config": conf, "moved": moved}
+
+    def _api_agent_setup(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Start an install or a sign-in. Never given a command, only an id."""
+        body = self._read_body()
+        session = self.app.setup.start(
+            str(body.get("agent") or ""), str(body.get("action") or "")
+        )
+        return {"ok": True, "session": session}
+
+    def _api_agent_setup_input(self, params: Dict[str, list]) -> Dict[str, Any]:
+        body = self._read_body()
+        return {"ok": True, "session": self.app.setup.write(str(body.get("text") or ""))}
 
     def _api_usage_refresh(self, params: Dict[str, list]) -> Dict[str, Any]:
         self.app.usage.poll_once()
@@ -499,7 +726,7 @@ class Handler(BaseHTTPRequestHandler):
         task = body.get("task") or ""
         # No folder is a legitimate answer, in either mode: the pipeline runs
         # in the scratch workspace instead of refusing to start.
-        workspace = body.get("workspace") or self.app.store.get("workspace") or ""
+        workspace = self._workspace_from(body)
         continue_from = body.get("continue_from") or ""
         compact_context = body.get("compact_context", False)
         if not isinstance(continue_from, str):
@@ -515,6 +742,7 @@ class Handler(BaseHTTPRequestHandler):
             workspace,
             continue_from=continue_from,
             compact_context=compact_context,
+            incognito=self._incognito_from(body),
         )
         return {"ok": True, "run": run.to_dict()}
 
@@ -530,10 +758,40 @@ class Handler(BaseHTTPRequestHandler):
         self.app.pipeline.cancel()
         return {"ok": True}
 
+    def _api_resume(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Run the failed run's unfinished stages again, reusing the rest.
+
+        With no ``file`` this continues the run the engine is still holding.
+        With one it loads that transcript back first, which is the path after
+        the app has been restarted - the answers already paid for are on disk
+        either way.
+        """
+        name = str(self._read_body().get("file") or "")
+        pipeline = self.app.pipeline
+        run = pipeline.revive(name) if name else pipeline.resume()
+        return {"ok": True, "run": run.to_dict()}
+
+    def _api_retry(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Run one seat again, with whatever quoted it.
+
+        ``file`` loads a transcript back first, exactly as `/api/resume` does:
+        a seat whose answer is not good enough is worth replacing whether or
+        not the app has been restarted since it gave it.
+        """
+        body = self._read_body()
+        stage = str(body.get("stage") or "")
+        if not stage:
+            raise ValueError("Which stage should run again?")
+        name = str(body.get("file") or "")
+        pipeline = self.app.pipeline
+        if name:
+            pipeline.revive(name, start=False)
+        return {"ok": True, "run": pipeline.retry(stage).to_dict()}
+
     def _api_commit(self, params: Dict[str, list]) -> Dict[str, Any]:
         """Commit the working tree of the selected folder."""
         body = self._read_body()
-        workspace = str(body.get("workspace") or self.app.store.get("workspace") or "")
+        workspace = self._workspace_from(body)
         if not workspace:
             raise ValueError(
                 "No working folder is selected, so there is nothing to commit."
@@ -563,21 +821,37 @@ class Handler(BaseHTTPRequestHandler):
         state = self.app.projects.snapshot_state(workspace)
         state["ok"] = True
         # Which chairs can actually be filled. The matrix draws its dots from
-        # this, so a missing CLI is visible before the start button is pressed
-        # rather than in the error that refuses it.
-        providers = self.app.store.get("providers", {})
-        state["roles"] = probe_all(providers, projects.ROLES)
+        # this, so a chair the operator has not connected - or whose CLI is
+        # missing - is visible before the start button is pressed rather than
+        # in the error that refuses it.
+        # Carrying what each seat is for and which CLI belongs in it, so the
+        # matrix can say why a chair exists rather than only which binary is
+        # currently sitting in it.
+        state["roles"] = [
+            {**role, **cfg.PROJECT_SEATS.get(role["id"], {})}
+            for role in probe_all(self.app.store.all(), projects.ROLES)
+        ]
         state["settings"] = self.app.store.get("project", {})
         return state
 
     def _api_project_start(self, params: Dict[str, list]) -> Dict[str, Any]:
         body = self._read_body()
+        if self._incognito_from(body):
+            # Refused rather than ignored. A build's board, spec and critique
+            # log are the state it pauses, resumes and is audited from, so a
+            # project that kept none of them would not be a project - and a
+            # request quietly answered with the opposite of what it asked for
+            # is the one failure mode a privacy control cannot have.
+            raise ValueError(
+                "A project keeps its board and spec on disk, so it cannot run "
+                "incognito."
+            )
         # `innovation` is per-run, not a saved setting: it is the slider on the
         # initializer, and the answer to "how much may it invent this time" is
         # different for a throwaway prototype and somebody's production repo.
         project = self.app.projects.start(
             str(body.get("goal") or body.get("brief") or ""),
-            str(body.get("workspace") or self.app.store.get("workspace") or ""),
+            self._workspace_from(body),
             resume=bool(body.get("resume")),
             innovation=_opt_int(body.get("innovation")),
         )
@@ -597,6 +871,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_project_handoff(self, params: Dict[str, list]) -> Dict[str, Any]:
         self.app.projects.handoff(str(self._read_body().get("role") or ""))
+        return {"ok": True}
+
+    def _api_project_dismiss(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Close the report on a finished project so the tab offers a new one.
+
+        Server-side because the engine holds the project in memory and finds it
+        again in ``.theseus/BOARD.json``: clearing it in the browser alone lasts
+        until the next reload. Nothing on disk is deleted.
+        """
+        body = self._read_body()
+        self.app.projects.dismiss(str(body.get("workspace") or ""))
         return {"ok": True}
 
     def _api_project_file(self, params: Dict[str, list]) -> Dict[str, Any]:
@@ -638,6 +923,29 @@ class Handler(BaseHTTPRequestHandler):
             "path": str(readable[name]),
             "text": ws.read_text(readable[name], projects.MAX_UI_TEXT),
         }
+
+    def _api_council_route(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Who would be seated for this prompt, without spending a token on it.
+
+        The composer calls this as the operator types so the strip shows the
+        bench that would actually run. It is the same call `start()` makes, on
+        the same config, so what is previewed is what is seated - a preview
+        computed a second way would eventually disagree with the run.
+
+        The run id is deliberately not passed: it is what shuffles the
+        anonymous aliases, and a preview that reshuffled the letters on every
+        keystroke would be unreadable. The letters are assigned for real when
+        the run starts.
+        """
+        body = self._read_body()
+        task = str(body.get("task") or "")
+        # Incognito narrows the field to the CLIs that can be told not to save
+        # the conversation, so a preview that ignored it would show a bench the
+        # run would not seat.
+        seating = self.app.pipeline.seat_council(
+            task, self.app.store.all(), incognito=self._incognito_from(body)
+        )
+        return {"ok": True, "seating": seating.to_dict()}
 
     def _api_save_role(self, params: Dict[str, list]) -> Dict[str, Any]:
         """Create a role, or edit one - including a built-in."""
@@ -750,7 +1058,7 @@ def make_server(
 
     handler = type("BoundHandler", (Handler,), {"app": state})
     server = Server((host, chosen), handler)
-    url = f"http://{host}:{chosen}/?token={urllib.parse.quote(state.token)}"
+    url = f"http://{host}:{chosen}/?ticket={urllib.parse.quote(state.ticket)}"
     return server, state, url
 
 

@@ -21,6 +21,7 @@ Three kinds here, deliberately separated:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from aicouncil import gitutil  # noqa: E402
 from aicouncil.config import ConfigStore  # noqa: E402
 from aicouncil.events import EventBus  # noqa: E402
 from aicouncil.projects import (  # noqa: E402
@@ -112,6 +114,11 @@ class TestReportParsing(unittest.TestCase):
     def test_an_unfenced_trailing_object_is_read(self):
         report = parse_report('Done.\n{"status": "ok", "reasoning": "wrote it"}')
         self.assertEqual(report["reasoning"], "wrote it")
+
+    def test_a_reply_that_is_only_the_object_is_read(self):
+        # An agent told to end on a JSON block and nothing else sometimes
+        # sends exactly that, with no prose in front of it.
+        self.assertEqual(parse_report('{"status": "blocked"}')["status"], "blocked")
 
     def test_a_board_only_report_is_read(self):
         # A QA turn reports a build and nothing else; a reviewer reports
@@ -318,6 +325,52 @@ class TestBoardFile(unittest.TestCase):
         self.assertEqual(back.column(COL_IN_REVIEW)[0]["id"], "t1")
         self.assertEqual(back.column(COL_BACKLOG)[0]["kind"], KIND_BUG)
 
+    def test_the_acceptance_verdict_comes_back_with_the_board(self):
+        # A resumed project that forgets it was accepted would run the whole
+        # acceptance turn again; one that forgets it was *not* would skip it.
+        ws = Workspace(self.tmp)
+        ws.ensure()
+        original = Project(id="p1", goal="build it", workspace=str(self.tmp))
+        original.release_health = HEALTH_FAILING
+        original.needs_release = True
+        original.last_release_log = "it does not start"
+        ws.write_board(original.board_document())
+
+        back = Project.from_board(str(self.tmp), ws.read_board())
+        self.assertEqual(back.release_health, HEALTH_FAILING)
+        self.assertTrue(back.needs_release)
+        self.assertEqual(back.last_release_log, "it does not start")
+
+    def test_a_mangled_acceptance_resumes_as_unknown_never_passing(self):
+        back = Project.from_board(
+            str(self.tmp), {"release_health": "seemed fine to me"}
+        )
+        self.assertEqual(back.release_health, HEALTH_UNKNOWN)
+
+    def test_the_safety_snapshot_comes_back_with_the_board(self):
+        # The one piece of state whose loss cannot be repaired by running the
+        # project again: it points at the tree as it was before the first agent
+        # wrote anything.
+        ws = Workspace(self.tmp)
+        ws.ensure()
+        original = Project(id="p1", goal="build it", workspace=str(self.tmp))
+        original.snapshot = gitutil.Snapshot(
+            root=str(self.tmp), head="a" * 40, commit="b" * 40,
+            had_changes=True, ref="refs/ai-council/snapshots/p1",
+        )
+        ws.write_board(original.board_document())
+
+        back = Project.from_board(str(self.tmp), ws.read_board())
+        self.assertEqual(back.snapshot.commit, "b" * 40)
+        self.assertEqual(back.snapshot.ref, "refs/ai-council/snapshots/p1")
+        self.assertTrue(back.snapshot.had_changes)
+
+    def test_a_snapshot_with_no_commit_restores_nothing_and_is_read_as_absent(self):
+        back = Project.from_board(
+            str(self.tmp), {"snapshot": {"root": "/x", "head": "a" * 40}}
+        )
+        self.assertIsNone(back.snapshot)
+
     def test_a_mangled_health_resumes_as_unknown_never_passing(self):
         # The one field that must never fail open. A board somebody hand-edited
         # into nonsense resumes as unverified, not as green.
@@ -371,6 +424,38 @@ class TestExhaustionDetection(unittest.TestCase):
             self.assertFalse(
                 self.engine._looks_exhausted(self.result(stderr=text)), text
             )
+
+
+class TestChairDefaults(unittest.TestCase):
+    """Who sits where, out of the box.
+
+    Pinned by a test rather than left to a comment because the pairing is a
+    judgement about which agent is good at what, and the cost of getting it
+    wrong is an hour of unattended quota spent by the wrong CLI.
+    """
+
+    def test_the_three_chairs_are_claude_codex_and_antigravity(self):
+        from aicouncil import config as cfg
+
+        self.assertEqual(cfg.agent_for(cfg.DEFAULT_ARCHITECT), "claude")
+        self.assertEqual(cfg.agent_for(cfg.DEFAULT_CODER), "codex")
+        self.assertEqual(cfg.agent_for(cfg.DEFAULT_QA), "agy")
+
+    def test_every_seat_is_described_and_recommends_its_default(self):
+        from aicouncil import config as cfg
+
+        defaults = {
+            "architect": cfg.DEFAULT_ARCHITECT,
+            "coder": cfg.DEFAULT_CODER,
+            "qa": cfg.DEFAULT_QA,
+        }
+        self.assertEqual(sorted(cfg.PROJECT_SEATS), sorted(ROLES))
+        for role, seat in cfg.PROJECT_SEATS.items():
+            self.assertEqual(seat["recommended_agent"], cfg.agent_for(defaults[role]))
+            self.assertTrue(seat["summary"].strip())
+            # The probe result these are merged into carries the provider's
+            # own label, and a seat key of the same name would overwrite it.
+            self.assertNotIn("label", seat)
 
 
 class TestDecisionEngine(unittest.TestCase):
@@ -452,6 +537,26 @@ class TestDecisionEngine(unittest.TestCase):
         d = self.decide()
         self.assertEqual(d.tasks[0]["id"], "t2")
 
+    def test_a_clear_green_board_nobody_has_used_is_accepted_first(self):
+        # A green build is three commands exiting zero. Whether the thing that
+        # was built does what was asked is a different question, and it is the
+        # last one this loop gets to ask.
+        self.project.tasks = [card("t1", COL_DONE)]
+        self.project.build_health = HEALTH_PASSING
+        self.project.needs_release = True
+        self.project.innovation_rounds = 1
+        d = self.decide()
+        self.assertEqual((d.role, d.kind), ("qa", "release"))
+
+    def test_acceptance_outranks_innovation(self):
+        # Inventing more work before anyone has run what was asked for spends
+        # the budget on the wrong end of the project.
+        self.project.tasks = [card("t1", COL_DONE)]
+        self.project.build_health = HEALTH_PASSING
+        self.project.needs_release = True
+        self.project.innovation_rounds = 3
+        self.assertEqual(self.decide().kind, "release")
+
     def test_a_clear_green_board_innovates(self):
         self.project.tasks = [card("t1", COL_DONE)]
         self.project.build_health = HEALTH_PASSING
@@ -465,6 +570,17 @@ class TestDecisionEngine(unittest.TestCase):
         self.project.innovation_rounds = 0
         self.assertIsNone(self.decide())
 
+    def test_an_accepted_board_is_not_accepted_twice(self):
+        # The gate is a flag rather than a health check, so a run that used the
+        # application and found it wanting still finishes instead of asking the
+        # same question until the stall guard ends it.
+        self.project.tasks = [card("t1", COL_DONE)]
+        self.project.build_health = HEALTH_PASSING
+        self.project.release_health = HEALTH_FAILING
+        self.project.needs_release = False
+        self.project.innovation_rounds = 0
+        self.assertIsNone(self.decide())
+
     def test_endless_fixing_is_bounded(self):
         self.project.tasks = [card("t1")]
         self.project.build_health = HEALTH_FAILING
@@ -472,6 +588,124 @@ class TestDecisionEngine(unittest.TestCase):
         self.assertIsNone(self.decide())
         self.assertEqual(self.project.status, FAILED)
         self.assertIn("failed 3 times", self.project.error)
+
+    def test_giving_up_is_not_relabelled_as_finishing(self):
+        # Every "nothing left to schedule" looks the same to the loop, which
+        # reads it as success - so the run that gave up on a red build used to
+        # be overwritten by COMPLETED one line later. The first ending wins.
+        self.project.tasks = [card("t1")]
+        self.project.build_health = HEALTH_FAILING
+        self.project.fix_attempts = 3
+        self.assertIsNone(self.decide())
+        self.engine._complete(self.project)
+        self.assertEqual(self.project.status, FAILED)
+        self.assertIn("failed 3 times", self.project.error)
+        self.assertEqual(self.project.note, "")
+
+
+class TestCavemanModeInProjects(unittest.TestCase):
+    """Projects has its own switch, read live on every turn."""
+
+    MARK = "ULTRA-LOW TOKEN EFFICIENCY MODE"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="theseus-caveman-"))
+        self.store = ConfigStore(self.tmp / "config.json")
+        self.root = self.tmp / "build"
+        self.root.mkdir()
+        Workspace(self.root).ensure()
+        self.engine = ProjectEngine(self.store, EventBus())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def context(self):
+        project = Project(id="p1", goal="build it", workspace=str(self.root))
+        project.config = self.store.all()
+        return self.engine._context(project, "coder")
+
+    def test_a_turn_says_nothing_about_style_by_default(self):
+        self.assertNotIn(self.MARK, self.context())
+
+    def test_switching_it_on_reaches_every_project_turn(self):
+        self.store.update({"caveman": {"project": True}})
+        self.assertIn(self.MARK, self.context())
+
+    def test_the_councils_switch_does_not_move_projects(self):
+        # Three switches, not one with three labels.
+        self.store.update({"caveman": {"council": True, "project": False}})
+        self.assertNotIn(self.MARK, self.context())
+
+
+class TestEfficiencyModeInProjects(unittest.TestCase):
+    """Projects reads its independent Efficiency switch, live, on every turn."""
+
+    MARK = "[SYSTEM INSTRUCTION: EFFICIENCY MODE]"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="theseus-efficiency-"))
+        self.store = ConfigStore(self.tmp / "config.json")
+        self.root = self.tmp / "build"
+        self.root.mkdir()
+        Workspace(self.root).ensure()
+        self.engine = ProjectEngine(self.store, EventBus())
+
+    def tearDown(self):
+        self.engine.stop()
+        self.engine.wait_for_worker(30)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def context(self):
+        project = Project(id="p1", goal="build it", workspace=str(self.root))
+        project.config = self.store.all()
+        return self.engine._context(project, "coder")
+
+    def test_a_turn_says_nothing_about_efficiency_by_default(self):
+        self.assertNotIn(self.MARK, self.context())
+
+    def test_switching_it_on_reaches_every_project_turn(self):
+        self.store.update({"efficiency": {"project": True}})
+        for role in ROLES:
+            with self.subTest(role=role):
+                project = Project(id="p1", goal="g", workspace=str(self.root))
+                project.config = self.store.all()
+                self.assertIn(self.MARK, self.engine._context(project, role))
+
+    def test_chat_switch_does_not_change_projects(self):
+        self.store.update({
+            "efficiency": {"chat": True, "project": False},
+        })
+        self.assertNotIn(self.MARK, self.context())
+
+    def test_switching_it_on_mid_project_reaches_the_next_turn(self):
+        # The gear that sets this sits in the tracker header of a *running*
+        # project, and `start()` pins a deep copy of the config onto it. Read
+        # off that snapshot the tick came on and nothing else did, for every
+        # remaining turn of a run that can last hours.
+        self.store.update({"providers": {r: mock_provider(r) for r in ROLES}})
+        project = self.engine.start("build it", str(self.root))
+        self.engine.stop()
+        self.engine.wait_for_worker(30)
+
+        self.assertNotIn(self.MARK, self.engine._context(project, "coder"))
+        self.store.update({"efficiency": {"project": True}})
+        self.assertIn(self.MARK, self.engine._context(project, "coder"))
+
+    def test_the_rest_of_the_config_stays_frozen_at_start(self):
+        # Only the style switches are live. Changing the CLI or the house rules
+        # halfway through is a different run, not a restyled one.
+        self.store.update({
+            "providers": {r: mock_provider(r) for r in ROLES},
+            "house_rules": "Original rules.",
+        })
+        project = self.engine.start("build it", str(self.root))
+        self.engine.stop()
+        self.engine.wait_for_worker(30)
+
+        self.store.update({"house_rules": "Replaced mid-run."})
+        context = self.engine._context(project, "coder")
+        self.assertIn("Original rules.", context)
+        self.assertNotIn("Replaced mid-run.", context)
 
 
 class TestApplyingReports(unittest.TestCase):
@@ -490,10 +724,12 @@ class TestApplyingReports(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def step(self, role="qa", ok=True) -> StepRecord:
+    def step(self, role="qa", ok=True, reported="", files=()) -> StepRecord:
         s = StepRecord(index=1, role=role, label="stub", heading="h", trigger="t")
         s.ok = ok
         s.error = "" if ok else "Exited with status 1."
+        s.reported_status = reported
+        s.files_modified = list(files)
         return s
 
     # -- verification is fail-closed ---------------------------------------
@@ -513,6 +749,27 @@ class TestApplyingReports(unittest.TestCase):
         self.engine._apply_verify(self.project, None, self.step(), {})
         self.assertEqual(self.project.build_health, HEALTH_FAILING)
         self.assertIn("without reporting a build status", self.project.last_build_log)
+
+    def test_a_verification_that_never_ran_is_not_a_failing_build(self):
+        # The other half of fail-closed, and the half that used to be wrong: a
+        # QA turn that crashed has tested nothing. Recording it as FAILING
+        # hands the developer the app's own error message to fix, which it
+        # cannot, and spends the whole fix budget finding that out.
+        self.project.needs_verification = True
+        self.engine._apply_verify(self.project, None, self.step(ok=False), {})
+        self.assertEqual(self.project.build_health, HEALTH_UNKNOWN)
+        self.assertTrue(self.project.needs_verification)
+        self.assertEqual(self.project.last_build_log, "")
+
+    def test_a_crashed_verification_that_still_reported_is_taken_at_its_word(self):
+        # Partial output is output. If the trace made it out before the CLI
+        # fell over, that trace is a real build failure.
+        self.engine._apply_verify(
+            self.project, None, self.step(ok=False),
+            {"build": {"health": "FAILING", "log": "3 tests failed"}},
+        )
+        self.assertEqual(self.project.build_health, HEALTH_FAILING)
+        self.assertIn("3 tests failed", self.project.last_build_log)
 
     def test_an_unrecognised_verdict_is_failing(self):
         self.engine._apply_verify(
@@ -535,6 +792,55 @@ class TestApplyingReports(unittest.TestCase):
         )
         self.assertEqual(self.project.column(COL_BACKLOG)[0]["kind"], KIND_BUG)
 
+    # -- acceptance is fail-closed too -------------------------------------
+
+    def test_an_accepted_application_is_recorded_as_such(self):
+        self.project.needs_release = True
+        self.engine._apply_release(
+            self.project, None, self.step(),
+            {"acceptance": {"health": "PASSING", "log": "ran it, it served"}},
+        )
+        self.assertEqual(self.project.release_health, HEALTH_PASSING)
+        self.assertFalse(self.project.needs_release)
+        self.assertIn("it served", self.project.last_release_log)
+
+    def test_an_acceptance_turn_that_says_nothing_is_not_a_pass(self):
+        # The last gate before COMPLETED. A silent turn here is the one that
+        # would let a project that has never been started call itself finished.
+        self.project.needs_release = True
+        self.engine._apply_release(self.project, None, self.step(), {})
+        self.assertEqual(self.project.release_health, HEALTH_FAILING)
+        self.assertFalse(self.project.needs_release)
+        self.assertIn("without saying whether", self.project.last_release_log)
+
+    def test_an_acceptance_turn_that_never_ran_leaves_it_unaccepted(self):
+        # Same distinction the verification turn makes: a CLI that fell over
+        # used nothing, and recording that as a broken application would hand
+        # the developer the app's own crash to fix.
+        self.project.needs_release = True
+        self.engine._apply_release(self.project, None, self.step(ok=False), {})
+        self.assertEqual(self.project.release_health, HEALTH_UNKNOWN)
+        self.assertTrue(self.project.needs_release)
+        self.assertEqual(self.project.last_release_log, "")
+
+    def test_what_acceptance_finds_comes_back_as_bugs(self):
+        self.project.needs_release = True
+        self.engine._apply_release(
+            self.project, None, self.step(),
+            {"acceptance": {"health": "FAILING", "log": "start crashes"},
+             "tasks": [{"id": "b1", "title": "crashes on start", "kind": "bug"}]},
+        )
+        self.assertEqual(self.project.column(COL_BACKLOG)[0]["kind"], KIND_BUG)
+
+    def test_acceptance_is_written_to_the_critique_log(self):
+        self.engine._apply_release(
+            self.project, None, self.step(),
+            {"acceptance": {"health": "PASSING", "log": "opened it, used it"}},
+        )
+        self.assertIn(
+            "Acceptance by", Workspace(self.root).critique_path.read_text("utf-8")
+        )
+
     # -- writing code invalidates a green build ----------------------------
 
     def test_writing_code_makes_the_build_unverified_again(self):
@@ -545,6 +851,29 @@ class TestApplyingReports(unittest.TestCase):
             self.step("coder"), {"files_modified": ["a.py"]},
         )
         self.assertEqual(self.project.build_health, HEALTH_UNKNOWN)
+        self.assertTrue(self.project.needs_verification)
+
+    def test_writing_code_makes_the_application_unaccepted_again(self):
+        # An application that worked two cards ago has not been used since.
+        self.project.release_health = HEALTH_PASSING
+        self.project.tasks = [card("t1", COL_IN_PROGRESS)]
+        self.engine._apply_implement(
+            self.project, _decision([card("t1", COL_IN_PROGRESS)]),
+            self.step("coder"), {"files_modified": ["a.py"]},
+        )
+        self.assertEqual(self.project.release_health, HEALTH_UNKNOWN)
+        self.assertTrue(self.project.needs_release)
+
+    def test_an_acceptance_turn_that_wrote_a_test_reopens_its_own_verdict(self):
+        # QA carries a write grant like every turn after the audit. If it wrote
+        # the end-to-end test it used, the tree it just accepted is not the one
+        # on disk any more.
+        self.engine._apply_release(
+            self.project, None, self.step(files=["e2e/test_start.py"]),
+            {"acceptance": {"health": "PASSING"}},
+        )
+        self.assertEqual(self.project.release_health, HEALTH_UNKNOWN)
+        self.assertTrue(self.project.needs_release)
         self.assertTrue(self.project.needs_verification)
 
     def test_a_clean_implement_turn_puts_its_card_up_for_review(self):
@@ -562,6 +891,32 @@ class TestApplyingReports(unittest.TestCase):
             self.step("coder", ok=False), {},
         )
         self.assertEqual(self.project.column(COL_IN_PROGRESS)[0]["id"], "t1")
+
+    def test_a_developer_that_says_it_is_blocked_keeps_its_card(self):
+        # Exit zero is not the same as done. The contract asks for `blocked`
+        # when an agent could not proceed, and sending that card to review
+        # asks the architect to read a diff that was never written.
+        self.project.build_health = HEALTH_PASSING
+        self.project.tasks = [card("t1", COL_IN_PROGRESS)]
+        self.engine._apply_implement(
+            self.project, _decision([card("t1", COL_IN_PROGRESS)]),
+            self.step("coder", reported="blocked"), {"status": "blocked"},
+        )
+        self.assertEqual(self.project.column(COL_IN_PROGRESS)[0]["id"], "t1")
+        # Nothing was written, so nothing needs retesting either.
+        self.assertEqual(self.project.build_health, HEALTH_PASSING)
+        self.assertFalse(self.project.needs_verification)
+
+    def test_a_blocked_turn_that_still_wrote_files_invalidates_the_build(self):
+        self.project.build_health = HEALTH_PASSING
+        self.project.tasks = [card("t1", COL_IN_PROGRESS)]
+        self.engine._apply_implement(
+            self.project, _decision([card("t1", COL_IN_PROGRESS)]),
+            self.step("coder", reported="blocked", files=["a.py"]),
+            {"status": "blocked"},
+        )
+        self.assertEqual(self.project.build_health, HEALTH_UNKNOWN)
+        self.assertTrue(self.project.needs_verification)
 
     # -- review --------------------------------------------------------------
 
@@ -584,6 +939,34 @@ class TestApplyingReports(unittest.TestCase):
         back = self.project.column(COL_BACKLOG)[0]
         self.assertEqual(back["id"], "t1")
         self.assertEqual(back["note"], "stubbed out")
+
+    def test_bouncing_a_card_does_not_retest_an_untouched_tree(self):
+        # A review moves cards; it does not write code. Marking the build
+        # unverified here spends a QA turn rebuilding a tree nothing has
+        # touched since it last passed - once per bounced card, before the
+        # developer has changed a line.
+        self.project.build_health = HEALTH_PASSING
+        self.project.tasks = [card("t1", COL_IN_REVIEW)]
+        self.engine._apply_review(
+            self.project, _decision([card("t1", COL_IN_REVIEW)]),
+            self.step("architect"),
+            {"reviews": [{"id": "t1", "verdict": "changes", "note": "no tests"}]},
+        )
+        self.assertEqual(self.project.column(COL_BACKLOG)[0]["id"], "t1")
+        self.assertEqual(self.project.build_health, HEALTH_PASSING)
+        self.assertFalse(self.project.needs_verification)
+
+    def test_a_reviewer_that_edited_something_does_invalidate_the_build(self):
+        # It can: every turn after the audit carries its CLI's write grant.
+        self.project.build_health = HEALTH_PASSING
+        self.project.tasks = [card("t1", COL_IN_REVIEW)]
+        self.engine._apply_review(
+            self.project, _decision([card("t1", COL_IN_REVIEW)]),
+            self.step("architect", files=["greeter.py"]),
+            {"reviews": [{"id": "t1", "verdict": "approve"}]},
+        )
+        self.assertEqual(self.project.build_health, HEALTH_UNKNOWN)
+        self.assertTrue(self.project.needs_verification)
 
     def test_a_card_with_no_verdict_stays_in_review(self):
         # Not approved by default. An unreviewed card sitting in review shows
@@ -728,6 +1111,22 @@ class TestHandOff(unittest.TestCase):
         # think it is still mid-continuation.
         self.assertFalse(self.project.continuation_needed)
 
+    def test_a_chair_running_the_same_cli_is_not_a_spare_chair(self):
+        # A hand-off exists to reach an agent with room left in it. Putting one
+        # CLI in two seats is allowed, but the second seat is the same agent
+        # under another name - handing it the same oversized prompt only
+        # spends another turn learning that.
+        providers = self.store.get("providers", {})
+        providers["qa"] = {**mock_provider("qa"), "command": providers["coder"]["command"]}
+        self.store.update({"providers": providers})
+        self.project.config = self.store.all()
+        self.stub_invokes([
+            self.result(ok=False, stderr="context window exceeded"),
+            self.result(ok=False, stderr="context window exceeded"),
+        ])
+        self.engine._run_role(self.project, self.decision("coder"))
+        self.assertEqual(self.ran, ["coder", "architect"])
+
     def test_an_ordinary_failure_is_not_handed_off(self):
         # A compile error is the agent's answer, not its exhaustion. Retrying
         # it on a different CLI would just spend a second agent's quota.
@@ -785,6 +1184,16 @@ class TestPreflight(unittest.TestCase):
         self.assertIn("QA", str(ctx.exception))
         self.assertIn("definitely-not-installed", str(ctx.exception))
 
+    def test_a_chair_on_an_agent_nobody_added_is_refused_by_name(self):
+        # As unfillable as a missing binary, and for a reason the operator can
+        # act on: the CLI is there, they just have not added it. A project runs
+        # unattended, so it will not start on a seat it cannot fill.
+        self.store.update({"providers": {"qa": {"enabled": False}}})
+        with self.assertRaises(ValueError) as ctx:
+            self.engine.start("build it", str(self.root))
+        self.assertIn("QA", str(ctx.exception))
+        self.assertIn("not connected", str(ctx.exception))
+
     def test_a_council_run_blocks_a_project(self):
         def busy():
             raise RuntimeError("A run is in progress.")
@@ -813,6 +1222,60 @@ class TestPreflight(unittest.TestCase):
         project = self.engine.start("build something else", str(self.root))
         self.assertNotEqual(project.id, "abc")
         self.engine.stop()
+
+    def test_a_run_that_hit_a_limit_resumes_with_its_budget_cleared(self):
+        # The bounds exist so an unattended loop stops; resuming is what makes
+        # them cheap. Leaving the counter that ended the run at its limit would
+        # end the resumed run on its first decision, for a reason it has
+        # already reported.
+        ws = Workspace(self.root)
+        ws.ensure()
+        ws.write_board({
+            "project_id": "abc", "goal": "build it", "status": FAILED,
+            "fix_attempts": 3, "build_health": HEALTH_FAILING,
+            "error": "The build has failed 3 times in a row",
+            "columns": {COL_BACKLOG: [{"id": "t1", "title": "finish it"}]},
+        })
+        project = self.engine.start("", str(self.root), resume=True)
+        self.assertEqual(project.id, "abc")
+        self.assertEqual(project.fix_attempts, 0)
+        self.assertEqual(project.error, "")
+        self.assertNotIn(project.status, (COMPLETED, FAILED))
+        self.engine.stop()
+
+    def test_a_completed_project_is_not_resumed(self):
+        ws = Workspace(self.root)
+        ws.ensure()
+        ws.write_board({"project_id": "abc", "goal": "g", "status": COMPLETED})
+        with self.assertRaises(ValueError) as ctx:
+            self.engine.start("", str(self.root), resume=True)
+        self.assertIn("already finished", str(ctx.exception))
+
+    def test_a_resumed_project_keeps_the_snapshot_it_started_with(self):
+        # Retaking it here would anchor the half-built codebase and quietly
+        # replace the only thing a rollback could restore.
+        taken = []
+        self.engine._take_snapshot = lambda p: taken.append(p)
+        Workspace(self.root).ensure()
+        project = Project(id="abc", goal="g", workspace=str(self.root))
+        project.config = self.store.all()
+        project.snapshot = gitutil.Snapshot(
+            root=str(self.root), head="a" * 40, commit="b" * 40,
+        )
+        self.engine._stop.set()
+        self.engine._execute(project)
+        self.assertEqual(taken, [])
+        self.assertEqual(project.snapshot.commit, "b" * 40)
+
+    def test_a_fresh_project_takes_one(self):
+        taken = []
+        self.engine._take_snapshot = lambda p: taken.append(p)
+        Workspace(self.root).ensure()
+        project = Project(id="abc", goal="g", workspace=str(self.root))
+        project.config = self.store.all()
+        self.engine._stop.set()
+        self.engine._execute(project)
+        self.assertEqual(len(taken), 1)
 
     def test_the_innovation_slider_overrides_the_setting(self):
         self.store.update({"project": {"innovation_rounds": 2}})
@@ -902,6 +1365,13 @@ class TestTheLoop(unittest.TestCase):
         # from a full budget rather than from a spent one.
         self.assertEqual(project.fix_attempts, 0)
 
+        # The board went clear and somebody then used what was built - the
+        # mock really imports the module and calls it, so this is the module
+        # working rather than its own test suite passing a second time.
+        self.assertIn("board clear, unaccepted", triggers)
+        self.assertEqual(project.release_health, HEALTH_PASSING)
+        self.assertIn("greet", project.last_release_log)
+
         # Every card reached Done, including the one nobody asked for.
         self.assertEqual(project.column(COL_BACKLOG), [])
         self.assertEqual(project.column(COL_IN_REVIEW), [])
@@ -940,6 +1410,7 @@ class TestTheLoop(unittest.TestCase):
         text = Workspace(self.root).critique()
         self.assertIn("Verification", text)
         self.assertIn("FAILING", text)
+        self.assertIn("Acceptance", text)
 
     def test_events_narrate_the_run(self):
         q = self.bus.subscribe()
@@ -1004,12 +1475,21 @@ class TestSnapshotState(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="theseus-snap-"))
+        # "No folder" resolves to `cfg.workspace_dir()`, which is read live -
+        # so it has to land somewhere disposable rather than in the operator's
+        # own scratch workspace.
+        self._previous_xdg = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = str(self.tmp / "xdg")
         self.store = ConfigStore(self.tmp / "config.json")
         self.root = self.tmp / "build"
         self.root.mkdir()
         self.engine = ProjectEngine(self.store, EventBus())
 
     def tearDown(self):
+        if self._previous_xdg is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = self._previous_xdg
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_an_empty_folder_offers_nothing(self):
@@ -1038,6 +1518,34 @@ class TestSnapshotState(unittest.TestCase):
         state = self.engine.snapshot_state(str(self.root))
         self.assertFalse(state["resumable"])
 
+    def test_a_dismissed_project_is_not_offered_again(self):
+        ws = Workspace(self.root)
+        ws.ensure()
+        project = Project(id="abc", goal="build it", workspace=str(self.root))
+        project.status = COMPLETED
+        self.engine._project = project
+
+        self.engine.dismiss(str(self.root))
+        # Both copies: the one in memory, and the board it would be found in
+        # again on the next reload.
+        self.assertIsNone(self.engine.snapshot_state(str(self.root))["project"])
+        self.assertTrue(ws.read_board()["dismissed"])
+
+    def test_a_board_left_on_disk_can_be_dismissed_without_being_in_memory(self):
+        ws = Workspace(self.root)
+        ws.ensure()
+        ws.write_board({"project_id": "abc", "goal": "g", "status": COMPLETED})
+        self.engine.dismiss(str(self.root))
+        self.assertIsNone(self.engine.snapshot_state(str(self.root))["project"])
+
+    def test_a_run_that_hit_a_limit_is_still_resumable(self):
+        # Everything it built is on disk and the board says where it got to.
+        # Only COMPLETED means there is nothing left to schedule.
+        ws = Workspace(self.root)
+        ws.ensure()
+        ws.write_board({"project_id": "abc", "goal": "g", "status": FAILED})
+        self.assertTrue(self.engine.snapshot_state(str(self.root))["resumable"])
+
     def test_a_finished_project_does_not_follow_you_to_another_folder(self):
         # A completed run stays in memory, but asked about a different folder
         # this must report *that* folder rather than the last thing it built.
@@ -1049,6 +1557,69 @@ class TestSnapshotState(unittest.TestCase):
 
         state = self.engine.snapshot_state(str(other))
         self.assertIsNone(state["project"])
+
+    def test_no_folder_finds_the_project_that_was_built_with_no_folder(self):
+        # Blank is the scratch workspace, not "nowhere to look". Read as no
+        # query at all, a build started without a folder could not be found
+        # again after a restart - and starting another one refused, because the
+        # board it could not see was still in progress.
+        from aicouncil import config as cfg
+
+        scratch = Path(cfg.workspace_dir())
+        ws = Workspace(scratch)
+        ws.ensure()
+        ws.write_board({"project_id": "abc", "goal": "g", "status": "IMPLEMENTING"})
+
+        state = self.engine.snapshot_state("")
+        self.assertTrue(state["found_on_disk"])
+        self.assertTrue(state["resumable"])
+        self.assertEqual(state["project"]["workspace"], str(scratch))
+
+    def test_a_finished_project_does_not_follow_you_to_no_folder(self):
+        # Clearing the folder is choosing one. The last build stays on screen
+        # otherwise, and the tab reports a project the status bar does not name.
+        finished = Project(id="abc", goal="g", workspace=str(self.root))
+        finished.status = COMPLETED
+        self.engine._project = finished
+
+        self.assertIsNone(self.engine.snapshot_state("")["project"])
+
+
+class TestNoFolderProject(unittest.TestCase):
+    """Building with nothing chosen. The scratch workspace is a place to work,
+    not a folder the operator picked."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="theseus-noscratch-"))
+        self._previous_xdg = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = str(self.tmp / "xdg")
+        self.store = ConfigStore(self.tmp / "config.json")
+        self.store.update({"providers": {r: mock_provider(r) for r in ROLES}})
+        self.engine = ProjectEngine(self.store, EventBus())
+
+    def tearDown(self):
+        self.engine.stop()
+        self.engine.wait_for_worker(30)
+        if self._previous_xdg is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = self._previous_xdg
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_it_builds_in_the_scratch_workspace(self):
+        from aicouncil import config as cfg
+
+        project = self.engine.start("build it", "")
+        self.assertEqual(project.workspace, str(cfg.workspace_dir()))
+
+    def test_the_scratch_workspace_is_not_remembered_as_a_choice(self):
+        # The line the council pipeline has drawn since scratch runs existed:
+        # answering "no folder" by selecting one - an internal path, in the
+        # picker and in the recents list - undoes the operator's choice behind
+        # their back, and the next run silently writes there.
+        self.engine.start("build it", "")
+        self.assertEqual(self.store.get("workspace"), "")
+        self.assertEqual(self.store.get("recent_workspaces"), [])
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""The Junior Draft / Senior Polish orchestration engine.
+"""The deliberating council orchestration engine.
 
 Two modes, and they share only their start: Council is the pipeline below,
 Solo is one assistant answering one message.
@@ -9,16 +9,23 @@ State machine (Council)
     idle
       |  start()
       v
-    drafting
+    deliberating             (members answer independently, read-only)
+      |
+      v
+    critiquing                (members review each other, anonymised)
       |
       v
     awaiting_approval       (skipped in Zero-Touch Mode)
       |  approve()      \\  reject() / cancel()
       v                  v
-    polishing --------> cancelled
+    synthesizing ------> cancelled
       |
       +--> complete  (exit 0)
       +--> failed    (non-zero exit, timeout, or an unhandled error)
+
+A run that predates this three-stage rewrite may still report the two-stage
+``drafting`` / ``polishing`` states it was written in; those constants are
+kept only so an old transcript's status pill still resolves to a label.
 
 State machine (Solo)
 --------------------
@@ -42,8 +49,9 @@ permission has been granted, and is invoked with its ``read_only_args``
 everywhere else. The two modes differ only in who can grant it.
 
 * **Council** can always be granted it. Zero-Touch Mode grants it up front;
-  otherwise a human grants it at the gate. Stage 1 is read-only by role and
-  never receives it either way; Stage 2 carries it in ``execute_approved``.
+  otherwise a human grants it at the gate. The deliberating and critiquing
+  stages are read-only by role and never receive it either way; only the
+  chairman carries it, in ``execute_approved``.
 * **Solo** has no gate, so Zero-Touch is the only thing that can grant it.
   Without Zero-Touch the conversation is read-only, which is the default and
   what makes "what does this repo do?" safe to ask.
@@ -71,18 +79,30 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from . import config as cfg
-from . import gitutil, prompts
+from . import gitutil, prompts, router
 from .events import EventBus
-from .providers import ProviderResult, ProviderRunner, probe_all
+from .providers import (
+    ProviderResult,
+    ProviderRunner,
+    probe_all,
+    resolve_binary,
+    supports_incognito,
+)
 
 # Pipeline states
 IDLE = "idle"
+# The deliberating council's three stages.
+DELIBERATING = "deliberating"   # Stage 1: members answer independently
+CRITIQUING = "critiquing"       # Stage 2: members review each other, anonymised
+SYNTHESIZING = "synthesizing"   # Stage 3: the chairman decides and applies
+# The two-stage council these replaced. No longer entered, and kept only so a
+# transcript written before the rewrite still reports a state the UI can label.
 DRAFTING = "drafting"
-AWAITING_APPROVAL = "awaiting_approval"
 POLISHING = "polishing"
+AWAITING_APPROVAL = "awaiting_approval"
 # Solo's only working state. Its own rather than a reused POLISHING: nothing
 # is being polished, and a state name that lies shows up in the status pill.
 RUNNING = "running"
@@ -104,6 +124,13 @@ MAX_TURN_CHARS = 12_000
 # keeps opening the sidebar cheap for someone with a year of runs on disk.
 HISTORY_SCAN_LIMIT = 200
 
+# How many incognito transcripts are held in memory. They are what lets a
+# private thread be continued while the app is open, and they are the one thing
+# in this engine that nothing on disk will ever clean up - so the oldest is
+# dropped rather than kept forever. Continuing the conversation on screen only
+# ever needs the newest.
+VOLATILE_RUN_LIMIT = 20
+
 # How much of the senior stage's own summary is quoted into the pull request
 # body. It is the description a reviewer reads first, but it is not the review
 # itself - the diff is.
@@ -111,6 +138,124 @@ MAX_PR_BODY_CHARS = 8_000
 # Git's own convention for a commit subject, and what GitHub shows before it
 # starts eliding a pull-request title.
 MAX_PR_TITLE_CHARS = 72
+
+# How long a degraded Zero-Touch run waits at the gate it did not ask for.
+# Zero-Touch means nobody is at the keyboard, so the gate that a failed
+# deliberation forces on has nobody to answer it; without a bound the worker
+# thread parks forever and the engine refuses every later run. Overridable per
+# install as ``council.gate_timeout_seconds``.
+DEFAULT_GATE_TIMEOUT = 3600.0
+
+
+def chat_stage_id(agent: str) -> str:
+    """The stage id one CLI answers a multi-agent Chat turn under.
+
+    Distinct from the council seat ids on purpose. Both read the same per-CLI
+    configuration, but a transcript has to say which of the two a stage was:
+    a council member was anonymised, critiqued and weighed, and one of three
+    Chat answers was none of those things.
+    """
+    return f"chat_{agent}"
+
+
+# Stage states that a continuation would have to run: it failed, or the run
+# never got to it.
+UNFINISHED_STATES = ("failed", "pending", "running")
+
+
+def _with_resumability(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Answer "can this transcript be continued?" for a run read off disk.
+
+    Recomputed on load rather than trusted from the file, because the answer is
+    a property of the stages and the file may predate the question being asked.
+    Every transcript written before Continue existed carries a failed chairman
+    and six paid-for answers and no `can_resume` key at all - reading the key
+    would tell the operator those are unusable, which is exactly backwards.
+    """
+    stages = data.get("stages") or {}
+    order = [s for s in (data.get("stage_order") or list(stages)) if s in stages]
+    unfinished = [
+        sid for sid in order
+        if str((stages.get(sid) or {}).get("state") or "") in UNFINISHED_STATES
+    ]
+    data["unfinished_stages"] = unfinished
+    data["can_resume"] = data.get("state") == FAILED and bool(unfinished)
+    # And the same for running one seat again, for the same reason: a
+    # transcript written before the question existed still has to answer it, or
+    # every archived run reads as one nothing can be done with.
+    kinds = {sid: str((stages.get(sid) or {}).get("kind") or "") for sid in order}
+    solo = bool(data.get("solo")) or str(data.get("mode") or "") == "solo"
+    data["retry_plan"] = (
+        {
+            sid: [sid, *_dependent_ids(kinds, order, solo, sid)]
+            for sid in order
+        }
+        if str(data.get("state") or "") in TERMINAL_STATES
+        else {}
+    )
+    return data
+
+
+def _dependent_ids(
+    kinds: Dict[str, str], order: List[str], solo: bool, stage_id: str
+) -> List[str]:
+    """`dependent_stages`, expressed over ids and kinds alone.
+
+    Taken apart from the `Run` so a transcript read off disk gets the same
+    answer as the run in memory: the question "what would re-running this
+    cost?" is asked of archived runs too, and two implementations of it would
+    eventually disagree.
+    """
+    kind = kinds.get(stage_id)
+    if kind is None or solo:
+        return []
+
+    after: List[str] = []
+    if kind == "position":
+        # Every critique, not just this seat's own: the others quoted it.
+        after = [sid for sid in order if kinds.get(sid) == "critique"]
+    if kind in ("position", "critique") and "chair" in kinds:
+        # The chairman reads all of it, so it follows any council stage.
+        after.append("chair")
+    return [sid for sid in after if sid != stage_id]
+
+
+def dependent_stages(run: "Run", stage_id: str) -> List[str]:
+    """The stages that quoted ``stage_id`` and so cannot outlive a new answer.
+
+    The council is not three independent rounds; each one is built out of the
+    last. A member's position is quoted verbatim into every *other* member's
+    critique - each seat reviews its peers - and every position and critique is
+    quoted into the chairman's prompt. So replacing one answer invalidates
+    everything downstream of it, and the honest cost of re-running a member is
+    the critiques and the verdict as well.
+
+    The alternative - re-run the seat and keep the reviews - reads fine in the
+    UI and is a lie in the transcript: peers would appear to have reviewed an
+    answer that was not there when they wrote, and the chairman would appear to
+    have weighed one it never saw.
+
+    Chat has no downstream: each CLI answers the message on its own.
+    """
+    return _dependent_ids(
+        {sid: stage.kind for sid, stage in run.stages.items()},
+        run.stage_order,
+        run.solo,
+        stage_id,
+    )
+
+
+def stage_succeeded(result: ProviderResult) -> bool:
+    """Whether a stage actually produced something, not merely exited zero.
+
+    A CLI that hits its own quota wall, refuses a sandbox or dies inside its
+    own harness can still exit 0 with an empty stdout - one of the three
+    catalogued agents does exactly that. Counted as success it costs twice
+    over: the seat is dropped from the deliberation, because there is no answer
+    to carry, while the transcript shows it green and the router is told the
+    agent did fine.
+    """
+    return bool(result.ok and result.stdout.strip())
 
 
 def resolve_workspace(folder: str) -> str:
@@ -220,14 +365,24 @@ def _pull_request_text(run: Run) -> Tuple[str, str]:
     if len(task) > MAX_PR_TITLE_CHARS:
         title = title.rsplit(" ", 1)[0] + "..."
 
-    stage = run.stages.get("polisher")
+    # The chairman's own account, falling back to the stage the two-stage
+    # council used to write with so an archived run still describes itself.
+    stage = run.stages.get("chair") or run.stages.get("polisher")
     summary = prompts.clip((stage.output if stage else "").strip(), MAX_PR_BODY_CHARS)
 
     lines = [f"**Task**\n\n{task}", ""]
     if run.reviewer_note:
         lines += [f"**Reviewer note at the approval gate**\n\n{run.reviewer_note}", ""]
+    if run.seating:
+        bench = ", ".join(
+            f"{s.agent} as {s.alias}" for s in run.seating.members
+        )
+        lines += [
+            f"**Council**\n\n{bench}; chaired by {run.seating.chair.agent}.",
+            "",
+        ]
     if summary:
-        lines += ["**What the senior stage reported**", "", summary, ""]
+        lines += ["**What the chairman reported**", "", summary, ""]
     lines += [
         "---",
         "",
@@ -253,6 +408,25 @@ class StageRecord:
     exit_code: Optional[int] = None
     model: str = ""  # "" means the CLI's own default was used
     effort: str = ""  # reasoning depth; "" means the CLI's own default
+    # -- council seating ---------------------------------------------------
+    # Which seat this record belongs to, and which of that seat's two turns it
+    # is. `kind` is "position" | "critique" | "chair" | "solo" | "legacy".
+    seat: str = ""
+    kind: str = "legacy"
+    agent: str = ""   # catalogued CLI: codex | claude | agy | custom
+    alias: str = ""   # the anonymous name peers saw this seat under
+    persona: str = ""
+    # What this agent said about its own confidence, 0-100, and why. None means
+    # it did not say - which is a real outcome and is displayed as such. This
+    # app never fills the gap with a figure of its own; see prompts.py.
+    confidence: Optional[int] = None
+    because: str = ""
+    # How far the chairman judged the members to have agreed, 0-100. Only the
+    # chair states one. Carried on the stage as well as on the run because the
+    # verdict card renders from the stage, and a chip that had to reach across
+    # to the run for one of its two figures would go missing exactly where the
+    # two are meant to be read together.
+    consensus: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -271,7 +445,46 @@ class StageRecord:
             "exit_code": self.exit_code,
             "model": self.model,
             "effort": self.effort,
+            "seat": self.seat,
+            "kind": self.kind,
+            "agent": self.agent,
+            "alias": self.alias,
+            "persona": self.persona,
+            "confidence": self.confidence,
+            "because": self.because,
+            "consensus": self.consensus,
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "StageRecord":
+        """Rebuild a stage record from a persisted transcript.
+
+        Only the fields a resumed run has to know about: what this stage is,
+        whether it got an answer, and the answer itself. `duration` is derived
+        on the way out and is not read back.
+        """
+        return cls(
+            id=str(data.get("id") or ""),
+            label=str(data.get("label") or ""),
+            role=str(data.get("role") or ""),
+            state=str(data.get("state") or "pending"),
+            started_at=float(data.get("started_at") or 0.0),
+            ended_at=float(data.get("ended_at") or 0.0),
+            output=str(data.get("output") or ""),
+            error=str(data.get("error") or ""),
+            command=list(data.get("command") or []),
+            exit_code=data.get("exit_code"),
+            model=str(data.get("model") or ""),
+            effort=str(data.get("effort") or ""),
+            seat=str(data.get("seat") or ""),
+            kind=str(data.get("kind") or "legacy"),
+            agent=str(data.get("agent") or ""),
+            alias=str(data.get("alias") or ""),
+            persona=str(data.get("persona") or ""),
+            confidence=data.get("confidence"),
+            because=str(data.get("because") or ""),
+            consensus=data.get("consensus"),
+        )
 
 
 @dataclass
@@ -286,6 +499,16 @@ class Run:
     # records where the work actually happened.
     workspace: str
     zero_touch: bool
+    # Whether this run may change files at all, decided once at start. A run
+    # with no folder chosen is an answer rather than a piece of work: there is
+    # nowhere the operator asked for it to be applied, so nothing is, and the
+    # code comes back in the reply instead.
+    read_only: bool = False
+    # Whether this conversation is private: no transcript on disk, no router
+    # feedback, and every agent invoked with its own no-save flag. Decided once
+    # at start and carried, never re-read from the browser - a toggle switched
+    # off midway must not retrospectively record a run that promised not to be.
+    incognito: bool = False
     mode: str = "council"  # "council" | "solo"
     # Pull-request delivery. The branch is named at start but only created
     # after write permission is granted, so a rejected run leaves no trace.
@@ -308,9 +531,34 @@ class Run:
     reviewer_note: str = ""
     error: str = ""
     rollback_note: str = ""
+    # Whether a human has already let this run past the approval gate. Carried
+    # on the run so continuing a failed chairman does not ask again: what the
+    # gate approved was this bench and these positions, and continuing reuses
+    # both unchanged. A run that never reached the gate has nothing approved,
+    # so it stops there exactly as it did the first time.
+    approved: bool = False
+    # How many times this run has been continued. Kept because a transcript
+    # showing one chairman answer that took three attempts should say so.
+    resumed: int = 0
+    # What the chairmen that did not finish had written when they stopped, one
+    # entry per attempt, oldest first. Held on the run rather than on the stage
+    # because the stage is wiped to `pending` before it runs again - and it is
+    # wiped for a good reason, so the attempt is lifted out first instead. The
+    # next chairman is shown these: a seat that hit its quota wall halfway
+    # through applying a patch left half a patch behind, and continuing without
+    # saying so asks the new one to work that out from the diff alone.
+    chairman_attempts: List[Dict[str, str]] = field(default_factory=list)
     # Continuation lineage. A follow-up run is a new, independently auditable
     # run that carries the earlier turns of its thread rather than reopening
     # the transcript it came from.
+    # Who sat on this council, why, and under which anonymous alias. Decided
+    # once at start from the task itself, then frozen: the router must not be
+    # allowed to re-seat the bench between the gate and the chairman, or the
+    # human would have approved one council and got another.
+    seating: Optional[router.Seating] = field(default=None, repr=False)
+    # How hard the critique stage was told to push, 0-5. Read off the run
+    # rather than the store for the same reason.
+    strictness: int = prompts.DEFAULT_STRICTNESS
     parent_run_id: str = ""
     conversation: List[Dict[str, Any]] = field(default_factory=list)
     # What that thread costs to replay, measured on the text the agents were
@@ -327,6 +575,64 @@ class Run:
     def solo(self) -> bool:
         """Whether this is a Solo conversation rather than a council run."""
         return self.mode == "solo"
+
+    @property
+    def stage_order(self) -> List[str]:
+        """The stages of this run, in the order they were reached.
+
+        Derived from the seating rather than stored, so a council of two and a
+        council of four both render without a second list to keep in step. The
+        legacy ids are the tail: a transcript from the two-stage council has no
+        seating, and must still list its stages.
+        """
+        order: List[str] = []
+        if self.seating:
+            order += [s.id for s in self.seating.members]
+            order += [f"{s.id}_critique" for s in self.seating.members]
+            order.append("chair")
+        # A multi-agent Chat turn has one stage per CLI, listed in the
+        # catalogue's order so the same three answers appear in the same three
+        # places every time - they are read side by side, and a bench that
+        # reshuffled itself per turn would make that comparison work.
+        order += [chat_stage_id(agent) for agent in cfg.AGENTS]
+        return [
+            s for s in [*order, "solo", "drafter", "polisher"]
+            if s in self.stages
+        ]
+
+    @property
+    def consensus(self) -> Optional[int]:
+        """How far the chairman judged the members to have agreed, 0-100."""
+        chair = self.stages.get("chair")
+        return chair.consensus if chair else None
+
+    @property
+    def confidence(self) -> Optional[int]:
+        """The chairman's stated confidence in the verdict, 0-100."""
+        chair = self.stages.get("chair")
+        return chair.confidence if chair else None
+
+    @property
+    def unfinished_stages(self) -> List[str]:
+        """The stages a continuation would have to run again.
+
+        Anything that failed, and anything the run never reached. A stage that
+        answered is not in here, which is the whole point: its output is on the
+        record and continuing replays it instead of paying for it twice.
+        """
+        return [
+            sid for sid in self.stage_order
+            if self.stages[sid].state in ("failed", "pending", "running")
+        ]
+
+    @property
+    def can_resume(self) -> bool:
+        """Whether Continue is worth offering on this run.
+
+        Only a failed one, and only while there is something left to run. A
+        cancelled run is not offered: it stopped because somebody said stop.
+        """
+        return self.state == FAILED and bool(self.unfinished_stages)
 
     @property
     def transcript_name(self) -> str:
@@ -350,6 +656,14 @@ class Run:
             # only knew the folder as a repository.
             "repo": self.workspace,
             "zero_touch": self.zero_touch,
+            # On the transcript because a run is rebuilt from it: continuing a
+            # no-folder run after a restart must not hand the chairman write
+            # permission the first attempt never had.
+            "read_only": self.read_only,
+            # Carried for the same reason, and read by the browser so a page
+            # reloaded mid-run shows the private thread as private rather than
+            # as an ordinary one whose transcript has gone missing.
+            "incognito": self.incognito,
             "mode": self.mode,
             # Kept alongside `mode` for transcripts written by, and read by,
             # a version that only knew the boolean.
@@ -363,9 +677,24 @@ class Run:
             "created_at": self.created_at,
             "ended_at": self.ended_at,
             "stages": {k: v.to_dict() for k, v in self.stages.items()},
-            "stage_order": [
-                s for s in ("solo", "drafter", "polisher") if s in self.stages
-            ],
+            "stage_order": self.stage_order,
+            "seating": self.seating.to_dict() if self.seating else None,
+            "strictness": self.strictness,
+            "strictness_name": prompts.strictness(self.strictness)["name"],
+            # Which writing styles this run answered under, read off the config
+            # frozen at start rather than off the gear as it stands now. The
+            # transcript is the only thing that can explain why an archived
+            # answer reads the way it does, and the switch it was written under
+            # may since have been turned off.
+            "styles": cfg.writing_styles(
+                self.config, "chat" if self.solo else "council"
+            ),
+            # The chairman's own two figures, lifted to the top of the run
+            # because they are what the verdict card shows. Both are the
+            # chairman's claims, not this app's arithmetic, and both are None
+            # when it did not make them.
+            "consensus": self.consensus,
+            "confidence": self.confidence,
             "diff": self.diff,
             "diff_stat": self.diff_stat,
             "snapshot": self.snapshot.to_dict() if self.snapshot else None,
@@ -381,6 +710,28 @@ class Run:
             "reviewer_note": self.reviewer_note,
             "error": self.error,
             "rollback_note": self.rollback_note,
+            "approved": self.approved,
+            "resumed": self.resumed,
+            # On the transcript so a continuation started after a restart shows
+            # the next chairman the same failed attempt an in-memory one would.
+            "chairman_attempts": self.chairman_attempts,
+            # What Continue would cost, decided here rather than in the browser
+            # so the button and the engine cannot disagree about whether there
+            # is anything left to do.
+            "can_resume": self.can_resume,
+            "unfinished_stages": self.unfinished_stages,
+            # And what running one seat again would cost: per stage, everything
+            # that would have to run with it because it quoted that stage. The
+            # rule lives in `dependent_stages`; this is it applied, so the
+            # button can say the price before it is paid.
+            "retry_plan": (
+                {
+                    sid: [sid, *dependent_stages(self, sid)]
+                    for sid in self.stage_order
+                }
+                if self.state in TERMINAL_STATES
+                else {}
+            ),
             "parent_run_id": self.parent_run_id,
             "conversation": self.conversation,
             "context": self.context,
@@ -409,15 +760,37 @@ class Pipeline:
         # environment during cleanup) sends a late transcript somewhere the
         # run was never meant to touch.
         self._runs_dir = Path(runs_dir) if runs_dir else cfg.runs_dir()
-        self._runs_dir.mkdir(parents=True, exist_ok=True)
+        cfg.private_dir(self._runs_dir)
         self._lock = threading.RLock()
         self._run: Optional[Run] = None
         self._thread: Optional[threading.Thread] = None
-        self._runner: Optional[ProviderRunner] = None
+        # Every provider currently executing, keyed by stage id. A dict rather
+        # than the single slot this used to be: Stage 1 and Stage 2 run one
+        # subprocess per seat concurrently, and Cancel has to reach all of them.
+        # A single slot would leave the other seats running after the run had
+        # gone terminal, still writing to the event bus.
+        self._runners: Dict[str, ProviderRunner] = {}
+        # Incognito transcripts, keyed by the filename they would have had.
+        # Held so a private conversation can be continued the same way every
+        # other one is - the browser attaches the last run by that name - and
+        # gone the moment the process is. Trimmed to VOLATILE_RUN_LIMIT, since
+        # nothing on disk exists to clean these up later.
+        self._volatile_runs: Dict[str, str] = {}
+        # `history()` reads whole transcripts to build one-line summaries, and
+        # a transcript is written once and then only read. Keyed by filename,
+        # invalidated on mtime and size.
+        self._summary_cache: Dict[
+            str, Tuple[Tuple[int, int], Dict[str, Any]]
+        ] = {}
         # Signalled when the human resolves the approval gate.
         self._gate = threading.Event()
         self._gate_decision = ""  # "approve" | "reject"
         self._cancel_requested = False
+        # Optional: returns {agent: percent-of-window-used}, for the router to
+        # route around an agent that is nearly out of quota. Wired by the
+        # server, which owns the usage poller. Left None the router simply has
+        # one less signal - it must not require a poller to seat a council.
+        self.quota_source: Optional[Any] = None
 
     # -- introspection -----------------------------------------------------
 
@@ -435,18 +808,28 @@ class Pipeline:
         """Full UI state: current run plus provider availability."""
         with self._lock:
             run = self._run.to_dict() if self._run else None
-        providers = self.store.get("providers", {})
+        conf = self.store.all()
+        chosen = set(cfg.selected_agents(conf))
         return {
             "run": run,
             "busy": self.is_busy(),
-            "config": self.store.all(),
+            "config": conf,
             # The agents assignable to either job. Served rather than hardcoded
             # in the browser so commands and permission flags have one home.
-            "agents": cfg.agent_catalog(),
+            #
+            # `selected` rides along because every picker in the UI filters on
+            # it and none of them can afford to wait for `/api/agents`, which
+            # shells out to each CLI to find out whether it is signed in. A
+            # hand-written command is nobody's catalogued agent and is always
+            # offered - it is how the mock agent is reachable.
+            "agents": [
+                dict(a, selected=a["id"] in chosen or a["id"] == cfg.CUSTOM_AGENT)
+                for a in cfg.agent_catalog()
+            ],
             # The role behaviours a stage can be assigned. Served rather than
             # duplicated in the browser, so the shipped text has one home.
             "roles": prompts.role_catalog(self.store.get("roles", {})),
-            "providers_status": probe_all(providers, cfg.PROVIDER_ORDER),
+            "providers_status": probe_all(conf, cfg.PROVIDER_ORDER),
         }
 
     def is_busy(self) -> bool:
@@ -461,6 +844,7 @@ class Pipeline:
         workspace: str = "",
         continue_from: str = "",
         compact_context: bool = False,
+        incognito: bool = False,
     ) -> Run:
         """Kick off a new run. Raises PipelineBusy if one is already active.
 
@@ -480,6 +864,11 @@ class Pipeline:
         ``compact_context`` summarises every earlier turn up front instead of
         waiting for the thread to reach the budget. A long thread is compacted
         either way; this is the operator asking for it sooner.
+
+        ``incognito`` keeps the conversation out of both records: no transcript
+        is written under ``runs/``, the router learns nothing from it, and every
+        agent is invoked with its own no-save flag - or is not seated at all,
+        if it has none.
         """
         task = (task or "").strip()
         if not task:
@@ -501,7 +890,18 @@ class Pipeline:
         # reply to review - so Zero-Touch is the only way to grant it there,
         # and without it the provider is invoked read-only.
         zero_touch = bool(conf.get("zero_touch"))
-        writes = mode == "council" or zero_touch
+        # A multi-agent Chat turn is read-only whatever Zero-Touch says, so it
+        # is settled here, before `writes` decides whether this run branches,
+        # snapshots or opens a pull request. Three CLIs turned loose on one
+        # folder at the same time would interleave their edits, and the diff
+        # afterwards could not say which agent wrote which line.
+        multi_agent = mode == "solo" and bool(conf.get("multi_agent"))
+        # `chosen` is the last term for the reason the operator gave: asking
+        # the council a question with no folder picked is asking for an answer,
+        # not for work applied to the scratch directory. Nothing writes, the
+        # gate has nothing to gate, and the chairman is told to put whatever
+        # code it decided on into its reply.
+        writes = (mode == "council" or zero_touch) and not multi_agent and bool(chosen)
         # Delivery protects a run that writes. On a read-only conversation
         # there is nothing to branch, nothing to commit, and refusing to start
         # because the tree is dirty would be absurd.
@@ -555,6 +955,11 @@ class Pipeline:
                 conversation.extend(t for t in earlier if isinstance(t, dict))
             conversation.append(_conversation_turn(previous))
             parent_run_id = str(previous.get("id") or "")
+            # A private thread does not become public because the toggle was
+            # switched off before the follow-up: this run carries the earlier
+            # turns of a conversation that was promised no record, and writing
+            # them into a transcript now would keep the promise for neither.
+            incognito = incognito or bool(previous.get("incognito"))
 
         # Fit the thread before the run is built, so what is stored on it is
         # what the prompts will render rather than an ideal it never used.
@@ -573,6 +978,8 @@ class Pipeline:
                 task=task,
                 workspace=root,
                 zero_touch=zero_touch,
+                read_only=not writes,
+                incognito=incognito,
                 mode=mode,
                 pull_request_mode=pull_request_mode,
                 # Whatever is checked out is what the pull request targets, so
@@ -595,34 +1002,63 @@ class Pipeline:
                 config=conf,
             )
             if mode == "solo":
-                # One agent with a configuration of its own. Recorded as a
-                # stage because that is how output, timings and the command
-                # echo are carried to the UI - not because it is one.
-                p = providers.get("solo", {})
-                run.stages["solo"] = StageRecord(
-                    id="solo",
-                    label=p.get("label", "Assistant"),
-                    role="Assistant",
-                    model=str(p.get("model") or ""),
-                    effort=str(p.get("effort") or ""),
+                bench = (
+                    self.available_agents(conf, incognito=incognito)
+                    if multi_agent else []
                 )
+                if len(bench) > 1:
+                    # One stage per installed CLI, each reading that CLI's own
+                    # card in Settings. Built here rather than in the worker so
+                    # all three are on screen as "queued" the moment the
+                    # message is sent, instead of appearing one at a time.
+                    for agent in bench:
+                        p = providers.get(cfg.council_provider_id(agent)) or {}
+                        stage_id = chat_stage_id(agent)
+                        run.stages[stage_id] = StageRecord(
+                            id=stage_id,
+                            label=str(p.get("label") or cfg.AGENTS[agent]["label"]),
+                            role="Assistant",
+                            model=str(p.get("model") or ""),
+                            effort=str(p.get("effort") or ""),
+                            kind="chat",
+                            agent=agent,
+                        )
+                else:
+                    # One agent with a configuration of its own. Recorded as a
+                    # stage because that is how output, timings and the command
+                    # echo are carried to the UI - not because it is one.
+                    #
+                    # Also where a multi-agent turn lands when only one CLI is
+                    # connected: a bench of one is the ordinary Chat assistant,
+                    # and refusing to answer would be worse than answering.
+                    p = providers.get("solo", {})
+                    # Said before the turn starts rather than after the CLI
+                    # refuses to launch. The assistant keeps whichever agent it
+                    # was assigned when one is removed and nothing is left to
+                    # move it to, and "claude is not connected" is a different
+                    # problem from "claude is not installed".
+                    if not cfg.provider_enabled(conf, p):
+                        raise ValueError(
+                            f"{p.get('label') or 'The assistant'} is not "
+                            f"connected. Open Settings → Agents and add an "
+                            f"agent, or assign Chat to one you have added."
+                        )
+                    run.stages["solo"] = StageRecord(
+                        id="solo",
+                        label=p.get("label", "Assistant"),
+                        role="Assistant",
+                        model=str(p.get("model") or ""),
+                        effort=str(p.get("effort") or ""),
+                        kind="solo",
+                    )
             else:
-                d = providers.get("drafter", {})
-                run.stages["drafter"] = StageRecord(
-                    id="drafter",
-                    label=d.get("label", "Codex"),
-                    role=d.get("role", "Junior Draft"),
-                    model=str(d.get("model") or ""),
-                    effort=str(d.get("effort") or ""),
+                run.strictness = prompts.strictness(
+                    (conf.get("council") or {}).get("strictness")
+                )["level"]
+                run.seating = self.seat_council(
+                    run.task, conf, run_id=run_id, incognito=incognito
                 )
-                p = providers.get("polisher", {})
-                run.stages["polisher"] = StageRecord(
-                    id="polisher",
-                    label=p.get("label", "Claude"),
-                    role=p.get("role", "Senior Polish"),
-                    model=str(p.get("model") or ""),
-                    effort=str(p.get("effort") or ""),
-                )
+                self._build_council_stages(run, providers, conf.get("roles", {}))
 
             self._run = run
             self._cancel_requested = False
@@ -641,6 +1077,151 @@ class Pipeline:
             self._thread = thread
         thread.start()
         return run
+
+    # -- seating -----------------------------------------------------------
+
+    def available_agents(
+        self, conf: Dict[str, Any], incognito: bool = False
+    ) -> List[str]:
+        """The catalogued CLIs the operator added that are actually installed.
+
+        Two conditions, not one. Being added in Settings is what puts a CLI on
+        this bench - no agent is seated because its binary happens to be on
+        PATH - and the binary still has to resolve, because seating one whose
+        executable is missing would cost a member per run for nothing.
+
+        Takes the whole configuration rather than its providers because the
+        first of those conditions lives in ``agent_settings``: one answer per
+        CLI, wherever it sits. See ``config.provider_enabled``.
+
+        Returned in the catalogue's own order, which is what the router breaks
+        ties on.
+
+        ``incognito`` narrows it further to the CLIs that can be told not to
+        save the conversation. An agent without that flag is not unavailable in
+        general, only for this run, and leaving it out is the whole difference
+        between a private council and one that quietly kept a copy.
+        """
+        providers = conf.get("providers") or {}
+        out: List[str] = []
+        for agent in cfg.AGENTS:
+            provider = providers.get(cfg.council_provider_id(agent)) or {}
+            if not cfg.provider_enabled(conf, provider):
+                continue
+            if incognito and not supports_incognito(provider):
+                continue
+            if resolve_binary(provider.get("command") or []):
+                out.append(agent)
+        return out
+
+    def seat_council(
+        self,
+        task: str,
+        conf: Dict[str, Any],
+        run_id: str = "",
+        incognito: bool = False,
+    ) -> router.Seating:
+        """Route the bench for a task against a frozen configuration.
+
+        Public because the UI asks for the same seating before a run starts, so
+        the operator can see who would be seated - and re-pin - without
+        spending a token to find out. Same inputs, same answer.
+        """
+        council = conf.get("council") or {}
+        providers = conf.get("providers") or {}
+        available = self.available_agents(conf, incognito=incognito)
+        if incognito and not available:
+            # Said here rather than left to the router's "check the agents in
+            # Settings", which would send the operator looking for a CLI that
+            # is installed, enabled and working perfectly well.
+            raise ValueError(
+                "No installed agent can run incognito. Turn Incognito off, or "
+                "give an agent its CLI's no-save flag in Settings."
+            )
+
+        quota: Dict[str, Optional[float]] = {}
+        if self.quota_source:
+            try:
+                quota = self.quota_source() or {}
+            except Exception:  # noqa: BLE001 - routing must not need a poller
+                quota = {}
+
+        seating = router.route(
+            # Manual routing scores every agent identically, so the pins decide
+            # and the leftovers fall in catalogue order. The seating still
+            # explains itself; it just stops depending on what was typed.
+            task if str(council.get("routing") or "auto") != "manual" else "",
+            available,
+            seat_count=int(council.get("seat_count") or 3),
+            chair_deliberates=bool(council.get("chair_deliberates", True)),
+            pins=council.get("pins") or {},
+            personas=council.get("personas") or {},
+            capabilities=council.get("capabilities") or {},
+            stats=council.get("stats") or {},
+            quota=quota,
+            run_id=run_id,
+        )
+
+        # The router decides *which CLI*; the provider id that carries its
+        # command is this app's business, not the router's.
+        roles = conf.get("roles") or {}
+        for seat in seating.seats:
+            seat.provider_id = cfg.council_provider_id(seat.agent)
+            role = prompts.role_by_id(seat.persona, roles) if seat.persona else None
+            seat.persona_name = str((role or {}).get("name") or "")
+        return seating
+
+    def _build_council_stages(
+        self, run: Run, providers: Dict[str, Any], roles: Dict[str, Any]
+    ) -> None:
+        """Create every stage record this seating implies, up front.
+
+        All of them, before any thread starts: the parallel stages publish
+        `run.to_dict()` from several threads at once, and a dict that grew
+        while one of them was iterating it would raise. Pre-creating the keys
+        means the workers only ever mutate records, never the map.
+        """
+        seating = run.seating
+        if seating is None:
+            return
+        for seat in seating.members:
+            provider = providers.get(seat.provider_id) or {}
+            common = {
+                "seat": seat.id,
+                "agent": seat.agent,
+                "alias": seat.alias,
+                "persona": seat.persona,
+                "model": str(provider.get("model") or ""),
+                "effort": str(provider.get("effort") or ""),
+            }
+            run.stages[seat.id] = StageRecord(
+                id=seat.id,
+                label=str(provider.get("label") or seat.agent),
+                role=seat.persona_name or "Council Member",
+                kind="position",
+                **common,
+            )
+            run.stages[f"{seat.id}_critique"] = StageRecord(
+                id=f"{seat.id}_critique",
+                label=str(provider.get("label") or seat.agent),
+                role="Peer critique",
+                kind="critique",
+                **common,
+            )
+
+        chair = seating.chair
+        chair_provider = providers.get(chair.provider_id) or {}
+        run.stages["chair"] = StageRecord(
+            id="chair",
+            label=str(chair_provider.get("label") or chair.agent),
+            role="Chairman",
+            kind="chair",
+            seat="chair",
+            agent=chair.agent,
+            persona="chairman",
+            model=str(chair_provider.get("model") or ""),
+            effort=str(chair_provider.get("effort") or ""),
+        )
 
     def approve(self, note: str = "") -> None:
         """Release the approval gate and continue to Stage 2."""
@@ -664,15 +1245,356 @@ class Pipeline:
         """Stop the run: kill any child process and release the gate."""
         with self._lock:
             self._cancel_requested = True
-            runner = self._runner
+            runners = list(self._runners.values())
             waiting = self._run is not None and self._run.state == AWAITING_APPROVAL
             if waiting:
                 self._gate_decision = "reject"
-        if runner:
+        for runner in runners:
             runner.cancel()
         if waiting:
             self._gate.set()
         self.bus.publish("log", level="warn", message="Cancellation requested.")
+
+    def revive(self, name: str, start: bool = True) -> Run:
+        """Load a finished transcript back into the engine so it can go again.
+
+        For the case the in-memory path cannot cover: the app was closed - or
+        crashed, or was restarted to install the CLI update that fixes the
+        failure - between the failed run and the decision to continue it. The
+        transcript has every answer already given, so continuing from disk
+        costs exactly what continuing in memory costs.
+
+        What is *not* on the transcript is the configuration, which is not
+        written into it. A revived run is therefore configured from Settings as
+        it stands now. That is the same rule `resume` follows for providers,
+        applied to the whole run because there is nothing else to apply.
+        """
+        data = self.load_run(name)
+        if data is None:
+            raise ValueError("That run transcript no longer exists.")
+        state = str(data.get("state") or "")
+        # `start` is what this is being loaded *for*. Continuing means finishing
+        # what stopped, so it needs a run that stopped; running one seat again
+        # is worth doing on a run that completed with an answer the operator
+        # does not accept, which is a different question with a different rule.
+        if start and state != FAILED:
+            raise ValueError("Only a failed run can be continued.")
+        if state not in TERMINAL_STATES:
+            raise ValueError(
+                "That transcript was written while the run was still going, so "
+                "what it holds is a half-finished record rather than a run to "
+                "pick up."
+            )
+        if data.get("pull_request_mode"):
+            # A PR run's branch, its commits and possibly a published pull
+            # request are all outside this transcript. Reconstructing half of
+            # that and calling it the same run would be a guess about the
+            # repository, so it is refused in as many words instead.
+            raise ValueError(
+                "That run was delivering a pull request, and the app has been "
+                "restarted since. Continue it by starting a new run on the "
+                "work branch."
+            )
+
+        seating = router.Seating.from_dict(data.get("seating") or {})
+        mode = str(data.get("mode") or "") or ("solo" if data.get("solo") else "council")
+        if mode == "council" and seating is None:
+            raise ValueError(
+                "That transcript has no seating recorded, so there is no bench "
+                "to put back. It can be read, but not continued."
+            )
+
+        workspace = str(data.get("workspace") or data.get("repo") or "")
+        if workspace and not Path(workspace).is_dir():
+            raise ValueError(
+                f"The folder that run worked in is gone: {workspace}"
+            )
+        root = resolve_workspace(workspace)
+
+        with self._lock:
+            if self._run is not None and self._run.state not in TERMINAL_STATES:
+                raise PipelineBusy("A run is already in progress.")
+
+            run = Run(
+                id=str(data.get("id") or ""),
+                task=str(data.get("task") or ""),
+                workspace=root,
+                zero_touch=bool(data.get("zero_touch")),
+                # A transcript written before a no-folder run meant "answer
+                # only" carries no flag, so the scratch workspace stands in for
+                # one: it is the folder nobody chose, and a revived run that
+                # lands there is held to the rule as it stands now rather than
+                # the one it was recorded under.
+                read_only=bool(
+                    data.get("read_only") or root == str(cfg.workspace_dir())
+                ),
+                # Only an in-memory transcript can carry this, since an
+                # incognito run writes no other kind - but it is read back the
+                # same way, so continuing one after a Cancel keeps both halves
+                # of the promise rather than starting to record halfway.
+                incognito=bool(data.get("incognito")),
+                mode=mode,
+                snapshot_planned=bool(data.get("snapshot_planned")),
+                state=FAILED,
+                created_at=float(data.get("created_at") or time.time()),
+                ended_at=float(data.get("ended_at") or 0.0),
+                stages={
+                    sid: StageRecord.from_dict(sdata)
+                    for sid, sdata in (data.get("stages") or {}).items()
+                },
+                diff=str(data.get("diff") or ""),
+                diff_stat=dict(data.get("diff_stat") or {}),
+                snapshot=(
+                    gitutil.Snapshot(**data["snapshot"])
+                    if isinstance(data.get("snapshot"), dict)
+                    else None
+                ),
+                reviewer_note=str(data.get("reviewer_note") or ""),
+                error=str(data.get("error") or ""),
+                approved=bool(data.get("approved")),
+                resumed=int(data.get("resumed") or 0),
+                chairman_attempts=[
+                    {
+                        "output": str(attempt.get("output") or ""),
+                        "error": str(attempt.get("error") or ""),
+                    }
+                    for attempt in (data.get("chairman_attempts") or [])
+                    if isinstance(attempt, dict)
+                ],
+                seating=seating,
+                strictness=int(
+                    data.get("strictness") or prompts.DEFAULT_STRICTNESS
+                ),
+                parent_run_id=str(data.get("parent_run_id") or ""),
+                conversation=list(data.get("conversation") or []),
+                context=dict(data.get("context") or {}),
+                config=self.store.all(),
+            )
+            self._run = run
+            self._cancel_requested = False
+            self._gate.clear()
+            self._gate_decision = ""
+
+        self.bus.publish("run_started", run=run.to_dict())
+        return self.resume() if start else run
+
+    def resume(self) -> Run:
+        """Run a failed run's unfinished stages again, keeping the rest.
+
+        The saving is the point: a council that lost only its chairman - to a
+        quota wall, a timeout, a CLI that fell over - has already paid for
+        every member position and every peer critique, and they are on the
+        record. Continuing replays those and asks only the stage that failed.
+
+        Not a new run. The same run resumes under the same id, so the
+        transcript stays one auditable history of one task rather than two
+        halves the operator has to line up by hand.
+        """
+        with self._lock:
+            run = self._run
+            if run is None:
+                raise ValueError("There is no run to continue.")
+            if run.state not in TERMINAL_STATES:
+                raise PipelineBusy("A run is already in progress.")
+            if run.state != FAILED:
+                raise ValueError(
+                    "Only a failed run can be continued. This one "
+                    f"{run.state.replace('_', ' ')}."
+                )
+            if not run.unfinished_stages:
+                raise ValueError(
+                    "Every stage of that run answered, so there is nothing "
+                    "left to continue."
+                )
+
+            # Everything that did not answer, plus everything downstream of it.
+            # A member re-run after the critiques were written would otherwise
+            # leave the transcript claiming its peers reviewed a position that
+            # did not exist when they wrote.
+            failed = {
+                sid for sid, stage in run.stages.items()
+                if stage.state in ("failed", "skipped", "running")
+            }
+            todo = set(failed)
+            for stage_id in failed:
+                todo |= set(dependent_stages(run, stage_id))
+            self._keep_chair_attempt(run, failed)
+            self._reset_stages(run, todo)
+
+            # Providers and roles are re-read from Settings; everything else
+            # about the run stays frozen. Deliberate, and the one exception to
+            # the rule that a run's configuration is fixed at start: the
+            # commonest reason to continue is that a seat hit its quota wall,
+            # and the commonest fix is to point that seat at a different model
+            # first. Freezing the command here would mean continuing into the
+            # same wall. What is *not* re-read is what the run is allowed to do
+            # - Zero-Touch, pull-request delivery, the snapshot, the bench -
+            # because those were decided, and in some cases approved, once.
+            fresh = self.store.all()
+            run.config = {
+                **run.config,
+                "providers": fresh.get("providers") or {},
+                "roles": fresh.get("roles") or {},
+            }
+
+            run.error = ""
+            run.ended_at = 0.0
+            run.resumed += 1
+            run.state = RUNNING
+            self._cancel_requested = False
+            self._gate.clear()
+            self._gate_decision = ""
+
+        kept = [
+            sid for sid in run.stage_order if run.stages[sid].state == "done"
+        ]
+        # A stage that answered and is running anyway is one that quoted a
+        # stage which did not. Said out loud: it is the difference between the
+        # cheapest continuation and an honest one, and the operator paying for
+        # it should know which they got.
+        cascaded = [sid for sid in run.unfinished_stages if sid not in failed]
+        self.bus.publish(
+            "log",
+            level="info",
+            message=(
+                f"Continuing this run. {len(kept)} answer(s) already given are "
+                f"being reused; {len(run.unfinished_stages)} stage(s) will run "
+                f"again."
+                + (
+                    f" {len(cascaded)} of those did answer, and are being "
+                    f"asked again because they quoted one that did not."
+                    if cascaded else ""
+                )
+                + (
+                    f" The chairman is being shown its "
+                    f"{len(run.chairman_attempts)} unfinished attempt(s), so "
+                    f"it knows what was already started."
+                    if run.chairman_attempts else ""
+                )
+            ),
+        )
+        self.bus.publish("state", state=run.state, run=run.to_dict())
+
+        thread = threading.Thread(
+            target=self._execute, args=(run,), name=f"run-{run.id}-resume", daemon=True
+        )
+        with self._lock:
+            self._thread = thread
+        thread.start()
+        return run
+
+    def _keep_chair_attempt(self, run: Run, failed: Iterable[str]) -> None:
+        """Lift a failed chairman's half-written answer off the stage it dies on.
+
+        The stage itself is about to be wiped, and rightly: one attempt's error
+        beside another attempt's answer is a record nobody can read. But the
+        text is worth keeping once, somewhere else, because a chairman that got
+        halfway through applying the outcome before it fell over has already
+        changed the folder the next one will open. The next chairman is shown
+        it as an unfinished attempt, and reads the folder to find out how much
+        of it actually landed.
+
+        Only a chairman that *failed*. One that answered and is running again
+        because a member it quoted was re-run is not a failed attempt, and
+        labelling a stale verdict as one would be a lie in the prompt.
+        """
+        if "chair" not in set(failed):
+            return
+        chair = run.stages.get("chair")
+        if chair is None or not (chair.output.strip() or chair.error.strip()):
+            return
+        run.chairman_attempts.append(
+            {"output": chair.output, "error": chair.error}
+        )
+
+    def _reset_stages(self, run: Run, stage_ids: Iterable[str]) -> None:
+        """Put stages back to `pending` so the next execution runs them.
+
+        A stage starts again from nothing: leaving the first attempt's error,
+        half-written output or confidence trailer in place would put one
+        attempt's failure beside another attempt's answer with nothing to say
+        which is which.
+        """
+        for stage_id in stage_ids:
+            stage = run.stages.get(stage_id)
+            if stage is None:
+                continue
+            stage.state = "pending"
+            stage.error = ""
+            stage.output = ""
+            stage.exit_code = None
+            stage.command = []
+            stage.started_at = 0.0
+            stage.ended_at = 0.0
+            stage.confidence = None
+            stage.because = ""
+            stage.consensus = None
+
+    def retry(self, stage_id: str) -> Run:
+        """Run one stage again, along with whatever quoted it.
+
+        The other half of continuing. `resume` finishes a run that stopped;
+        this re-runs a seat whose answer the operator does not accept - one
+        that timed out into an empty reply, or hit its wall mid-sentence, or
+        simply answered badly - without disturbing the seats that did fine.
+
+        What it does *not* do is re-run that seat alone regardless of who read
+        it. A position is quoted into every peer's critique and into the
+        chairman's prompt, so replacing it and keeping those would leave a
+        transcript whose reviews discuss an answer that is no longer in it.
+        `dependent_stages` decides what follows, and the UI states the cost
+        before the click rather than after.
+        """
+        with self._lock:
+            run = self._run
+            if run is None:
+                raise ValueError("There is no run to retry a stage of.")
+            if run.state not in TERMINAL_STATES:
+                raise PipelineBusy("A run is already in progress.")
+            if stage_id not in run.stages:
+                raise ValueError(f"This run has no {stage_id!r} stage.")
+
+            again = [stage_id, *dependent_stages(run, stage_id)]
+            self._reset_stages(run, again)
+
+            fresh = self.store.all()
+            run.config = {
+                **run.config,
+                "providers": fresh.get("providers") or {},
+                "roles": fresh.get("roles") or {},
+            }
+            run.error = ""
+            run.ended_at = 0.0
+            run.resumed += 1
+            run.state = RUNNING
+            self._cancel_requested = False
+            self._gate.clear()
+            self._gate_decision = ""
+
+        label = run.stages[stage_id].label
+        others = len(again) - 1
+        self.bus.publish(
+            "log",
+            level="info",
+            message=(
+                f"Running {label} again"
+                + (
+                    f", with {others} stage(s) that quoted it. "
+                    if others else ". "
+                )
+                + f"{len(run.stage_order) - len(again)} answer(s) are being "
+                f"reused."
+            ),
+        )
+        self.bus.publish("state", state=run.state, run=run.to_dict())
+
+        thread = threading.Thread(
+            target=self._execute, args=(run,), name=f"run-{run.id}-retry", daemon=True
+        )
+        with self._lock:
+            self._thread = thread
+        thread.start()
+        return run
 
     def wait_for_worker(self, timeout: float = 30.0) -> bool:
         """Block until the worker thread has fully wound down.
@@ -706,6 +1628,10 @@ class Pipeline:
             )
 
         note = gitutil.restore_snapshot(snap)
+        # The operator undoing the work is the strongest signal the council got
+        # it wrong, and the only one that does not rely on an agent's account
+        # of itself. Recorded before the event goes out.
+        self._record_router_feedback(run, rolled_back=True)
         with self._lock:
             run.rollback_note = note
             run.diff = gitutil.working_diff(run.workspace)
@@ -720,6 +1646,11 @@ class Pipeline:
             run.state = state
             if state in TERMINAL_STATES:
                 run.ended_at = time.time()
+                # A terminal event tells the browser it can attach this run to
+                # the next message. Put the transcript on disk first so its
+                # context preview and the follow-up itself cannot race the
+                # worker thread's final persistence.
+                self._persist(run)
         self.bus.publish("state", state=state, run=run.to_dict(), **extra)
 
     def _stage_output_cb(self, stage_id: str):
@@ -739,8 +1670,42 @@ class Pipeline:
         auto_approve: bool,
         read_only: bool = False,
     ) -> ProviderResult:
-        """Run one stage. ``provider`` comes from the run's frozen config."""
+        """Run one stage. ``provider`` comes from the run's frozen config.
+
+        A stage that already answered is replayed rather than re-run. During a
+        first execution nothing is `done` before it runs, so this costs
+        nothing; on a continuation it is the whole saving - the members and
+        their critiques are already on the record, and only the stage that
+        failed is asked to spend anything.
+        """
         stage = run.stages[stage_id]
+        if stage.state == "done" and stage.output.strip():
+            self.bus.publish(
+                "log",
+                level="info",
+                message=(
+                    f"Reusing {stage.label}'s answer from the first attempt - "
+                    f"it is not being asked again."
+                ),
+            )
+            replayed = ProviderResult(
+                provider_id=str(provider.get("id") or stage_id),
+                ok=True,
+                exit_code=stage.exit_code if stage.exit_code is not None else 0,
+                stdout=stage.output,
+                stderr="",
+                duration=0.0,
+                command=list(stage.command),
+            )
+            self.bus.publish(
+                "stage_finished",
+                stage=stage_id,
+                ok=True,
+                run=run.to_dict(),
+                result=replayed.to_dict(),
+            )
+            return replayed
+
         stage.model = str(provider.get("model") or "")
         stage.effort = str(provider.get("effort") or "")
         stage.state = "running"
@@ -749,22 +1714,54 @@ class Pipeline:
 
         runner = ProviderRunner(provider, self._stage_output_cb(stage_id))
         with self._lock:
-            self._runner = runner
+            self._runners[stage_id] = runner
             if self._cancel_requested:
                 runner.cancel()
 
-        result = runner.run(
-            prompt, cwd=run.workspace, auto_approve=auto_approve, read_only=read_only
-        )
+        try:
+            result = runner.run(
+                prompt,
+                cwd=run.workspace,
+                auto_approve=auto_approve,
+                read_only=read_only,
+                # Off the run, so every stage of a private conversation is
+                # invoked the same way - including a continuation started after
+                # the toggle was switched back off.
+                incognito=run.incognito,
+            )
+        finally:
+            # Always deregistered, including on the way out of an exception. A
+            # runner left in the map would be cancelled by the *next* run's
+            # Cancel button, against a process that has already exited.
+            with self._lock:
+                self._runners.pop(stage_id, None)
 
-        with self._lock:
-            self._runner = None
         stage.ended_at = time.time()
         stage.output = result.stdout
         stage.command = result.command
         stage.exit_code = result.exit_code
         stage.error = result.error
-        stage.state = "done" if result.ok else "failed"
+        ok = stage_succeeded(result)
+        if result.ok and not ok:
+            # `result.error` is whatever the CLI said on the way out. A CLI
+            # that explains itself and still exits 0 - Antigravity naming the
+            # tool permission it auto-denied, say - has already given the
+            # operator the one sentence worth reading, and burying it under a
+            # generic "printed nothing" is how a fixable configuration problem
+            # comes to look like an act of God.
+            stage.error = (
+                f"The CLI exited cleanly but printed nothing: {result.error}"
+                if result.error else
+                "The CLI exited cleanly but printed nothing. Nothing from this "
+                "stage reached the rest of the run."
+            )
+        stage.state = "done" if ok else "failed"
+        # Read the agent's own trailer off its reply. Absent is a legitimate
+        # answer and stays None rather than becoming a default.
+        trailer = prompts.parse_trailer(result.stdout)
+        stage.confidence = trailer["confidence"]
+        stage.because = trailer["because"]
+        stage.consensus = trailer["consensus"]
 
         self.bus.publish(
             "stage_finished",
@@ -778,7 +1775,12 @@ class Pipeline:
     def _execute(self, run: Run) -> None:
         """Worker-thread body for one run, in whichever mode it was started."""
         try:
-            if run.solo:
+            if run.solo and "solo" not in run.stages:
+                # Chat, asked of every CLI at once. Told apart by the stages
+                # built at start rather than by re-reading the toggle, which
+                # can be flipped while the run is in flight.
+                self._execute_chat_bench(run)
+            elif run.solo:
                 self._execute_solo(run)
             else:
                 self._execute_council(run)
@@ -786,7 +1788,74 @@ class Pipeline:
             run.error = f"{type(exc).__name__}: {exc}"
             self._set_state(run, FAILED)
         finally:
-            self._persist(run)
+            if not run.solo:
+                self._record_router_feedback(run)
+            if run.state not in TERMINAL_STATES:
+                # Every path above ends by transitioning into a terminal state,
+                # and `_set_state` writes the transcript there so a follow-up
+                # cannot race this thread. This is the belt to those braces: a
+                # run that somehow ended non-terminal is still recorded, and
+                # the ordinary case no longer writes the same file twice - a
+                # second dump of every stage's output and the whole diff.
+                self._persist(run)
+
+    def _chat_prompt(self, run: Run, behavior: str = "") -> str:
+        """The prompt for one Chat turn, in either shape.
+
+        Shared so a multi-agent turn cannot drift from a single-agent one: the
+        three CLIs must be asked exactly what one would have been asked, or
+        their answers are not comparable and the feature is worth nothing.
+        """
+        return prompts.build_chat_prompt(
+            run.task,
+            run.conversation,
+            behavior=behavior,
+            **cfg.writing_styles(run.config, "chat"),
+        )
+
+    def _execute_chat_bench(self, run: Run) -> None:
+        """Every installed CLI answers the same message, at once, on its own.
+
+        Not a council: nobody is anonymised, nothing is critiqued and nothing
+        is synthesised. Three answers to one question, left as three answers -
+        the comparison is the operator's to make, and this app does not rank
+        them or pick a winner.
+
+        Read-only without exception, and the run carries no diff, no snapshot
+        and no delivery for the reason given where `multi_agent` is defined.
+        """
+        providers = run.config.get("providers") or {}
+        self._set_state(run, RUNNING)
+
+        specs = []
+        for stage_id in run.stage_order:
+            stage = run.stages[stage_id]
+            provider = providers.get(cfg.council_provider_id(stage.agent)) or {}
+            # A behaviour typed for Chat is the operator's instruction to the
+            # assistant, not to a CLI, so all three carry it. Without it a
+            # multi-agent turn would silently drop an instruction that a
+            # single-agent turn honours.
+            behavior = str((providers.get("solo") or {}).get("behavior") or "")
+            specs.append((
+                stage_id,
+                provider,
+                self._chat_prompt(run, behavior),
+                False,  # never auto-approve
+                True,   # always read-only
+            ))
+
+        results = self._run_parallel(run, specs)
+
+        if self._is_cancelled():
+            self._finish_cancelled(run)
+            return
+        # One CLI that could not run is a bench of two, which still answers the
+        # question. The run fails only when nothing at all came back.
+        if not any(stage_succeeded(r) for r in results.values()):
+            run.error = "No agent answered."
+            self._set_state(run, FAILED)
+            return
+        self._set_state(run, COMPLETE)
 
     def _execute_solo(self, run: Run) -> None:
         """One assistant, one message, one answer.
@@ -794,13 +1863,16 @@ class Pipeline:
         There is no gate here - nothing stands between the message and the
         reply for a human to review - so whether it may write is settled before
         it starts. Zero-Touch grants it, exactly as it does for the council;
-        without it the provider is invoked with its read-only arguments and
-        there is nothing to recover from either.
+        without it, or with no folder to write in, the provider is invoked with
+        its read-only arguments and there is nothing to recover from either.
         """
         provider = (run.config.get("providers") or {}).get("solo", {})
         # Read off the run, not the store: the toggle can be flipped mid-run,
         # and what this conversation was granted was decided when it started.
-        writes = run.zero_touch
+        # `read_only` rather than `zero_touch` because Zero-Touch is only one
+        # of the two questions - a conversation with no folder chosen answers
+        # and writes nothing however the toggle is set.
+        writes = not run.read_only
 
         if writes:
             self._prepare_branch(run)
@@ -817,12 +1889,10 @@ class Pipeline:
             # Still bare, even when it may write. Nothing is added that the
             # operator did not put there: permission to change files is not a
             # reason to start injecting a persona, the house rules or a
-            # repository preamble into a message they typed themselves.
-            prompts.build_chat_prompt(
-                run.task,
-                run.conversation,
-                behavior=str(provider.get("behavior") or ""),
-            ),
+            # repository preamble into a message they typed themselves. The
+            # style switches below are the operator's own, set for Chat in
+            # Settings, and add nothing when they are off.
+            self._chat_prompt(run, str(provider.get("behavior") or "")),
             auto_approve=writes,
             read_only=not writes,
         )
@@ -841,8 +1911,8 @@ class Pipeline:
 
         if self._is_cancelled():
             self._finish_cancelled(run)
-        elif not result.ok:
-            run.error = result.error or "The assistant failed."
+        elif not stage_succeeded(result):
+            run.error = run.stages["solo"].error or "The assistant failed."
             self._set_state(run, FAILED)
         elif writes and run.pull_request_mode:
             self._publish(run)
@@ -850,142 +1920,487 @@ class Pipeline:
         else:
             self._set_state(run, COMPLETE)
 
+    def _run_parallel(
+        self, run: Run, specs: List[Tuple[str, Dict[str, Any], str, bool, bool]]
+    ) -> Dict[str, ProviderResult]:
+        """Run several stages at once, one thread and one subprocess each.
+
+        Returns the results that completed, keyed by stage id; a seat that
+        raised is absent rather than present-and-broken, so callers filter by
+        membership instead of inspecting a sentinel.
+
+        A seat that throws must not take the council with it. One CLI missing
+        its binary is a bench of two, which is still a council - the run only
+        fails when nothing at all survives, and that is decided by the caller
+        rather than here.
+        """
+        results: Dict[str, ProviderResult] = {}
+
+        def work(
+            stage_id: str,
+            provider: Dict[str, Any],
+            prompt: str,
+            auto_approve: bool,
+            read_only: bool,
+        ) -> None:
+            try:
+                results[stage_id] = self._run_stage(
+                    run, stage_id, provider, prompt, auto_approve, read_only
+                )
+            except Exception as exc:  # noqa: BLE001 - one seat, not the run
+                stage = run.stages.get(stage_id)
+                if stage:
+                    stage.state = "failed"
+                    stage.error = f"{type(exc).__name__}: {exc}"
+                    stage.ended_at = time.time()
+                self.bus.publish(
+                    "log",
+                    level="warn",
+                    message=f"{stage_id} could not run: {exc}",
+                )
+                self.bus.publish(
+                    "stage_finished", stage=stage_id, ok=False, run=run.to_dict(),
+                    result={"error": str(exc), "ok": False},
+                )
+
+        threads = [
+            threading.Thread(
+                target=work, args=spec, name=f"{run.id}-{spec[0]}", daemon=True
+            )
+            for spec in specs
+        ]
+        for t in threads:
+            t.start()
+        # Joined without a timeout on purpose: each ProviderRunner already
+        # enforces its own, and Cancel reaches every one of them through
+        # `_runners`. A timeout here would orphan a live subprocess.
+        for t in threads:
+            t.join()
+        return results
+
+    def _skip_unrun_critiques(self, run: Run, seating: router.Seating) -> None:
+        """Close off the critique stages that were never dispatched.
+
+        A seat only critiques if its own position survived, so a bench of
+        three with one silent member cross-evaluates in two. The stage record
+        for the third has to say `skipped` rather than stay `pending`: the
+        thread hides a pending stage with no output, so what the operator saw
+        was three positions, two critiques and no explanation.
+        """
+        for seat in seating.members:
+            stage = run.stages.get(f"{seat.id}_critique")
+            if stage and stage.state == "pending":
+                stage.state = "skipped"
+                stage.error = "No position from this seat, so it had no peers to review."
+
+    def _persona_system(self, seat: router.Seat, roles: Dict[str, Any]) -> str:
+        """The lens a seat brings, as edited in the Roles catalogue.
+
+        Blank for the neutral council member, which is what the stage contract
+        alone should feel like.
+        """
+        role = prompts.role_by_id(seat.persona, roles) if seat.persona else None
+        return str((role or {}).get("system") or "")
+
+    def _seat_provider(self, run: Run, seat: router.Seat) -> Dict[str, Any]:
+        """The frozen provider config a seat runs under."""
+        providers = run.config.get("providers", {})
+        return providers.get(seat.provider_id) or {}
+
+    def _deliberation_provider(self, run: Run, seat: router.Seat) -> Dict[str, Any]:
+        """The same, with Stages 1 and 2 held to their own reasoning effort.
+
+        Effort is a property of the CLI, so the seat an agent holds and the
+        chair it may also run share one setting. This is the only place the two
+        come apart: a council's quota goes on the members reading the folder,
+        and the chairman verifies that reading anyway - so the deliberation can
+        think cheaper without demoting the one stage that writes. Empty, the
+        default, hands back the seat's own provider untouched.
+        """
+        provider = self._seat_provider(run, seat)
+        effort = str(
+            (run.config.get("council") or {}).get("deliberation_effort") or ""
+        ).strip()
+        if not effort or not provider:
+            return provider
+        return dict(provider, effort=effort)
+
     def _execute_council(self, run: Run) -> None:
-        """Worker-thread body for one council run: draft, gate, polish, deliver."""
+        """One council run: deliberate, critique, gate, synthesise, deliver.
+
+        Three stages, and the permission model is positional exactly as it was
+        with two: every seat in Stages 1 and 2 is invoked with its CLI's
+        read-only arguments and never receives the auto-approve flags, and the
+        chairman in Stage 3 is the only thing that can write. The gate still
+        sits immediately before the only stage that can change a file, so
+        rejecting still leaves the repository untouched.
+        """
         conf = run.config
-        providers = conf.get("providers", {})
+        roles = conf.get("roles", {})
         house_rules = conf.get("house_rules", "")
+        # One reading for the whole run, off the config frozen at start: a
+        # mid-run edit in the gear would otherwise leave the chairman writing in
+        # a different voice to the members it is synthesising. Projects is the
+        # deliberate exception - see `ProjectEngine._context`.
+        styles = cfg.writing_styles(conf, "council")
         workspace_status = gitutil.status(run.workspace).to_dict()
+        seating = run.seating
+        if seating is None:  # start() always seats a council run
+            raise RuntimeError("Council run reached execution with no seating.")
 
-        draft_text = ""
-        # Whether Stage 2 may modify files. Zero-Touch grants this up front;
-        # otherwise it is granted by the human at the approval gate. Reaching
-        # Stage 2 without it would hand the CLI a task it cannot complete: it
-        # would block on an interactive permission prompt that nothing in this
-        # pipeline can answer.
-        execute_approved = run.zero_touch
-        # Set when Stage 1 fails, which forces the gate back on.
-        draft_failed = False
+        # Zero-Touch grants it up front; `approved` is a grant a human already
+        # made at the gate on an earlier attempt at this same run.
+        execute_approved = (run.zero_touch or run.approved) and not run.read_only
+        # Set when the deliberation produced too little to synthesise from,
+        # which forces the gate back on even under Zero-Touch.
+        degraded = False
 
-        # ---- Stage 1: Junior Draft --------------------------------------
-        self._set_state(run, DRAFTING)
-        draft_prompt = prompts.build_draft_prompt(
-            run.task, run.workspace, workspace_status, house_rules,
-            run.conversation,
-            system=prompts.resolve_system(
-                "drafter", providers.get("drafter", {}),
-                conf.get("roles", {}),
+        # ---- Stage 1: independent positions ------------------------------
+        self._set_state(run, DELIBERATING)
+        self.bus.publish(
+            "log",
+            level="info",
+            message=(
+                f"Council seated: "
+                + ", ".join(f"{s.alias} ({s.agent})" for s in seating.members)
+                + f", chaired by {seating.chair.agent}."
             ),
         )
-        # Stage 1 is read-only by instruction, so it never receives the
-        # auto-approve flags regardless of the Zero-Touch setting.
-        result = self._run_stage(
+        for note in seating.notes:
+            self.bus.publish("log", level="warn", message=note)
+
+        # Why there will be no gate, no diff and no files afterwards, said at
+        # the top rather than left to be inferred from their absence.
+        if run.read_only:
+            self.bus.publish(
+                "log",
+                level="info",
+                message=(
+                    "No working folder, so this run answers rather than "
+                    "builds: every stage is read-only, there is nothing to "
+                    "approve, and the chairman writes any code into its reply."
+                ),
+            )
+
+        # Read-only is a role here, enforced by what the CLI is invoked with.
+        # A provider that declares no `read_only_args` - the Custom command
+        # preset ships with none - is held to it by the prompt alone, which is
+        # a weaker promise than the one the stage makes and is worth saying out
+        # loud rather than implying. The chairman is on the list only when the
+        # run itself writes nothing; otherwise writing is its job.
+        read_only_seats = [
+            *seating.members, *([seating.chair] if run.read_only else [])
+        ]
+        unguarded = sorted({
+            str(self._seat_provider(run, seat).get("label") or seat.agent)
+            for seat in read_only_seats
+            if not (self._seat_provider(run, seat).get("read_only_args") or [])
+        })
+        if unguarded:
+            self.bus.publish(
+                "log",
+                level="warn",
+                message=(
+                    f"{', '.join(unguarded)} has no read-only arguments "
+                    f"configured, so nothing but the prompt stops it writing "
+                    + ("on a run that is meant to write nothing. "
+                       if run.read_only else "during the deliberation. ")
+                    + "Set them under Agents in Settings."
+                ),
+            )
+
+        results = self._run_parallel(
             run,
-            "drafter",
-            providers.get("drafter", {}),
-            draft_prompt,
-            auto_approve=False,
+            [
+                (
+                    seat.id,
+                    self._deliberation_provider(run, seat),
+                    prompts.build_member_prompt(
+                        run.task,
+                        run.workspace,
+                        workspace_status,
+                        house_rules,
+                        run.conversation,
+                        persona_system=self._persona_system(seat, roles),
+                        **styles,
+                    ),
+                    False,  # never auto-approved
+                    True,   # and explicitly read-only
+                )
+                for seat in seating.members
+            ],
         )
 
         if self._is_cancelled():
             self._finish_cancelled(run)
             return
 
-        if not result.ok:
-            # A failed junior is recoverable - the senior can work from the
-            # task alone - but it is not what the operator asked for.
-            # Continuing unattended would turn "junior drafts, senior
-            # verifies" into a lone agent writing to the repo with no draft
-            # and nobody watching, which is a combination nobody selected.
-            # Degrade to the approval gate instead of escalating past it; the
-            # operator can still approve.
-            draft_failed = True
+        # What survived. A seat that failed is simply not at the table for the
+        # rest of the run; it is not replaced, because a substitute would not
+        # have deliberated independently with the others.
+        positions = [
+            {"seat": seat, "alias": seat.alias, "output": results[seat.id].stdout}
+            for seat in seating.members
+            if seat.id in results and stage_succeeded(results[seat.id])
+        ]
+        if len(positions) < len(seating.members):
+            lost = len(seating.members) - len(positions)
             self.bus.publish(
                 "log",
                 level="warn",
                 message=(
-                    f"Draft stage failed ({result.error}). "
+                    f"{lost} of {len(seating.members)} members produced no "
+                    f"answer. The council continues with {len(positions)}."
+                ),
+            )
+
+        # The CLIs actually behind the surviving answers, which is not the same
+        # as how many of them there are: two seats on one agent are two
+        # positions and one voice.
+        voices = {p["seat"].agent for p in positions}
+
+        if not positions:
+            degraded = True
+            self.bus.publish(
+                "log",
+                level="warn",
+                message=(
+                    "No member produced an answer. "
                     + (
-                        "Pausing for approval: Zero-Touch assumes a draft to "
-                        "verify, and there is none."
+                        "Pausing for approval: Zero-Touch assumes a "
+                        "deliberation to synthesise, and there is none."
                         if run.zero_touch
-                        else "The senior stage can continue alone."
+                        else "The chairman can still work the task alone."
                     )
                 ),
             )
-        draft_text = result.stdout
+        elif len(voices) < 2:
+            # One voice is not a quorum however many chairs were laid out. It
+            # happens two ways: seats duplicated onto the only installed CLI,
+            # and everyone but one member failing. Either way what reaches the
+            # chairman is a single opinion with nothing to weigh it against,
+            # and Zero-Touch writing that unattended is not what the toggle
+            # promises - so the gate comes back on.
+            degraded = True
+            self.bus.publish(
+                "log",
+                level="warn",
+                message=(
+                    f"One CLI ({positions[0]['seat'].agent}) is behind every "
+                    f"position that survived, so there is no second opinion to "
+                    f"weigh it against. "
+                    + (
+                        "Pausing for approval rather than writing on one "
+                        "voice unattended."
+                        if run.zero_touch
+                        else "The chairman is working from a single position."
+                    )
+                ),
+            )
+
+        # ---- Stage 2: peer critique --------------------------------------
+        # Skipped when there are not two *voices* to compare. A lone member
+        # handed its own answer back under an alias would be reviewing itself
+        # while believing it was reviewing a colleague, and two seats on one
+        # CLI is the same thing wearing two badges: the same model, the same
+        # blind spots, reviewing the answer it would have written. Counting
+        # positions instead of agents bought a stage of that at full price on
+        # every machine with one CLI installed.
+        critiques: List[Dict[str, Any]] = []
+        if len(voices) >= 2:
+            self._set_state(run, CRITIQUING)
+            critique_results = self._run_parallel(
+                run,
+                [
+                    (
+                        f"{p['seat'].id}_critique",
+                        self._deliberation_provider(run, p["seat"]),
+                        prompts.build_critique_prompt(
+                            run.task,
+                            # Every position except this seat's own.
+                            [
+                                {"alias": o["alias"], "output": o["output"]}
+                                for o in positions
+                                if o["seat"].id != p["seat"].id
+                            ],
+                            run.workspace,
+                            workspace_status,
+                            house_rules,
+                            persona_system=self._persona_system(p["seat"], roles),
+                            strictness_level=run.strictness,
+                            **styles,
+                            # Its own answer, named as its own. A fresh process
+                            # has no memory of Stage 1, so without this it
+                            # cannot say where a peer differs from what it
+                            # argued itself.
+                            own_position=p["output"],
+                        ),
+                        False,
+                        True,
+                    )
+                    for p in positions
+                ],
+            )
+            if self._is_cancelled():
+                self._finish_cancelled(run)
+                return
+            # A seat with no position has no peers to review and never ran.
+            # Saying so is the difference between a bench of three that
+            # cross-evaluated in pairs and one that silently did two of three:
+            # a stage left `pending` is filtered out of the thread entirely,
+            # so the missing card looked like a rendering quirk.
+            self._skip_unrun_critiques(run, seating)
+            critiques = [
+                {
+                    "alias": p["seat"].alias,
+                    "output": critique_results[f"{p['seat'].id}_critique"].stdout,
+                }
+                for p in positions
+                if f"{p['seat'].id}_critique" in critique_results
+                and stage_succeeded(critique_results[f"{p['seat'].id}_critique"])
+            ]
+        else:
+            self._skip_unrun_critiques(run, seating)
+            if positions:
+                self.bus.publish(
+                    "log",
+                    level="info",
+                    message=(
+                        "One position survived, so there was nothing to "
+                        "peer-review. Going straight to the chairman."
+                        if len(positions) == 1
+                        else f"Every surviving position came from the same CLI "
+                             f"({positions[0]['seat'].agent}), so peer review "
+                             f"would be that agent reviewing itself. Skipped, "
+                             f"and the calls it would have cost with it."
+                    ),
+                )
 
         # ---- Approval gate ----------------------------------------------
-        if not run.zero_touch or draft_failed:
-            self._set_state(run, AWAITING_APPROVAL, draft=draft_text)
+        # Unmoved: it is still the last thing before the only stage that can
+        # write, and what it shows is now the whole deliberation rather than
+        # one draft.
+        # `run.approved` is the continuation case: this bench and these
+        # positions have already been through the gate once, and re-asking
+        # would make the operator approve the identical deliberation twice to
+        # get one chairman answer.
+        if (not run.zero_touch or degraded) and not run.approved and not run.read_only:
+            self._set_state(run, AWAITING_APPROVAL)
             self.bus.publish(
                 "log",
                 level="info",
                 message=(
                     "Paused for review. Nothing has been written to disk yet."
-                    if not draft_failed
-                    else "Paused for review: the draft stage failed, so there "
-                         "is nothing to verify. Approving runs the senior "
-                         "stage alone against your task."
+                    if not degraded
+                    else "Paused for review: the council did not reach a "
+                         "quorum. Approving runs the chairman on what little "
+                         "there is."
                 ),
             )
-            self._gate.wait()
+            # A gate the operator chose waits as long as they need. A gate
+            # forced onto a Zero-Touch run has nobody to answer it - that is
+            # what the toggle said - so it waits a bounded time and then gives
+            # up, which is what it would have done had the chairman failed.
+            # Parking forever also leaves `is_busy()` true and refuses every
+            # later run and project.
+            timeout = (
+                float(
+                    (conf.get("council") or {}).get("gate_timeout_seconds")
+                    or DEFAULT_GATE_TIMEOUT
+                )
+                if run.zero_touch
+                else None
+            )
+            if not self._gate.wait(timeout):
+                self._finish_cancelled(
+                    run,
+                    f"Zero-Touch was on, the council did not reach a quorum, "
+                    f"and nobody approved the run within {int(timeout or 0)}s. "
+                    f"Nothing was written.",
+                )
+                return
             with self._lock:
                 decision = self._gate_decision
             if decision != "approve" or self._is_cancelled():
                 self._finish_cancelled(run, "Rejected at the approval gate.")
                 return
             execute_approved = True
+            run.approved = True
 
         # ---- Delivery branch and safety snapshot ------------------------
         # Both happen here, after permission to write has been granted, so
-        # rejecting at the gate still leaves the repository untouched.
-        self._prepare_branch(run)
-        self._take_snapshot(run)
+        # rejecting at the gate still leaves the repository untouched. A
+        # read-only run never gets that permission, and anchoring a tree that
+        # nothing is going to touch would only produce a rollback offer for a
+        # run that changed nothing.
+        if not run.read_only:
+            self._prepare_branch(run)
+            self._take_snapshot(run)
 
         if self._is_cancelled():
             self._finish_cancelled(run)
             return
 
-        # ---- Stage 2: Senior Polish -------------------------------------
-        self._set_state(run, POLISHING)
-        polish_prompt = prompts.build_polish_prompt(
-            run.task,
-            draft_text,
-            run.workspace,
-            workspace_status,
-            house_rules,
-            run.reviewer_note,
-            run.conversation,
-            system=prompts.resolve_system(
-                "polisher", providers.get("polisher", {}),
-                conf.get("roles", {}),
-            ),
-        )
+        # ---- Stage 3: the chairman synthesises and applies ---------------
+        self._set_state(run, SYNTHESIZING)
+        chair_role = prompts.role_by_id("chairman", roles) or {}
+        chair_provider = dict(self._seat_provider(run, seating.chair))
+        # The chair is usually the same CLI as one of the members, but it is
+        # the only one that applies a patch, so it gets its own ceiling.
+        chair_timeout = (conf.get("council") or {}).get("chair_timeout_seconds")
+        if chair_timeout:
+            chair_provider["timeout_seconds"] = chair_timeout
 
         result = self._run_stage(
             run,
-            "polisher",
-            providers.get("polisher", {}),
-            polish_prompt,
+            "chair",
+            chair_provider,
+            prompts.build_chairman_prompt(
+                run.task,
+                [{"alias": p["alias"], "output": p["output"]} for p in positions],
+                critiques,
+                run.workspace,
+                workspace_status,
+                house_rules,
+                run.reviewer_note,
+                run.conversation,
+                run.chairman_attempts,
+                strictness_level=run.strictness,
+                system=str(chair_role.get("system") or ""),
+                read_only=run.read_only,
+                **styles,
+            ),
             auto_approve=execute_approved,
+            read_only=run.read_only,
         )
 
         # ---- Collect the diff -------------------------------------------
-        try:
-            run.diff = gitutil.working_diff(run.workspace)
-            run.diff_stat = gitutil.diff_stat(run.workspace)
-        except (gitutil.GitError, OSError) as exc:
-            self.bus.publish(
-                "log", level="warn", message=f"Could not read the diff: {exc}"
-            )
+        # Only when the chairman could have written. Asking git for a diff
+        # after a read-only run would report whatever the operator had already
+        # left in the tree as though the council had done it.
+        if not run.read_only:
+            try:
+                run.diff = gitutil.working_diff(run.workspace)
+                run.diff_stat = gitutil.diff_stat(run.workspace)
+            except (gitutil.GitError, OSError) as exc:
+                self.bus.publish(
+                    "log", level="warn", message=f"Could not read the diff: {exc}"
+                )
 
         if self._is_cancelled():
             self._finish_cancelled(run)
             return
 
-        if not result.ok:
-            run.error = result.error or "The senior stage failed."
+        if not stage_succeeded(result):
+            run.error = run.stages["chair"].error or "The chairman failed."
+            # A failed chairman in delivery mode leaves the operator standing
+            # on the work branch, and the next run reads the current branch as
+            # its base - which is the hazard `_publish` checks out to avoid on
+            # the way past. Not checked out here: whatever the chairman half
+            # wrote is still uncommitted in the tree, and carrying that onto
+            # the base branch is worse than staying put. Said out loud
+            # instead, as the cancelled path does.
+            self._warn_left_on_work_branch(run)
             self._set_state(run, FAILED)
         elif run.pull_request_mode:
             self._publish(run)
@@ -1002,6 +2417,12 @@ class Pipeline:
         """
         if not run.pull_request_mode:
             return
+        if run.resumed and gitutil.status(run.workspace).branch == run.work_branch:
+            # A continuation is already standing on the branch the first
+            # attempt cut. `git checkout -b` would fail on it, and failing the
+            # run over a branch that already exists is the opposite of what
+            # continuing is for.
+            return
         gitutil.create_branch(run.workspace, run.work_branch)
         self.bus.publish(
             "log",
@@ -1015,6 +2436,12 @@ class Pipeline:
     def _take_snapshot(self, run: Run) -> None:
         """Anchor the tree immediately before anything writes to it."""
         if not run.config.get("safety_snapshot", True):
+            return
+        if run.snapshot is not None:
+            # A continuation keeps the first attempt's anchor. Re-taking it
+            # here would anchor to whatever the failed chairman had already
+            # written, and rollback would then restore the half-applied state
+            # rather than the tree the run started from.
             return
         try:
             run.snapshot = gitutil.take_snapshot(run.workspace)
@@ -1109,6 +2536,31 @@ class Pipeline:
         with self._lock:
             return self._cancel_requested
 
+    def _warn_left_on_work_branch(self, run: Run, why: str = "") -> None:
+        """Say so when a run ends with the repository on its delivery branch.
+
+        The next run takes whatever is checked out as its pull-request base, so
+        being left somewhere nobody chose is not cosmetic.
+        """
+        if not run.work_branch:
+            return
+        try:
+            here = gitutil.status(run.workspace).branch
+        except (gitutil.GitError, OSError):
+            return
+        if here != run.work_branch:
+            return
+        self.bus.publish(
+            "log",
+            level="warn",
+            message=(
+                f"{why or 'Ended'} on {run.work_branch}. Nothing was pushed and "
+                f"{run.base_branch} is unchanged - switch back to "
+                f"{run.base_branch} before the next run, or it will branch "
+                f"from here."
+            ),
+        )
+
     def _finish_cancelled(self, run: Run, message: str = "Run cancelled.") -> None:
         for stage in run.stages.values():
             if stage.state in ("pending", "running"):
@@ -1117,15 +2569,7 @@ class Pipeline:
         # A cancellation after the gate leaves the operator on the delivery
         # branch. Saying so is the difference between "nothing happened" and
         # "your repository is on a branch you did not create".
-        if run.work_branch and gitutil.status(run.workspace).branch == run.work_branch:
-            self.bus.publish(
-                "log",
-                level="warn",
-                message=(
-                    f"Cancelled on {run.work_branch}. Nothing was pushed and "
-                    f"{run.base_branch} is unchanged."
-                ),
-            )
+        self._warn_left_on_work_branch(run, "Cancelled")
         # Only a council run can have changed the tree. Reading a diff after a
         # cancelled conversation would attribute the operator's own
         # uncommitted work to an agent that never had permission to write.
@@ -1135,15 +2579,97 @@ class Pipeline:
                 run.diff_stat = gitutil.diff_stat(run.workspace)
             except (gitutil.GitError, OSError):
                 pass
+        # `_set_state` has already written the transcript on the way into a
+        # terminal state, and nothing here changes the run after it.
         self._set_state(run, CANCELLED)
-        self._persist(run)
+
+    def _record_router_feedback(self, run: Run, rolled_back: bool = False) -> None:
+        """Fold this run's seats back into the router's history.
+
+        This is the only part of LLMRouter's training loop that survives the
+        port: there is no benchmark sweep here, so the signal is whatever the
+        runs themselves produce. Bounded hard in `router.score_history` for
+        exactly that reason.
+
+        A rollback is recorded against the chairman alone. It is the seat that
+        wrote the code the operator threw away; the members proposed, which is
+        not the same thing and should not be penalised the same way.
+
+        What is recorded is deliberately narrow. A stage that never ran carries
+        no information about the agent that would have run it - an exception in
+        the engine, or a cancellation, used to be written into the history as a
+        failure by every seat - so only stages that actually finished are
+        sampled. Even then the signal is "the CLI answered", not "the answer
+        was good"; the only judgement in here is the operator's rollback.
+        """
+        if not run.seating:
+            return
+        if run.incognito:
+            # The stats are a persistent record of who was seated and how it
+            # went, which is the record this run was told not to leave. One
+            # lost sample is cheaper than a private council showing up in the
+            # config file.
+            return
+        try:
+            council = dict(self.store.get("council") or {})
+            stats = dict(council.get("stats") or {})
+            weights = run.seating.profile.weights
+
+            if rolled_back:
+                router.record_outcome(
+                    stats, run.seating.chair.agent, weights, ok=False,
+                    rolled_back=True,
+                )
+            else:
+                for seat in run.seating.members:
+                    stage = run.stages.get(seat.id)
+                    if not stage or stage.state not in ("done", "failed"):
+                        continue
+                    router.record_outcome(
+                        stats, seat.agent, weights,
+                        ok=stage.state == "done",
+                    )
+                chair_stage = run.stages.get("chair")
+                if chair_stage and chair_stage.state in ("done", "failed"):
+                    router.record_outcome(
+                        stats, run.seating.chair.agent, weights,
+                        ok=chair_stage.state == "done",
+                    )
+
+            council["stats"] = stats
+            self.store.update({"council": council})
+        except Exception:  # noqa: BLE001
+            # Losing a feedback sample is not worth failing a finished run
+            # over, and the router works without any history at all.
+            pass
 
     def _persist(self, run: Run) -> None:
-        """Write the run transcript to disk for later inspection."""
+        """Write the run transcript to disk for later inspection.
+
+        An incognito run is held in memory instead. It has to be held
+        somewhere: the browser continues a conversation by naming the
+        transcript the last run wrote, so a private run that stored nothing at
+        all could be read once and never followed up on. What it does not get
+        is a file, a place in the sidebar, or any life beyond this process.
+        """
+        if run.incognito:
+            # Kept as the same JSON text the disk path would have written, so
+            # what `load_run` hands back is the same shape either way - a
+            # tuple that became a list, a stray object that became a string.
+            # A private run must not be the one that behaves differently.
+            text = json.dumps(run.to_dict(), indent=2, default=str)
+            with self._lock:
+                self._volatile_runs.pop(run.transcript_name, None)
+                self._volatile_runs[run.transcript_name] = text
+                for name in list(self._volatile_runs)[:-VOLATILE_RUN_LIMIT]:
+                    del self._volatile_runs[name]
+            return
         try:
             path = self._runs_dir / run.transcript_name
-            path.write_text(
-                json.dumps(run.to_dict(), indent=2, default=str), encoding="utf-8"
+            # Owner-only: a transcript carries the task, every stage's output
+            # and the whole diff of the repository the run touched.
+            cfg.write_private_text(
+                path, json.dumps(run.to_dict(), indent=2, default=str)
             )
         except OSError:
             pass  # a transcript we cannot save is not worth failing a run over
@@ -1173,62 +2699,106 @@ class Pipeline:
         except OSError:
             return []
 
-        # Read the whole window before picking leaves out of it. Two runs can
-        # share a timestamp, so the filename sort alone does not guarantee a
-        # child is seen before its parent, and a parent mistaken for a leaf
+        # Summarise the whole window before picking leaves out of it. Two runs
+        # can share a timestamp, so the filename sort alone does not guarantee
+        # a child is seen before its parent, and a parent mistaken for a leaf
         # would list the same conversation twice.
-        loaded: List[Tuple[str, Dict[str, Any]]] = []
-        parents: set = set()
-        for f in files:
-            try:
-                data = json.loads(f.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                continue
-            if not isinstance(data, dict):
-                continue
-            loaded.append((f.name, data))
-            parent = str(data.get("parent_run_id") or "")
-            if parent:
-                parents.add(parent)
+        rows = [r for r in (self._summary_of(f) for f in files) if r is not None]
+        parents = {r["parent_run_id"] for r in rows if r["parent_run_id"]}
+        self._prune_summary_cache({f.name for f in files})
 
         out: List[Dict[str, Any]] = []
-        for name, data in loaded:
-            if str(data.get("id") or "") in parents:
+        for row in rows:
+            if row["id"] in parents:
                 continue
-            # `solo` covers transcripts written before `mode` existed.
-            run_mode = str(data.get("mode") or "") or (
-                "solo" if data.get("solo") else "council"
-            )
-            if mode and run_mode != mode:
+            if mode and row["mode"] != mode:
                 continue
-            conversation = [
-                t for t in (data.get("conversation") or []) if isinstance(t, dict)
-            ]
-            first = conversation[0] if conversation else data
-            out.append(
-                {
-                    "id": data.get("id"),
-                    # A conversation is named for what it was opened about, so
-                    # the title is its first message and not its latest.
-                    "title": str(first.get("task") or "")[:200],
-                    "task": (data.get("task") or "")[:200],
-                    "workspace": _transcript_workspace(data),
-                    "state": data.get("state"),
-                    "created_at": data.get("created_at"),
-                    # Served so the browser can switch to the right mode before
-                    # continuing, rather than let the server refuse it after.
-                    "mode": run_mode,
-                    "zero_touch": data.get("zero_touch"),
-                    "diff_stat": data.get("diff_stat") or {},
-                    # Every earlier turn, plus this run's own message.
-                    "messages": len(conversation) + 1,
-                    "context": data.get("context") or {},
-                    "file": name,
-                }
-            )
+            summary = dict(row)
+            # Lineage is how the leaves were picked, not something the sidebar
+            # has any use for.
+            del summary["parent_run_id"]
+            out.append(summary)
             if len(out) >= limit:
                 break
         return out
+
+    def _summary_of(self, path: Path) -> Optional[Dict[str, Any]]:
+        """One conversation row, read from the transcript or from the cache.
+
+        A transcript is written when its run reaches a terminal state and then
+        only ever read, while the sidebar is rebuilt after every run, every
+        mode switch and every delete. Parsing a window of two hundred of them -
+        each carrying every stage's full output and the run's whole diff - to
+        produce a dozen short fields is the one part of listing conversations
+        that costs anything, so the answer is kept against the file's own mtime
+        and size. Both, rather than mtime alone: a same-second rewrite of the
+        same run is exactly what `_persist` does.
+        """
+        try:
+            st = path.stat()
+            stamp = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+        with self._lock:
+            cached = self._summary_cache.get(path.name)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        if not isinstance(data, dict):
+            return None
+
+        # `solo` covers transcripts written before `mode` existed.
+        run_mode = str(data.get("mode") or "") or (
+            "solo" if data.get("solo") else "council"
+        )
+        conversation = [
+            t for t in (data.get("conversation") or []) if isinstance(t, dict)
+        ]
+        first = conversation[0] if conversation else data
+        row = {
+            "id": str(data.get("id") or ""),
+            # A conversation is named for what it was opened about, so the
+            # title is its first message and not its latest.
+            "title": str(first.get("task") or "")[:200],
+            "task": (data.get("task") or "")[:200],
+            "workspace": _transcript_workspace(data),
+            "state": data.get("state"),
+            "created_at": data.get("created_at"),
+            # Served so the browser can switch to the right mode before
+            # continuing, rather than let the server refuse it after.
+            "mode": run_mode,
+            "zero_touch": data.get("zero_touch"),
+            # So the row itself can say a run stopped halfway and can still be
+            # finished. Discoverability is the whole problem here: the operator
+            # who needs this is looking at a list of conversations, not at the
+            # run they gave up on.
+            "can_resume": _with_resumability(data)["can_resume"],
+            "diff_stat": data.get("diff_stat") or {},
+            # Every earlier turn, plus this run's own message.
+            "messages": len(conversation) + 1,
+            "context": data.get("context") or {},
+            "file": path.name,
+            "parent_run_id": str(data.get("parent_run_id") or ""),
+        }
+        with self._lock:
+            self._summary_cache[path.name] = (stamp, row)
+        return row
+
+    def _prune_summary_cache(self, keep: set) -> None:
+        """Forget summaries of transcripts that are no longer in the window.
+
+        Deleted runs and runs that have aged out of `HISTORY_SCAN_LIMIT` both
+        land here; without it the cache would be a second, unbounded copy of
+        every conversation the app had ever listed.
+        """
+        with self._lock:
+            for name in [n for n in self._summary_cache if n not in keep]:
+                del self._summary_cache[name]
 
     def context_preview(self, name: str) -> Dict[str, Any]:
         """What continuing a persisted transcript would replay, and what it costs.
@@ -1313,11 +2883,23 @@ class Pipeline:
         return removed
 
     def load_run(self, name: str) -> Optional[Dict[str, Any]]:
-        """Load a persisted transcript by filename."""
+        """Load a run transcript by filename, from memory or from disk.
+
+        The in-memory half is where an incognito conversation lives. Checked
+        first, and by exact name: these are names this engine generated, not
+        names a client can steer, and a private run must be continuable by
+        exactly the call that continues a public one.
+        """
+        with self._lock:
+            text = self._volatile_runs.get(name)
+        if text is not None:
+            return _with_resumability(json.loads(text))
+
         path = self._transcript_path(name)
         if path is None or not path.exists():
             return None
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return None
+        return _with_resumability(data)

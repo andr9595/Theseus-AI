@@ -15,21 +15,39 @@
       <!-- The ship of Theseus. Flat by construction: solid fills, no strokes,
            no gradients inside the glyph. The mast is the gap between the two
            sails rather than a drawn bar - at 21px a 1px rule would grey out. -->
-      <div class="brand-mark" aria-hidden="true">
-        <svg viewBox="0 0 24 24" width="21" height="21" fill="currentColor">
+      <!-- The mark is also the collapse control, so it is a real button: the
+           history it hides is reachable from the keyboard, so the thing that
+           hides it has to be too. -->
+      <button id="sidebar-toggle" class="brand-mark" type="button"
+              aria-controls="chat-list" aria-expanded="true"
+              aria-label="Collapse chat history" title="Collapse chat history">
+        <svg class="mark-logo" viewBox="0 0 24 24" width="21" height="21" fill="currentColor" aria-hidden="true">
           <path d="M11.1 2.6v9.3H5.1z"/>
           <path d="M12.9 5.8v6.1h6z"/>
           <path d="M2.5 13.3h19l-1.8 4a3.6 3.6 0 0 1-3.3 2.1H7.6a3.6 3.6 0 0 1-3.3-2.1z"/>
         </svg>
-      </div>
+        <!-- Hovered, the ship gives way to the action. Two glyphs rather than
+             one mirrored: flipping the panel would carry its divider across to
+             the right and draw a rail that isn't there. -->
+        <svg class="mark-collapse" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="3" y="3" width="18" height="18" rx="2"/>
+          <path d="M9 3v18M17 16l-4-4 4-4"/>
+        </svg>
+        <svg class="mark-expand" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="3" y="3" width="18" height="18" rx="2"/>
+          <path d="M9 3v18M13 16l4-4-4-4"/>
+        </svg>
+      </button>
       <h1>Theseus AI</h1>
     </div>
 
-    <button id="new-chat" class="new-chat" type="button">
+    <!-- The labels are spans rather than bare text so the collapsed rail can
+         drop them without touching the icons beside them. -->
+    <button id="new-chat" class="new-chat" type="button" aria-label="New chat" title="New chat">
       <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
         <path d="M12 5v14M5 12h14"/>
       </svg>
-      New chat
+      <span class="sidebar-label">New chat</span>
     </button>
 
     <!-- The whole sidebar below the button is history. Grouped by day in
@@ -37,12 +55,26 @@
     <div id="chat-list" class="chat-list"></div>
 
     <nav class="sidebar-foot">
-      <button id="settings-btn" class="foot-btn" type="button">
+      <!-- Quota belongs with Settings rather than on the composer: it is the
+           same subscription whichever mode is on screen. Hovering names the
+           figures, clicking opens them window by window - a dot on the icon is
+           the only part that survives the collapsed rail, and it appears only
+           once a limit is close enough to be worth interrupting for. -->
+      <button id="usage-btn" class="foot-btn usage-btn" type="button"
+              aria-haspopup="dialog" aria-expanded="false"
+              aria-label="Agent usage" title="Agent usage">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true">
+          <path d="M4 19v-6M10 19V9M16 19V5M3 19h18"/>
+        </svg>
+        <span class="sidebar-label">Usage</span>
+        <span class="usage-alert" aria-hidden="true"></span>
+      </button>
+      <button id="settings-btn" class="foot-btn" type="button" aria-label="Settings" title="Settings">
         <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
           <circle cx="12" cy="12" r="3"/>
           <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2v.2a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0-1.2-2.9H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 8a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V2a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V8a1.7 1.7 0 0 0 1.5 1H22a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>
         </svg>
-        Settings
+        <span class="sidebar-label">Settings</span>
       </button>
       <div class="profile">
         <span class="profile-mark" id="profile-mark" aria-hidden="true">?</span>
@@ -66,14 +98,51 @@
       </div>
       <div class="mode-bar-right">
         <button id="cancel-btn" class="btn btn-quiet btn-sm hidden" type="button">Cancel</button>
+        <!-- Shown only on a failed run that still has stages left. Continuing
+             reuses every answer already given and pays only for the stage that
+             failed, which is the difference between losing a chairman and
+             losing the whole council. -->
+        <button id="continue-btn" class="btn btn-quiet btn-sm hidden" type="button">Continue</button>
         <button id="rollback-btn" class="btn btn-quiet btn-sm hidden" type="button">Roll back</button>
         <button id="pr-btn" class="btn btn-quiet btn-sm hidden" type="button">View pull request</button>
+        <!-- Last in the row, so it holds the top-right corner whether or not
+             the run controls beside it are showing. Dim is off and bright is
+             on: the state has to be readable at a glance from across the room,
+             because the cost of misreading it is a conversation recorded that
+             was meant not to be. -->
+        <button id="incognito-btn" class="incognito-btn" type="button" aria-pressed="false">
+          <!-- Hat and glasses, drawn rather than fetched like every other mark
+               here (see the CSP header). The brim is one stroke so it stays a
+               brim at 19px instead of turning into a filled bar. -->
+          <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor"
+               stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M8.4 4.6a1.6 1.6 0 0 1 2-1l3.3 1.1a1.6 1.6 0 0 1 1 2l-1 3.1-6.3-2.1z"/>
+            <path d="M2.8 11.2c3.2-2.4 6-3.4 9.2-3.4s6 1 9.2 3.4"/>
+            <circle cx="7.3" cy="16.2" r="3.1"/>
+            <circle cx="16.7" cy="16.2" r="3.1"/>
+            <path d="M10.4 15.8h3.2"/>
+          </svg>
+        </button>
       </div>
     </div>
 
     <!-- Council members. Sticky above the thread rather than inside it: it is
-         the control surface for the run, so it must not scroll away mid-run. -->
+         the control surface for the run, so it must not scroll away mid-run.
+         Who sits here is routed from the prompt, so it changes as you type. -->
     <div id="council-strip" class="council-strip hidden"></div>
+
+    <!-- The three stages, as a stepper. Rendered with the same cells the
+         project tracker uses, so a stage in flight reads identically in both
+         places rather than inventing a second visual language for progress. -->
+    <div id="council-steps" class="council-steps hidden">
+      <div class="column">
+        <div class="project-strip"></div>
+        <!-- The opened cell, agent by agent. Under the row rather than in a
+             popover: it is a list that grows with the council, and a menu
+             floating over the thread would cover the answers it links to. -->
+        <div id="step-detail"></div>
+      </div>
+    </div>
 
     <div id="scroll" class="scroll">
       <div class="column">
@@ -91,20 +160,33 @@
 
           <!-- The initializer. -->
           <section id="project-setup" class="project-setup">
-            <h2 class="project-title">Build something, unattended</h2>
-            <p class="project-sub">
-              Three agents work one folder around a shared board &mdash; an
-              architect plans and reviews, a developer builds, QA tests &mdash;
-              and the board decides who goes next. The first turn is a
-              read-only look at what is already there. Every turn after it
-              <b>runs with its CLI's auto-approve flags</b>, so files change
-              without asking. Pick the folder deliberately.
-            </p>
+            <div>
+              <h2 class="project-title">Build something, unattended</h2>
+              <p class="project-sub">
+                Three agents work one folder around a shared board &mdash; an
+                architect plans and reviews, a developer builds, QA tests &mdash;
+                and the board decides who goes next. The first turn is a
+                read-only look at what is already there. Every turn after it
+                <b>runs with its CLI's auto-approve flags</b>, so files change
+                without asking. Pick the folder deliberately.
+              </p>
+            </div>
 
             <div class="field">
               <label for="project-goal">What should it build?</label>
-              <textarea id="project-goal" rows="5" spellcheck="false"
-                placeholder="e.g. A cross-platform CLI that watches a directory and reports file-size changes as JSON, with tests and a systemd unit."></textarea>
+              <div class="project-goal-box">
+                <textarea id="project-goal" rows="5" spellcheck="false"
+                  placeholder="e.g. A cross-platform CLI that watches a directory and reports file-size changes as JSON, with tests and a systemd unit."></textarea>
+                <div class="project-goal-foot">
+                  <button class="project-gear-btn icon-round" type="button"
+                    aria-label="Project options" aria-haspopup="true">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+                      <circle cx="12" cy="12" r="3"/>
+                      <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2v.2a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0-1.2-2.9H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 8a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V2a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V8a1.7 1.7 0 0 0 1.5 1H22a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>
+                    </svg>
+                  </button>
+                </div>
+              </div>
               <span class="field-hint">
                 The only thing in the whole run that comes from you. Say what
                 it is for and what &ldquo;finished&rdquo; means &mdash; that is
@@ -166,6 +248,13 @@
                 <p id="project-where" class="project-sub"></p>
               </div>
               <div class="project-controls">
+                <button class="project-gear-btn icon-round" type="button"
+                  aria-label="Project options" aria-haspopup="true">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+                    <circle cx="12" cy="12" r="3"/>
+                    <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2v.2a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0-1.2-2.9H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 8a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V2a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V8a1.7 1.7 0 0 0 1.5 1H22a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>
+                  </svg>
+                </button>
                 <button id="project-pause" class="btn btn-quiet btn-sm" type="button">Pause</button>
                 <button id="project-resume" class="btn btn-quiet btn-sm hidden" type="button">Resume</button>
                 <button id="project-handoff" class="btn btn-quiet btn-sm" type="button" aria-haspopup="true">Hand off</button>
@@ -304,7 +393,7 @@
       </div>
     </div>
     <textarea id="approval-note" class="approval-note" rows="2" spellcheck="false"
-      placeholder="Optional: steer the senior stage. Takes precedence over the draft."></textarea>
+      placeholder="Optional: steer the chairman. Takes precedence over the council."></textarea>
     <div class="approval-actions">
       <button id="reject-btn" class="btn btn-quiet btn-sm" type="button">Reject</button>
       <button id="approve-btn" class="btn btn-primary btn-sm" type="button">Approve &amp; execute</button>
@@ -351,6 +440,30 @@
   </div>
 </div>
 
+<!-- ================= Uncommitted changes =================
+     Opened from the status bar's "N uncommitted" chip, in every mode. The
+     diff block under a run shows what *that run* did; this shows what is in
+     the folder right now, whoever put it there. -->
+<div id="changes" class="modal hidden" role="dialog" aria-modal="true" aria-label="Uncommitted changes">
+  <div class="modal-card modal-card-tall">
+    <header class="modal-head">
+      <h3>Uncommitted changes</h3>
+      <button class="icon-btn" data-close="changes" type="button" aria-label="Close">&times;</button>
+    </header>
+    <div id="changes-where" class="changes-where"></div>
+    <div id="changes-files" class="changes-files"></div>
+    <div id="changes-diff" class="diff-view changes-diff"></div>
+    <footer class="modal-foot">
+      <input id="changes-message" class="commit-message" spellcheck="false"
+        placeholder="Commit message&hellip;" aria-label="Commit message">
+      <button id="changes-commit" class="btn btn-primary" type="button">
+        Commit everything
+      </button>
+    </footer>
+    <p id="changes-note" class="changes-note"></p>
+  </div>
+</div>
+
 <!-- ================= Settings ================= -->
 <div id="settings" class="modal hidden" role="dialog" aria-modal="true" aria-label="Settings">
   <div class="modal-card modal-card-tall">
@@ -360,27 +473,154 @@
     </header>
     <!-- One destination per kind of setting, so no panel is scrolled past to
          reach another. Every panel stays in the DOM: Save reads them all. -->
-    <div class="settings-tabs" role="tablist">
-      <button class="settings-tab active" data-settings-tab="stages" role="tab">Agents</button>
-      <button class="settings-tab" data-settings-tab="roles" role="tab">Roles</button>
-      <button class="settings-tab" data-settings-tab="run" role="tab">Run</button>
-      <button class="settings-tab" data-settings-tab="project" role="tab">Project</button>
-      <button class="settings-tab" data-settings-tab="app" role="tab">App</button>
+    <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+      <button class="settings-tab active" type="button" role="tab"
+        id="settings-tab-agents" data-settings-tab="agents"
+        aria-controls="settings-panel-agents" aria-selected="true">Agents</button>
+      <button class="settings-tab" type="button" role="tab" tabindex="-1"
+        id="settings-tab-council" data-settings-tab="council"
+        aria-controls="settings-panel-council" aria-selected="false">Council</button>
+      <button class="settings-tab" type="button" role="tab" tabindex="-1"
+        id="settings-tab-roles" data-settings-tab="roles"
+        aria-controls="settings-panel-roles" aria-selected="false">Roles</button>
+      <button class="settings-tab" type="button" role="tab" tabindex="-1"
+        id="settings-tab-run" data-settings-tab="run"
+        aria-controls="settings-panel-run" aria-selected="false">Runs</button>
+      <button class="settings-tab" type="button" role="tab" tabindex="-1"
+        id="settings-tab-app" data-settings-tab="app"
+        aria-controls="settings-panel-app" aria-selected="false">General</button>
     </div>
     <div class="modal-body">
-      <section class="settings-panel active" data-settings-panel="stages">
+      <section class="settings-panel active" data-settings-panel="agents"
+        id="settings-panel-agents" role="tabpanel" aria-labelledby="settings-tab-agents">
+        <h4 class="settings-head">
+          Your agents
+          <button id="agents-refresh" class="btn btn-quiet btn-sm" type="button">
+            Re-check
+          </button>
+        </h4>
         <p class="settings-note">
-          Each one shells out to a locally installed CLI that carries your own
-          subscription auth. No API keys are stored or sent. The two council
-          stages and the Chat assistant are configured independently &mdash;
-          Chat's behaviour is optional and blank by default, and which CLI it
-          runs is picked from the composer, not here.
+          Add the agents you have access to &mdash; one, two or all three, in
+          any combination. None is required and none is preferred: what you add
+          here is the whole bench, and nothing is seated because it happens to
+          be installed. Signing in runs the vendor's own command and the account
+          stays with their CLI; <b>no API key is ever asked for, stored or
+          sent</b>, which is what keeps a run free at the point of use.
+        </p>
+        <div id="agent-connections" class="agent-connections"></div>
+
+        <h4 class="settings-head">How each CLI is run</h4>
+        <p class="settings-note">
+          One card per agent you have added, plus the Chat assistant and the
+          three project chairs. What a council seat is <em>told to be</em> is
+          not here: that travels with the seat, on the <b>Council</b> tab or on
+          the bench above the composer.
+          <button id="run-doctor" class="btn btn-quiet btn-sm" type="button">
+            Re-check CLIs
+          </button>
         </p>
         <div id="provider-forms"></div>
         <div id="doctor-out" class="doctor"></div>
       </section>
 
-      <section class="settings-panel" data-settings-panel="roles">
+      <section class="settings-panel" data-settings-panel="council"
+        id="settings-panel-council" role="tabpanel" aria-labelledby="settings-tab-council"
+        hidden>
+        <p class="settings-note">
+          Who deliberates, and how hard they push each other. The bench is
+          chosen per run from what you asked for &mdash; a security question
+          seats a different council than a rename &mdash; so most of this
+          decides the <em>bounds</em> of that choice rather than the choice.
+        </p>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="council-seats">Members</label>
+            <input id="council-seats" type="number" min="2" max="6">
+            <span class="field-hint">
+              How many answer the task independently. Two is the floor: one
+              member has no peer to review. The ceiling is the number of agent
+              CLIs installed &mdash; asking for more seats than that seats
+              fewer, and the run says so.
+            </span>
+          </div>
+          <div class="field">
+            <label for="council-deliberation-effort">Deliberation effort</label>
+            <select id="council-deliberation-effort">
+              <option value="">Each CLI's own setting</option>
+              <option value="low">Low &mdash; fastest, least thinking</option>
+              <option value="medium">Medium &mdash; balanced</option>
+              <option value="high">High &mdash; deeper thinking, slower</option>
+            </select>
+            <span class="field-hint">
+              How hard the members think in Stages 1 and 2, overriding what
+              each agent is set to under Agents. Reading the folder is where a
+              council spends its quota, and the chair verifies that reading
+              anyway &mdash; so this buys a cheaper bench without demoting the
+              one stage that writes. The chair keeps its CLI's own setting.
+            </span>
+          </div>
+          <div class="field">
+            <label for="council-chair-timeout">Chair timeout (s)</label>
+            <input id="council-chair-timeout" type="number" min="60" max="7200">
+            <span class="field-hint">
+              The chair applies the patch, so it gets longer than the
+              read-only members.
+            </span>
+          </div>
+        </div>
+
+        <label class="toggle" for="council-routing">
+          <input type="checkbox" id="council-routing">
+          <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+          <span class="toggle-text">
+            <strong>Route the bench from the prompt</strong>
+            <em>Off pins the council to your seating below and ignores what you asked</em>
+          </span>
+        </label>
+
+        <label class="toggle" for="council-chair-deliberates">
+          <input type="checkbox" id="council-chair-deliberates">
+          <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+          <span class="toggle-text">
+            <strong>Chair also holds a seat</strong>
+            <em id="council-chair-note">Three positions instead of two, at the cost of a chair weighing its own</em>
+          </span>
+        </label>
+
+        <div class="field">
+          <label for="council-strictness">Strictness</label>
+          <div class="project-slider">
+            <input id="council-strictness" type="range" min="0" max="5" step="1" value="2">
+            <output id="council-strictness-out" for="council-strictness"></output>
+          </div>
+          <span class="field-hint" id="council-strictness-hint"></span>
+        </div>
+
+        <h4 class="settings-head">Seating</h4>
+        <p class="settings-note">
+          Which CLI holds each seat, and what it is told to be. Pin either and
+          the router works around it; leave a seat on <b>Auto</b> and it is
+          chosen per run. The same two choices are one click away on any seat
+          in the bench above the composer &mdash; this is the whole council at
+          once. The behaviours themselves are written under <b>Roles</b>.
+        </p>
+        <div id="council-pins" class="council-pins"></div>
+
+        <h4 class="settings-head">What each CLI is good at</h4>
+        <p class="settings-note">
+          Half of what the router scores against &mdash; the other half is what
+          your prompt is about. These are <b>starting positions, not
+          measurements</b>: nothing here was benchmarked, and a figure you
+          disagree with is meant to be edited. Runs feed back into the choice
+          on their own, within bounds.
+        </p>
+        <div id="council-capabilities" class="council-caps"></div>
+      </section>
+
+      <section class="settings-panel" data-settings-panel="roles"
+        id="settings-panel-roles" role="tabpanel" aria-labelledby="settings-tab-roles"
+        hidden>
         <h4 class="settings-head">
           Roles
           <button id="role-new" class="btn btn-quiet btn-sm" type="button">New role</button>
@@ -396,7 +636,9 @@
       <!-- The full set. The gear beside the composer carries the two that get
            changed per run; these are the rest, in one place rather than
            stacked down a sidebar that is now history. -->
-      <section class="settings-panel" data-settings-panel="run">
+      <section class="settings-panel" data-settings-panel="run"
+        id="settings-panel-run" role="tabpanel" aria-labelledby="settings-tab-run"
+        hidden>
         <p class="settings-note">
           Zero-Touch applies in both modes: it is what hands the CLI its
           auto-approve flags. Council can also be granted that at the approval
@@ -471,22 +713,22 @@
             <span class="field-hint">Where the initializer's slider starts. Zero builds what was asked for and stops.</span>
           </div>
         </div>
-      </section>
 
-      <section class="settings-panel" data-settings-panel="project">
-        <p class="settings-note">
-          Appended to every prompt the council is given, whichever folder the
-          run happens in. Chat does not get them: it is a conversation, not a
-          run against a project.
-        </p>
         <div class="field">
           <label for="house-rules">Standing project rules</label>
-          <textarea id="house-rules" rows="10" spellcheck="false"
+          <textarea id="house-rules" rows="8" spellcheck="false"
             placeholder="e.g. Use tabs. Never add dependencies without asking. All new code needs tests."></textarea>
+          <span class="field-hint">
+            Appended to every council and project prompt, whichever folder the
+            run happens in. Chat does not get them: it is a conversation, not
+            a run against a project.
+          </span>
         </div>
       </section>
 
-      <section class="settings-panel" data-settings-panel="app">
+      <section class="settings-panel" data-settings-panel="app"
+        id="settings-panel-app" role="tabpanel" aria-labelledby="settings-tab-app"
+        hidden>
         <p class="settings-note">
           Where this dashboard serves itself, and what it calls you. A changed
           port takes effect the next time the app starts.
@@ -528,17 +770,62 @@
             Delete all chats <span id="count-chat" class="count"></span>
           </button>
         </div>
+
+        <h4 class="settings-head">Reset</h4>
+        <p class="settings-note">
+          Puts every setting on every tab back to the shipped default, at once
+          and without saving first. Conversations and files are untouched.
+        </p>
+        <div class="history-actions">
+          <button id="reset-config" class="btn btn-quiet btn-sm" type="button">
+            Reset all settings
+          </button>
+        </div>
       </section>
     </div>
     <footer class="modal-foot">
-      <button id="reset-config" class="btn btn-quiet" type="button">Reset to defaults</button>
       <span class="modal-foot-spacer"></span>
-      <button id="run-doctor" class="btn btn-quiet" type="button">Re-check CLIs</button>
+      <button class="btn btn-quiet" data-close="settings" type="button">Cancel</button>
       <button id="save-settings" class="btn btn-primary" type="button">Save</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ================= Agent setup ================= -->
+<!-- The vendor's own install or sign-in command, running on a terminal this
+     app owns. What is shown is its output with the colour taken out, not a
+     terminal emulator: a flow that needs one is offered as a command to paste
+     instead, because a pane that half-draws a menu is worse than a line of
+     text that says what to type. -->
+<div id="agent-setup" class="modal hidden" role="dialog" aria-modal="true"
+  aria-label="Agent setup">
+  <div class="modal-card">
+    <header class="modal-head">
+      <h3 id="agent-setup-title">Setting up</h3>
+      <button class="icon-btn" data-close="agent-setup" type="button" aria-label="Close">&times;</button>
+    </header>
+    <div class="modal-body">
+      <p class="settings-note" id="agent-setup-note"></p>
+      <a id="agent-setup-url" class="btn btn-primary hidden" target="_blank" rel="noopener">
+        Open the sign-in page
+      </a>
+      <pre id="agent-setup-output" class="setup-output" aria-live="polite"></pre>
+      <div class="field">
+        <label for="agent-setup-input">
+          Type an answer <span class="field-hint">&mdash; only if it asks for one</span>
+        </label>
+        <input id="agent-setup-input" type="text" autocomplete="off" spellcheck="false">
+      </div>
+    </div>
+    <footer class="modal-foot">
+      <span class="modal-foot-spacer"></span>
+      <button id="agent-setup-cancel" class="btn btn-quiet" type="button">Stop</button>
+      <button class="btn btn-primary" data-close="agent-setup" type="button">Done</button>
     </footer>
   </div>
 </div>
 
 <div id="toasts" class="toasts" aria-live="assertive"></div>
 
+<script src="/continuation.js"></script>
 <script src="/app.js"></script>

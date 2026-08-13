@@ -109,12 +109,363 @@ class TestAuth(ServerTestBase):
         self.assertEqual(status, 403)
 
 
+class TestLaunchTicket(ServerTestBase):
+    """A session token on a browser's command line is readable by every other
+    user on the machine for as long as the window is open, so the launch URL
+    carries a ticket that buys the token once instead."""
+
+    def test_session_endpoint_rejects_get(self):
+        status, _ = self.request("/api/session", token="")
+        self.assertEqual(status, 405)
+
+    def test_the_launch_url_does_not_carry_the_session_token(self):
+        self.assertIn("ticket=", self.url)
+        self.assertNotIn(self.state.token, self.url)
+
+    def test_ticket_buys_the_token_exactly_once(self):
+        ticket = self.state.ticket
+        status, data = self.request(
+            "/api/session", method="POST", body={"ticket": ticket}, token=""
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["token"], self.token)
+
+        # Replay: whoever read the ticket out of the process table arrives
+        # second, and second gets nothing.
+        status, _ = self.request(
+            "/api/session", method="POST", body={"ticket": ticket}, token=""
+        )
+        self.assertEqual(status, 401)
+
+    def test_unknown_ticket_is_rejected(self):
+        status, _ = self.request(
+            "/api/session", method="POST", body={"ticket": "not-the-ticket"}, token=""
+        )
+        self.assertEqual(status, 401)
+
+
 class TestStaticFiles(ServerTestBase):
     def test_index_is_served_without_a_token(self):
         with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
             self.assertEqual(res.status, 200)
             body = res.read().decode()
         self.assertIn("Theseus AI", body)
+
+    def test_the_mark_collapses_the_sidebar_to_a_rail(self):
+        # The mark has to be a real button, not a decorative div, or the only
+        # way back to the history is the mouse.
+        with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
+            body = res.read().decode()
+        self.assertIn('<button id="sidebar-toggle" class="brand-mark"', body)
+        self.assertIn('aria-controls="chat-list"', body)
+        self.assertIn('<span class="sidebar-label">New chat</span>', body)
+
+        # Hovering the mark has to say what clicking it will do, and say the
+        # right one of the two things it can do.
+        self.assertIn('class="mark-logo"', body)
+        self.assertIn('class="mark-collapse"', body)
+        self.assertIn('class="mark-expand"', body)
+
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn("function setSidebarCollapsed(collapsed)", script)
+        self.assertIn("$('#sidebar-toggle').addEventListener('click'", script)
+
+        # One surface: the colour lives on the shell, so neither column paints
+        # its own and there is no seam between them.
+        with urllib.request.urlopen(f"{self.base}/app.css", timeout=15) as res:
+            css = res.read().decode()
+        self.assertIn(".app.sidebar-collapsed", css)
+        self.assertNotIn("background: var(--bg-1);\n  border-right:", css)
+        self.assertIn(".app.sidebar-collapsed .brand-mark:hover .mark-expand", css)
+
+    def test_incognito_sits_top_right_and_says_which_way_it_is_set(self):
+        # The one control whose state has to be readable before the message is
+        # sent rather than after: colour carries it for the eye, `aria-pressed`
+        # for everything else.
+        with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
+            body = res.read().decode()
+        self.assertIn('<button id="incognito-btn" class="incognito-btn"', body)
+        self.assertIn('aria-pressed="false"', body)
+        # Last in the row, so it holds the corner whether or not the run
+        # controls beside it are showing.
+        self.assertLess(body.index('id="pr-btn"'), body.index('id="incognito-btn"'))
+
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn("function renderIncognito()", script)
+        self.assertIn("$('#incognito-btn').addEventListener('click'", script)
+        self.assertIn("sessionStorage.setItem('ac_incognito'", script)
+        # The choice has to reach both the run and the seating preview, or the
+        # strip would show a bench the run will not seat.
+        self.assertIn("incognito: state.incognito,", script)
+        self.assertIn("body: { task, incognito: state.incognito }", script)
+
+        with urllib.request.urlopen(f"{self.base}/app.css", timeout=15) as res:
+            css = res.read().decode()
+        self.assertIn('.incognito-btn[aria-pressed="true"]', css)
+
+    def test_the_sidebar_reports_quota_window_by_window(self):
+        # Claude rations a 5-hour session *and* a week; Codex reports whatever
+        # its last run logged. Reducing those to one percentage per agent would
+        # show a number no vendor gave, so the panel lists every limit it has.
+        with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
+            body = res.read().decode()
+        self.assertIn('id="usage-btn"', body)
+        self.assertIn('<span class="sidebar-label">Usage</span>', body)
+
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn("function usageForAgent(agentId)", script)
+        self.assertIn("reading.limits.map(usageLimitHtml)", script)
+        self.assertIn("$('#usage-btn').addEventListener('click'", script)
+        self.assertIn("api('/api/usage/refresh'", script)
+        # An agent with no quota source says so rather than showing a figure
+        # this app inferred for it.
+        self.assertIn("No quota source known for this CLI.", script)
+        # The bars are filled from `data-fill` because the CSP serves no
+        # `unsafe-inline`, so a style attribute in the markup would be dropped
+        # and every bar would sit empty.
+        self.assertNotIn('style="width', script)
+        self.assertIn("function paintUsageBars(root)", script)
+
+        with urllib.request.urlopen(f"{self.base}/app.css", timeout=15) as res:
+            css = res.read().decode()
+        self.assertIn(".usage-menu", css)
+        self.assertIn(".usage-btn.warn .usage-alert", css)
+
+    def test_a_seat_holds_its_quota_chip_rather_than_losing_it_to_the_grid(self):
+        # The chip is a refresh button, so the seat around it cannot be one
+        # too: the parser lifts a nested button back out, and the strip's grid
+        # then hands it a square of its own beside the agent it belongs to.
+        # Only high usage renders the chip, so the bench broke exactly when the
+        # reading mattered.
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn('<div class="member ', script)
+        self.assertIn('<button class="member-main" type="button">', script)
+        self.assertNotIn('<button class="member ', script)
+        # Both controls still answer: the chip refreshes, and anything else in
+        # the seat opens the seat's menu.
+        self.assertIn("const chip = e.target.closest('[data-usage-for]');", script)
+        self.assertIn("const member = e.target.closest('.member');", script)
+
+        with urllib.request.urlopen(f"{self.base}/app.css", timeout=15) as res:
+            css = res.read().decode()
+        self.assertIn(".member-main {", css)
+        # The focus ring moved to the wrapper with the button it now contains.
+        self.assertIn(".member:has(:focus-visible)", css)
+
+    def test_caveman_settings_live_with_the_modes_that_use_them(self):
+        # All three modes toggle it from their composer gear, so Settings
+        # carries no checkbox for any of them - including Project, which used
+        # to own one and could overwrite the gear's value on save.
+        with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
+            body = res.read().decode()
+        self.assertNotIn('id="caveman-council"', body)
+        self.assertNotIn('id="caveman-chat"', body)
+        self.assertNotIn('id="caveman-project"', body)
+
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn(
+            "const cavemanMode = project ? 'project' : (chat ? 'chat' : 'council');",
+            script,
+        )
+        self.assertIn("row('caveman', 'Caveman mode'", script)
+        self.assertIn("patchConfig({ caveman: { [cavemanMode]:", script)
+
+    def test_efficiency_settings_live_with_the_modes_that_use_them(self):
+        with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
+            body = res.read().decode()
+        self.assertNotIn('id="efficiency-council"', body)
+        self.assertNotIn('id="efficiency-chat"', body)
+        self.assertNotIn('id="efficiency-project"', body)
+
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn(
+            "const efficiencyMode = project ? 'project' : "
+            "(chat ? 'chat' : 'council');",
+            script,
+        )
+        self.assertIn("row('efficiency', 'Efficiency mode'", script)
+        self.assertIn("patchConfig({", script)
+        self.assertIn("efficiency: {", script)
+
+    def test_the_model_is_chosen_in_one_place_and_from_a_list(self):
+        # The connection card says whether an agent is added, installed and
+        # signed in; the model belongs to the card below it, which is the only
+        # place asking for it. A second control for one setting is how a form
+        # ends up saving whichever of the two was read last.
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertNotIn("data-agent-models", script)
+        self.assertNotIn("Choose a model", script)
+
+        # Typed by hand, a model is a guess at what the account may run. The
+        # list is the CLI's own answer, fetched once the panel is up because
+        # nothing has asked for it before the operator opens Settings.
+        self.assertIn(
+            '`<select data-field="model">${modelOptionsHtml(id, p)}</select>`',
+            script,
+        )
+        self.assertIn("function hydrateModelSelects()", script)
+        self.assertIn(
+            "if (asked.has(key) || (cached && (cached.models || []).length)) return;",
+            script,
+        )
+        # A model saved before the catalogue was fetched still has to be an
+        # option, or opening the panel would silently offer to clear it.
+        self.assertIn("if (current && !models.includes(current)) models.push(current);", script)
+
+    def test_reasoning_effort_is_chosen_from_a_list_like_the_model(self):
+        # The two boxes sit side by side on the same card and answer the same
+        # kind of question, so one of them being free text was the odd one out:
+        # a level typed by hand is a guess, and Codex fails the run on a level
+        # it does not know rather than ignoring it.
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn('`<select data-field="effort">` +', script)
+        self.assertIn("function hydrateEffortSelects()", script)
+        self.assertNotIn(
+            '`<input type="text" data-field="effort" value="${esc(p.effort || \'\')}" ` +',
+            script,
+        )
+        # A level configured before the list was fetched, or one that stopped
+        # being legal when the model changed, stays on offer and says so.
+        self.assertIn("' — not offered for this model'", script)
+        # The advanced forms keep their text boxes: their model is free text
+        # too, so there is no model to ask the levels for.
+        self.assertIn('`<input type="text" data-field="effort" value="${esc(p.effort || \'\')}">` +', script)
+
+    def test_efforts_can_be_asked_for_an_unsaved_model(self):
+        # The Settings form asks about the model on screen, which is not the
+        # saved one until Save is pressed. Asking must not write it.
+        before = self.store.get("providers", {})["council_codex"].get("model", "")
+        _, data = self.request(
+            "/api/efforts?provider=council_codex&for_model=1&model=not-saved-yet"
+        )
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["model"], "not-saved-yet")
+        self.assertEqual(
+            self.store.get("providers", {})["council_codex"].get("model", ""),
+            before,
+        )
+
+        # Without the flag the saved model is still what answers, because a
+        # blank `model` parameter does not survive the query string.
+        _, plain = self.request("/api/efforts?provider=council_codex")
+        self.assertEqual(plain["model"], before)
+
+    def test_deliberation_effort_is_settable_and_saved(self):
+        # A knob only reachable by hand-editing the config file is half a
+        # setting, so this checks both ends: the control is served, and the
+        # save collects it rather than leaving the stored value behind.
+        with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
+            body = res.read().decode()
+        self.assertIn('id="council-deliberation-effort"', body)
+
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn(
+            "$('#council-deliberation-effort').value = "
+            "council.deliberation_effort || '';",
+            script,
+        )
+        self.assertIn(
+            "deliberation_effort: $('#council-deliberation-effort').value,",
+            script,
+        )
+
+    def test_project_has_its_own_run_options_cogwheel(self):
+        with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
+            body = res.read().decode()
+        self.assertEqual(body.count('class="project-gear-btn icon-round"'), 2)
+        self.assertIn('aria-label="Project options"', body)
+        goal_box = body.split('class="project-goal-box"', 1)[1].split(
+            'class="field-hint"', 1
+        )[0]
+        self.assertIn('id="project-goal"', goal_box)
+        self.assertIn('class="project-gear-btn icon-round"', goal_box)
+
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn("const project = mode === 'project';", script)
+        self.assertIn("project ? 'project' : (chat ? 'chat' : 'council')", script)
+        self.assertIn("$$('.project-gear-btn').forEach", script)
+        # 'run' and 'agents' are the live tab ids in index.html; the pair this
+        # once asserted ('project'/'stages') was renamed out of the dialog.
+        self.assertIn("openSettings(project ? 'run' : 'agents')", script)
+
+    def test_completed_run_is_only_rendered_in_its_own_mode(self):
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        helper = script.split("function runOnScreen()", 1)[1].split(
+            "/** The folder", 1
+        )[0]
+        self.assertIn("mode === uiMode() ? run : null", helper)
+        thread = script.split("function renderThread()", 1)[1].split(
+            "/* ---- Projects", 1
+        )[0]
+        self.assertIn("const run = runOnScreen();", thread)
+
+    def test_accepted_chat_submit_clears_only_the_submitted_message(self):
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn("const submittedValue = input.value;", script)
+        self.assertIn("if (input.value === submittedValue) {", script)
+        self.assertIn("input.value = '';", script)
+
+    def test_completed_chat_stays_attached_for_the_next_message(self):
+        with urllib.request.urlopen(f"{self.base}/continuation.js", timeout=15) as res:
+            continuation = res.read().decode()
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+
+        # The pure decision covers every terminal transcript, and refuses all
+        # states in which silently attaching would be surprising or invalid.
+        for terminal in ("complete", "failed", "cancelled"):
+            self.assertIn(f"'{terminal}'", continuation)
+        for guard in (
+            "options.busy",
+            "options.fresh",
+            "options.openChat",
+            "mode !== options.mode",
+            "runWorkspace !== options.workspace",
+        ):
+            self.assertIn(guard, continuation)
+
+        handler = script.split("on('state', (d) => {", 1)[1].split(
+            "on('stage_started'", 1
+        )[0]
+        terminal = handler.split("if (!state.busy) {", 1)[1]
+        self.assertIn("restoreContinuation();", terminal)
+        load_state = script.split("async function loadState()", 1)[1].split(
+            "async function startRun()", 1
+        )[0]
+        # This is the missed-event/reload/commit-refresh case that produced
+        # two newest root chats in the operator's actual history.
+        self.assertIn("restoreContinuation();", load_state)
+        self.assertIn("state.freshChat = false;", script)
+        self.assertIn("function startFreshChat()", script)
+        self.assertIn("if (!alreadyAttachedLatest) clearContinuation();", script)
+
+        with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
+            html = res.read().decode()
+        self.assertLess(
+            html.index('<script src="/continuation.js"></script>'),
+            html.index('<script src="/app.js"></script>'),
+        )
+
+    def test_chat_hides_intermediate_agent_output(self):
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        handler = script.split("on('stage_output', (d) => {", 1)[1].split(
+            "on('stage_finished'", 1
+        )[0]
+        self.assertIn("if (state.run && state.run.solo)", handler)
+        self.assertNotIn("live.textContent", handler)
 
     def test_security_headers_are_present(self):
         with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
@@ -171,6 +522,21 @@ class TestConcurrentConfigWriters(unittest.TestCase):
         self.assertTrue(fresh["zero_touch"])
         self.assertEqual(fresh["house_rules"], "use tabs")
 
+    def test_remembering_a_workspace_does_not_revert_the_other_instance(self):
+        # This one runs at the start of every run with a chosen folder, which
+        # made it the likeliest write to be holding a stale copy - and it was
+        # the only writer that did not re-read first.
+        a = ConfigStore(self.path)
+        b = ConfigStore(self.path)
+
+        b.update({"zero_touch": True, "house_rules": "use tabs"})
+        a.remember_workspace("/tmp/some-project")
+
+        fresh = ConfigStore(self.path).all()
+        self.assertEqual(fresh["workspace"], "/tmp/some-project")
+        self.assertTrue(fresh["zero_touch"], "starting a run reverted zero_touch")
+        self.assertEqual(fresh["house_rules"], "use tabs")
+
     def test_same_key_written_twice_takes_the_later_value(self):
         a = ConfigStore(self.path)
         b = ConfigStore(self.path)
@@ -207,8 +573,8 @@ class TestAgentAssignment(unittest.TestCase):
             polisher["auto_approve_args"],
             ["--dangerously-bypass-approvals-and-sandbox"],
         )
-        # The job itself is untouched: only the agent doing it changed.
-        self.assertEqual(polisher["role"], "Senior Polish")
+        # Everything that is not the CLI is untouched: only the agent changed.
+        self.assertEqual(polisher["id"], "polisher")
         self.assertEqual(polisher["timeout_seconds"], 1800)
 
     def test_the_same_agent_may_hold_both_jobs(self):
@@ -318,6 +684,133 @@ class TestAgentAssignment(unittest.TestCase):
         )
 
 
+class TestGlobalAgentSettings(unittest.TestCase):
+    """One CLI, one model, one reasoning level - wherever it is sitting.
+
+    Antigravity is a single login with a single catalogue. Choosing a model for
+    it on the Projects tab and finding the council still on the old one is a
+    setting that did not take, not a per-tab preference: the CLI is the thing
+    being configured, and every chair it holds runs the same binary.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-global-"))
+        self.path = self.tmp / "config.json"
+        self.store = ConfigStore(self.path)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _agy(self, conf):
+        """Every provider that runs `agy`: the council seat and the QA chair."""
+        return [
+            p for p in conf["providers"].values()
+            if isinstance(p, dict) and agent_for(p) == "agy"
+        ]
+
+    def test_a_model_chosen_on_one_chair_is_the_clis_everywhere(self):
+        conf = self.store.update({"providers": {"qa": {"model": "gemini-3.6-flash"}}})
+        self.assertTrue(len(self._agy(conf)) > 1)
+        for provider in self._agy(conf):
+            self.assertEqual(provider["model"], "gemini-3.6-flash")
+        self.assertEqual(conf["agent_settings"]["agy"]["model"], "gemini-3.6-flash")
+
+    def test_an_effort_chosen_on_one_chair_is_the_clis_everywhere(self):
+        conf = self.store.update({"providers": {"council_agy": {"effort": "high"}}})
+        for provider in self._agy(conf):
+            self.assertEqual(provider["effort"], "high")
+
+    def test_a_hand_typed_model_is_remembered_for_every_chair(self):
+        # The picker saves what was typed so it is offered next time. Offered
+        # on one card and missing on another would be the same list problem in
+        # a new place.
+        conf = self.store.update({
+            "providers": {"qa": {"model": "new-agy-model", "models": ["new-agy-model"]}}
+        })
+        for provider in self._agy(conf):
+            self.assertEqual(provider["models"], ["new-agy-model"])
+
+    def test_the_setting_is_stored_against_the_cli(self):
+        # The provider copies on disk are derived from this one, projected on
+        # every load. Written the other way round, five chairs would be five
+        # answers to the same question.
+        self.store.update({"providers": {"qa": {"model": "gemini-3.6-flash"}}})
+        raw = json.loads(self.path.read_text())
+        self.assertEqual(raw["agent_settings"]["agy"]["model"], "gemini-3.6-flash")
+
+    def test_a_stale_copy_in_the_same_save_does_not_undo_an_edit(self):
+        # Settings posts every card at once, so a save that changes Claude's
+        # model on the council card also carries the chat card's copy of the
+        # old one. Taking the last one read would discard the edit.
+        self.store.update({"providers": {"council_claude": {"model": "opus"}}})
+        conf = self.store.update({
+            "providers": {
+                "council_claude": {"model": "sonnet"},
+                "solo": {"model": "opus"},
+            }
+        })
+        self.assertEqual(conf["providers"]["solo"]["model"], "sonnet")
+
+    def test_a_hand_written_command_keeps_its_own(self):
+        # A custom template is nobody's catalogued agent; there is no CLI for
+        # it to share a setting with.
+        self.store.update({
+            "providers": {"drafter": {"command": ["python3", "mock-agent.py", "{prompt}"]}}
+        })
+        self.store.update({"providers": {"drafter": {"model": "mock-1"}}})
+        conf = self.store.update({"providers": {"council_claude": {"model": "opus"}}})
+        self.assertEqual(conf["providers"]["drafter"]["model"], "mock-1")
+
+    def test_a_swapped_chair_arrives_on_the_new_clis_settings(self):
+        # Not the departing CLI's model, which would be rejected at launch,
+        # and not a blank either: the arriving CLI already has one.
+        self.store.update({"providers": {"council_codex": {"model": "gpt-5.5"}}})
+        conf = self.store.update({"providers": {"qa": {"agent": "codex"}}})
+        self.assertEqual(conf["providers"]["qa"]["model"], "gpt-5.5")
+        # And the CLI that left is untouched by having been swapped out.
+        self.assertEqual(conf["agent_settings"]["agy"]["model"], "")
+
+    def test_an_existing_config_adopts_what_each_cli_was_already_set_to(self):
+        # Written before the setting was global: the same CLI carried its own
+        # model in every chair. The council seat is the one the operator sees
+        # on the bench, so it is the one that wins.
+        self.path.write_text(json.dumps({
+            "providers": {
+                "council_agy": {
+                    "command": ["agy", "--prompt={prompt}"],
+                    "model": "gemini-3.6-flash",
+                    "models": ["gemini-3.6-flash"],
+                    "effort": "high",
+                },
+                "qa": {
+                    "command": ["agy", "--prompt={prompt}"],
+                    "model": "gemini-3.6-pro",
+                    "models": ["gemini-3.6-pro"],
+                },
+            },
+        }))
+        conf = ConfigStore(self.path).all()
+        self.assertEqual(conf["agent_settings"]["agy"]["model"], "gemini-3.6-flash")
+        self.assertEqual(conf["providers"]["qa"]["model"], "gemini-3.6-flash")
+        self.assertEqual(conf["providers"]["qa"]["effort"], "high")
+        # The remembered lists are unioned rather than picked between: they are
+        # only names typed into the picker, and a precedence rule would lose
+        # one of them for no reason.
+        self.assertEqual(
+            conf["agent_settings"]["agy"]["models"],
+            ["gemini-3.6-flash", "gemini-3.6-pro"],
+        )
+
+    def test_an_adopted_config_is_not_re_adopted_afterwards(self):
+        # Once the settings exist they are the source; re-reading the provider
+        # copies would resurrect a value the operator had since cleared.
+        self.store.update({"providers": {"council_agy": {"model": "gemini-3.6-flash"}}})
+        self.store.update({"providers": {"council_agy": {"model": ""}}})
+        conf = ConfigStore(self.path).all()
+        self.assertEqual(conf["agent_settings"]["agy"]["model"], "")
+        self.assertEqual(conf["providers"]["qa"]["model"], "")
+
+
 class TestSoloConfigMigration(unittest.TestCase):
     """A config written when Solo was a toggle over one council stage."""
 
@@ -364,11 +857,306 @@ class TestSoloConfigMigration(unittest.TestCase):
         self.assertNotIn("solo_mode", conf)
         self.assertNotIn("solo_stage", conf)
 
+    def test_a_providers_council_role_is_swept_wherever_it_sits(self):
+        # A config written before Council became a deliberating bench carries
+        # a behaviour on the provider. Nothing reads one now - a seat's lens is
+        # the persona the router assigns it - so leaving the key would show the
+        # operator an instruction that has not been followed since the rewrite.
+        conf = self.load({"providers": {
+            "drafter": {"role": "Junior Draft",
+                        "role_template": "junior_draft",
+                        "role_system": "Be terse."},
+            "council_codex": {"role_template": "security_review"},
+        }})
+        for pid in ("drafter", "council_codex", "polisher", "solo"):
+            provider = conf["providers"][pid]
+            self.assertFalse(
+                {"role", "role_template", "role_system"} & set(provider),
+                f"{pid} still carries a council role: {sorted(provider)}",
+            )
+        # Swept, not reset: the rest of the provider is the operator's.
+        self.assertEqual(conf["providers"]["drafter"]["timeout_seconds"], 900)
+
+    def test_a_pinned_persona_is_not_swept_with_the_dead_role_keys(self):
+        # `council.personas` is where a behaviour lives now. The sweep above
+        # must not take the live setting out with the dead ones.
+        conf = self.load({"council": {"personas": {"seat1": "security_review"}}})
+        self.assertEqual(conf["council"]["personas"]["seat1"], "security_review")
+
     def test_an_unknown_mode_falls_back_to_council(self):
         self.assertEqual(self.load({"mode": "committee"})["mode"], "council")
 
+    def test_a_stored_antigravity_seat_gets_the_missing_read_grant(self):
+        # `--mode plan` alone made every Antigravity read-only stage produce
+        # nothing: headless `agy` auto-denies the `read_file` it cannot prompt
+        # for. The merge cannot repair this on its own - a list is replaced
+        # wholesale, so a config written before the fix keeps the broken pair
+        # forever.
+        conf = self.load({"providers": {
+            "council_agy": {
+                "command": ["agy", "--print-timeout", "60m", "--prompt={prompt}"],
+                "read_only_args": ["--mode", "plan"],
+            },
+            "qa": {
+                "command": ["/home/x/.local/bin/agy", "--prompt={prompt}"],
+                "read_only_args": ["--mode", "plan"],
+            },
+        }})
+        for pid in ("council_agy", "qa"):
+            self.assertEqual(
+                conf["providers"][pid]["read_only_args"],
+                ["--mode", "plan", "--dangerously-skip-permissions"],
+                f"{pid} still cannot read anything in a read-only stage",
+            )
+
+    def test_the_repair_leaves_hand_written_flags_alone(self):
+        # Only the exact broken default is replaced. Anything else is a choice
+        # somebody made, and this is not entitled to overrule it.
+        conf = self.load({"providers": {"council_agy": {
+            "command": ["agy", "--prompt={prompt}"],
+            "read_only_args": ["--mode", "plan", "--sandbox"],
+        }}})
+        self.assertEqual(
+            conf["providers"]["council_agy"]["read_only_args"],
+            ["--mode", "plan", "--sandbox"],
+        )
+
+    def test_the_repair_does_not_reach_the_other_clis(self):
+        conf = self.load({"providers": {"council_claude": {
+            "command": ["claude", "-p", "{prompt}"],
+            "read_only_args": ["--mode", "plan"],
+        }}})
+        self.assertEqual(
+            conf["providers"]["council_claude"]["read_only_args"], ["--mode", "plan"]
+        )
+
+    def test_a_swapped_assistant_gets_its_own_cli_s_no_save_flag(self):
+        # The merge fills a key absent from the file with the default for that
+        # provider *id*, which is the right CLI only where nobody swapped one
+        # in. A chat assistant pointed at Antigravity would otherwise inherit
+        # Claude's flag - and `supports_incognito` would then seat a CLI that
+        # cannot honour the promise.
+        conf = self.load({"providers": {
+            "solo": {
+                "command": ["agy", "--print-timeout", "60m", "--prompt={prompt}"],
+            },
+            "council_codex": {"command": ["codex", "exec", "{prompt}"]},
+            "qa": {"command": ["/home/x/.local/bin/my-wrapper", "{prompt}"]},
+        }})
+        self.assertEqual(conf["providers"]["solo"]["incognito_args"], [])
+        self.assertEqual(
+            conf["providers"]["council_codex"]["incognito_args"], ["--ephemeral"]
+        )
+        # A hand-written command is nobody's catalogued agent, so it declares
+        # nothing rather than borrowing whatever sat in that slot before.
+        self.assertEqual(conf["providers"]["qa"]["incognito_args"], [])
+
+    def test_incognito_flags_the_operator_wrote_are_left_alone(self):
+        conf = self.load({"providers": {"solo": {
+            "command": ["/usr/local/bin/private-claude", "{prompt}"],
+            "incognito_args": ["--no-history"],
+        }}})
+        self.assertEqual(
+            conf["providers"]["solo"]["incognito_args"], ["--no-history"]
+        )
+
+
+class TestAgentSelection(unittest.TestCase):
+    """No agent is required, none is preferred, and the operator says which.
+
+    Installation is not the answer to that question: a machine can carry all
+    three binaries and a subscription for one, so what decides whether a CLI is
+    seated is `agent_settings.<cli>.selected` and nothing else.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-select-"))
+        self.path = self.tmp / "config.json"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def load(self, raw):
+        self.path.write_text(json.dumps(raw))
+        return ConfigStore(self.path).all()
+
+    def seats(self, conf):
+        return {
+            agent: cfg.provider_enabled(
+                conf, conf["providers"][cfg.council_provider_id(agent)]
+            )
+            for agent in cfg.AGENTS
+        }
+
+    def test_a_fresh_install_has_added_nobody(self):
+        conf = ConfigStore(self.path).all()
+        self.assertEqual(cfg.selected_agents(conf), [])
+        self.assertEqual(self.seats(conf), {a: False for a in cfg.AGENTS})
+
+    def test_adding_one_agent_seats_only_that_one(self):
+        store = ConfigStore(self.path)
+        conf = store.update({"agent_settings": {"claude": {"selected": True}}})
+        self.assertEqual(cfg.selected_agents(conf), ["claude"])
+        self.assertEqual(self.seats(conf)["claude"], True)
+        self.assertEqual(self.seats(conf)["codex"], False)
+
+    def test_selection_reaches_every_chair_the_cli_holds(self):
+        # One CLI, one answer. Chat and the project chairs run the same binary
+        # as the council seat, and three places to write "removed" is three
+        # places to forget it.
+        conf = ConfigStore(self.path).update(
+            {"agent_settings": {"claude": {"selected": True}}}
+        )
+        for provider in conf["providers"].values():
+            if agent_for(provider) == "claude":
+                self.assertTrue(cfg.provider_enabled(conf, provider), provider["id"])
+            elif agent_for(provider) in cfg.AGENTS:
+                self.assertFalse(cfg.provider_enabled(conf, provider), provider["id"])
+
+    def test_a_config_written_before_selection_keeps_its_bench(self):
+        # The one migration that matters: applying the new default to an
+        # existing install would empty its council at the next launch.
+        conf = self.load({
+            "version": 1,
+            "providers": {
+                cfg.council_provider_id("codex"): {"enabled": True},
+                cfg.council_provider_id("claude"): {"enabled": False},
+                cfg.council_provider_id("agy"): {"enabled": True},
+            },
+        })
+        self.assertEqual(cfg.selected_agents(conf), ["codex", "agy"])
+
+    def test_removing_an_agent_survives_a_reload(self):
+        # `false` written by the panel is an answer, not an absence, and the
+        # migration above must not read it back as "never asked".
+        store = ConfigStore(self.path)
+        store.update({"agent_settings": {"agy": {"selected": True}}})
+        store.update({"agent_settings": {"agy": {"selected": False}}})
+        self.assertEqual(cfg.selected_agents(store.reload()), [])
+
+    def test_a_hand_written_command_answers_to_nobody(self):
+        # What keeps the mock agent - and any wrapper - usable with no vendor
+        # CLI added at all. It also must not inherit the "off" of whichever
+        # catalogued CLI used to hold the chair.
+        conf = self.load({
+            "agent_settings": {a: {"selected": False} for a in cfg.AGENTS},
+            "providers": {"solo": {
+                "command": ["python3", "/tmp/mock-agent.py", "{prompt}"],
+            }},
+        })
+        self.assertEqual(cfg.selected_agents(conf), [])
+        self.assertTrue(cfg.provider_enabled(conf, conf["providers"]["solo"]))
+
+    def test_a_wrapper_the_file_disabled_stays_disabled(self):
+        conf = self.load({"providers": {"solo": {
+            "command": ["python3", "/tmp/mock-agent.py", "{prompt}"],
+            "enabled": False,
+        }}})
+        self.assertFalse(cfg.provider_enabled(conf, conf["providers"]["solo"]))
+
+
+class TestAgentEndpoints(ServerTestBase):
+    """The Settings → Agents panel's half of the contract."""
+
+    def tearDown(self):
+        for agent in cfg.AGENTS:
+            self.request(
+                "/api/agents/select", method="POST",
+                body={"agent": agent, "selected": False},
+            )
+
+    def test_state_says_which_agents_are_added(self):
+        _, data = self.request("/api/state")
+        catalogued = {a["id"]: a for a in data["agents"]}
+        self.assertIn("selected", catalogued["codex"])
+        # The custom template is always offered: it is a blank command rather
+        # than a vendor, and it is how the mock agent is reached.
+        self.assertTrue(catalogued["custom"]["selected"])
+
+    def test_adding_an_agent_enables_its_seat(self):
+        status, data = self.request(
+            "/api/agents/select", method="POST",
+            body={"agent": "codex", "selected": True},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(cfg.provider_enabled(
+            data["config"], data["config"]["providers"]["council_codex"]
+        ))
+
+    def test_removing_the_cli_a_chair_held_moves_that_chair(self):
+        # Chat pointed at an agent the operator has just removed is a message
+        # that fails at launch; the chair goes to one they kept.
+        for agent in ("codex", "claude"):
+            self.request(
+                "/api/agents/select", method="POST",
+                body={"agent": agent, "selected": True},
+            )
+        _, data = self.request(
+            "/api/agents/select", method="POST",
+            body={"agent": "claude", "selected": False},
+        )
+        self.assertEqual(data["moved"].get("solo"), "codex")
+        self.assertEqual(
+            agent_for(data["config"]["providers"]["solo"]), "codex"
+        )
+
+    def test_an_unknown_agent_is_refused(self):
+        status, data = self.request(
+            "/api/agents/select", method="POST",
+            body={"agent": "gpt-5-via-curl", "selected": True},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("No such agent", data["error"])
+
+    def test_setup_takes_an_id_and_an_action_and_nothing_else(self):
+        # The endpoint that runs a process must never be handed one.
+        for body in (
+            {"agent": "codex", "action": "rm -rf /"},
+            {"agent": "/bin/sh", "action": "login"},
+            {"agent": "codex", "action": ""},
+        ):
+            status, _ = self.request("/api/agents/setup", method="POST", body=body)
+            self.assertEqual(status, 400, body)
+
+    def test_a_full_screen_sign_in_is_offered_as_a_command_instead(self):
+        status, data = self.request(
+            "/api/agents/setup", method="POST",
+            body={"agent": "agy", "action": "login"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("terminal", data["error"])
+
 
 class TestApi(ServerTestBase):
+    def test_the_page_explains_an_engine_too_old_to_offer_continue(self):
+        # The browser reloads app.js by itself; the engine only reloads when
+        # the app is restarted. A page newer than the server it is talking to
+        # would otherwise draw neither button and give no reason.
+        with urllib.request.urlopen(f"{self.base}/app.js", timeout=15) as res:
+            script = res.read().decode()
+        self.assertIn("run.can_resume === undefined", script)
+        self.assertIn("started before Continue", script)
+
+    def test_retry_needs_to_be_told_which_stage(self):
+        status, data = self.request("/api/retry", method="POST", body={})
+        self.assertEqual(status, 400)
+        self.assertIn("which stage", data["error"].lower())
+
+    def test_retry_says_why_when_there_is_no_run(self):
+        status, data = self.request(
+            "/api/retry", method="POST", body={"stage": "chair"}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("no run", data["error"].lower())
+
+    def test_resume_says_why_when_there_is_nothing_to_continue(self):
+        # The button is only offered on a failed run, but the endpoint is
+        # reachable regardless - and whoever reaches it should be told what is
+        # wrong rather than handed a stack trace.
+        status, data = self.request("/api/resume", method="POST")
+        self.assertEqual(status, 400)
+        self.assertIn("no run to continue", data["error"].lower())
+
     def test_config_round_trips(self):
         status, data = self.request(
             "/api/config", method="POST", body={"house_rules": "use tabs"}
@@ -378,6 +1166,40 @@ class TestApi(ServerTestBase):
 
         status, data = self.request("/api/config")
         self.assertEqual(data["config"]["house_rules"], "use tabs")
+
+    def test_caveman_modes_round_trip_independently(self):
+        modes = {"council": True, "chat": False, "project": True}
+        status, data = self.request(
+            "/api/config", method="POST", body={"caveman": modes}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["config"]["caveman"], modes)
+
+        _, data = self.request("/api/config")
+        self.assertEqual(data["config"]["caveman"], modes)
+        self.request(
+            "/api/config",
+            method="POST",
+            body={"caveman": {mode: False for mode in modes}},
+        )
+
+    def test_efficiency_modes_round_trip_independently(self):
+        modes = {"council": False, "chat": True, "project": True}
+        status, data = self.request(
+            "/api/config",
+            method="POST",
+            body={"efficiency": modes},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["config"]["efficiency"], modes)
+
+        _, data = self.request("/api/config")
+        self.assertEqual(data["config"]["efficiency"], modes)
+        self.request(
+            "/api/config",
+            method="POST",
+            body={"efficiency": {mode: False for mode in modes}},
+        )
 
     def test_zero_touch_toggle_persists(self):
         self.request("/api/config", method="POST", body={"zero_touch": True})
@@ -416,13 +1238,21 @@ class TestApi(ServerTestBase):
         ids = {p["id"] for p in data["providers"]}
         # Against the configured chairs rather than a literal, for the same
         # reason as the agent catalogue above. What must not silently vanish is
-        # named separately: the two council stages, chat, and the three
-        # Projects roles.
+        # named separately: every council seat - Settings draws one card per
+        # seat provider and reads its availability from here - plus chat and
+        # the three Projects roles.
         self.assertEqual(ids, set(cfg.DEFAULTS["providers"]))
-        self.assertLessEqual({"drafter", "polisher", "solo"}, ids)
+        self.assertLessEqual(set(cfg.COUNCIL_PROVIDERS), ids)
+        self.assertLessEqual({"solo"}, ids)
         self.assertLessEqual({"architect", "coder", "qa"}, ids)
         for p in data["providers"]:
             self.assertIn("available", p)
+            # Beside it, never folded into it. Every screen that draws a chair
+            # from this row - the doctor pane, the Projects matrix - has to be
+            # able to tell "you have not added this" from "the binary is not
+            # there", because only one of those is fixed by installing
+            # something and the pipeline refuses on both.
+            self.assertIn("connected", p)
 
     def test_filesystem_listing_returns_directories(self):
         status, data = self.request(f"/api/fs?path={Path.home()}")
@@ -468,6 +1298,80 @@ class TestApi(ServerTestBase):
         self.assertEqual(status, 400)
         self.assertIn("no longer exists", data["error"])
 
+    def test_an_explicit_no_folder_is_not_replaced_by_the_saved_one(self):
+        # The browser confirms a Zero-Touch run by naming the folder it will
+        # write in, and sends that same choice as an empty string. Read with
+        # `or`, the empty string is dropped and the run lands in whatever the
+        # picker was last pointed at - a repository nobody confirmed.
+        seen = self._capture_start()
+        self.request("/api/config", method="POST",
+                     body={"workspace": str(Path(__file__).parent.parent)})
+        self.addCleanup(self.request, "/api/config", "POST", {"workspace": ""})
+        self.request("/api/start", method="POST",
+                     body={"task": "hello", "workspace": ""})
+        self.assertEqual(seen["workspace"], "")
+
+    def test_a_start_that_names_no_folder_at_all_uses_the_saved_one(self):
+        # Absent is not the same as empty: an API client that sends only a task
+        # still gets the folder the operator chose.
+        seen = self._capture_start()
+        repo = str(Path(__file__).parent.parent)
+        self.request("/api/config", method="POST", body={"workspace": repo})
+        self.addCleanup(self.request, "/api/config", "POST", {"workspace": ""})
+        self.request("/api/start", method="POST", body={"task": "hello"})
+        self.assertEqual(seen["workspace"], repo)
+
+    def test_start_rejects_a_workspace_that_is_not_a_path(self):
+        status, data = self.request(
+            "/api/start", method="POST",
+            body={"task": "hello", "workspace": ["/tmp", "/var"]},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("workspace", data["error"])
+
+    def _capture_start(self):
+        """Intercept the pipeline so the arguments can be read without a run."""
+        seen = {}
+
+        def fake_start(task, workspace="", **kwargs):
+            seen["workspace"] = workspace
+            seen.update(kwargs)
+            raise ValueError("stop here - the argument is what is under test")
+
+        real = self.state.pipeline.start
+        self.state.pipeline.start = fake_start
+        self.addCleanup(setattr, self.state.pipeline, "start", real)
+        return seen
+
+    def test_start_carries_the_incognito_choice_through(self):
+        seen = self._capture_start()
+        self.request("/api/start", method="POST",
+                     body={"task": "hello", "incognito": True})
+        self.assertIs(seen["incognito"], True)
+
+    def test_start_is_not_incognito_unless_asked(self):
+        seen = self._capture_start()
+        self.request("/api/start", method="POST", body={"task": "hello"})
+        self.assertIs(seen["incognito"], False)
+
+    def test_start_rejects_an_incognito_flag_that_is_not_a_boolean(self):
+        # `"false"` is true in Python, so a client that sent one would be told
+        # its run was private while every stage was recorded as usual.
+        status, data = self.request(
+            "/api/start", method="POST",
+            body={"task": "hello", "incognito": "false"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("incognito", data["error"])
+
+    def test_the_routing_preview_rejects_a_non_boolean_too(self):
+        status, data = self.request(
+            "/api/council/route", method="POST",
+            body={"task": "hello", "incognito": "yes"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("incognito", data["error"])
+
     def test_approve_without_a_gate_is_a_400(self):
         status, _ = self.request("/api/approve", method="POST", body={})
         self.assertEqual(status, 400)
@@ -510,6 +1414,49 @@ class TestApi(ServerTestBase):
         self.assertIn("No such run transcript", data["error"])
 
 
+class TestPickerEndpoints(ServerTestBase):
+    """What the model and effort menus are served, and how often it costs a
+    process launch. Opening a picker used to run `agy models` every time."""
+
+    STUB = (
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "open(sys.argv[0] + '.calls', 'a').write('x')\n"
+        "print('gemini-3.6-flash-high')\n"
+    )
+
+    def setUp(self):
+        self.stub = self.tmp / "agy"
+        self.stub.write_text(self.STUB)
+        self.stub.chmod(0o755)
+        # Rewriting it dates it, so each test starts with the catalogue empty
+        # for this binary; the launch count has to start from zero with it.
+        Path(str(self.stub) + ".calls").unlink(missing_ok=True)
+        self.store.update({
+            "providers": {
+                "council_agy": {"command": [str(self.stub), "--prompt={prompt}"]}
+            }
+        })
+
+    def _calls(self):
+        marker = Path(str(self.stub) + ".calls")
+        return len(marker.read_text()) if marker.exists() else 0
+
+    def test_reopening_the_menu_does_not_relaunch_the_cli(self):
+        _, first = self.request("/api/models?provider=council_agy")
+        _, second = self.request("/api/models?provider=council_agy")
+        self.assertEqual(first["models"], ["gemini-3.6-flash-high"])
+        self.assertEqual(second["models"], ["gemini-3.6-flash-high"])
+        self.assertTrue(second["cached"])
+        self.assertEqual(self._calls(), 1)
+
+    def test_refresh_asks_the_cli_again(self):
+        self.request("/api/models?provider=council_agy")
+        _, fresh = self.request("/api/models?provider=council_agy&refresh=1")
+        self.assertFalse(fresh["cached"])
+        self.assertEqual(self._calls(), 2)
+
+
 class TestProjectRoutes(ServerTestBase):
     """The Projects tab's endpoints, over the same real socket."""
 
@@ -527,6 +1474,11 @@ class TestProjectRoutes(ServerTestBase):
         # The matrix draws its availability dots from this.
         self.assertEqual({r["id"] for r in data["roles"]}, {"architect", "coder", "qa"})
         self.assertIn("max_steps", data["settings"])
+        # And disables Start from it. A chair on an agent nobody added is
+        # refused by the engine, so the matrix has to know before the button
+        # is pressed rather than after.
+        for role in data["roles"]:
+            self.assertIn("connected", role)
 
     def test_a_project_on_disk_is_reported(self):
         theseus = self.folder / ".theseus"
@@ -571,6 +1523,26 @@ class TestProjectRoutes(ServerTestBase):
         # round of invented work.
         self.assertIsNone(_opt_int(True))
 
+    def test_a_project_asked_to_run_incognito_is_refused(self):
+        # Refused rather than ignored. The board, spec and critique log are the
+        # state a build pauses and resumes from, and a request answered with
+        # the opposite of what it asked for is the one failure mode a privacy
+        # control cannot have. The tab disables the button; this is the half
+        # that holds for a client that does not.
+        def fake_start(*a, **kw):
+            self.fail("the engine was reached despite the refusal")
+
+        real = self.state.projects.start
+        self.state.projects.start = fake_start
+        self.addCleanup(setattr, self.state.projects, "start", real)
+        status, data = self.request(
+            "/api/project/start", method="POST",
+            body={"goal": "build it", "workspace": str(self.folder),
+                  "incognito": True},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("incognito", data["error"])
+
     def test_starting_with_innovation_off_reaches_the_engine(self):
         seen = {}
 
@@ -585,11 +1557,58 @@ class TestProjectRoutes(ServerTestBase):
         )
         self.assertEqual(seen["innovation"], 0)
 
+    def test_an_explicit_no_folder_reaches_the_engine_as_no_folder(self):
+        # Three agents create, edit and delete files without asking, and the
+        # browser confirms the build by naming the folder. An empty string
+        # quietly swapped for the saved one points them at a repository the
+        # operator never confirmed.
+        seen = {}
+
+        def fake_start(goal, workspace="", resume=False, innovation=None):
+            seen["workspace"] = workspace
+            raise ValueError("stop here - the argument is what is under test")
+
+        real = self.state.projects.start
+        self.state.projects.start = fake_start
+        self.addCleanup(setattr, self.state.projects, "start", real)
+        self.request("/api/config", method="POST",
+                     body={"workspace": str(self.folder)})
+        self.addCleanup(self.request, "/api/config", "POST", {"workspace": ""})
+        self.request(
+            "/api/project/start", method="POST",
+            body={"goal": "build it", "workspace": ""},
+        )
+        self.assertEqual(seen["workspace"], "")
+
     def test_controls_refuse_when_nothing_is_running(self):
         for path in ("/api/project/pause", "/api/project/resume"):
             status, data = self.request(path, method="POST")
             self.assertEqual(status, 400, path)
             self.assertFalse(data["ok"])
+
+    def test_dismissing_closes_the_board_so_the_tab_offers_a_new_one(self):
+        # Clearing it in the browser alone lasts until the next reload: the
+        # engine finds the same board again on disk.
+        theseus = self.folder / ".theseus"
+        theseus.mkdir()
+        (theseus / "BOARD.json").write_text(
+            json.dumps({"project_id": "abc123", "status": "COMPLETED",
+                        "goal": "a thing"}),
+            encoding="utf-8",
+        )
+        status, data = self.request(
+            "/api/project/dismiss", method="POST",
+            body={"workspace": str(self.folder)},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+
+        _, after = self.request(
+            f"/api/project?workspace={urllib.parse.quote(str(self.folder))}"
+        )
+        self.assertIsNone(after["project"])
+        # Closing the report is not deleting the build.
+        self.assertTrue((theseus / "BOARD.json").exists())
 
     def test_an_unknown_handoff_role_is_refused(self):
         status, data = self.request(

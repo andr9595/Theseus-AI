@@ -21,9 +21,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from aicouncil import config as cfg  # noqa: E402
 from aicouncil import gitutil  # noqa: E402
+from aicouncil import router  # noqa: E402
 from aicouncil.config import ConfigStore  # noqa: E402
 from aicouncil.events import EventBus  # noqa: E402
-from aicouncil.pipeline import Pipeline, PipelineBusy  # noqa: E402
+from aicouncil.pipeline import (  # noqa: E402
+    Pipeline,
+    PipelineBusy,
+    Run,
+    VOLATILE_RUN_LIMIT,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MOCK = str(REPO_ROOT / "scripts" / "mock-agent.py")
@@ -65,6 +71,40 @@ def mock_provider(pid: str, role: str, extra=None):
     }
 
 
+def mock_council(agent: str, extra=None):
+    """One CLI's council seat, pointed at the mock agent.
+
+    No `--role`: a council turn is identified by what the prompt asks for, not
+    by the chair it was sent to - the same CLI holds a member seat, critiques
+    its peers and may chair, and which of those it is doing is decided per run
+    by the router.
+    """
+    return {
+        "id": cfg.council_provider_id(agent),
+        "label": f"Mock {agent}",
+        "command": [sys.executable, MOCK, *(extra or []), "{prompt}"],
+        "auto_approve_args": ["--dangerously-skip-permissions"],
+        "read_only_args": ["--read-only"],
+        # Cleared for the same reason every real agent declares its own: these
+        # merge onto the CLI preset, and Claude's `--output-format stream-json`
+        # left on a command that is not Claude puts `stream-json` where the
+        # prompt should be. The seat then runs on an 11-character task and
+        # still exits zero, which is the worst kind of green.
+        "stream_args": [],
+        "prompt_on_stdin": False,
+        "timeout_seconds": 60,
+    }
+
+
+def council_providers(extra_for=None):
+    """The whole bench on the mock, optionally breaking one agent."""
+    extra_for = extra_for or {}
+    return {
+        cfg.council_provider_id(a): mock_council(a, extra_for.get(a))
+        for a in cfg.AGENTS
+    }
+
+
 def git(args, cwd):
     subprocess.run(
         ["git", *args], cwd=cwd, check=True,
@@ -89,6 +129,20 @@ class PipelineTestBase(unittest.TestCase):
         # still cannot reach the developer's real history.
         previous_xdg = os.environ.get("XDG_CONFIG_HOME")
         os.environ["XDG_CONFIG_HOME"] = str(self.tmp / "xdg")
+        # The mock paces its output so the UI's streaming is visible when it is
+        # driven by hand. A council run is seven stages rather than two, so that
+        # pacing now dominates the suite's runtime. Nothing here is testing the
+        # delay itself.
+        previous_delay = os.environ.get("MOCK_AGENT_DELAY")
+        os.environ["MOCK_AGENT_DELAY"] = "0"
+
+        def restore_delay():
+            if previous_delay is None:
+                os.environ.pop("MOCK_AGENT_DELAY", None)
+            else:
+                os.environ["MOCK_AGENT_DELAY"] = previous_delay
+
+        self.addCleanup(restore_delay)
 
         def restore_xdg():
             if previous_xdg is None:
@@ -114,14 +168,41 @@ class PipelineTestBase(unittest.TestCase):
         self.store.update({
             "workspace": str(self.repo),
             "safety_snapshot": True,
-            "providers": {
-                "drafter": mock_provider("drafter", "Junior Draft"),
-                "polisher": mock_provider("polisher", "Senior Polish"),
-            },
+            "providers": council_providers(),
         })
         self.bus = EventBus()
         self.runs_dir = self.tmp / "xdg" / "ai-council" / "runs"
         self.pipeline = Pipeline(self.store, self.bus, runs_dir=self.runs_dir)
+
+    # -- council helpers ---------------------------------------------------
+    #
+    # The bench is routed per run, so a test cannot name "seat2" and know which
+    # CLI is in it. These ask the run what it seated instead, which is also the
+    # only way an assertion stays true when the routing changes.
+
+    def member_ids(self, run):
+        """The Stage 1 stage ids of this run, in seating order."""
+        return [s.id for s in run.seating.members]
+
+    def member_stages(self, run):
+        return [run.stages[s.id] for s in run.seating.members]
+
+    def critique_stages(self, run):
+        return [run.stages[f"{s.id}_critique"] for s in run.seating.members]
+
+    def pin_chair(self, agent, provider=None):
+        """Fix the chair to one CLI, and optionally break that CLI.
+
+        The bench is routed, so "break the stage that writes" is no longer a
+        thing a test can say by naming a provider - any of the three could be
+        chairing. Pinning makes the intent precise, and sitting the chair out
+        of the deliberation keeps the breakage on the chair alone rather than
+        also taking out a member seat.
+        """
+        patch = {"council": {"pins": {"chair": agent}, "chair_deliberates": False}}
+        if provider is not None:
+            patch["providers"] = {cfg.council_provider_id(agent): provider}
+        self.store.update(patch)
 
     def tearDown(self):
         self.pipeline.cancel()
@@ -161,25 +242,78 @@ class TestZeroTouch(PipelineTestBase):
         self.wait_terminal()
 
         self.assertEqual(run.state, "complete", run.error)
-        self.assertEqual(run.stages["drafter"].state, "done")
-        self.assertEqual(run.stages["polisher"].state, "done")
+        for stage in self.member_stages(run):
+            self.assertEqual(stage.state, "done", stage.error)
+        for stage in self.critique_stages(run):
+            self.assertEqual(stage.state, "done", stage.error)
+        self.assertEqual(run.stages["chair"].state, "done")
         # Zero-Touch means the file really was written.
         self.assertTrue((self.repo / "AI_COUNCIL_DEMO.md").exists())
         self.assertIn("AI_COUNCIL_DEMO.md", run.diff)
         self.assertGreaterEqual(run.diff_stat["files"], 1)
 
-    def test_stage_one_never_receives_auto_approve_flags(self):
-        # The junior is read-only by contract; the flag must not reach it even
-        # when Zero-Touch is on.
+    def test_only_the_chairman_is_granted_permission_to_write(self):
+        # The permission model is positional: every deliberating seat is
+        # read-only by contract *and* by flag, and the chairman is the only
+        # thing that can change a file - even under Zero-Touch.
         self.store.update({"zero_touch": True})
         run = self.pipeline.start("anything", str(self.repo))
         self.wait_terminal()
-        self.assertNotIn(
-            "--dangerously-skip-permissions", run.stages["drafter"].command
-        )
+
+        for stage in self.member_stages(run) + self.critique_stages(run):
+            self.assertNotIn(
+                "--dangerously-skip-permissions", stage.command,
+                f"{stage.id} was handed write permission",
+            )
+            self.assertIn(
+                "--read-only", stage.command,
+                f"{stage.id} was not invoked read-only",
+            )
         self.assertIn(
-            "--dangerously-skip-permissions", run.stages["polisher"].command
+            "--dangerously-skip-permissions", run.stages["chair"].command
         )
+        self.assertNotIn("--read-only", run.stages["chair"].command)
+
+    def test_a_critic_reviews_its_peers_and_never_itself(self):
+        # Asserted on what each critic actually reported rather than on the
+        # prompt it was given - the prompt is redacted out of `command`, and
+        # the mock names every peer it was shown under its own heading. A
+        # member reviewing itself under an alias, believing it a colleague, is
+        # worse than not running the stage at all.
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+
+        for seat in run.seating.members:
+            reported = run.stages[f"{seat.id}_critique"].output
+            self.assertNotIn(
+                f"### {seat.alias}", reported,
+                f"{seat.id} was handed its own answer to review",
+            )
+            for other in run.seating.members:
+                if other.id != seat.id:
+                    self.assertIn(f"### {other.alias}", reported)
+
+    def test_the_chairman_reports_its_own_confidence(self):
+        # Parsed off the reply, never computed here. A run whose chairman said
+        # nothing reports None rather than a number this app invented.
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.confidence, 75)
+        self.assertEqual(run.consensus, 80)
+        # Both figures also ride on the chair's own stage record, which is what
+        # the verdict card renders from - the run-level properties are a
+        # convenience, not the source the UI reads.
+        chair = run.stages["chair"]
+        self.assertEqual(chair.confidence, 75)
+        self.assertEqual(chair.consensus, 80)
+        self.assertTrue(chair.because)
+        # And a member states a confidence but never a consensus: it has not
+        # seen the other members, so it has no view on how far they agreed.
+        for stage in self.member_stages(run):
+            self.assertIsNotNone(stage.confidence)
+            self.assertIsNone(stage.consensus)
 
     def test_rollback_restores_the_tree(self):
         self.store.update({"zero_touch": True})
@@ -391,6 +525,155 @@ class TestSoloMode(PipelineTestBase):
             )
 
 
+class TestMultiAgentChat(PipelineTestBase):
+    """One message, every installed CLI, three answers left as three answers."""
+
+    def setUp(self):
+        super().setUp()
+        assistant = mock_provider("solo", "Assistant")
+        assistant["read_only_args"] = ["--read-only"]
+        assistant["behavior"] = ""
+        # Both halves of the config: the per-CLI cards the bench reads, and the
+        # single assistant it falls back to when only one CLI is installed.
+        self.store.update({
+            "mode": "solo",
+            "multi_agent": True,
+            "providers": {"solo": assistant, **council_providers()},
+        })
+
+    def test_every_installed_agent_answers_the_same_message(self):
+        run = self.pipeline.start("what is this repo?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(
+            sorted(run.stages),
+            sorted(f"chat_{agent}" for agent in cfg.AGENTS),
+        )
+        self.assertNotIn("solo", run.stages)
+        for stage in run.stages.values():
+            self.assertTrue(stage.output.strip(), stage.id)
+            self.assertEqual(stage.kind, "chat")
+
+    def test_the_bench_is_read_only_even_with_zero_touch_on(self):
+        # Three agents editing one folder at once, with nothing arbitrating
+        # between them, is a race rather than a feature - so the grant Chat
+        # would otherwise get is refused for this shape of turn.
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        for stage in run.stages.values():
+            self.assertIn("--read-only", stage.command)
+            self.assertNotIn("--dangerously-skip-permissions", stage.command)
+        self.assertTrue(gitutil.status(self.repo).clean)
+        self.assertIsNone(run.snapshot)
+        self.assertEqual(run.diff, "")
+
+    def test_one_agent_installed_falls_back_to_the_single_assistant(self):
+        # A bench of one is the ordinary Chat assistant. Refusing to answer
+        # because two CLIs are missing would be worse than answering.
+        only = council_providers()[cfg.council_provider_id("codex")]
+        self.store.update({
+            "providers": {
+                cfg.council_provider_id(a): {
+                    **council_providers()[cfg.council_provider_id(a)],
+                    "enabled": a == "codex",
+                }
+                for a in cfg.AGENTS
+            },
+        })
+        self.assertTrue(only["command"])
+        run = self.pipeline.start("hello", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(list(run.stages), ["solo"])
+
+    def test_all_three_answers_carry_into_the_next_turn(self):
+        first = self.pipeline.start("first question", str(self.repo))
+        self.wait_terminal()
+        second = self.pipeline.start(
+            "and now?", str(self.repo), continue_from=first.transcript_name
+        )
+        self.wait_terminal()
+
+        self.assertEqual(second.state, "complete", second.error)
+        self.assertEqual(len(second.conversation), 1)
+        replies = second.conversation[0]["replies"]
+        self.assertEqual(
+            sorted(r["stage"] for r in replies),
+            sorted(f"chat_{agent}" for agent in cfg.AGENTS),
+        )
+        # Labelled, not merged: a follow-up has to be able to say "Codex was
+        # right" and have that mean something.
+        for reply in replies:
+            self.assertTrue(reply["label"].strip())
+            self.assertTrue(reply["output"].strip())
+
+    def test_the_toggle_off_is_the_ordinary_single_assistant(self):
+        self.store.update({"multi_agent": False})
+        run = self.pipeline.start("hello", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(list(run.stages), ["solo"])
+
+
+class TestAgentsAreOptIn(PipelineTestBase):
+    """An installed CLI is not a seated one.
+
+    Every other test in this file drives hand-written commands, which answer to
+    nobody's selection by design - that is what keeps the mock agent usable
+    with no vendor CLI added at all. These point the bench at the shipped
+    catalogued commands instead, over stand-in binaries, because the question
+    here is exactly whether being on PATH is enough. It is not: the operator
+    saying so in Settings is.
+    """
+
+    def setUp(self):
+        super().setUp()
+        bindir = self.tmp / "bin"
+        bindir.mkdir()
+        for agent in cfg.AGENTS:
+            fake = bindir / agent
+            fake.write_text(f"#!{sys.executable}\nprint('ok')\n", encoding="utf-8")
+            fake.chmod(0o755)
+        previous = os.environ["PATH"]
+        self.addCleanup(lambda: os.environ.__setitem__("PATH", previous))
+        os.environ["PATH"] = f"{bindir}{os.pathsep}{previous}"
+        # Back to the shipped commands: `agent_for` reads the CLI off the
+        # command, and the mock's `python3` is nobody's.
+        self.store.update({
+            "providers": {
+                pid: {"command": list(seat["command"])}
+                for pid, seat in cfg.DEFAULT_COUNCIL_PROVIDERS.items()
+            },
+        })
+
+    def test_an_installed_agent_nobody_added_is_not_seated(self):
+        self.assertEqual(self.pipeline.available_agents(self.store.all()), [])
+
+    def test_one_added_agent_is_the_whole_bench(self):
+        conf = self.store.update({"agent_settings": {"claude": {"selected": True}}})
+        self.assertEqual(self.pipeline.available_agents(conf), ["claude"])
+
+    def test_a_council_with_nobody_added_says_what_to_do_about_it(self):
+        with self.assertRaises(ValueError) as caught:
+            self.pipeline.seat_council("what is a monad?", self.store.all())
+        self.assertIn("Settings", str(caught.exception))
+
+    def test_chat_refuses_before_launching_an_agent_nobody_added(self):
+        # Said up front rather than after the CLI fails: "not connected" is a
+        # different problem from "not installed", and only one of them is
+        # fixed by installing something.
+        self.store.update({"mode": "solo"})
+        with self.assertRaises(ValueError) as caught:
+            self.pipeline.start("hello", str(self.repo))
+        self.assertIn("not connected", str(caught.exception))
+
+
 class TestWorkingFolderIsOptional(PipelineTestBase):
     """A repository is what makes a run reviewable, not what makes it possible.
 
@@ -430,7 +713,100 @@ class TestWorkingFolderIsOptional(PipelineTestBase):
 
         self.assertEqual(run.state, "complete", run.error)
         self.assertEqual(run.workspace, str(cfg.workspace_dir()))
-        self.assertTrue((cfg.workspace_dir() / "AI_COUNCIL_DEMO.md").exists())
+        self.assertTrue(run.stages["chair"].output.strip())
+
+    def test_no_folder_chosen_means_nothing_is_written(self):
+        # The choice the operator actually made: ask the council a question,
+        # get an answer. Zero-Touch grants permission to write in the folder
+        # they picked, and they picked none - so there is nothing to grant.
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("add a demo artifact")
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertTrue(run.read_only)
+        self.assertFalse((cfg.workspace_dir() / "AI_COUNCIL_DEMO.md").exists())
+        self.assertIn("--read-only", run.stages["chair"].command)
+        self.assertNotIn(
+            "--dangerously-skip-permissions", run.stages["chair"].command
+        )
+        # No permission means no delivery state either: a diff, a snapshot or a
+        # rollback offer would all describe work that did not happen.
+        self.assertEqual(run.diff, "")
+        self.assertIsNone(run.snapshot)
+        self.assertFalse(run.snapshot_planned)
+        self.assertFalse(run.to_dict()["can_rollback"])
+
+    def test_a_no_folder_run_is_not_stopped_at_the_gate(self):
+        # The gate exists to stand between the deliberation and the only stage
+        # that writes. Nothing writes here, so asking would be asking the
+        # operator to approve nothing.
+        self.store.update({"zero_touch": False})
+        run = self.pipeline.start("add a demo artifact")
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertFalse(run.approved)
+        self.assertFalse((cfg.workspace_dir() / "AI_COUNCIL_DEMO.md").exists())
+
+    def test_a_conversation_writes_nothing_with_no_folder_and_zero_touch(self):
+        # Chat's only grant is Zero-Touch, and it is a grant over a folder.
+        # Without one there is nothing it can be a grant over.
+        self.store.update({"mode": "solo", "zero_touch": True})
+        run = self.pipeline.start("add a demo artifact")
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertTrue(run.read_only)
+        self.assertIn("--read-only", run.stages["solo"].command)
+        self.assertNotIn(
+            "--dangerously-skip-permissions", run.stages["solo"].command
+        )
+        self.assertFalse((cfg.workspace_dir() / "AI_COUNCIL_DEMO.md").exists())
+
+    def test_continuing_a_no_folder_run_after_a_restart_still_writes_nothing(self):
+        # The run is rebuilt from its transcript, and a rebuilt run that came
+        # back with write permission would apply, after a restart, work the
+        # operator never asked to have applied anywhere.
+        self.store.update({"zero_touch": True})
+        self.pin_chair("claude", mock_council("claude", ["--fail"]))
+        run = self.pipeline.start("add a demo artifact")
+        self.wait_terminal()
+        self.assertEqual(run.state, "failed")
+        self.store.update({
+            "providers": {cfg.council_provider_id("claude"): mock_council("claude")},
+        })
+
+        restarted = Pipeline(self.store, self.bus, runs_dir=self.runs_dir)
+        self.addCleanup(restarted.wait_for_worker)
+        revived = restarted.revive(run.transcript_name)
+        self.wait_for(
+            lambda: not restarted.is_busy(), what="the revived run to finish"
+        )
+        restarted.wait_for_worker()
+
+        self.assertEqual(revived.state, "complete", revived.error)
+        self.assertTrue(revived.read_only)
+        self.assertIn("--read-only", revived.stages["chair"].command)
+        self.assertFalse((cfg.workspace_dir() / "AI_COUNCIL_DEMO.md").exists())
+
+    def test_a_transcript_written_before_the_flag_is_still_read_only(self):
+        # Transcripts on disk predate the rule. The scratch workspace stands in
+        # for the missing flag: it is the folder nobody chose.
+        self.store.update({"zero_touch": True})
+        self.pin_chair("claude", mock_council("claude", ["--fail"]))
+        run = self.pipeline.start("add a demo artifact")
+        self.wait_terminal()
+        path = self.runs_dir / run.transcript_name
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.pop("read_only", None)
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        restarted = Pipeline(self.store, self.bus, runs_dir=self.runs_dir)
+        self.addCleanup(restarted.wait_for_worker)
+        revived = restarted.revive(run.transcript_name, start=False)
+
+        self.assertTrue(revived.read_only)
 
     def test_a_conversation_needs_no_folder(self):
         self.store.update({"mode": "solo"})
@@ -481,6 +857,175 @@ class TestWorkingFolderIsOptional(PipelineTestBase):
         self.assertIn("not a git repository", prompt)
 
 
+class TestIncognito(PipelineTestBase):
+    """A private conversation leaves no record in either place it could.
+
+    Two records exist: this app's own transcripts, and the history each CLI
+    keeps of its own sessions. A mode that suppressed one and not the other
+    would be worth less than nothing, because the operator would believe it had
+    suppressed both.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # The mock stands in for a CLI that can be told not to save. It ignores
+        # the flag itself; what is under test is that the flag is passed, and
+        # that an agent without one is left out rather than run anyway.
+        self.store.update({
+            "providers": {
+                cfg.council_provider_id(a): dict(
+                    mock_council(a), incognito_args=["--incognito"]
+                )
+                for a in cfg.AGENTS
+            },
+        })
+
+    def transcripts(self):
+        return sorted(p.name for p in self.runs_dir.glob("*.json"))
+
+    def test_a_private_run_writes_no_transcript(self):
+        run = self.pipeline.start("what is a monad?", incognito=True)
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertTrue(run.incognito)
+        self.assertEqual(self.transcripts(), [])
+
+    def test_an_ordinary_run_still_writes_one(self):
+        # The control. Without it "no transcript" could mean the engine had
+        # stopped writing them at all.
+        run = self.pipeline.start("what is a monad?")
+        self.wait_terminal()
+
+        self.assertEqual(self.transcripts(), [run.transcript_name])
+
+    def test_every_stage_is_told_not_to_save(self):
+        run = self.pipeline.start("what is a monad?", incognito=True)
+        self.wait_terminal()
+
+        for stage in run.stages.values():
+            self.assertIn(
+                "--incognito", stage.command,
+                f"{stage.id} was run without its no-save flag",
+            )
+
+    def test_a_private_conversation_is_not_listed(self):
+        self.pipeline.start("what is a monad?", incognito=True)
+        self.wait_terminal()
+
+        self.assertEqual(self.pipeline.history(), [])
+
+    def test_a_private_conversation_can_still_be_continued(self):
+        # Continuing is how a conversation works at all: the browser attaches
+        # the last run by the name its transcript would have had. Held in
+        # memory rather than on disk, so it survives the session and nothing
+        # else.
+        first = self.pipeline.start("what is a monad?", incognito=True)
+        self.wait_terminal()
+        second = self.pipeline.start(
+            "and a functor?", continue_from=first.transcript_name
+        )
+        self.wait_terminal()
+
+        self.assertEqual(second.state, "complete", second.error)
+        self.assertEqual(len(second.conversation), 1)
+        self.assertEqual(second.conversation[0]["task"], "what is a monad?")
+        # The follow-up asked for no privacy of its own and gets it anyway: it
+        # carries the earlier turns of a conversation that was promised none.
+        self.assertTrue(second.incognito)
+        self.assertEqual(self.transcripts(), [])
+
+    def test_the_router_learns_nothing_from_a_private_run(self):
+        # The seating history is a persistent record of who sat and how it
+        # went, which is the record this run was told not to leave.
+        before = self.store.get("council", {}).get("stats", {})
+        self.pipeline.start("what is a monad?", incognito=True)
+        self.wait_terminal()
+
+        self.assertEqual(self.store.get("council", {}).get("stats", {}), before)
+
+    def test_an_ordinary_run_still_teaches_the_router(self):
+        self.pipeline.start("what is a monad?")
+        self.wait_terminal()
+
+        self.assertTrue(self.store.get("council", {}).get("stats"))
+
+    def test_an_agent_that_cannot_run_incognito_is_not_seated(self):
+        # Left out for this run only, and for a reason of the run rather than
+        # of the agent: its binary is installed, enabled and working.
+        self.store.update({
+            "providers": {
+                cfg.council_provider_id("agy"): dict(
+                    mock_council("agy"), incognito_args=[]
+                ),
+            },
+            "council": {"seat_count": 3, "chair_deliberates": True},
+        })
+        seating = self.pipeline.seat_council(
+            "what is a monad?", self.store.all(), incognito=True
+        )
+
+        seated = {s.agent for s in seating.seats}
+        self.assertNotIn("agy", seated)
+        self.assertTrue(seated)
+
+    def test_the_same_agent_is_seated_when_the_run_is_not_private(self):
+        self.store.update({
+            "providers": {
+                cfg.council_provider_id("agy"): dict(
+                    mock_council("agy"), incognito_args=[]
+                ),
+            },
+        })
+        seating = self.pipeline.seat_council("what is a monad?", self.store.all())
+
+        self.assertIn("agy", {s.agent for s in seating.seats})
+
+    def test_a_bench_with_nobody_left_says_why(self):
+        # Rather than the router's "check the agents in Settings", which would
+        # send the operator looking for a CLI that is working perfectly well.
+        self.store.update({
+            "providers": {
+                cfg.council_provider_id(a): dict(mock_council(a), incognito_args=[])
+                for a in cfg.AGENTS
+            },
+        })
+        with self.assertRaises(ValueError) as ctx:
+            self.pipeline.start("what is a monad?", incognito=True)
+        self.assertIn("incognito", str(ctx.exception))
+
+    def test_a_private_chat_turn_is_private_too(self):
+        assistant = mock_provider("solo", "Assistant")
+        assistant["read_only_args"] = ["--read-only"]
+        assistant["incognito_args"] = ["--incognito"]
+        self.store.update({"mode": "solo", "providers": {"solo": assistant}})
+
+        run = self.pipeline.start("what is a monad?", incognito=True)
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertIn("--incognito", run.stages["solo"].command)
+        self.assertEqual(self.transcripts(), [])
+
+    def test_only_the_newest_private_runs_are_held_in_memory(self):
+        # Nothing on disk exists to clean these up later, so the map is bounded
+        # rather than left to grow for as long as the app is open.
+        made = []
+        for i in range(VOLATILE_RUN_LIMIT + 3):
+            run = Run(
+                id=f"{i:04d}", task="private", workspace=str(self.repo),
+                zero_touch=False, incognito=True,
+            )
+            made.append(run.transcript_name)
+            self.pipeline._persist(run)
+
+        held = list(self.pipeline._volatile_runs)
+        self.assertEqual(len(held), VOLATILE_RUN_LIMIT)
+        self.assertEqual(held, made[-VOLATILE_RUN_LIMIT:])
+        self.assertIsNone(self.pipeline.load_run(made[0]))
+        self.assertIsNotNone(self.pipeline.load_run(made[-1]))
+
+
 class TestDiffStat(PipelineTestBase):
     def test_binary_untracked_files_are_counted_but_not_line_counted(self):
         # Regression: an agent that imports a module to verify its work leaves
@@ -502,6 +1047,43 @@ class TestDiffStat(PipelineTestBase):
         diff = gitutil.working_diff(self.repo)
         self.assertIn("blob.bin", diff)
 
+    def test_an_enormous_diff_is_capped_rather_than_read_whole(self):
+        # The point of the cap is memory, not display: a staged 500 MB asset
+        # used to be a 500 MB string before anything clipped it. Asserting the
+        # returned length proves git was stopped at the cap.
+        big = self.repo / "big.txt"
+        big.write_text("original\n")
+        git(["add", "-A"], self.repo)
+        git(["commit", "-qm", "add big"], self.repo)
+        big.write_text("".join(f"line {i}\n" for i in range(200_000)))
+
+        diff = gitutil.working_diff(self.repo, max_bytes=20_000)
+        self.assertIn("diff truncated for display", diff)
+        self.assertLess(len(diff), 21_000)
+
+
+class TestPrivateOnDisk(PipelineTestBase):
+    """What this app writes is private: the task, every stage's output and the
+    full diff of a repository that is not ours to leak to the next login."""
+
+    @unittest.skipUnless(os.name == "posix", "file modes are a POSIX concept")
+    def test_transcripts_and_config_are_owner_only(self):
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+
+        transcript = self.runs_dir / run.transcript_name
+        self.assertEqual(transcript.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.runs_dir.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.config_path.stat().st_mode & 0o777, 0o600)
+
+    @unittest.skipUnless(os.name == "posix", "file modes are a POSIX concept")
+    def test_a_directory_an_earlier_version_left_open_is_tightened(self):
+        loose = self.tmp / "loose-runs"
+        loose.mkdir(mode=0o755)
+        cfg.private_dir(loose)
+        self.assertEqual(loose.stat().st_mode & 0o777, 0o700)
+
 
 class TestApprovalGate(PipelineTestBase):
     def test_run_pauses_and_writes_nothing_before_approval(self):
@@ -513,15 +1095,17 @@ class TestApprovalGate(PipelineTestBase):
         # The critical guarantee: the gate is reached with a pristine tree.
         self.assertFalse((self.repo / "AI_COUNCIL_DEMO.md").exists())
         self.assertTrue(gitutil.status(self.repo).clean)
-        self.assertTrue(run.stages["drafter"].output.strip())
-        self.assertEqual(run.stages["polisher"].state, "pending")
+        # The whole council has spoken and none of it touched a file.
+        for stage in self.member_stages(run):
+            self.assertTrue(stage.output.strip(), f"{stage.id} said nothing")
+        self.assertEqual(run.stages["chair"].state, "pending")
 
         self.pipeline.approve("also mention the reviewer note")
         self.wait_terminal()
         self.assertEqual(run.state, "complete", run.error)
         self.assertTrue((self.repo / "AI_COUNCIL_DEMO.md").exists())
 
-    def test_approval_grants_execute_permission_to_stage_two(self):
+    def test_approval_grants_execute_permission_to_the_chairman(self):
         # With Zero-Touch off, the flag must still be passed *after* the human
         # approves - otherwise the CLI would block on an interactive prompt.
         self.store.update({"zero_touch": False})
@@ -530,7 +1114,7 @@ class TestApprovalGate(PipelineTestBase):
         self.pipeline.approve()
         self.wait_terminal()
         self.assertIn(
-            "--dangerously-skip-permissions", run.stages["polisher"].command
+            "--dangerously-skip-permissions", run.stages["chair"].command
         )
 
     def test_reject_abandons_the_run_without_touching_files(self):
@@ -543,7 +1127,7 @@ class TestApprovalGate(PipelineTestBase):
         self.assertEqual(run.state, "cancelled")
         self.assertFalse((self.repo / "AI_COUNCIL_DEMO.md").exists())
         self.assertTrue(gitutil.status(self.repo).clean)
-        self.assertEqual(run.stages["polisher"].state, "skipped")
+        self.assertEqual(run.stages["chair"].state, "skipped")
 
     def test_reviewer_note_reaches_the_senior_prompt(self):
         self.store.update({"zero_touch": False})
@@ -562,9 +1146,12 @@ class TestApprovalGate(PipelineTestBase):
         run = self.pipeline.start("do the thing", str(self.repo))
         self.wait_for(lambda: run.state == "awaiting_approval")
 
+        # Swap the command under every seat the chair could be sitting in.
         self.store.update({
             "providers": {
-                "polisher": {"command": ["definitely-not-the-approved-command"]},
+                cfg.council_provider_id(a):
+                    {"command": ["definitely-not-the-approved-command"]}
+                for a in cfg.AGENTS
             },
         })
         self.pipeline.approve()
@@ -572,7 +1159,7 @@ class TestApprovalGate(PipelineTestBase):
 
         self.assertEqual(run.state, "complete", run.error)
         self.assertNotIn(
-            "definitely-not-the-approved-command", run.stages["polisher"].command
+            "definitely-not-the-approved-command", run.stages["chair"].command
         )
 
 
@@ -734,10 +1321,8 @@ class TestPullRequestMode(PipelineTestBase):
         self.assertTrue((self.repo / "AI_COUNCIL_DEMO.md").exists())
         self.assertTrue(run.to_dict()["can_rollback"])
 
-    def test_a_senior_stage_that_changes_nothing_opens_no_pull_request(self):
-        self.store.update({
-            "providers": {"polisher": mock_provider("polisher", "Senior", ["--fail"])},
-        })
+    def test_a_chairman_that_changes_nothing_opens_no_pull_request(self):
+        self.pin_chair("claude", mock_council("claude", ["--fail"]))
         run = self.pipeline.start("do nothing at all", str(self.repo))
         self.wait_terminal()
 
@@ -757,75 +1342,228 @@ class TestPullRequestMode(PipelineTestBase):
 
 
 class TestFailureHandling(PipelineTestBase):
-    def test_failing_senior_stage_marks_the_run_failed(self):
-        self.store.update({
-            "zero_touch": True,
-            "providers": {"polisher": mock_provider("polisher", "Senior", ["--fail"])},
-        })
+    def test_failing_chairman_marks_the_run_failed(self):
+        self.store.update({"zero_touch": True})
+        self.pin_chair("claude", mock_council("claude", ["--fail"]))
         run = self.pipeline.start("this will fail", str(self.repo))
         self.wait_terminal()
         self.assertEqual(run.state, "failed")
-        self.assertEqual(run.stages["polisher"].state, "failed")
+        self.assertEqual(run.stages["chair"].state, "failed")
         self.assertTrue(run.error)
 
-    def test_failing_junior_stage_does_not_abort_the_run(self):
-        # A dead junior is recoverable — the senior can work from the task
-        # alone — but recovery is the operator's call, not the pipeline's.
-        # Under Zero-Touch the run degrades to the approval gate rather than
-        # proceeding unattended; see TestDraftFailureDoesNotEscalate.
-        self.store.update({
-            "zero_touch": False,
-            "providers": {"drafter": mock_provider("drafter", "Junior", ["--fail"])},
-        })
-        run = self.pipeline.start("carry on regardless", str(self.repo))
-        self.wait_for(lambda: run.state == "awaiting_approval")
-        self.assertEqual(run.stages["drafter"].state, "failed")
-
-        self.pipeline.approve()
-        self.wait_terminal()
-        self.assertEqual(run.state, "complete", run.error)
-
-    def test_missing_executable_is_reported_not_raised(self):
+    def test_one_failing_member_does_not_abort_the_council(self):
+        # A seat that dies is simply not at the table for the rest of the run.
+        # It is not replaced: a substitute would not have deliberated
+        # independently with the others, which is the only thing Stage 1 buys.
         self.store.update({
             "zero_touch": True,
             "providers": {
-                "polisher": {
-                    "id": "polisher",
-                    "label": "Ghost",
-                    "role": "Senior",
-                    "command": ["definitely-not-a-real-binary-xyz", "{prompt}"],
-                    "auto_approve_args": [],
-                    "timeout_seconds": 30,
-                }
+                cfg.council_provider_id("codex"): mock_council("codex", ["--fail"]),
             },
         })
-        run = self.pipeline.start("go", str(self.repo))
+        run = self.pipeline.start("carry on regardless", str(self.repo))
         self.wait_terminal()
-        self.assertEqual(run.state, "failed")
-        self.assertIn("not installed", run.stages["polisher"].error)
+
+        self.assertEqual(run.state, "complete", run.error)
+        states = {s.agent: s.state for s in self.member_stages(run)}
+        self.assertEqual(states.get("codex"), "failed")
+        self.assertIn("done", states.values())
+        self.assertTrue((self.repo / "AI_COUNCIL_DEMO.md").exists())
+
+    def test_a_council_with_no_surviving_member_degrades_to_the_gate(self):
+        # Zero-Touch assumes a deliberation to synthesise. With none, the run
+        # pauses for a human rather than letting one agent write to the repo
+        # with nobody watching - a combination nobody selected.
+        self.store.update({
+            "zero_touch": True,
+            "providers": {
+                cfg.council_provider_id(a): mock_council(a, ["--fail"])
+                for a in cfg.AGENTS
+            },
+        })
+        self.pin_chair("claude")
+        run = self.pipeline.start("everyone fails", str(self.repo))
+        self.wait_for(
+            lambda: run.state == "awaiting_approval", what="the degraded gate"
+        )
+        self.assertFalse((self.repo / "AI_COUNCIL_DEMO.md").exists())
+        self.pipeline.reject()
+        self.wait_terminal()
+
+    def test_a_lone_position_skips_the_critique_stage_and_stops_at_the_gate(self):
+        # One member handed its own answer back under an alias would be
+        # reviewing itself while believing it a colleague. Skipping is right.
+        # Chair sits out, so the bench is codex and agy - and only agy answers.
+        # One voice is not a quorum, so Zero-Touch pauses rather than letting a
+        # single unreviewed opinion be written unattended.
+        self.store.update({
+            "zero_touch": True,
+            "providers": {
+                cfg.council_provider_id("codex"): mock_council("codex", ["--fail"]),
+            },
+        })
+        self.pin_chair("claude")
+        run = self.pipeline.start("only one survives", str(self.repo))
+        self.wait_for(
+            lambda: run.state == "awaiting_approval", what="the quorum gate"
+        )
+        self.assertFalse((self.repo / "AI_COUNCIL_DEMO.md").exists())
+        self.pipeline.approve()
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        for stage in self.critique_stages(run):
+            self.assertIn(stage.state, ("skipped", "failed"))
+
+    def test_a_bench_of_one_cli_is_one_seat_and_not_a_quorum(self):
+        # A machine with one CLI installed used to get two seats on it: two
+        # correlated answers rather than two votes, and then two critiques of
+        # its own work. It is seated once now, the critique stage is skipped
+        # rather than run against itself, and Zero-Touch still stops for a
+        # human rather than writing on a council that never disagreed.
+        self.store.update({
+            "zero_touch": True,
+            "providers": {
+                cfg.council_provider_id(a): {
+                    "command": ["definitely-not-a-real-binary-xyz", "{prompt}"],
+                }
+                for a in cfg.AGENTS
+                if a != "codex"
+            },
+        })
+        run = self.pipeline.start("one voice only", str(self.repo))
+        self.wait_for(
+            lambda: run.state == "awaiting_approval", what="the quorum gate"
+        )
+        self.assertEqual({s.agent for s in run.seating.members}, {"codex"})
+        self.assertEqual(len(run.seating.members), 1)
+        # The calls that are not made are the point: one member and no
+        # critique, rather than two of each through the same CLI.
+        for stage in self.critique_stages(run):
+            self.assertIn(stage.state, ("pending", "skipped"))
+        self.assertFalse((self.repo / "AI_COUNCIL_DEMO.md").exists())
+        self.pipeline.reject()
+        self.wait_terminal()
+
+    def test_seats_pinned_to_the_same_cli_do_not_review_each_other(self):
+        # The router will not duplicate a CLI on its own any more, but a pin
+        # will, and a pin is the operator's to make. What it must not buy is a
+        # peer-review stage in which one model reviews the answer it would
+        # have written itself: same weights, same blind spots, full price.
+        self.store.update({
+            "zero_touch": True,
+            "council": {
+                "seat_count": 2,
+                "chair_deliberates": False,
+                "pins": {"seat1": "codex", "seat2": "codex", "chair": "claude"},
+            },
+        })
+        run = self.pipeline.start("two seats, one voice", str(self.repo))
+        self.wait_for(
+            lambda: run.state == "awaiting_approval", what="the quorum gate"
+        )
+
+        self.assertEqual({s.agent for s in run.seating.members}, {"codex"})
+        self.assertEqual(len(self.member_stages(run)), 2)
+        for stage in self.critique_stages(run):
+            self.assertIn(stage.state, ("pending", "skipped"))
+        self.pipeline.reject()
+        self.wait_terminal()
+
+    def test_a_silent_member_is_failed_not_counted_as_an_answer(self):
+        # Exit 0 with an empty stdout is what a CLI that hit its own quota
+        # wall does. Counted as success it costs twice: the seat is dropped
+        # from the deliberation anyway, while the transcript shows it green
+        # and its critique card is left pending with no explanation.
+        self.store.update({
+            "zero_touch": True,
+            "providers": {
+                cfg.council_provider_id("agy"): mock_council("agy", ["--silent"]),
+            },
+        })
+        run = self.pipeline.start("one seat says nothing", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        states = {s.agent: s.state for s in self.member_stages(run)}
+        self.assertEqual(states.get("agy"), "failed")
+        silent = [s for s in run.seating.members if s.agent == "agy"][0]
+        critique = run.stages[f"{silent.id}_critique"]
+        self.assertEqual(critique.state, "skipped")
+        self.assertIn("no peers", critique.error)
+        # The seats that did answer still cross-evaluated.
+        answered = [
+            run.stages[f"{s.id}_critique"]
+            for s in run.seating.members
+            if s.agent != "agy"
+        ]
+        self.assertTrue(all(s.state == "done" for s in answered))
+
+    def test_a_silent_member_that_said_why_has_its_reason_carried(self):
+        # The half of "printed nothing" that is actually actionable. A CLI
+        # that names the permission it was denied has told the operator how to
+        # fix it; replacing that with a generic sentence about empty output
+        # turns a two-minute settings change into a mystery.
+        reason = 'a tool required the "read_file" permission and was auto-denied'
+        self.store.update({
+            "zero_touch": True,
+            "providers": {
+                cfg.council_provider_id("agy"): mock_council(
+                    "agy", ["--silent-reason", reason]
+                ),
+            },
+        })
+        run = self.pipeline.start("one seat is denied its tools", str(self.repo))
+        self.wait_terminal()
+
+        silent = [s for s in self.member_stages(run) if s.agent == "agy"][0]
+        self.assertEqual(silent.state, "failed")
+        self.assertIn("read_file", silent.error)
+        self.assertIn("printed nothing", silent.error)
+
+    def test_no_installed_cli_refuses_to_start(self):
+        # The router seats only CLIs that actually resolve, so a machine with
+        # none of them says so before a run begins rather than failing at the
+        # first seat. This is stricter than the two-stage council was: it used
+        # to start, run, and report the failure per stage.
+        self.store.update({
+            "zero_touch": True,
+            "providers": {
+                cfg.council_provider_id(a): {
+                    "command": ["definitely-not-a-real-binary-xyz", "{prompt}"],
+                }
+                for a in cfg.AGENTS
+            },
+        })
+        with self.assertRaises(ValueError) as ctx:
+            self.pipeline.start("go", str(self.repo))
+        self.assertIn("nobody to seat", str(ctx.exception))
 
     def test_unusable_provider_config_finishes_the_stage(self):
         # A stage that cannot be launched must still end. It used to be left
         # marked "running" forever, with no end time and no error on it.
+        #
+        # Asserted on a member rather than the chair: the binary has to resolve
+        # or the router would not seat it at all, and the chair's timeout is
+        # replaced by `council.chair_timeout_seconds` on the way in - so the
+        # chair cannot carry a broken one.
         self.store.update({
             "zero_touch": True,
             "providers": {
-                "polisher": {
-                    "id": "polisher",
-                    "label": "Broken",
-                    "role": "Senior",
-                    "command": [],
-                    "timeout_seconds": "not a number",
-                }
+                cfg.council_provider_id("codex"): dict(
+                    mock_council("codex"), timeout_seconds="not a number"
+                ),
             },
         })
         run = self.pipeline.start("go", str(self.repo))
         self.wait_terminal()
 
-        self.assertEqual(run.state, "failed")
-        self.assertEqual(run.stages["polisher"].state, "failed")
-        self.assertTrue(run.stages["polisher"].ended_at)
-        self.assertIn("misconfigured", run.stages["polisher"].error)
+        broken = [s for s in self.member_stages(run) if s.agent == "codex"]
+        self.assertTrue(broken, "codex was not seated")
+        for stage in broken:
+            self.assertEqual(stage.state, "failed")
+            self.assertTrue(stage.ended_at, "a stage that failed to launch never ended")
+            self.assertIn("misconfigured", stage.error)
 
     def test_a_folder_that_does_not_exist_is_rejected(self):
         with self.assertRaises(ValueError) as ctx:
@@ -848,6 +1586,513 @@ class TestFailureHandling(PipelineTestBase):
         with self.assertRaises(ValueError) as ctx:
             self.pipeline.start("go", str(self.repo))
         self.assertIn("uncommitted", str(ctx.exception))
+
+
+class TestContinuingAFailedRun(PipelineTestBase):
+    """Continue: run what failed again, and nothing that did not.
+
+    The reason it exists is money. A council that loses only its chairman - to
+    a quota wall, a timeout, a CLI that fell over - has already paid for every
+    member position and every peer critique, and starting again spends all of
+    it a second time to get back to where it stopped.
+    """
+
+    def fail_the_chair(self):
+        self.store.update({"zero_touch": True})
+        self.pin_chair("claude", mock_council("claude", ["--fail"]))
+        run = self.pipeline.start("write the greeting", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "failed")
+        return run
+
+    def mend_the_chair(self):
+        self.store.update({
+            "providers": {cfg.council_provider_id("claude"): mock_council("claude")},
+        })
+
+    def test_only_the_failed_stage_is_offered(self):
+        run = self.fail_the_chair()
+        self.assertTrue(run.can_resume)
+        self.assertEqual(run.unfinished_stages, ["chair"])
+
+    def test_a_finished_run_has_nothing_to_continue(self):
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("finish cleanly", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertFalse(run.can_resume)
+        with self.assertRaises(ValueError):
+            self.pipeline.resume()
+
+    def test_the_members_are_not_asked_again(self):
+        # The whole saving, asserted on the clock: a reused stage keeps the
+        # timestamps of the attempt that actually ran it.
+        run = self.fail_the_chair()
+        before = {s.id: (s.started_at, s.output) for s in self.member_stages(run)}
+        self.mend_the_chair()
+
+        self.pipeline.resume()
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        after = {s.id: (s.started_at, s.output) for s in self.member_stages(run)}
+        self.assertEqual(before, after)
+        self.assertEqual(run.stages["chair"].state, "done")
+        self.assertTrue(run.stages["chair"].output.strip())
+
+    def test_the_failed_chairs_own_answer_is_carried_into_the_retry(self):
+        # The half of the saving the members do not cover. A chairman that fell
+        # over partway through applying the outcome left the folder half
+        # changed, and the one that continues is told what it was doing rather
+        # than left to work it out from the diff.
+        run = self.fail_the_chair()
+        attempt = run.stages["chair"].output
+        self.assertTrue(attempt.strip(), "the failed chair printed nothing")
+        self.mend_the_chair()
+
+        self.pipeline.resume()
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(run.chairman_attempts[-1]["output"], attempt)
+        self.assertIn("simulated failure", run.chairman_attempts[-1]["error"])
+        # And it reached the CLI, which is the only claim worth making: the
+        # recorded command redacts the prompt to a character count, so the
+        # agent's own echo is the evidence.
+        self.assertIn(
+            "earlier chairman attempts carried", run.stages["chair"].output
+        )
+
+    def test_every_unfinished_attempt_is_kept(self):
+        run = self.fail_the_chair()
+        self.pipeline.resume()
+        self.wait_terminal()
+        self.assertEqual(run.state, "failed")
+
+        self.mend_the_chair()
+        self.pipeline.resume()
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(len(run.chairman_attempts), 2)
+
+    def test_a_continued_run_keeps_its_identity(self):
+        # One run, one id, one transcript. Two half-runs the operator has to
+        # line up by hand would lose the thing the transcript is for.
+        run = self.fail_the_chair()
+        run_id = run.id
+        self.mend_the_chair()
+
+        resumed = self.pipeline.resume()
+        self.wait_terminal()
+
+        self.assertIs(resumed, run)
+        self.assertEqual(resumed.id, run_id)
+        self.assertEqual(resumed.resumed, 1)
+
+    def test_continuing_picks_up_a_seat_pointed_at_a_working_command(self):
+        # Why providers are re-read on continue and nothing else is: the fix
+        # for "this CLI hit its quota" is to change what that seat runs, and a
+        # frozen command would continue straight back into the same wall.
+        run = self.fail_the_chair()
+        self.assertIn("chair", run.unfinished_stages)
+        self.mend_the_chair()
+
+        self.pipeline.resume()
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertTrue((self.repo / "AI_COUNCIL_DEMO.md").exists())
+
+    def test_a_failed_chair_that_fails_again_can_be_continued_again(self):
+        run = self.fail_the_chair()
+        self.pipeline.resume()
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "failed")
+        self.assertEqual(run.resumed, 1)
+        self.assertTrue(run.can_resume)
+
+        self.mend_the_chair()
+        self.pipeline.resume()
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(run.resumed, 2)
+
+    def test_the_gate_is_not_asked_twice(self):
+        # A human approved this bench and these positions once. Continuing
+        # reuses both unchanged, so asking again would be asking about
+        # something that has not changed.
+        self.pin_chair("claude", mock_council("claude", ["--fail"]))
+        run = self.pipeline.start("needs approval", str(self.repo))
+        self.wait_for(lambda: run.state == "awaiting_approval", what="the gate")
+        self.pipeline.approve("go ahead")
+        self.wait_terminal()
+        self.assertEqual(run.state, "failed")
+        self.assertTrue(run.approved)
+
+        self.mend_the_chair()
+        self.pipeline.resume()
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        # And the grant survived with it: the chairman was invoked with the
+        # auto-approve flag the human granted, not read-only.
+        self.assertIn(
+            "--dangerously-skip-permissions", run.stages["chair"].command
+        )
+
+    def test_the_first_attempts_snapshot_is_kept(self):
+        # Rollback after a continuation must undo the whole run, including
+        # whatever the first, failed chairman had already written.
+        run = self.fail_the_chair()
+        snapshot = run.snapshot
+        self.assertIsNotNone(snapshot)
+        self.mend_the_chair()
+
+        self.pipeline.resume()
+        self.wait_terminal()
+
+        self.assertIs(run.snapshot, snapshot)
+
+    def test_nothing_to_continue_without_a_run(self):
+        with self.assertRaises(ValueError):
+            self.pipeline.resume()
+
+    def test_a_failed_run_can_be_continued_after_a_restart(self):
+        # The case in-memory continuation cannot cover: the app was closed
+        # between the failure and the decision to continue. A fresh Pipeline
+        # standing in for the restart - same runs directory, no memory of the
+        # run - still finishes it without asking the members again.
+        run = self.fail_the_chair()
+        name = run.transcript_name
+        members = {s.id: s.output for s in self.member_stages(run)}
+        self.mend_the_chair()
+
+        restarted = Pipeline(self.store, self.bus, runs_dir=self.runs_dir)
+        self.addCleanup(restarted.wait_for_worker)
+        revived = restarted.revive(name)
+        self.wait_for(
+            lambda: not restarted.is_busy(), what="the revived run to finish"
+        )
+        restarted.wait_for_worker()
+
+        self.assertEqual(revived.state, "complete", revived.error)
+        self.assertEqual(revived.id, run.id)
+        self.assertEqual(
+            {s.id: s.output for s in self.member_stages(revived)}, members
+        )
+        self.assertTrue(revived.stages["chair"].output.strip())
+
+    def test_the_failed_chairs_answer_survives_a_restart_too(self):
+        # It is on the transcript for the same reason the members' answers are:
+        # the app being closed between the failure and the decision to continue
+        # must not cost the next chairman what it already knew.
+        run = self.fail_the_chair()
+        name = run.transcript_name
+        attempt = run.stages["chair"].output
+        self.mend_the_chair()
+
+        restarted = Pipeline(self.store, self.bus, runs_dir=self.runs_dir)
+        self.addCleanup(restarted.wait_for_worker)
+        revived = restarted.revive(name)
+        self.wait_for(
+            lambda: not restarted.is_busy(), what="the revived run to finish"
+        )
+        restarted.wait_for_worker()
+
+        self.assertEqual(revived.state, "complete", revived.error)
+        self.assertEqual(revived.chairman_attempts[-1]["output"], attempt)
+        self.assertIn(
+            "earlier chairman attempts carried", revived.stages["chair"].output
+        )
+
+    def test_a_finished_transcript_is_not_revived(self):
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("finish cleanly", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+
+        with self.assertRaises(ValueError):
+            self.pipeline.revive(run.transcript_name)
+
+    def test_reviving_a_transcript_that_is_gone_says_so(self):
+        with self.assertRaises(ValueError):
+            self.pipeline.revive("1700000000-nosuchrun.json")
+
+    def test_a_transcript_written_before_continue_existed_can_still_continue(self):
+        # The runs that need this most are the ones already on disk: a council
+        # that paid for six answers and lost its chairman to a quota wall,
+        # written by a version that had no `can_resume` to record. Answering
+        # from the stored key would call those unusable, which is backwards.
+        run = self.fail_the_chair()
+        path = self.runs_dir / run.transcript_name
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.pop("can_resume", None)
+        data.pop("unfinished_stages", None)
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        loaded = self.pipeline.load_run(run.transcript_name)
+        self.assertTrue(loaded["can_resume"])
+        self.assertEqual(loaded["unfinished_stages"], ["chair"])
+
+        # And it is not merely labelled continuable - it continues.
+        self.mend_the_chair()
+        restarted = Pipeline(self.store, self.bus, runs_dir=self.runs_dir)
+        self.addCleanup(restarted.wait_for_worker)
+        revived = restarted.revive(run.transcript_name)
+        self.wait_for(lambda: not restarted.is_busy(), what="the revived run")
+        restarted.wait_for_worker()
+        self.assertEqual(revived.state, "complete", revived.error)
+
+    def test_the_conversation_list_says_which_rows_can_continue(self):
+        # Discoverability: whoever needs this is scanning a list of
+        # conversations for the one they gave up on, not opening each in turn.
+        run = self.fail_the_chair()
+        rows = self.pipeline.history(mode="council")
+        row = next(r for r in rows if r["file"] == run.transcript_name)
+        self.assertTrue(row["can_resume"])
+
+    def test_a_completed_run_is_not_offered_in_the_list(self):
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("finish cleanly", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+
+        rows = self.pipeline.history(mode="council")
+        row = next(r for r in rows if r["file"] == run.transcript_name)
+        self.assertFalse(row["can_resume"])
+
+    def test_a_pull_request_run_is_not_revived_after_a_restart(self):
+        # Its branch, its commits and possibly a published PR are all outside
+        # the transcript. Half-reconstructing that would be a guess about the
+        # repository, so it is refused in words the operator can act on.
+        run = self.fail_the_chair()
+        path = self.runs_dir / run.transcript_name
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["pull_request_mode"] = True
+        data["work_branch"] = "council/whatever"
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        with self.assertRaises(ValueError) as caught:
+            self.pipeline.revive(run.transcript_name)
+        self.assertIn("pull request", str(caught.exception).lower())
+
+    def test_a_failed_chat_turn_can_be_continued_too(self):
+        # Chat has one stage, so there is nothing to reuse - but the message,
+        # the thread and the folder are all still here, and retyping them is
+        # the thing continuing is meant to save.
+        self.store.update({
+            "mode": "solo",
+            "providers": {"solo": mock_provider("solo", "Assistant", ["--fail"])},
+        })
+        run = self.pipeline.start("what does this repo do?", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "failed")
+        self.assertTrue(run.can_resume)
+
+        self.store.update({"providers": {"solo": mock_provider("solo", "Assistant")}})
+        self.pipeline.resume()
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(run.task, "what does this repo do?")
+
+
+class TestRunningOneSeatAgain(PipelineTestBase):
+    """Retry: replace one answer without throwing away the rest.
+
+    The rule that makes it honest is what follows a re-run. A position is
+    quoted into every peer's critique and into the chairman's prompt, so a seat
+    that answers again invalidates the reviews of it - keeping them would leave
+    a transcript whose critiques discuss an answer no longer in it.
+    """
+
+    def council(self):
+        self.store.update({"mode": "council", "zero_touch": True})
+        run = self.pipeline.start("do a thing", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+        return run
+
+    def test_a_finished_run_offers_every_seat(self):
+        run = self.council()
+        plan = run.to_dict()["retry_plan"]
+        self.assertEqual(sorted(plan), sorted(run.stage_order))
+
+    def test_re_running_a_position_takes_the_reviews_of_it_with_it(self):
+        run = self.council()
+        seat = run.seating.members[0].id
+        plan = run.to_dict()["retry_plan"][seat]
+
+        self.assertEqual(plan[0], seat)
+        for member in run.seating.members:
+            self.assertIn(f"{member.id}_critique", plan)
+        self.assertIn("chair", plan)
+        # Not the other members' own positions: they were written blind, at the
+        # same time, and are not downstream of this one.
+        for other in run.seating.members[1:]:
+            self.assertNotIn(other.id, plan)
+
+    def test_re_running_a_critique_only_takes_the_verdict(self):
+        run = self.council()
+        critique = f"{run.seating.members[0].id}_critique"
+        self.assertEqual(run.to_dict()["retry_plan"][critique], [critique, "chair"])
+
+    def test_re_running_the_chair_takes_nothing_else(self):
+        run = self.council()
+        self.assertEqual(run.to_dict()["retry_plan"]["chair"], ["chair"])
+
+    def test_a_verdict_that_answered_is_not_called_an_unfinished_attempt(self):
+        # The chair re-runs here because the position it quoted changed, not
+        # because it failed. Handing the next one the old verdict labelled as
+        # an attempt that fell over would put a lie in the prompt.
+        run = self.council()
+
+        self.pipeline.retry(run.seating.members[0].id)
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(run.chairman_attempts, [])
+        self.assertNotIn(
+            "earlier chairman attempts carried", run.stages["chair"].output
+        )
+
+    def test_the_kept_answers_are_not_asked_again(self):
+        run = self.council()
+        seat = run.seating.members[0].id
+        untouched = [
+            s for s in run.seating.members[1:]
+        ]
+        before = {s.id: run.stages[s.id].started_at for s in untouched}
+
+        self.pipeline.retry(seat)
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        after = {s.id: run.stages[s.id].started_at for s in untouched}
+        self.assertEqual(before, after)
+        # And the stage asked for really did run again.
+        self.assertEqual(run.stages[seat].state, "done")
+        self.assertEqual(run.resumed, 1)
+
+    def test_the_reviews_of_a_re_run_position_are_written_fresh(self):
+        run = self.council()
+        seat = run.seating.members[0].id
+        before = {
+            f"{m.id}_critique": run.stages[f"{m.id}_critique"].started_at
+            for m in run.seating.members
+        }
+
+        self.pipeline.retry(seat)
+        self.wait_terminal()
+
+        for stage_id, started in before.items():
+            self.assertNotEqual(run.stages[stage_id].started_at, started, stage_id)
+
+    def test_a_chat_turn_has_nothing_downstream(self):
+        self.store.update({
+            "mode": "solo",
+            "providers": {"solo": mock_provider("solo", "Assistant")},
+        })
+        run = self.pipeline.start("what is this?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.to_dict()["retry_plan"], {"solo": ["solo"]})
+
+    def test_a_seat_that_died_can_be_replaced_on_a_run_that_finished(self):
+        # The case the operator actually hits: the council carried on with two
+        # of three, the chairman answered, and the run reads `complete` - so
+        # Continue is not offered and the dead seat is nobody's problem. Here
+        # it is one click, and the reviews and verdict are rewritten around the
+        # answer that was missing when they were written.
+        self.store.update({
+            "zero_touch": True,
+            "council": {"chair_deliberates": True},
+            "providers": {
+                cfg.council_provider_id("codex"): mock_council("codex", ["--fail"]),
+            },
+        })
+        run = self.pipeline.start("carry on regardless", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+
+        dead = next(
+            s for s in self.member_stages(run) if s.agent == "codex"
+        )
+        self.assertEqual(dead.state, "failed")
+        survivors = {
+            s.id: s.started_at for s in self.member_stages(run) if s.state == "done"
+        }
+        reviews = {
+            s.id: s.started_at for s in self.critique_stages(run)
+            if s.state == "done"
+        }
+        self.assertTrue(survivors and reviews)
+
+        self.store.update({
+            "providers": {cfg.council_provider_id("codex"): mock_council("codex")},
+        })
+        self.pipeline.retry(dead.id)
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(run.stages[dead.id].state, "done")
+        # The positions that answered the first time are untouched...
+        for stage_id, started in survivors.items():
+            self.assertEqual(run.stages[stage_id].started_at, started, stage_id)
+        # ...and the reviews of them are not, because the bench they reviewed
+        # has a member in it that was not there before.
+        for stage_id, started in reviews.items():
+            self.assertNotEqual(run.stages[stage_id].started_at, started, stage_id)
+
+    def test_an_archived_run_is_offered_the_same_plan(self):
+        # Asked of a transcript, not of the engine: the runs worth re-seating a
+        # dead member on are usually yesterday's, and a file written before the
+        # question existed has to answer it the same way.
+        run = self.council()
+        path = self.runs_dir / run.transcript_name
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.pop("retry_plan", None)
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        loaded = self.pipeline.load_run(run.transcript_name)
+        self.assertEqual(loaded["retry_plan"], run.to_dict()["retry_plan"])
+
+    def test_a_seat_can_be_re_run_after_a_restart(self):
+        run = self.council()
+        seat = run.seating.members[0].id
+        kept = {
+            s.id: s.started_at for s in self.member_stages(run) if s.id != seat
+        }
+
+        restarted = Pipeline(self.store, self.bus, runs_dir=self.runs_dir)
+        self.addCleanup(restarted.wait_for_worker)
+        restarted.revive(run.transcript_name, start=False)
+        revived = restarted.retry(seat)
+        self.wait_for(lambda: not restarted.is_busy(), what="the retried run")
+        restarted.wait_for_worker()
+
+        self.assertEqual(revived.state, "complete", revived.error)
+        self.assertEqual(revived.id, run.id)
+        for stage_id, started in kept.items():
+            self.assertEqual(revived.stages[stage_id].started_at, started, stage_id)
+
+    def test_a_stage_this_run_never_had_is_refused(self):
+        self.council()
+        with self.assertRaises(ValueError):
+            self.pipeline.retry("seat9")
+
+    def test_nothing_is_offered_while_a_run_is_in_flight(self):
+        # The plan is a question about a finished run. Offered mid-run it would
+        # invite a click that the engine would have to refuse anyway.
+        self.store.update({"mode": "council", "zero_touch": True})
+        run = self.pipeline.start("do a thing", str(self.repo))
+        self.wait_for(
+            lambda: run.state not in ("idle", "queued"), what="the run to start"
+        )
+        self.assertEqual(run.to_dict()["retry_plan"], {})
+        self.wait_terminal()
 
 
 class TestCancellation(PipelineTestBase):
@@ -952,9 +2197,15 @@ class TestContinuedConversation(PipelineTestBase):
         self.assertIn("MAGIC-THREAD-TOKEN", second.conversation[0]["task"])
         self.assertTrue(second.conversation[0]["replies"])
 
-        # And it reached the CLIs, not just the Run object: both stages were
-        # launched with a materially longer prompt than the same task alone.
-        for stage in ("drafter", "polisher"):
+        # And it reached the CLIs, not just the Run object. Compared per seat
+        # id rather than per CLI: the bench is routed, so seat 1 of the
+        # follow-up need not be the same agent as seat 1 of the first run -
+        # what has to hold is that the seat was told what came before.
+        #
+        # Only the stages that carry the thread are checked. A critique is
+        # given the peers' answers rather than the history, so its prompt does
+        # not grow with the conversation and asserting it would be wrong.
+        for stage in [*self.member_ids(second), "chair"]:
             self.assertGreater(
                 self.prompt_size(second, stage), self.prompt_size(first, stage) + 200,
                 f"the {stage} stage was not told what came before",
@@ -1140,6 +2391,32 @@ class TestConversationList(PipelineTestBase):
         # every time the operator sends another message.
         self.assertEqual(listed[0]["title"], "the original request")
 
+    def test_many_chat_follow_ups_remain_one_conversation(self):
+        self.store.update({
+            "mode": "solo",
+            "providers": {"solo": mock_provider("solo", "Assistant")},
+        })
+        previous = ""
+        runs = []
+        for number in range(1, 9):
+            run = self.run_once(
+                f"chat message {number}",
+                continue_from=previous,
+            )
+            runs.append(run)
+            previous = run.transcript_name
+
+        listed = self.pipeline.history(mode="solo")
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0]["file"], runs[-1].transcript_name)
+        self.assertEqual(listed[0]["messages"], 8)
+        self.assertEqual(listed[0]["title"], "chat message 1")
+        self.assertEqual(runs[-1].parent_run_id, runs[-2].id)
+        self.assertEqual(
+            [turn["task"] for turn in runs[-1].conversation],
+            [f"chat message {number}" for number in range(1, 8)],
+        )
+
     def test_continuing_the_same_run_twice_lists_both_branches(self):
         first = self.run_once("the original request")
         left = self.run_once("down one path", continue_from=first.transcript_name)
@@ -1175,8 +2452,69 @@ class TestConversationList(PipelineTestBase):
         self.assertEqual([c["file"] for c in self.pipeline.history()],
                          [run.transcript_name])
 
+    def test_an_edited_transcript_is_read_again(self):
+        # The rows are cached against each file's mtime and size, so listing a
+        # year of runs does not reparse every diff in them. A transcript that
+        # changed on disk has to defeat that, or the sidebar would keep showing
+        # a title the file no longer carries.
+        run = self.run_once("the first title")
+        self.assertEqual(self.pipeline.history()[0]["title"], "the first title")
+
+        path = self.pipeline.runs_dir / run.transcript_name
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["task"] = "an entirely different title"
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        self.assertEqual(
+            self.pipeline.history()[0]["title"], "an entirely different title"
+        )
+
+    def test_a_deleted_transcript_is_forgotten_rather_than_cached(self):
+        run = self.run_once("do the thing")
+        self.pipeline.history()
+        self.pipeline.delete_run(run.transcript_name)
+
+        self.assertEqual(self.pipeline.history(), [])
+        self.assertEqual(self.pipeline._summary_cache, {})
+
 
 class TestEventStream(PipelineTestBase):
+    def test_terminal_event_is_published_after_transcript_exists(self):
+        q = self.bus.subscribe()
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("persist before terminal event", str(self.repo))
+
+        while True:
+            event = q.get(timeout=5)
+            if event["kind"] == "state" and event["state"] in (
+                "complete", "failed", "cancelled"
+            ):
+                break
+
+        self.assertTrue((self.pipeline.runs_dir / run.transcript_name).is_file())
+
+    def test_the_transcript_is_written_once_rather_than_twice(self):
+        # The worker used to persist again on its way out, after `_set_state`
+        # had already written the same file on the way into the terminal state.
+        # A transcript carries every stage's output and the whole diff, so the
+        # second dump was the largest write in the run and changed nothing.
+        writes = []
+        real = self.pipeline._persist
+
+        def counted(run):
+            writes.append(run.state)
+            real(run)
+
+        self.pipeline._persist = counted
+        self.addCleanup(setattr, self.pipeline, "_persist", real)
+
+        self.store.update({"zero_touch": True})
+        run = self.pipeline.start("write me once", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(writes, ["complete"], run.error)
+        self.assertTrue((self.pipeline.runs_dir / run.transcript_name).is_file())
+
     def test_subscribers_observe_the_whole_run(self):
         q = self.bus.subscribe()
         self.store.update({"zero_touch": True})
@@ -1225,20 +2563,30 @@ if __name__ == "__main__":
 
 
 class TestDraftFailureDoesNotEscalate(PipelineTestBase):
-    """A failed Stage 1 must not turn Zero-Touch into an unattended solo run.
+    """A dead Stage 1 must not turn Zero-Touch into an unattended solo run.
 
-    Zero-Touch means "you may skip my approval because a junior drafted it and
-    a senior is verifying that draft". With no draft, that premise is gone —
-    proceeding anyway silently grants an agent unattended write access under a
-    setting the operator chose for a different situation.
+    Zero-Touch means "you may skip my approval because a council deliberated
+    and a chairman is synthesising what it decided". With no positions at all
+    that premise is gone — proceeding anyway silently grants one agent
+    unattended write access under a setting the operator chose for a different
+    situation.
+
+    One member dying is a different case and does not degrade: the council
+    continues with whoever is left. It takes losing all of them.
     """
 
     def setUp(self):
         super().setUp()
         self.store.update({
             "zero_touch": True,
-            "providers": {"drafter": mock_provider("drafter", "Junior", ["--fail"])},
+            "providers": {
+                cfg.council_provider_id(a): mock_council(a, ["--fail"])
+                for a in cfg.AGENTS
+            },
         })
+        # The chair has to survive to be approvable, so it is pinned to a CLI
+        # that is put back in working order.
+        self.pin_chair("claude", mock_council("claude"))
 
     def test_zero_touch_falls_back_to_the_gate(self):
         run = self.pipeline.start("do the thing", str(self.repo))
@@ -1265,22 +2613,34 @@ class TestDraftFailureDoesNotEscalate(PipelineTestBase):
         self.assertEqual(run.state, "cancelled")
         self.assertTrue(gitutil.status(self.repo).clean)
 
-    def test_a_healthy_draft_still_skips_the_gate_under_zero_touch(self):
+    def test_a_healthy_council_still_skips_the_gate_under_zero_touch(self):
         # The fallback must not become a gate on every Zero-Touch run.
-        self.store.update({
-            "providers": {"drafter": mock_provider("drafter", "Junior Draft")},
-        })
+        self.store.update({"providers": council_providers()})
         run = self.pipeline.start("do the thing", str(self.repo))
         self.wait_terminal()
         self.assertEqual(run.state, "complete", run.error)
         self.assertNotEqual(run.state, "awaiting_approval")
 
 
-class TestRoleTemplates(unittest.TestCase):
+def seat(persona="", seat_id="seat1", agent="codex"):
+    """One routed seat, as the seating hands it to the pipeline."""
+    return router.Seat(
+        id=seat_id,
+        agent=agent,
+        provider_id=cfg.council_provider_id(agent),
+        alias="Agent A",
+        persona=persona,
+    )
+
+
+class TestRoleTemplates(PipelineTestBase):
     """Role behaviour is a setting, not a constant.
 
     The shipped prompts are defaults the operator can replace; what must not
-    change is that the resolved text actually reaches the CLI.
+    change is that the resolved text actually reaches the CLI. Which role a
+    seat gets is no longer a per-stage setting at all - it is the persona the
+    router assigned, resolved by `Pipeline._persona_system` against the same
+    catalogue - so that is what these drive.
     """
 
     def test_catalog_entries_are_complete(self):
@@ -1294,54 +2654,72 @@ class TestRoleTemplates(unittest.TestCase):
             self.assertTrue(role["system"].strip())
             self.assertIsInstance(role["writes"], bool)
 
-    def test_stage_defaults_when_nothing_is_configured(self):
-        from aicouncil import prompts
-
-        self.assertIn("JUNIOR ENGINEER", prompts.resolve_system("drafter", {}))
-        self.assertIn("SENIOR STAFF ARCHITECT", prompts.resolve_system("polisher", {}))
-
-    def test_a_template_replaces_the_stage_default(self):
-        from aicouncil import prompts
-
-        text = prompts.resolve_system("drafter", {"role_template": "security_review"})
+    def test_a_seat_gets_the_persona_it_was_routed(self):
+        text = self.pipeline._persona_system(seat("security_review"), {})
         self.assertIn("SECURITY REVIEWER", text)
-        self.assertNotIn("JUNIOR ENGINEER", text)
 
-    def test_edited_text_beats_the_template(self):
-        from aicouncil import prompts
-
-        text = prompts.resolve_system(
-            "drafter",
-            {"role_template": "security_review", "role_system": "Be a poet."},
+    def test_an_edited_persona_beats_the_shipped_text(self):
+        text = self.pipeline._persona_system(
+            seat("security_review"), {"security_review": {"system": "Be a poet."}}
         )
         self.assertEqual(text, "Be a poet.")
+        self.assertNotIn("SECURITY REVIEWER", text)
 
-    def test_blank_override_falls_back_rather_than_sending_nothing(self):
-        # Clearing the box in Settings must restore the template, not ship an
-        # empty system prompt.
+    def test_an_unrouted_seat_gets_no_lens_rather_than_a_default(self):
+        # There is no per-stage fallback any more, and inventing one would put
+        # a behaviour nobody chose in front of a seat. Blank is the neutral
+        # council member: the stage contract and nothing else.
+        self.assertEqual(self.pipeline._persona_system(seat(""), {}), "")
+
+    def test_a_persona_that_no_longer_exists_adds_no_lens(self):
+        # Deleting a role the Council panel still pins must not resurrect some
+        # other role's wording under that seat's name.
+        self.assertEqual(self.pipeline._persona_system(seat("gone"), {}), "")
+
+    def test_an_emptied_persona_adds_no_lens(self):
+        # Blanking a role's text in the editor is the operator saying "no
+        # lens", which composes onto the stage contract as nothing at all.
+        text = self.pipeline._persona_system(
+            seat("pragmatist"), {"pragmatist": {"system": "   "}}
+        )
+        self.assertEqual(text.strip(), "")
+
+    def test_the_resolved_persona_reaches_the_agent(self):
         from aicouncil import prompts
 
-        for blank in ("", "   ", "\n\t "):
-            text = prompts.resolve_system("drafter", {"role_system": blank})
-            self.assertIn("JUNIOR ENGINEER", text)
-
-    def test_an_unknown_template_falls_back_to_the_stage_default(self):
-        from aicouncil import prompts
-
-        text = prompts.resolve_system("polisher", {"role_template": "no_such_role"})
-        self.assertIn("SENIOR STAFF ARCHITECT", text)
-
-    def test_the_resolved_role_reaches_the_agent(self):
-        from aicouncil import prompts
-
-        prompt = prompts.build_draft_prompt(
+        prompt = prompts.build_member_prompt(
             "add a feature", "/tmp/r", None, "",
-            system=prompts.resolve_system(
-                "drafter", {"role_template": "adversarial_review"}
+            persona_system=self.pipeline._persona_system(
+                seat("adversarial_review"), {}
             ),
         )
         self.assertIn("ADVERSARIAL REVIEWER", prompt)
         self.assertIn("add a feature", prompt)
+        # Composed onto the stage contract, not in place of it: a persona must
+        # not be able to talk a read-only seat out of being read-only.
+        self.assertIn("# Your lens", prompt)
+
+    def test_a_seat_with_no_persona_leaves_the_contract_alone(self):
+        from aicouncil import prompts
+
+        prompt = prompts.build_member_prompt(
+            "add a feature", "/tmp/r", None, "",
+            persona_system=self.pipeline._persona_system(seat(""), {}),
+        )
+        self.assertNotIn("# Your lens", prompt)
+        self.assertIn("add a feature", prompt)
+
+    def test_the_persona_also_reaches_the_critique_turn(self):
+        # The lens is the seat's, not the stage's: a Pragmatist that turned
+        # neutral the moment it started reviewing peers would be half a seat.
+        from aicouncil import prompts
+
+        prompt = prompts.build_critique_prompt(
+            "task", [{"alias": "Agent B", "output": "their answer"}],
+            "/tmp/r", None, "",
+            persona_system=self.pipeline._persona_system(seat("pragmatist"), {}),
+        )
+        self.assertIn("PRAGMATISM", prompt.upper())
 
     def test_house_rules_still_apply_over_a_custom_role(self):
         from aicouncil import prompts
@@ -1601,19 +2979,677 @@ class TestSoloPrompt(unittest.TestCase):
         self.assertLess(prompt.index("add a login route"), prompt.index("and now?"))
 
 
-class TestRoleReachesTheRun(PipelineTestBase):
-    def test_a_configured_role_is_used_by_a_real_run(self):
-        # End to end: set a role, run, and confirm the agent saw that text.
+class TestReadOnlyChairmanPrompt(unittest.TestCase):
+    """A run with no folder asks the chairman for the answer, not for edits.
+
+    The shipped chairman text is a write-mode contract - apply the outcome,
+    then report what changed - and it arrives from the role catalogue rather
+    than from a default, so the swap has to be made on the text that is handed
+    in.
+    """
+
+    def chairman(self, **kwargs):
+        from aicouncil import prompts
+
+        return prompts.build_chairman_prompt(
+            "add a demo artifact", [{"alias": "Agent A", "output": "do it"}],
+            [], "/tmp", **kwargs,
+        )
+
+    def test_the_write_mode_contract_is_the_default(self):
+        from aicouncil import prompts
+
+        prompt = self.chairman(system=prompts.CHAIRMAN_SYSTEM)
+        self.assertIn("Apply the edits to the working tree", prompt)
+
+    def test_a_read_only_run_swaps_the_shipped_chairman(self):
+        from aicouncil import prompts
+
+        prompt = self.chairman(system=prompts.CHAIRMAN_SYSTEM, read_only=True)
+        self.assertNotIn("Apply the edits to the working tree", prompt)
+        self.assertIn("Nothing on this run writes to disk", prompt)
+        self.assertIn("a fenced block per file", prompt)
+
+    def test_an_edited_chairman_is_kept_and_overruled(self):
+        # The operator's wording is theirs. What it says about applying the
+        # outcome cannot stand, because there is nothing to apply it to.
+        prompt = self.chairman(
+            system="You are the CHAIRMAN. Apply the edits yourself.",
+            read_only=True,
+        )
+        self.assertIn("Apply the edits yourself.", prompt)
+        self.assertIn("# This run writes nothing", prompt)
+
+    def test_the_deliberation_still_reaches_the_chairman(self):
+        # The read-only chairman is the same stage with a different
+        # deliverable, and the mock council fixture identifies it by this
+        # heading - a swap that lost it would silently reseat the stage.
+        prompt = self.chairman(read_only=True)
+        self.assertIn("# Stage 1 - independent positions", prompt)
+        self.assertIn("CONSENSUS: <integer 0-100>", prompt)
+
+
+class TestContinuedChairmanPrompt(unittest.TestCase):
+    """What a continued run tells the chairman about the one before it.
+
+    The deliberation is replayed either way. This is the part that was being
+    thrown away: a chairman that failed partway through applying the outcome
+    had already changed the folder, and the next one arrived knowing nothing
+    about it.
+    """
+
+    def chairman(self, attempts, **kwargs):
+        from aicouncil import prompts
+
+        return prompts.build_chairman_prompt(
+            "finish the work", [{"alias": "Agent A", "output": "do it"}],
+            [], "/tmp", previous_attempts=attempts, **kwargs,
+        )
+
+    def test_nothing_is_added_on_a_first_attempt(self):
+        self.assertNotIn("Earlier chairman attempts", self.chairman(None))
+        self.assertNotIn("Earlier chairman attempts", self.chairman([]))
+
+    def test_the_attempt_is_quoted_and_labelled_as_unfinished(self):
+        prompt = self.chairman([
+            {"output": "PARTIAL-VERDICT", "error": "Timed out after 900s."},
+        ])
+        self.assertIn("PARTIAL-VERDICT", prompt)
+        self.assertIn("Timed out after 900s.", prompt)
+        self.assertIn("did not finish", prompt)
+        # The folder, not the recollection, is what says how much of it landed.
+        self.assertIn("only authority on what actually landed", prompt)
+
+    def test_the_attempts_are_oldest_first(self):
+        prompt = self.chairman([
+            {"output": "FIRST-TRY", "error": ""},
+            {"output": "SECOND-TRY", "error": ""},
+        ])
+        self.assertLess(prompt.index("FIRST-TRY"), prompt.index("SECOND-TRY"))
+
+    def test_a_chair_that_printed_nothing_still_says_why(self):
+        prompt = self.chairman([{"output": "   ", "error": "Quota exhausted."}])
+        self.assertIn("Nothing usable was written.", prompt)
+        self.assertIn("Quota exhausted.", prompt)
+
+    def test_the_attempts_cannot_push_the_prompt_past_its_ceiling(self):
+        # Three failed attempts at 200,000 characters each is not a plausible
+        # run, which is the point: the bound holds without being reasoned about.
+        from aicouncil import prompts
+        from aicouncil.providers import ARGV_PROMPT_LIMIT
+
+        big = "x" * 200_000
+        prompt = self.chairman(
+            [{"output": big, "error": big} for _ in range(3)],
+            house_rules=big,
+            conversation=[{"task": big, "replies": []}],
+        )
+        self.assertLessEqual(len(prompt), prompts.MAX_CHAIRMAN_PROMPT)
+        self.assertLess(len(prompt), ARGV_PROMPT_LIMIT)
+
+    def test_the_deliberation_is_not_crowded_out_by_them(self):
+        # The attempts are context; the positions are what is being decided
+        # between, and they still have to arrive.
+        big = "x" * 200_000
+        prompt = self.chairman([{"output": big, "error": ""} for _ in range(3)])
+        self.assertIn("# Stage 1 - independent positions", prompt)
+        self.assertIn("do it", prompt)
+
+
+class TestCavemanPrompt(unittest.TestCase):
+    """The style switch: telegraphic prose, byte-exact code.
+
+    Each mode owns its own switch, so every test here is also a test that the
+    other two modes were left alone.
+    """
+
+    MARK = "ULTRA-LOW TOKEN EFFICIENCY MODE"
+
+    def test_nothing_is_added_when_it_is_off(self):
+        from aicouncil import prompts
+
+        self.assertEqual(prompts.build_chat_prompt("what is this?"),
+                         "what is this?")
+        self.assertNotIn(self.MARK, prompts.build_member_prompt("t", "/tmp"))
+
+    def test_chat_gets_it_before_the_message(self):
+        from aicouncil import prompts
+
+        prompt = prompts.build_chat_prompt("what is this?", caveman=True)
+        self.assertIn(self.MARK, prompt)
+        self.assertLess(prompt.index(self.MARK), prompt.index("what is this?"))
+
+    def test_a_typed_behaviour_still_arrives_alongside_it(self):
+        # The switch is a style, not a replacement for what the operator wrote.
+        from aicouncil import prompts
+
+        prompt = prompts.build_chat_prompt(
+            "hello", behavior="Always show the code.", caveman=True
+        )
+        self.assertIn(self.MARK, prompt)
+        self.assertIn("Always show the code.", prompt)
+
+    def test_every_council_stage_gets_the_same_instruction(self):
+        # A chairman writing tersely over members who wrote at length would
+        # read as three different voices in one transcript.
+        from aicouncil import prompts
+
+        member = prompts.build_member_prompt("t", "/tmp", caveman=True)
+        critique = prompts.build_critique_prompt(
+            "t", [{"alias": "Agent B", "output": "x"}], "/tmp", caveman=True
+        )
+        chair = prompts.build_chairman_prompt(
+            "t", [{"alias": "Agent A", "output": "x"}], [], "/tmp", caveman=True
+        )
+        for prompt in (member, critique, chair):
+            self.assertIn(self.MARK, prompt)
+
+    def test_code_and_paths_are_carved_out_of_the_compression(self):
+        # The whole reason this is safe to send: what the operator has to use
+        # out of an answer is exempt from being shortened.
+        from aicouncil import prompts
+
+        prompt = prompts.build_member_prompt("t", "/tmp", caveman=True)
+        self.assertIn("byte-exact", prompt)
+        self.assertIn("Preservation Exception", prompt)
+
+    def test_a_project_turn_carries_it_only_when_it_is_on(self):
+        from aicouncil import prompts
+
+        off = prompts.project_context_block("p1", "/tmp", "{}")
+        on = prompts.project_context_block("p1", "/tmp", "{}", caveman=True)
+        self.assertNotIn(self.MARK, off)
+        self.assertIn(self.MARK, on)
+
+
+class TestEfficiencyPrompt(unittest.TestCase):
+    """Concise normal prose remains independent from Caveman Mode."""
+
+    MARK = "[SYSTEM INSTRUCTION: EFFICIENCY MODE]"
+
+    def test_nothing_is_added_when_it_is_off(self):
+        from aicouncil import prompts
+
+        self.assertEqual(
+            prompts.build_chat_prompt("what is this?"),
+            "what is this?",
+        )
+        self.assertNotIn(self.MARK, prompts.build_member_prompt("t", "/tmp"))
+
+    def test_chat_gets_it_before_the_message(self):
+        from aicouncil import prompts
+
+        prompt = prompts.build_chat_prompt("what is this?", efficiency=True)
+        self.assertIn(self.MARK, prompt)
+        self.assertLess(prompt.index(self.MARK), prompt.index("what is this?"))
+
+    def test_every_council_stage_gets_the_same_instruction(self):
+        from aicouncil import prompts
+
+        member = prompts.build_member_prompt("t", "/tmp", efficiency=True)
+        critique = prompts.build_critique_prompt(
+            "t",
+            [{"alias": "Agent B", "output": "x"}],
+            "/tmp",
+            efficiency=True,
+        )
+        chair = prompts.build_chairman_prompt(
+            "t",
+            [{"alias": "Agent A", "output": "x"}],
+            [],
+            "/tmp",
+            efficiency=True,
+        )
+        for prompt in (member, critique, chair):
+            self.assertIn(self.MARK, prompt)
+
+    def test_it_preserves_technical_content_and_necessary_reasoning(self):
+        from aicouncil import prompts
+
+        prompt = prompts.build_member_prompt("t", "/tmp", efficiency=True)
+        self.assertIn("Keep code blocks, shell commands, file paths", prompt)
+        self.assertIn("Preserve essential reasoning", prompt)
+
+    def test_it_can_coexist_with_caveman_mode(self):
+        from aicouncil import prompts
+
+        prompt = prompts.build_chat_prompt(
+            "hello",
+            caveman=True,
+            efficiency=True,
+        )
+        self.assertIn(self.MARK, prompt)
+        self.assertIn("ULTRA-LOW TOKEN EFFICIENCY MODE", prompt)
+
+    def test_both_styles_arrive_under_one_heading_everywhere(self):
+        # Two identically-titled sections is the agent being told twice, in
+        # different words, how to write. Every builder composes them the same
+        # way, so every builder is checked.
+        from aicouncil import prompts
+
+        built = (
+            prompts.build_chat_prompt("hello", caveman=True, efficiency=True),
+            prompts.build_member_prompt(
+                "t", "/tmp", caveman=True, efficiency=True
+            ),
+            prompts.build_critique_prompt(
+                "t",
+                [{"alias": "Agent B", "output": "x"}],
+                "/tmp",
+                caveman=True,
+                efficiency=True,
+            ),
+            prompts.build_chairman_prompt(
+                "t",
+                [{"alias": "Agent A", "output": "x"}],
+                [],
+                "/tmp",
+                caveman=True,
+                efficiency=True,
+            ),
+            prompts.project_context_block(
+                "p1", "/tmp", "{}", caveman=True, efficiency=True
+            ),
+        )
+        for prompt in built:
+            self.assertEqual(prompt.count("# How to write your answer"), 1)
+            self.assertIn(self.MARK, prompt)
+            self.assertIn("ULTRA-LOW TOKEN EFFICIENCY MODE", prompt)
+            # Caveman is the claim on the voice; Efficiency applies inside it.
+            self.assertLess(
+                prompt.index("ULTRA-LOW TOKEN EFFICIENCY MODE"),
+                prompt.index(self.MARK),
+            )
+
+    def test_a_project_turn_carries_it_only_when_it_is_on(self):
+        from aicouncil import prompts
+
+        off = prompts.project_context_block("p1", "/tmp", "{}")
+        on = prompts.project_context_block(
+            "p1",
+            "/tmp",
+            "{}",
+            efficiency=True,
+        )
+        self.assertNotIn(self.MARK, off)
+        self.assertIn(self.MARK, on)
+
+
+class TestStyleDoesNotEatTheContract(unittest.TestCase):
+    """A shortened answer must still be a parseable one.
+
+    Both switches tell an agent to cut what is not needed, and both name code
+    as the thing that may not be cut - which leaves the machine-read part of a
+    reply unmentioned. A seat that pruned its confidence trailer, or a project
+    turn that dropped its fenced report, would be obeying the style and
+    breaking the engine.
+    """
+
+    GUARD = "This changes your voice, not the contract."
+
+    def _prompts(self, **styles):
+        from aicouncil import prompts
+
+        return {
+            "chat": prompts.build_chat_prompt("hello", **styles),
+            "member": prompts.build_member_prompt("t", "/tmp", **styles),
+            "critique": prompts.build_critique_prompt(
+                "t", [{"alias": "Agent B", "output": "x"}], "/tmp", **styles
+            ),
+            "chair": prompts.build_chairman_prompt(
+                "t", [{"alias": "Agent A", "output": "x"}], [], "/tmp", **styles
+            ),
+            "project": prompts.project_context_block(
+                "p1", "/tmp", "{}", **styles
+            ),
+        }
+
+    def test_every_styled_prompt_says_the_contract_still_stands(self):
+        for style in cfg.WRITING_STYLES:
+            for name, prompt in self._prompts(**{style: True}).items():
+                with self.subTest(style=style, prompt=name):
+                    self.assertIn(self.GUARD, prompt)
+
+    def test_it_is_said_once_when_both_are_on(self):
+        # Same reason the heading is one heading: an agent told the same thing
+        # twice in different words has nothing to go on when they differ.
+        for name, prompt in self._prompts(caveman=True, efficiency=True).items():
+            with self.subTest(prompt=name):
+                self.assertEqual(prompt.count(self.GUARD), 1)
+
+    def test_an_unstyled_prompt_is_left_alone(self):
+        # It is part of the style block, not a new standing instruction: a run
+        # with no style switched on is byte-for-byte what it always was.
+        for name, prompt in self._prompts().items():
+            with self.subTest(prompt=name):
+                self.assertNotIn(self.GUARD, prompt)
+
+    def test_the_thing_it_protects_is_actually_in_the_prompt(self):
+        # The guard would be words about nothing if the trailer it defends had
+        # been dropped from the stage contract.
+        from aicouncil import prompts
+
+        for name, prompt in self._prompts(caveman=True).items():
+            if name in ("chat", "project"):
+                continue
+            with self.subTest(prompt=name):
+                self.assertIn(prompts.CONFIDENCE_CONTRACT.strip()[:40], prompt)
+
+
+class TestTheTranscriptRecordsItsStyles(PipelineTestBase):
+    """An archived answer has to be able to say why it reads as it does."""
+
+    def test_a_run_records_the_switches_it_answered_under(self):
         self.store.update({
+            "mode": "solo",
+            "efficiency": {"chat": True},
+            "providers": {"solo": mock_provider("solo", "Assistant")},
+        })
+        run = self.pipeline.start("what is this?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(
+            run.to_dict()["styles"], {"caveman": False, "efficiency": True}
+        )
+
+    def test_turning_the_switch_off_afterwards_does_not_rewrite_history(self):
+        # The gear is a live setting; the transcript is a record. A run written
+        # under Caveman still says so once Caveman is off, or the record
+        # explains the wrong answer.
+        self.store.update({
+            "mode": "solo",
+            "caveman": {"chat": True},
+            "providers": {"solo": mock_provider("solo", "Assistant")},
+        })
+        run = self.pipeline.start("what is this?", str(self.repo))
+        self.wait_terminal()
+        self.store.update({"caveman": {"chat": False}})
+
+        self.assertTrue(run.to_dict()["styles"]["caveman"])
+        persisted = self.pipeline.load_run(run.transcript_name)
+        self.assertTrue(persisted["styles"]["caveman"])
+
+    def test_a_council_run_records_the_councils_switches(self):
+        # Not Chat's. The two are independent, and a transcript that quoted the
+        # wrong one would be worse than quoting none.
+        self.store.update({
+            "mode": "council",
             "zero_touch": True,
-            "providers": {"drafter": {"role_system": "SENTINEL-ROLE-TEXT"}},
+            "caveman": {"council": True, "chat": False},
         })
         run = self.pipeline.start("do a thing", str(self.repo))
         self.wait_terminal()
-        # The mock agent echoes the prompt length and its role; the prompt it
-        # received is what the pipeline built.
-        self.assertTrue(run.stages["drafter"].output)
+
         self.assertEqual(run.state, "complete", run.error)
+        self.assertTrue(run.to_dict()["styles"]["caveman"])
+
+
+class TestWritingStyleReading(unittest.TestCase):
+    """The one reader all three run loops pull their style switches through."""
+
+    def test_each_mode_sees_only_its_own_switches(self):
+        conf = {
+            "caveman": {"council": True, "chat": False, "project": True},
+            "efficiency": {"council": False, "chat": True, "project": True},
+        }
+        self.assertEqual(
+            cfg.writing_styles(conf, "council"),
+            {"caveman": True, "efficiency": False},
+        )
+        self.assertEqual(
+            cfg.writing_styles(conf, "chat"),
+            {"caveman": False, "efficiency": True},
+        )
+        self.assertEqual(
+            cfg.writing_styles(conf, "project"),
+            {"caveman": True, "efficiency": True},
+        )
+
+    def test_a_hand_edited_config_is_off_rather_than_a_crash(self):
+        # These are read inside a running loop, so a config someone typed into
+        # by hand has to degrade to "off", not take the run down with it.
+        for broken in ({}, {"efficiency": None}, {"efficiency": "yes"}):
+            with self.subTest(broken=broken):
+                self.assertEqual(
+                    cfg.writing_styles(broken, "chat"),
+                    {"caveman": False, "efficiency": False},
+                )
+
+    def test_the_keys_it_returns_are_what_the_builders_take(self):
+        # It is splatted straight into the prompt builders; a style added to
+        # one and not the other is a TypeError at run time, not import time.
+        from aicouncil import prompts
+
+        prompts.build_chat_prompt("hi", **cfg.writing_styles({}, "chat"))
+        self.assertEqual(
+            sorted(cfg.writing_styles({}, "council")),
+            sorted(cfg.WRITING_STYLES),
+        )
+
+
+class TestCavemanReachesTheRun(PipelineTestBase):
+    """End to end: the switch a mode owns is the one that reaches its CLI."""
+
+    # The mock echoes this when the instruction reached it. Asserting on the
+    # recorded command would prove nothing: it redacts the prompt to a length.
+    MARK = "caveman mode requested"
+
+    def setUp(self):
+        super().setUp()
+        assistant = mock_provider("solo", "Assistant")
+        # The shipped solo provider's streaming flags survive the deep merge,
+        # and `--output-format stream-json` leaves the mock's own parser
+        # reading "stream-json" as the prompt. Cleared so the assertion below
+        # is about what the pipeline sent and not about argparse.
+        assistant["stream_args"] = []
+        assistant["read_only_args"] = []
+        self.store.update({"mode": "solo", "providers": {"solo": assistant}})
+
+    def _sent(self, run):
+        return run.stages["solo"].output
+
+    def test_chat_answers_telegraphically_once_it_is_switched_on(self):
+        self.store.update({"caveman": {"chat": True}})
+        run = self.pipeline.start("what does this repo do?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertIn(self.MARK, self._sent(run))
+
+    def test_switching_it_on_for_the_council_leaves_chat_alone(self):
+        # Three switches, not one with three labels. Turning the council terse
+        # must not quietly change how a conversation answers.
+        self.store.update({"caveman": {"council": True, "chat": False}})
+        run = self.pipeline.start("what does this repo do?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertNotIn(self.MARK, self._sent(run))
+
+    def test_it_can_be_switched_off_again(self):
+        # `ConfigStore.update` deep-merges, so a switch is only really a switch
+        # if writing False over True survives the merge.
+        self.store.update({"caveman": {"chat": True}})
+        self.store.update({"caveman": {"chat": False}})
+        run = self.pipeline.start("what does this repo do?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertNotIn(self.MARK, self._sent(run))
+
+
+class TestCavemanReachesCouncilRun(PipelineTestBase):
+    """The Council setting reaches members, critiques, and the chair."""
+
+    MARK = "caveman mode requested"
+
+    def test_every_council_invocation_gets_the_instruction(self):
+        self.store.update({
+            "mode": "council",
+            "zero_touch": True,
+            "caveman": {"council": True},
+        })
+        run = self.pipeline.start("do a thing", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        stages = self.member_stages(run) + self.critique_stages(run)
+        stages.append(run.stages["chair"])
+        for stage in stages:
+            self.assertIn(self.MARK, stage.output, stage.id)
+
+
+class TestEfficiencyReachesTheRun(PipelineTestBase):
+    MARK = "efficiency mode requested"
+
+    def setUp(self):
+        super().setUp()
+        assistant = mock_provider("solo", "Assistant")
+        assistant["stream_args"] = []
+        assistant["read_only_args"] = []
+        self.store.update({"mode": "solo", "providers": {"solo": assistant}})
+
+    def test_chat_receives_only_its_own_efficiency_switch(self):
+        self.store.update({
+            "efficiency": {"chat": True, "council": False},
+        })
+        run = self.pipeline.start("what does this repo do?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertIn(self.MARK, run.stages["solo"].output)
+
+    def test_council_switch_does_not_change_chat(self):
+        self.store.update({
+            "efficiency": {"council": True, "chat": False},
+        })
+        run = self.pipeline.start("what does this repo do?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertNotIn(self.MARK, run.stages["solo"].output)
+
+    def test_it_can_be_switched_off_again(self):
+        # `ConfigStore.update` deep-merges, so a switch is only really a switch
+        # if writing False over True survives the merge.
+        self.store.update({"efficiency": {"chat": True}})
+        self.store.update({"efficiency": {"chat": False}})
+        run = self.pipeline.start("what does this repo do?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertNotIn(self.MARK, run.stages["solo"].output)
+
+    def test_a_multi_agent_answer_carries_it_to_every_cli(self):
+        # The bench shares `_chat_prompt` with the single-agent turn, which is
+        # what makes the two answers comparable. Pinned so a future prompt
+        # built separately for the bench cannot quietly drop the style.
+        self.store.update({
+            "multi_agent": True,
+            "efficiency": {"chat": True},
+            "providers": council_providers(),
+        })
+        run = self.pipeline.start("what is this repo?", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertEqual(len(run.stages), len(cfg.AGENTS))
+        for stage in run.stages.values():
+            self.assertIn(self.MARK, stage.output, stage.id)
+
+
+class TestEfficiencyReachesCouncilRun(PipelineTestBase):
+    MARK = "efficiency mode requested"
+
+    def test_every_council_invocation_gets_the_instruction(self):
+        self.store.update({
+            "mode": "council",
+            "zero_touch": True,
+            "efficiency": {"council": True},
+        })
+        run = self.pipeline.start("do a thing", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        stages = self.member_stages(run) + self.critique_stages(run)
+        stages.append(run.stages["chair"])
+        for stage in stages:
+            self.assertIn(self.MARK, stage.output, stage.id)
+
+
+class TestDeliberationEffort(PipelineTestBase):
+    """Stages 1 and 2 can be told to think less hard than the one that writes.
+
+    Worth an end-to-end run rather than a unit test on the helper: the point of
+    the setting is that one agent's member seat and its chair stop sharing a
+    provider, and only a routed run puts the same CLI in both.
+    """
+
+    def graded_providers(self):
+        # `effort_args` cleared for the reason `mock_council` clears
+        # `stream_args`: these merge onto the CLI preset, and Claude's
+        # `--effort {effort}` on a command that is not Claude would hand the
+        # mock a flag it has never heard of.
+        return {
+            pid: dict(provider, effort="high", effort_args=[])
+            for pid, provider in council_providers().items()
+        }
+
+    def test_it_is_unset_by_default(self):
+        # Off unless asked for: a council that quietly thought less hard than
+        # the CLIs were configured to would be a worse council for no stated
+        # reason.
+        self.assertEqual(cfg.DEFAULTS["council"]["deliberation_effort"], "")
+
+    def test_it_demotes_the_members_and_leaves_the_chair(self):
+        self.store.update({
+            "zero_touch": True,
+            "providers": self.graded_providers(),
+            "council": {"deliberation_effort": "low"},
+        })
+        run = self.pipeline.start("do a thing", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        for stage in self.member_stages(run) + self.critique_stages(run):
+            self.assertEqual(stage.effort, "low", stage.id)
+        self.assertEqual(run.stages["chair"].effort, "high")
+
+    def test_blank_leaves_every_seat_on_its_own_setting(self):
+        self.store.update({
+            "zero_touch": True,
+            "providers": self.graded_providers(),
+        })
+        run = self.pipeline.start("do a thing", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        stages = self.member_stages(run) + self.critique_stages(run)
+        stages.append(run.stages["chair"])
+        for stage in stages:
+            self.assertEqual(stage.effort, "high", stage.id)
+
+
+class TestRoleReachesTheRun(PipelineTestBase):
+    def test_a_configured_persona_is_used_by_a_real_run(self):
+        # End to end: pin a seat's lens, run, and confirm the agent answered
+        # as that persona rather than as the neutral member. The mock varies
+        # its position by the lens it was given, so its own output is the
+        # evidence that the persona text actually reached the CLI.
+        self.store.update({
+            "zero_touch": True,
+            "council": {
+                "personas": {"seat1": "pragmatist"},
+                "chair_deliberates": False,
+            },
+        })
+        run = self.pipeline.start("do a thing", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        seat1 = run.stages["seat1"]
+        self.assertEqual(seat1.persona, "pragmatist")
+        self.assertIn("not paid for by this task", seat1.output)
 
 
 class TestCommitFromTheApp(PipelineTestBase):
@@ -1719,16 +3755,36 @@ class TestWorkspaceMigration(unittest.TestCase):
         store = self.write({"providers": {"drafter": {"cwd_mode": "repo"}}})
         self.assertNotIn("cwd_mode", store.get("providers")["drafter"])
 
+    def test_a_seat_can_be_unpinned_again(self):
+        # `update` deep-merges, so a save that dropped the key would leave the
+        # old pin in place and the panel would appear to set the seat back to
+        # Auto without doing it. The UI writes a blank instead, which
+        # overwrites - and the router reads a blank as unpinned.
+        store = self.write({"council": {"pins": {"chair": "claude"}}})
+        store.update({"council": {"pins": {"chair": ""}}})
+        self.assertEqual(store.get("council")["pins"]["chair"], "")
 
-class TestEditableRoles(unittest.TestCase):
-    """Built-ins are defaults, not laws — and a role you add is not a lesser one."""
+        store.update({"council": {"personas": {"seat1": "visionary"}}})
+        store.update({"council": {"personas": {"seat1": ""}}})
+        self.assertEqual(store.get("council")["personas"]["seat1"], "")
 
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-roles-"))
-        self.store = ConfigStore(self.tmp / "config.json")
+    def test_the_bench_is_shown_unless_it_has_been_switched_off(self):
+        # A display toggle, but one that decides whether the only place to pin
+        # a seat by hand is on screen at all.
+        self.assertTrue(cfg.DEFAULTS["council"]["show_seats"])
+        store = self.write({})
+        self.assertTrue(store.get("council")["show_seats"])
+        store.update({"council": {"show_seats": False}})
+        self.assertFalse(store.get("council")["show_seats"])
 
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
+
+class TestEditableRoles(PipelineTestBase):
+    """Built-ins are defaults, not laws — and a role you add is not a lesser one.
+
+    On the base fixture rather than a bare ConfigStore, because what a role
+    edit has to survive is the trip through `Pipeline._persona_system` onto a
+    seat - the only path that puts one in front of a CLI.
+    """
 
     def test_an_untouched_builtin_reports_the_shipped_text(self):
         from aicouncil import prompts
@@ -1769,11 +3825,13 @@ class TestEditableRoles(unittest.TestCase):
         self.assertEqual(set(perf), set(catalog[0]))
 
     def test_a_custom_role_reaches_the_prompt(self):
-        from aicouncil import prompts
-
+        # A role the operator wrote is seatable on exactly the same terms as a
+        # built-in: pin it to a seat and its text is the lens that seat brings.
         stored = {"perf": {"name": "Perf", "system": "PROFILE-FIRST-SENTINEL"}}
-        text = prompts.resolve_system("drafter", {"role_template": "perf"}, stored)
-        self.assertEqual(text, "PROFILE-FIRST-SENTINEL")
+        self.assertEqual(
+            self.pipeline._persona_system(seat("perf"), stored),
+            "PROFILE-FIRST-SENTINEL",
+        )
 
     def test_deleting_a_builtin_edit_restores_the_shipped_text(self):
         from aicouncil import prompts
@@ -1790,16 +3848,36 @@ class TestEditableRoles(unittest.TestCase):
         self.assertIn("JUNIOR ENGINEER", role["system"])
         self.assertFalse(role["edited"])
 
-    def test_a_stage_pointing_at_a_deleted_role_falls_back(self):
-        from aicouncil import prompts
+    def test_a_seat_pinned_to_a_deleted_role_runs_neutral(self):
+        # Deleting a role the Council panel is still pinned to must not take
+        # the seat down with it, and must not seat some other role's wording
+        # under that seat's name. It loses its lens and nothing else.
+        self.store.update({
+            "roles": {"perf": {"name": "Perf", "system": "PROFILE-FIRST."}},
+            "council": {"personas": {"seat1": "perf"}},
+        })
+        self.assertEqual(
+            self.pipeline._persona_system(seat("perf"), self.store.get("roles")),
+            "PROFILE-FIRST.",
+        )
 
-        text = prompts.resolve_system("polisher", {"role_template": "gone"}, {})
-        self.assertIn("SENIOR STAFF ARCHITECT", text)
+        self.store.replace_roles({})
+        # The pin outlives the role - nothing rewrites it - so this is what a
+        # seating built from that config actually hands the pipeline.
+        self.assertEqual(self.store.get("council")["personas"]["seat1"], "perf")
+        self.assertEqual(
+            self.pipeline._persona_system(seat("perf"), self.store.get("roles")), ""
+        )
 
     def test_an_empty_role_never_produces_an_empty_prompt(self):
+        # A role blanked in the editor contributes no lens. The stage contract
+        # is not the role's to erase, though, so the prompt is still whole.
         from aicouncil import prompts
 
         stored = {"hollow": {"name": "Hollow", "system": "   "}}
-        text = prompts.resolve_system("drafter", {"role_template": "hollow"}, stored)
-        self.assertTrue(text.strip())
-        self.assertIn("JUNIOR ENGINEER", text)
+        prompt = prompts.build_member_prompt(
+            "task", "/tmp/r", None, "",
+            persona_system=self.pipeline._persona_system(seat("hollow"), stored),
+        )
+        self.assertNotIn("# Your lens", prompt)
+        self.assertIn("one member of an AI council", prompt)

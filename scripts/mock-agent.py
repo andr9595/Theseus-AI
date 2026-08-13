@@ -2,11 +2,21 @@
 """A stand-in coding agent, for demos and tests.
 
 Neither `codex` nor `claude` needs to be installed to exercise the pipeline:
-point a provider at this script and the full Draft -> Approve -> Polish ->
-Diff -> Rollback loop runs for real, including writing files to the target
-repository so the diff viewer has something to show.
+point a seat at this script and the full Deliberate -> Critique -> Approve ->
+Synthesize -> Diff -> Rollback loop runs for real, including writing files to
+the target repository so the diff viewer has something to show. A council turn
+is recognised by what its prompt asks for rather than by `--role` - see
+``COUNCIL_MARKERS`` below - so the same command works in every seat.
 
-Wire it up in Settings, one argument per line:
+Wire it up in Settings, one argument per line, in as many Agents cards as you
+want seated (`--role` is accepted but ignored for a council prompt, so its
+value does not matter here):
+
+    python3
+    /abs/path/scripts/mock-agent.py
+    {prompt}
+
+The legacy two-stage council still resolves its stages by `--role`:
 
     Stage 1 command                    Stage 2 command
     ---------------                    ---------------
@@ -16,17 +26,15 @@ Wire it up in Settings, one argument per line:
     drafter                            polisher
     {prompt}                           {prompt}
 
-Or run `./run.sh --doctor` after setting AI_COUNCIL_MOCK=1 to have the
-defaults point here automatically.
-
 It also speaks Projects Mode. Point the architect, coder and QA chairs at it
 and the whole decision loop runs for real against a real directory: it audits
 the folder read-only, plans two cards, implements a Python module with a
 genuine bug in it, fails its own test suite, is handed the trace, fixes it,
-gets the cards reviewed and proposes one enhancement before declaring itself
-finished. Nothing about that sequence is faked - the tests really run and
-really fail - which is the only way to know the loop works rather than merely
-to believe it.
+gets the cards reviewed, runs the finished module the way its user would, and
+proposes one enhancement before declaring itself finished. Nothing about that
+sequence is faked - the tests really run and really fail, and the acceptance
+turn really calls the code that was written - which is the only way to know the
+loop works rather than merely to believe it.
 """
 
 from __future__ import annotations
@@ -181,6 +189,217 @@ def run_polisher(task: str, write: bool) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# The deliberating council
+# --------------------------------------------------------------------------
+#
+# Like a project turn, a council turn is identified by what the prompt asks for
+# rather than by `--role`: one CLI holds a member seat, critiques its peers and
+# may chair, and the seating is decided per run by the router. There is no
+# fixed chair to point a `--role` at.
+#
+# Order matters. The chairman's prompt quotes every member's answer verbatim,
+# so it contains the member contract's own wording; checking for the chair
+# marker first is what stops a chairman turn being mistaken for a member one.
+
+COUNCIL_MARKERS = [
+    ("# Stage 1 - independent positions", "chair"),
+    ("# Your fellow members' answers", "critique"),
+    ("You are one member of an AI council", "member"),
+]
+
+
+def council_turn(prompt: str) -> str:
+    """Which council stage this prompt is asking for, or '' if none."""
+    for marker, name in COUNCIL_MARKERS:
+        if marker in prompt:
+            return name
+    return ""
+
+
+def council_lens(prompt: str) -> str:
+    """The persona this seat was given, so members do not all answer alike.
+
+    A council whose members return identical text would let the critique and
+    synthesis stages pass while proving nothing about either - the whole point
+    of the fixture is that the chairman receives genuinely differing positions
+    to reconcile.
+    """
+    if "PRAGMATISM" in prompt:
+        return "pragmatist"
+    if "LONGER VIEW" in prompt:
+        return "visionary"
+    if "SECURITY REVIEWER" in prompt:
+        return "security"
+    if "ADVERSARIAL REVIEWER" in prompt:
+        return "reviewer"
+    return "neutral"
+
+
+def peer_aliases(prompt: str) -> list[str]:
+    """The anonymised peers quoted in a critique prompt, in order."""
+    return [
+        line[3:].strip()
+        for line in prompt.splitlines()
+        if line.startswith("## Agent ")
+    ]
+
+
+def trailer(confidence: int, because: str) -> None:
+    """The two lines every council stage is contracted to end with."""
+    emit()
+    emit(f"CONFIDENCE: {confidence}")
+    emit(f"BECAUSE: {because}")
+
+
+def run_council_member(task: str, lens: str) -> int:
+    positions = {
+        "pragmatist": (
+            "Add the marker file and stop there. Anything larger is not paid "
+            "for by this task.",
+            65,
+            "the task may want more than a marker file",
+        ),
+        "visionary": (
+            "Add the marker file, but note the council has no place to record "
+            "an artifact list - that is the recurring gap.",
+            55,
+            "the structural claim is not grounded in a file I read",
+        ),
+        "security": (
+            "Adding the marker file is safe: it crosses no trust boundary and "
+            "takes no untrusted input.",
+            80,
+            "I did not check whether the path is attacker-controlled",
+        ),
+    }
+    position, confidence, because = positions.get(
+        lens,
+        (
+            "Add a marker file recording what the council was asked to do.",
+            70,
+            "I did not verify the file does not already exist",
+        ),
+    )
+
+    files = repo_files()
+    emit("## Position")
+    emit()
+    emit(f"{position}")
+    emit()
+    emit(f"The task, as I read it: **{task}**")
+    emit()
+    emit("## Grounding")
+    emit()
+    if files:
+        emit(f"I read {len(files)} tracked file(s):")
+        emit()
+        for f in files[:5]:
+            emit(f"- `{f}`")
+    else:
+        emit("No tracked files were visible from this working directory.")
+    emit()
+    emit("## Proposal")
+    emit()
+    emit("Create `AI_COUNCIL_DEMO.md` recording the task.")
+    emit()
+    emit("## Where I could be wrong")
+    emit()
+    emit(f"- {because.capitalize()}.")
+    emit("- I am a mock agent, so this proves plumbing rather than judgement.")
+    trailer(confidence, because)
+    return 0
+
+
+def run_council_critique(prompt: str) -> int:
+    aliases = peer_aliases(prompt)
+    emit("Checked each peer's claims against the working tree.")
+    emit()
+    for alias in aliases or ["Agent A"]:
+        emit(f"### {alias}")
+        emit("**Hallucinations:** none found - the files cited do exist.")
+        emit(
+            "**Errors:** the position does not say what happens if the target "
+            "file is already present."
+        )
+        emit("**Missing:** no test covers the artifact being written.")
+        emit("**Sound:** the read-only survey of the tree was accurate.")
+        emit()
+    trailer(
+        60,
+        "I verified the file paths but not the git history behind them",
+    )
+    return 0
+
+
+def run_council_chair(task: str, write: bool) -> int:
+    emit("Weighed the positions against the critiques and the tree itself.")
+    emit()
+    emit("## Verdict")
+    emit()
+    emit(
+        f"Write the marker file recording the task. The council agreed on the "
+        f"action and split only on how much more to do, which this task does "
+        f"not pay for."
+    )
+    emit()
+    emit("## Consensus")
+    emit()
+    emit("- The marker file is the right change, and it is safe.")
+    emit("- The tree was read accurately by every member.")
+    emit()
+    emit("## Disagreement")
+    emit()
+    emit(
+        "- One member wanted a broader structural change. Not carried: no "
+        "member grounded it in a file, and the critiques said so."
+    )
+    emit()
+
+    target = Path("AI_COUNCIL_DEMO.md")
+    if not write:
+        emit("_Dry run: no files were modified._")
+        emit()
+        emit("## Summary of changes")
+        emit()
+        emit("- None. This stage was not granted permission to write.")
+        emit()
+        emit("## Verification")
+        emit()
+        emit("- Nothing to verify; nothing was applied.")
+        emit()
+        emit("CONSENSUS: 80")
+        trailer(70, "the council was not unanimous on scope")
+        return 0
+
+    existed = target.exists()
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        target.write_text(
+            "# Theseus AI demo artifact\n\n"
+            f"Written by the mock chairman at {stamp}.\n\n"
+            f"**Task:** {task}\n\n"
+            "The council deliberated, critiqued each other and this stage\n"
+            "applied the outcome. Deleting this file is safe.\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        emit(f"error: could not write {target}: {exc}")
+        return 1
+
+    emit("## Summary of changes")
+    emit()
+    emit(f"- `{target}` - {'rewrote' if existed else 'added'} the demo artifact.")
+    emit()
+    emit("## Verification")
+    emit()
+    emit("- Confirmed the file was written and is readable.")
+    emit()
+    emit("CONSENSUS: 80")
+    trailer(75, "the council was not unanimous on scope")
+    return 0
+
+
 def run_solo(task: str, write: bool) -> int:
     """Answer the message, and write if permission arrived with it.
 
@@ -247,6 +466,7 @@ PROJECT_TURNS = [
     ("# Your turn: implement", "implement"),
     ("# Your turn: fix the build", "fix"),
     ("# Your turn: verify", "verify"),
+    ("# Your turn: acceptance", "release"),
     ("# Your turn: review", "review"),
     ("# Your turn: innovate", "innovate"),
 ]
@@ -303,6 +523,18 @@ def run_tests() -> tuple[bool, str]:
     return proc.returncode == 0, (
         f"$ python3 -m unittest discover -s . -q\nexit {proc.returncode}\n{output}"
     )
+
+
+def use_the_greeter() -> tuple[bool, str]:
+    """Run the built module the way its user would. Nothing simulated here."""
+    proc = subprocess.run(
+        [sys.executable, "-c", 'from greeter import greet; print(greet("Ada"))'],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    out = (proc.stdout + proc.stderr).strip()
+    if proc.returncode != 0:
+        return False, f"exit {proc.returncode}\n{out}"
+    return "Ada" in out, f"printed {out!r}"
 
 
 def run_project_turn(turn: str, goal: str) -> int:
@@ -398,6 +630,28 @@ def run_project_turn(turn: str, goal: str) -> int:
             },
         )
 
+    if turn == "release":
+        # Not the test suite again: the acceptance turn is the one that uses
+        # the thing that was built. This imports the module the developer wrote
+        # and calls it the way the goal describes, which is as close to "start
+        # the application" as a two-file fixture gets - and it really runs, so
+        # a greeter that still ignores its argument really fails here.
+        works, detail = use_the_greeter()
+        emit(f"Used greet('Ada'): {detail}")
+        return report(
+            reasoning=f"Ran the module as its user would. {detail}",
+            acceptance={
+                "health": "PASSING" if works else "FAILING",
+                "log": f"$ python3 -c 'from greeter import greet; "
+                       f"print(greet(\"Ada\"))'\n{detail}",
+            },
+            tasks=[] if works else [
+                {"id": "b_release", "title": "greet() does not use the name",
+                 "detail": detail, "column": "backlog", "kind": "bug",
+                 "assigned_to": "coder"},
+            ],
+        )
+
     if turn == "review":
         pending = column(board, "in_review")
         emit(f"Reviewed {len(pending)} card(s).")
@@ -442,7 +696,27 @@ def main() -> int:
     # be exercised exactly as it would be against a real CLI.
     parser.add_argument("--dangerously-skip-permissions", action="store_true")
     parser.add_argument("--dangerously-bypass-approvals-and-sandbox", action="store_true")
+    # The mirror image: what a stage that will never be approved is invoked
+    # with. Accepted as a real flag rather than swallowed by `parse_known_args`
+    # so that a test can assert a deliberating seat actually received it.
+    parser.add_argument("--read-only", action="store_true")
     parser.add_argument("--fail", action="store_true", help="exit non-zero, to test error handling")
+    # What a CLI that hits its own quota wall, or dies inside its own harness,
+    # actually does: exits zero having printed nothing at all. It is the more
+    # dangerous half of "the agent failed", because everything downstream reads
+    # the exit code first.
+    parser.add_argument(
+        "--silent", action="store_true", help="exit zero with no output at all"
+    )
+    # The same, except the CLI says why on its way out. Antigravity does this
+    # when a tool it needed was auto-denied: exit 0, stdout empty, and one
+    # sentence on stderr naming the permission and how to grant it. That
+    # sentence is the whole difference between a fixable configuration problem
+    # and an unexplained blank stage.
+    parser.add_argument(
+        "--silent-reason", default="",
+        help="exit zero with nothing on stdout and this line on stderr",
+    )
     args, unknown = parser.parse_known_args()
 
     if unknown:
@@ -452,13 +726,30 @@ def main() -> int:
     prompt = read_prompt(args.prompt)
     task = summarise_task(prompt)
 
+    # Before the banner: a silent CLI is silent on every stream, which is what
+    # makes it look like a success to anything reading the exit code.
+    if args.silent:
+        return 0
+    if args.silent_reason:
+        print(args.silent_reason, file=sys.stderr, flush=True)
+        return 0
+
     zero_touch = (
         args.dangerously_skip_permissions
         or args.dangerously_bypass_approvals_and_sandbox
-    )
+    ) and not args.read_only
     emit(f"[mock-agent] role={args.role} zero-touch={'yes' if zero_touch else 'no'} "
          f"cwd={Path.cwd()}")
     emit(f"[mock-agent] received a {len(prompt)} character prompt")
+    # Echoed so a test can see which instructions actually reached the CLI: the
+    # recorded command redacts the prompt to a character count, so the agent's
+    # own output is the only honest evidence of what it was told.
+    if "ULTRA-LOW TOKEN EFFICIENCY MODE" in prompt:
+        emit("[mock-agent] caveman mode requested")
+    if "[SYSTEM INSTRUCTION: EFFICIENCY MODE]" in prompt:
+        emit("[mock-agent] efficiency mode requested")
+    if "# Earlier chairman attempts on this run" in prompt:
+        emit("[mock-agent] earlier chairman attempts carried")
     emit()
 
     if args.fail:
@@ -470,6 +761,18 @@ def main() -> int:
         # A project turn is identified by what it asks for, not by the chair it
         # was sent to - see PROJECT_TURNS.
         return run_project_turn(turn, task)
+
+    seat = council_turn(prompt)
+    if seat == "member":
+        return run_council_member(task, council_lens(prompt))
+    if seat == "critique":
+        return run_council_critique(prompt)
+    if seat == "chair":
+        # The chairman writes only where permission actually arrived, which is
+        # the same gate the real CLIs apply to their edit tools.
+        return run_council_chair(
+            task, write=zero_touch or os.environ.get("MOCK_APPLY") == "1"
+        )
 
     if args.role == "solo":
         return run_solo(task, write=zero_touch)

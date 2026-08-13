@@ -103,10 +103,14 @@ def _print_doctor(store: cfg.ConfigStore) -> int:
         print("  pull request: off")
     print("\nProviders:")
     missing = []
-    # Named for what each chair does rather than for its config key: a project
-    # role has no council `role` to fall back on, and "coder" on its own says
-    # nothing about which of the three tabs it belongs to.
+    # Named for what each chair does rather than for its config key: "coder"
+    # on its own says nothing about which of the three tabs it belongs to.
+    # `drafter` and `polisher` are named for what they are now - entries kept
+    # so archived transcripts render, dispatched on by nothing - because a
+    # doctor line that reads like a live job invites someone to configure one.
     jobs = {
+        "drafter": "(retired)",
+        "polisher": "(retired)",
         "solo": "Chat assistant",
         "architect": "Project: arch",
         "coder": "Project: dev",
@@ -117,22 +121,34 @@ def _print_doctor(store: cfg.ConfigStore) -> int:
         if not provider:
             continue
         info = probe(provider)
-        mark = "OK  " if info["available"] else "MISS"
+        # Three marks rather than two. A CLI that is installed but not added is
+        # not a problem to fix by installing something, and reporting it as
+        # missing would send the operator looking for a binary that is there.
+        if not cfg.provider_enabled(store.all(), provider):
+            mark = "OFF "
+        else:
+            mark = "OK  " if info["available"] else "MISS"
         version = f"  [{info['version']}]" if info["version"] else ""
         location = info["path"] or "not found on PATH"
         # The job comes first: either agent can be assigned to either job, so
         # which CLI is doing what is the part worth reading at a glance.
-        job = jobs.get(key) or provider.get("role") or key
+        job = jobs.get(key) or key
         print(
             f"  [{mark}] {job:<14} {info['label']:<8} "
             f"{info['executable']:<10} -> {location}{version}"
         )
-        if not info["available"]:
+        if mark == "MISS":
             missing.append(info["executable"])
+    added = cfg.selected_agents(store.all())
+    print(
+        f"\n  Agents added: {', '.join(added) if added else 'none yet'}."
+        f"\n  Add, install or sign in to one in Settings -> Agents."
+    )
     if missing:
         print(
-            f"\n  {len(missing)} CLI(s) missing: {', '.join(missing)}."
-            f"\n  Run scripts/install-deps.sh, or repoint the command in Settings."
+            f"\n  {len(missing)} added CLI(s) missing: {', '.join(missing)}."
+            f"\n  Install it from Settings -> Agents, run"
+            f" scripts/install-deps.sh --agent <name>, or repoint the command."
         )
     return 0
 
@@ -140,7 +156,7 @@ def _print_doctor(store: cfg.ConfigStore) -> int:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="aicouncil",
-        description=f"{APP_NAME} - a local Junior Draft / Senior Polish coding pipeline.",
+        description=f"{APP_NAME} - a local, deliberating multi-agent coding council.",
     )
     parser.add_argument("--port", type=int, default=None, help="preferred port")
     parser.add_argument("--host", default="127.0.0.1", help="bind address (loopback only)")

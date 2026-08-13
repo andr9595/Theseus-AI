@@ -17,6 +17,11 @@ Three behaviours are worth calling out:
   neither does Chat until Zero-Touch is switched on, being invoked with
   ``read_only_args`` instead.
 
+* **Incognito is a capability, not a preference.** ``incognito_args`` carries
+  the CLI's own no-save flag, and a provider that declares none is *refused*
+  rather than run without one - a run that promised to leave no trace and then
+  left one in the agent's own history would be worse than no promise at all.
+
 * **No shell.** Commands are executed as argv lists with ``shell=False``, so a
   prompt containing backticks, ``$(...)`` or a semicolon is inert data rather
   than something the shell will interpret.
@@ -29,6 +34,7 @@ Three behaviours are worth calling out:
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -42,6 +48,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+
+from . import config as cfg
 
 PROMPT_TOKEN = "{prompt}"
 MODEL_TOKEN = "{model}"
@@ -100,11 +108,23 @@ def resolve_binary(command: List[str]) -> Optional[str]:
     return shutil.which(exe)
 
 
+def supports_incognito(provider: Dict) -> bool:
+    """Whether this provider can be asked not to save its own conversation.
+
+    Judged by the flags it declares rather than by a stored capability field,
+    for the reason ``config.agent_for`` derives the agent from the command: a
+    second field can disagree with the first, and here the disagreement would
+    be a privacy promise the CLI never received.
+    """
+    return any(a for a in (provider.get("incognito_args") or []))
+
+
 def build_argv(
     provider: Dict,
     prompt: str,
     auto_approve: bool,
     read_only: bool = False,
+    incognito: bool = False,
 ) -> tuple[List[str], Optional[str]]:
     """Assemble the argv for a provider invocation.
 
@@ -115,6 +135,10 @@ def build_argv(
     the first is what the pipeline hands a stage the human approved, the second
     is what Solo Mode hands an assistant that will never be approved at all.
 
+    ``incognito`` is orthogonal to both - what a run may write to the working
+    folder and what the CLI writes to its own history are different questions -
+    and is refused outright on a provider with no flags for it.
+
     The ``{prompt}`` token may appear anywhere in the template, including
     embedded in a larger string (e.g. ``--message={prompt}``) - the one
     exception being a prompt too large for argv, which has to move to stdin
@@ -123,6 +147,17 @@ def build_argv(
     template: List[str] = list(provider.get("command") or [])
     if not template:
         raise ProviderUnavailable("No command configured for this provider")
+
+    if incognito and not supports_incognito(provider):
+        # Before anything else is assembled: the alternative to refusing is
+        # launching this CLI normally under a run that has told the operator
+        # nothing is being saved, and the trace would be in the agent's own
+        # history where this app cannot even find it to apologise for it.
+        raise ProviderUnavailable(
+            f"{provider.get('label') or provider.get('id') or 'This provider'} "
+            f"has no incognito arguments configured, so it cannot be asked to "
+            f"leave the conversation out of its own history."
+        )
 
     placeholders = [t for t in template if PROMPT_TOKEN in t]
     configured_stdin = bool(provider.get("prompt_on_stdin"))
@@ -164,6 +199,14 @@ def build_argv(
             if use_stdin:
                 # Drop a bare placeholder; keep a decorated one with the token
                 # emptied out so flags like `--message=` are not malformed.
+                #
+                # The one shape this cannot see: a template that splits an
+                # option from its value, `cli -m {prompt}`. Dropping the value
+                # leaves `-m` looking for one. It is not detectable by
+                # inspection - the shipped `claude -p {prompt}` is the same
+                # shape with a standalone flag - so an operator whose CLI takes
+                # the prompt as a separate option value should enable 'Pipe the
+                # prompt on stdin' rather than rely on the argv path.
                 if token.strip() == PROMPT_TOKEN:
                     continue
                 argv.append(token.replace(PROMPT_TOKEN, ""))
@@ -211,6 +254,10 @@ def build_argv(
             if not token:
                 continue
             extra.append(token.replace(EFFORT_TOKEN, effort))
+
+    if incognito:
+        # Checked for support above, so this is only the appending.
+        extra.extend(a for a in (provider.get("incognito_args") or []) if a)
 
     if read_only:
         # Stated rather than assumed. Withholding the auto-approve flags is
@@ -486,6 +533,7 @@ class ProviderRunner:
         cwd: str,
         auto_approve: bool,
         read_only: bool = False,
+        incognito: bool = False,
     ) -> ProviderResult:
         pid = str(self.provider.get("id", "provider"))
         started = time.monotonic()
@@ -496,7 +544,11 @@ class ProviderRunner:
         # exception here leaves the stage running forever with no error on it.
         try:
             argv, stdin_text = build_argv(
-                self.provider, prompt, auto_approve, read_only=read_only
+                self.provider,
+                prompt,
+                auto_approve,
+                read_only=read_only,
+                incognito=incognito,
             )
             timeout = int(self.provider.get("timeout_seconds") or 900)
             if timeout <= 0:
@@ -657,6 +709,14 @@ class ProviderRunner:
             # stderr empty, and that reason beats a bare exit status.
             reported = reader.error if reader is not None else ""
             error = last_stderr or reported or f"Exited with status {exit_code}."
+        elif not stdout.strip() and stderr.strip():
+            # Exit 0, nothing on stdout, and something on stderr. `agy` ends
+            # this way when a tool it needed was auto-denied, and the sentence
+            # it leaves there names the tool and the fix. The caller decides
+            # whether an empty answer counts as failure - all this does is make
+            # sure the reason survives if it does, rather than being thrown
+            # away for the want of a non-zero status.
+            error = stderr.strip().splitlines()[-1]
 
         return ProviderResult(
             provider_id=pid,
@@ -673,11 +733,154 @@ class ProviderRunner:
 
 
 # --------------------------------------------------------------------------
+# The catalogue
+# --------------------------------------------------------------------------
+#
+# What a CLI can run changes about as often as the CLI itself does, and asking
+# it costs a process launch - up to a minute of it for `agy models` on a cold
+# start. Paid once that is the price of an honest list; paid on every click of
+# a dropdown it is the reason the menu sat on "Asking Antigravity…" every time
+# it was opened.
+#
+# So every authoritative answer is written to `catalog.json` in the app's
+# config directory and served from there, restarts included. Freshness is
+# judged by the file it was read from - the binary itself for `agy` and
+# `claude`,
+# Codex's own account cache for `codex` - so upgrading a CLI or signing into
+# another account re-asks on its own. Anything else is the Refresh button in
+# the menu, which is also the answer when a probe was simply unlucky.
+
+CATALOG_VERSION = 1
+
+# Only a complete answer is kept. A fallback level set, a partial alias
+# resolution or a signed-out `agy` are all *this moment's* answer rather than
+# the CLI's, and freezing one into a file would outlive the reason for it.
+_AUTHORITATIVE = "_authoritative"
+
+_CATALOG: Optional[Dict[str, Dict]] = None
+_CATALOG_LOCK = threading.RLock()
+_PROBE_LOCKS: Dict[str, threading.Lock] = {}
+
+
+def catalog_path() -> Path:
+    """Where the discovered lists are kept: the app's own config directory,
+    never the repo-local override - a catalogue is per machine, not per repo."""
+    return cfg.config_dir() / "catalog.json"
+
+
+def _read_catalog() -> Dict[str, Dict]:
+    try:
+        data = json.loads(catalog_path().read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    # A file from another version is discarded rather than migrated: it holds
+    # nothing that cannot be asked for again in a second.
+    if not isinstance(data, dict) or data.get("version") != CATALOG_VERSION:
+        return {}
+    entries = data.get("entries")
+    return entries if isinstance(entries, dict) else {}
+
+
+def _catalog() -> Dict[str, Dict]:
+    global _CATALOG
+    with _CATALOG_LOCK:
+        if _CATALOG is None:
+            _CATALOG = _read_catalog()
+        return _CATALOG
+
+
+def _write_catalog() -> None:
+    """Persist the catalogue, owner-only, the way the config is written."""
+    try:
+        path = catalog_path()
+        tmp = path.with_suffix(".json.tmp")
+        payload = {"version": CATALOG_VERSION, "entries": _catalog()}
+        cfg.write_private_text(tmp, json.dumps(payload, indent=2) + "\n")
+        tmp.replace(path)  # atomic on POSIX
+    except OSError:
+        # A catalogue that cannot be saved is a slow menu, not a broken app.
+        pass
+
+
+def _stamp(source: str) -> str:
+    """A file's identity for freshness purposes: when it changed and how big.
+
+    Not a hash. This runs in front of every menu, and reading a 200 MB CLI to
+    decide whether to skip a 200 ms probe would be the wrong way round.
+    """
+    try:
+        st = os.stat(source)
+    except OSError:
+        return ""
+    return f"{st.st_mtime_ns}:{st.st_size}"
+
+
+def _probe_lock(key: str) -> threading.Lock:
+    with _CATALOG_LOCK:
+        return _PROBE_LOCKS.setdefault(key, threading.Lock())
+
+
+def _catalogued(key: str, source: str, refresh: bool, probe: Callable[[], Dict]) -> Dict:
+    """Serve ``probe``'s last complete answer, or ask for a new one.
+
+    The lock is held *across* the probe rather than around the lookup: two
+    windows opening the same menu at once would otherwise both miss and both
+    launch the CLI, which is the cost this exists to avoid. The second one
+    finds the answer waiting when it gets in.
+    """
+    fingerprint = _stamp(source)
+
+    def hit() -> Optional[Dict]:
+        with _CATALOG_LOCK:
+            entry = _catalog().get(key)
+        if not isinstance(entry, dict) or entry.get("fingerprint") != fingerprint:
+            return None
+        result = copy.deepcopy(entry.get("result") or {})
+        result["cached"] = True
+        result["fetched_at"] = entry.get("fetched_at") or 0
+        return result
+
+    if not refresh:
+        found = hit()
+        if found is not None:
+            return found
+
+    with _probe_lock(key):
+        if not refresh:
+            found = hit()
+            if found is not None:
+                return found
+        result = probe()
+        fetched_at = time.time()
+        if result.pop(_AUTHORITATIVE, False):
+            with _CATALOG_LOCK:
+                _catalog()[key] = {
+                    "fingerprint": fingerprint,
+                    "fetched_at": fetched_at,
+                    "result": copy.deepcopy(result),
+                }
+            _write_catalog()
+    result["cached"] = False
+    result["fetched_at"] = fetched_at
+    return result
+
+
+def _catalog_source(provider: Dict) -> str:
+    """The file whose age decides whether a stored answer still holds."""
+    base = os.path.basename(str((provider.get("command") or [""])[0]))
+    # Codex reads its list from its own account cache rather than from itself,
+    # so that file - refreshed when the entitlements change - is what dates it.
+    if "codex" in base:
+        return str(_codex_cache())
+    return resolve_binary(list(provider.get("command") or [])) or ""
+
+
+# --------------------------------------------------------------------------
 # Diagnostics
 # --------------------------------------------------------------------------
 
 
-def discover_models(provider: Dict) -> Dict:
+def discover_models(provider: Dict, refresh: bool = False) -> Dict:
     """Ask the CLI what models it can actually run, rather than guessing.
 
     A hand-written list is worse than no list: it looks authoritative and is
@@ -692,11 +895,21 @@ def discover_models(provider: Dict) -> Dict:
     at right now, so the menu can say `opus -> claude-opus-5` instead of
     leaving the reader to guess which generation they just picked.
 
+    Asked once and then served from the catalogue above, so reopening the menu
+    costs nothing; ``refresh`` asks again regardless.
+
     Returns ``{"models": [...], "resolved": {alias: id}, "source": "...",
-    "error": "..."}``. Callers fall back to the configured list when ``models``
-    is empty, and must treat ``resolved`` as optional - it is empty whenever
-    the CLI could not be asked.
+    "error": "...", "cached": bool, "fetched_at": float}``. Callers fall back
+    to the configured list when ``models`` is empty, and must treat
+    ``resolved`` as optional - it is empty whenever the CLI could not be asked.
     """
+    source = _catalog_source(provider)
+    return _catalogued(
+        f"models:{source}", source, refresh, lambda: _discover_models_now(provider)
+    )
+
+
+def _discover_models_now(provider: Dict) -> Dict:
     exe = (provider.get("command") or [""])[0]
     base = os.path.basename(str(exe))
 
@@ -710,11 +923,20 @@ def discover_models(provider: Dict) -> Dict:
 
 
 def _discover_agy_models(provider: Dict) -> Dict:
-    """Ask `agy models`, which prints one model per line and nothing else.
+    """Ask `agy models`, which prints one model per line, id first.
 
     Antigravity has a subcommand for this, so there is no guessing to do at
     all. It needs the CLI to be signed in; when it is not, the CLI says so in
     a sentence worth passing straight through rather than paraphrasing.
+
+    Each line is the id, a tab, and the name a human would recognise:
+
+        gemini-3.6-flash-high\tGemini 3.6 Flash (High)
+        claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)
+
+    Both halves are kept. The id is what `--model` takes; the name is what the
+    picker shows beside it, because `gemini-3.6-flash-high` and
+    `gemini-3.5-flash-high` are one character apart on screen.
     """
     path = resolve_binary(list(provider.get("command") or []))
     if not path:
@@ -729,13 +951,24 @@ def _discover_agy_models(provider: Dict) -> Dict:
     except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
         return {"models": [], "source": "", "error": f"Could not run `agy models`: {exc}"}
 
-    # A model id never contains a space, so this drops the "Available models:"
-    # style heading and the human-readable "Gemini 3.6 Flash (High)" form the
-    # CLI uses in error messages, without needing to know either is coming.
-    models = [
-        word for word in (line.strip() for line in (proc.stdout or "").splitlines())
-        if word and not word.endswith(":") and len(word.split()) == 1
-    ]
+    models: List[str] = []
+    labels: Dict[str, str] = {}
+    for line in (proc.stdout or "").splitlines():
+        # The id is the first tab-separated field, and a model id never
+        # contains a space. Requiring that of the *whole* line instead is what
+        # made this return nothing at all against the real CLI: every line has
+        # a name after the tab, so every line was thrown away and the menu had
+        # no models to offer. Judging the id alone still drops an "Available
+        # models:" heading and any sentence the CLI prints, without this having
+        # to know either was coming.
+        fields = [field.strip() for field in line.split("\t")]
+        ident = fields[0]
+        if not ident or ident.endswith(":") or len(ident.split()) != 1:
+            continue
+        models.append(ident)
+        if len(fields) > 1 and fields[1]:
+            labels[ident] = fields[1]
+
     error = ""
     if not models:
         error = _one_line((proc.stderr or proc.stdout or "").strip()) or (
@@ -743,8 +976,12 @@ def _discover_agy_models(provider: Dict) -> Dict:
         )
     return {
         "models": models,
-        "source": "agy models (asked just now)" if models else "",
+        "labels": labels,
+        "source": "agy models" if models else "",
         "error": error,
+        # A signed-out CLI is worth reporting and not worth keeping: signing in
+        # does not touch the binary, so nothing else would ever expire it.
+        _AUTHORITATIVE: bool(models),
     }
 
 
@@ -772,8 +1009,12 @@ def _discover_claude_models(provider: Dict) -> Dict:
     return {
         "models": list(CLAUDE_ALIASES),
         "resolved": resolved,
+        # Kept only when every alias answered, for the reason the in-process
+        # cache below applies the same rule: half a map would be frozen half
+        # blank, and now on disk rather than only until the next restart.
+        _AUTHORITATIVE: len(resolved) == len(CLAUDE_ALIASES),
         "source": (
-            "claude --model aliases, resolved by asking the CLI just now"
+            "claude --model aliases, resolved by asking the CLI"
             if resolved else
             # Not an error: the aliases are still the right thing to offer, and
             # a red banner over a list that works would be a lie about it.
@@ -867,10 +1108,16 @@ def _resolve_claude_alias(path: str, alias: str) -> str:
     return ""
 
 
+def _codex_cache() -> Path:
+    """Codex's own account-scoped catalogue, which is its answer to both
+    questions this module asks - which models, and which levels per model."""
+    home = os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
+    return Path(home) / "models_cache.json"
+
+
 def _discover_codex_models() -> Dict:
     """Read Codex's own account-scoped model cache."""
-    home = os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
-    cache = Path(home) / "models_cache.json"
+    cache = _codex_cache()
     if not cache.exists():
         return {
             "models": [],
@@ -899,6 +1146,7 @@ def _discover_codex_models() -> Dict:
         "models": models,
         "source": f"{cache} (fetched {data.get('fetched_at', '?')})",
         "error": "" if models else "Cache contained no selectable models.",
+        _AUTHORITATIVE: bool(models),
     }
 
 
@@ -923,16 +1171,21 @@ EFFORT_NOTES = {
 }
 
 
-def discover_efforts(provider: Dict) -> Dict:
+def discover_efforts(provider: Dict, refresh: bool = False) -> Dict:
     """What reasoning levels the configured CLI will accept.
 
     The legal set is not universal and not static: Codex varies it per model
     (only some models offer ``ultra``) and Claude keeps its own. Both are asked
     rather than assumed, for the same reason the model list is.
 
+    Catalogued like the model list, and keyed by the selected model as well as
+    the binary: which levels are legal depends on which model is pinned, so one
+    entry per CLI would answer the wrong question after a model change.
+
     Returns ``{"levels": [{"effort", "description"}], "default": str,
-    "source": str, "error": str}``. An empty ``levels`` means this command has
-    no effort knob, which is the honest answer for a hand-written template.
+    "source": str, "error": str, "cached": bool, "fetched_at": float}``. An
+    empty ``levels`` means this command has no effort knob, which is the honest
+    answer for a hand-written template.
     """
     if not (provider.get("effort_args") or []):
         return {
@@ -943,6 +1196,15 @@ def discover_efforts(provider: Dict) -> Dict:
             ),
         }
 
+    source = _catalog_source(provider)
+    model = str(provider.get("model") or "").strip()
+    return _catalogued(
+        f"efforts:{source}|{model}", source, refresh,
+        lambda: _discover_efforts_now(provider),
+    )
+
+
+def _discover_efforts_now(provider: Dict) -> Dict:
     exe = (provider.get("command") or [""])[0]
     base = os.path.basename(str(exe))
     if "codex" in base:
@@ -972,10 +1234,16 @@ def _discover_agy_efforts(provider: Dict) -> Dict:
     launch, so it is flagged as the definite refusal it is.
     """
     model = str(provider.get("model") or "").strip()
-    if model and model in set(_discover_agy_models(provider).get("models") or []):
+    # The catalogued list, not a fresh `agy models`: this runs behind the
+    # effort menu, and asking the CLI twice for one dropdown is precisely the
+    # wait the catalogue exists to remove.
+    listed = set(discover_models(provider).get("models") or [])
+    if model and model in listed:
         return {
             "levels": [], "default": "", "source": "",
             "conflicts_with_model": True,
+            # A refusal read off a list that was itself trustworthy.
+            _AUTHORITATIVE: True,
             "error": (
                 f"{model} is one of the complete selections `agy models` lists, "
                 f"so it takes no separate effort. To choose one, use a base "
@@ -1002,10 +1270,11 @@ def _discover_agy_efforts(provider: Dict) -> Dict:
             match = re.search(r"valid:\s*([a-zA-Z0-9_, -]+?)\)", text)
             if match:
                 levels = [v.strip() for v in match.group(1).split(",") if v.strip()]
-                source = "agy --effort validation (asked just now)"
+                source = "agy --effort validation"
         except (OSError, subprocess.TimeoutExpired, ValueError):
             pass
 
+    asked = bool(levels)
     if not levels:
         levels = list(AGY_EFFORT_FALLBACK)
         source = "known values for agy --effort (the CLI could not be asked)"
@@ -1020,6 +1289,10 @@ def _discover_agy_efforts(provider: Dict) -> Dict:
         "default": "",
         "source": source,
         "error": "",
+        # The fallback is this app's transcription rather than the CLI's
+        # answer. Kept on screen, never kept on disk - a machine that was busy
+        # for one probe would otherwise stop asking altogether.
+        _AUTHORITATIVE: asked,
     }
 
 
@@ -1045,10 +1318,11 @@ def _discover_claude_efforts(provider: Dict) -> Dict:
             match = re.search(r"Valid values:\s*([a-zA-Z0-9_, -]+)", text)
             if match:
                 levels = [v.strip() for v in match.group(1).split(",") if v.strip()]
-                source = "claude --effort validation (asked just now)"
+                source = "claude --effort validation"
         except (OSError, subprocess.TimeoutExpired, ValueError):
             pass
 
+    asked = bool(levels)
     if not levels:
         levels = list(CLAUDE_EFFORT_FALLBACK)
         source = "known values for claude --effort (the CLI could not be asked)"
@@ -1063,6 +1337,8 @@ def _discover_claude_efforts(provider: Dict) -> Dict:
         "default": "",
         "source": source,
         "error": "",
+        # Same rule as Antigravity's: the transcribed set is shown, not stored.
+        _AUTHORITATIVE: asked,
     }
 
 
@@ -1077,8 +1353,7 @@ def _discover_codex_efforts(model: str) -> Dict:
     offers only the levels *every* listed model accepts. That set is safe
     whatever the CLI chooses; picking a model first unlocks the rest.
     """
-    home = os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
-    cache = Path(home) / "models_cache.json"
+    cache = _codex_cache()
     try:
         data = json.loads(cache.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
@@ -1113,6 +1388,7 @@ def _discover_codex_efforts(model: str) -> Dict:
                     "default": str(entry.get("default_reasoning_level") or ""),
                     "source": f"{cache} · {model} (fetched {fetched})",
                     "error": "",
+                    _AUTHORITATIVE: True,
                 }
         return {
             "levels": [], "default": "", "source": str(cache),
@@ -1141,10 +1417,11 @@ def _discover_codex_efforts(model: str) -> Dict:
             "" if ordered else
             "No reasoning level is accepted by every model in the catalogue."
         ),
+        _AUTHORITATIVE: bool(ordered),
     }
 
 
-def probe_all(providers: Dict[str, Dict], order: tuple) -> List[Dict]:
+def probe_all(conf: Dict[str, Any], order: tuple) -> List[Dict]:
     """Probe several chairs, launching each distinct binary once.
 
     Six providers are usually two or three binaries: the council's two stages,
@@ -1153,7 +1430,15 @@ def probe_all(providers: Dict[str, Dict], order: tuple) -> List[Dict]:
     fifteen seconds for it, and this runs on every `/api/state`, so probing per
     provider would have the dashboard launch six processes to learn three
     things - and would stall the first paint behind all of them.
+
+    Each row carries `connected` beside `available`, because there are two
+    separate ways for a chair to be unfillable and the one thing worse than
+    refusing a run is refusing one the screen said was ready. `available` is
+    whether the binary resolves; `connected` is whether the operator added that
+    CLI in Settings. Takes the whole configuration for the second of those -
+    see `config.provider_enabled`.
     """
+    providers = conf.get("providers") or {}
     cache: Dict[str, Dict] = {}
     out: List[Dict] = []
     for pid in order:
@@ -1169,7 +1454,12 @@ def probe_all(providers: Dict[str, Dict], order: tuple) -> List[Dict]:
         if found is None:
             found = probe(provider)
             cache[key] = found
-        out.append({**found, "id": pid, "label": provider.get("label")})
+        out.append({
+            **found,
+            "id": pid,
+            "label": provider.get("label"),
+            "connected": cfg.provider_enabled(conf, provider),
+        })
     return out
 
 

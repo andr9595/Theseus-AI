@@ -62,18 +62,33 @@ function toast(message, kind = 'info', ttl = 5200) {
    2. API client
    ========================================================================== */
 
-/** The launcher hands us the session token in the query string. Strip it from
- *  the visible URL immediately so it does not end up in a screenshot, a
- *  bookmark or the window title. */
-const TOKEN = (() => {
+/** The launcher hands us a single-use *ticket* in the query string, never the
+ *  session token itself - the token would sit in the browser's command line
+ *  for the whole session, where any other local user can read it. `claimSession`
+ *  trades the ticket for the token before anything else runs, and strips it
+ *  from the visible URL so it cannot end up in a screenshot or a bookmark. */
+let TOKEN = sessionStorage.getItem('ac_token') || '';
+
+async function claimSession() {
   const params = new URLSearchParams(location.search);
-  const t = params.get('token') || sessionStorage.getItem('ac_token') || '';
-  if (params.get('token')) {
-    sessionStorage.setItem('ac_token', t);
-    history.replaceState(null, '', location.pathname);
-  }
-  return t;
-})();
+  const ticket = params.get('ticket');
+  if (!ticket) return;
+  history.replaceState(null, '', location.pathname);
+  try {
+    const res = await fetch('/api/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ticket }),
+    });
+    const data = await res.json();
+    // Only on success: a spent ticket (a reload of an old URL) must not throw
+    // away a token this tab already holds.
+    if (data.token) {
+      TOKEN = data.token;
+      sessionStorage.setItem('ac_token', TOKEN);
+    }
+  } catch { /* boot() shows the missing-session screen */ }
+}
 
 async function api(path, { method = 'GET', body } = {}) {
   const res = await fetch(path, {
@@ -562,6 +577,9 @@ const state = {
   // operator asked to compact it before the next run.
   continueContext: null,
   compactContext: false,
+  // Explicitly blank composers must survive state refreshes. False at boot so
+  // the latest completed run can be restored and continued after a reload.
+  freshChat: false,
   // The conversation list in the sidebar, and the one open in the main pane.
   chats: [],
   // Which mode `state.chats` was fetched for, so a list that arrives after the
@@ -572,6 +590,25 @@ const state = {
   // pointer, and the version it points at is the thing worth knowing. Filled
   // in from /api/models; empty until the CLI has been asked once.
   resolvedModels: {},
+  // The last answer each picker got, keyed by agent — see `catalogKey`. The
+  // server keeps its own copy across restarts; this one is what lets a
+  // reopened menu paint on the click instead of after the round trip.
+  modelLists: {},
+  effortLists: {},
+  // Who the router would seat for what is currently in the composer, from
+  // /api/council/route. Refreshed as you type, because the bench is chosen
+  // from the prompt and a strip showing last run's council would be worse
+  // than one showing none. Null until the first answer arrives.
+  seating: null,
+  // Whether the next run is private: nothing written to the conversation
+  // history, nothing left in the CLIs' own. Held for the tab rather than in
+  // the config, the way a browser's own private window is - a mode you are
+  // currently in, not a setting the next launch should inherit.
+  incognito: sessionStorage.getItem('ac_incognito') === '1',
+  // Which stepper cell is opened out into a per-agent breakdown, by step key.
+  // Held here rather than on the DOM because the stepper is re-rendered on
+  // every event of a live run, which would otherwise close it as you read.
+  openStep: '',
 };
 
 const STATE_LABELS = {
@@ -609,6 +646,20 @@ function visibleMode() {
   return selectedMode();
 }
 
+/** A completed run does not own the screen after its mode is left. The server
+ *  retains the latest run globally, so filter it here or switching from Chat
+ *  to Council would keep rendering the Chat conversation under the Council
+ *  selector (and vice versa). */
+function runOnScreen() {
+  const run = (state.openChat && state.openChat.run) || state.run;
+  if (!run) return null;
+  // A live run owns the screen, but once it ends an explicit "New chat" must
+  // stay blank even when /api/state returns that latest completed run again.
+  if (!state.openChat && state.freshChat && !state.busy) return null;
+  const mode = run.mode || (run.solo ? 'solo' : 'council');
+  return mode === uiMode() ? run : null;
+}
+
 /** The folder the operator chose, or '' for the scratch workspace. */
 function workspacePath() {
   return ((state.config || {}).workspace) || '';
@@ -626,8 +677,29 @@ function runWorkspace(run) {
   return (run && (run.workspace || run.repo)) || '';
 }
 
+/** The incognito control: bright when on, dim when off, and off the limits
+ *  while a run is in flight — the run it would change has already been given
+ *  its answer, and a toggle that appeared to work mid-run would be a lie about
+ *  what was being recorded. Projects are excluded for a reason of their own:
+ *  a build's board, spec and critique log are the state it resumes from. */
+function renderIncognito() {
+  const btn = $('#incognito-btn');
+  const project = uiMode() === 'project';
+  btn.setAttribute('aria-pressed', String(state.incognito && !project));
+  btn.disabled = state.busy || project;
+  btn.setAttribute(
+    'aria-label', state.incognito ? 'Turn incognito off' : 'Turn incognito on'
+  );
+  btn.title = project
+    ? 'A project keeps its board on disk, so it cannot run incognito.'
+    : state.incognito
+      ? 'Incognito is ON. This conversation is not saved here or in the ' +
+        'agents’ own history, and disappears when Theseus closes.'
+      : 'Incognito is off. Conversations are saved to the Chats list.';
+}
+
 function renderStatus() {
-  const run = state.run;
+  const run = runOnScreen();
   const s = run ? run.state : 'idle';
 
   // No status pill any more: what a stage is doing reads off the member that
@@ -639,6 +711,15 @@ function renderStatus() {
       meta.push(STATE_LABELS[s] || s);
     }
     if (run.zero_touch) meta.push('ZERO-TOUCH');
+    // Off the run rather than off the button: what matters when reading a
+    // conversation back is whether *it* was private, not what the toggle says
+    // now. A run started incognito stays labelled after the toggle goes off.
+    if (run.incognito) meta.push('INCOGNITO');
+    // Which writing styles this run was answered under, off the run rather
+    // than off the gear: an archived answer that reads strangely should say
+    // why, and the switch that did it may since have been turned off.
+    if ((run.styles || {}).caveman) meta.push('CAVEMAN');
+    if ((run.styles || {}).efficiency) meta.push('EFFICIENCY');
     if (run.work_branch) meta.push(run.work_branch);
     if (run.diff_stat && run.diff_stat.files) {
       meta.push(`${run.diff_stat.files} file(s) +${run.diff_stat.insertions}/-${run.diff_stat.deletions}`);
@@ -648,6 +729,13 @@ function renderStatus() {
   $('#topbar-meta').textContent = meta.join('  ·  ');
 
   $('#cancel-btn').classList.toggle('hidden', !state.busy);
+  renderIncognito();
+  // On the live run, and on a failed one opened from history: that second case
+  // is the app having been restarted since it failed, which is exactly when
+  // the answers already paid for are worth most.
+  const resumable = !!(run && run.can_resume && !state.busy);
+  $('#continue-btn').classList.toggle('hidden', !resumable);
+  if (resumable) $('#continue-btn').title = continueHint(run);
   $('#rollback-btn').classList.toggle('hidden', !(run && run.can_rollback));
   $('#pr-btn').classList.toggle('hidden', !(run && run.pull_request && run.pull_request.url));
   renderContinuation();
@@ -663,13 +751,14 @@ function renderStatus() {
     : state.busy ? 'A run is already in progress.'
     : hasTask ? 'Send' : 'Describe what you want first.';
 
-  // The gate itself is placed in the thread by `renderThread`, next to the
-  // draft it is judging. What it says still depends only on the run.
+  // The gate itself is placed in the thread by `renderThread`, after the
+  // deliberation it is judging. What it says still depends only on the run.
   const gated = !!(run && !run.solo && run.state === 'awaiting_approval');
   if (gated) {
     $('#approval-copy').innerHTML =
-      'The draft above is ready. <b>Nothing has been written to disk yet.</b> ' +
-      'Approving lets the senior stage apply changes in ' +
+      'The council has finished deliberating; the chairman has not run yet, ' +
+      'so <b>nothing has been written to disk</b>. ' +
+      'Approving lets the chairman apply changes in ' +
       `<b>${esc(runWorkspace(run))}</b>.` +
       // Whether a rollback point exists changes what approving costs, and the
       // gate is the last moment that can change the answer.
@@ -677,6 +766,97 @@ function renderStatus() {
         ' <b>No safety snapshot will be taken</b>, so this run cannot be ' +
         'rolled back.');
   }
+}
+
+/** What Continue would do, in stages rather than in reassurance.
+ *
+ *  The number that matters is how much is *not* being paid for again — that is
+ *  the whole reason to continue rather than to ask again from the top. */
+function continueHint(run) {
+  const stages = run.stages || {};
+  const name = id => {
+    const st = stages[id] || {};
+    return st.role && st.label ? `${st.role} (${st.label})` : (st.label || id);
+  };
+  const left = (run.unfinished_stages || []).map(name);
+  const kept = (run.stage_order || [])
+    .filter(id => (stages[id] || {}).state === 'done').length;
+  if (!left.length) return 'Continue this run.';
+  return `Runs ${left.join(', ')} again` +
+    (kept ? `, reusing ${kept} answer${kept === 1 ? '' : 's'} already given.`
+          : '. Nothing from the first attempt survived to reuse.');
+}
+
+/** The "again" control on one seat's card, when running it again is possible.
+ *
+ *  Offered on any finished run, not only a failed one: a seat that answered
+ *  badly, timed out into two lines, or hit its wall mid-sentence is worth
+ *  replacing on a run that otherwise went fine. The title carries the price,
+ *  because re-running a position also re-runs everything that quoted it. */
+function retryHtml(stageId) {
+  const run = runOnScreen();
+  if (!run || state.busy || !stageId) return '';
+  const plan = (run.retry_plan || {})[stageId];
+  if (!plan || !plan.length) return '';
+
+  const stages = run.stages || {};
+  const kindOf = id => (stages[id] || {}).kind || '';
+  const label = id => (stages[id] || {}).label || id;
+  // Named by what each one *is*, not by which CLI ran it. Three critiques and
+  // a chairman are often the same two CLIs, so a list of labels reads as
+  // "Claude, Antigravity, Codex, Claude" — which says nothing about what is
+  // being spent.
+  const seat = kindOf(stageId) === 'critique'
+    ? `${label(stageId)}'s critique`
+    : kindOf(stageId) === 'chair' ? 'the verdict' : label(stageId);
+  const others = plan.slice(1);
+  const critiques = others.filter(id => kindOf(id) === 'critique').length;
+  const parts = [];
+  if (critiques) {
+    parts.push(`${critiques} peer critique${critiques === 1 ? '' : 's'}`);
+  }
+  if (others.some(id => kindOf(id) === 'chair')) parts.push('the verdict');
+  const kept = Object.keys(stages).length - plan.length;
+
+  const cost = parts.length
+    ? `Runs ${seat} again, and with it ${parts.join(' and ')} — they quoted ` +
+      `it. ${kept} answer${kept === 1 ? '' : 's'} kept.`
+    : `Runs ${seat} again. Every other answer is kept.`;
+
+  return `<button class="msg-retry" type="button" data-retry="${esc(stageId)}" ` +
+    `title="${esc(cost)}">again</button>`;
+}
+
+/** Run one seat again, with whatever quoted it. */
+async function retryStage(stageId) {
+  const run = runOnScreen();
+  if (!run) return;
+  const body = { stage: stageId };
+  if (state.openChat && run.file) body.file = run.file;
+  try {
+    await api('/api/retry', { method: 'POST', body });
+    state.openChat = null;
+  } catch (err) { toast(err.message, 'error', 9000); }
+}
+
+/** Continue the failed run: same run, same id, only the unfinished stages.
+ *
+ *  Not to be confused with `continueRun` below, which continues a *thread* by
+ *  starting a new run that replays it. This one finishes a run that stopped
+ *  halfway, and pays for nothing that already answered.
+ *
+ *  A transcript opened from history carries its filename, which is what lets
+ *  the engine load a run back after the app has been restarted. */
+async function resumeRun() {
+  const run = runOnScreen();
+  if (!run) return;
+  const body = state.openChat && run.file ? { file: run.file } : {};
+  try {
+    await api('/api/resume', { method: 'POST', body });
+    // The run is live again, so the thread has to stop rendering the frozen
+    // copy history handed it or the stages would never appear to move.
+    state.openChat = null;
+  } catch (err) { toast(err.message, 'error', 9000); }
 }
 
 /** One line describing what a thread costs to replay.
@@ -751,6 +931,7 @@ async function continueRun(file, task, mode = '', quiet = false) {
   if (mode && mode !== selectedMode()) {
     await patchConfig({ mode });
   }
+  state.freshChat = false;
   state.continueFrom = file;
   state.continueTask = (task || '').slice(0, 90);
   state.continueContext = null;
@@ -782,6 +963,41 @@ function clearContinuation() {
   renderContinuation();
 }
 
+/** Reattach the completed conversation returned by /api/state or an event.
+ *
+ * A state refresh used to restore only the visible transcript. The composer
+ * therefore looked connected while `continue_from` was empty, and its next
+ * message became a new history row. Keep display and submission attached by
+ * deriving both from the same run.
+ */
+function restoreContinuation() {
+  const target = Continuation.target(state.run, {
+    busy: state.busy,
+    fresh: state.freshChat,
+    openChat: !!state.openChat,
+    mode: selectedMode(),
+    workspace: workspacePath() || state.scratchWorkspace,
+  });
+  if (!target) return;
+
+  // Commit events can refresh state twice. Preserve the context preview and
+  // compaction choice when this conversation is already attached.
+  if (state.continueFrom === target.file) {
+    state.continueTask = target.task;
+    renderContinuation();
+    return;
+  }
+  continueRun(target.file, target.task, target.mode, true);
+}
+
+/** Blank the composer intentionally. Unlike a transient attachment clear,
+ * this survives /api/state refreshes until a run starts or history is opened. */
+function startFreshChat() {
+  state.openChat = null;
+  state.freshChat = true;
+  clearContinuation();
+}
+
 /** Which catalogued agent a provider runs, judged by its executable — the
  *  same rule the server applies in `config.agent_for`. */
 function agentOf(provider) {
@@ -797,53 +1013,356 @@ function roleTag(role) {
   return String(role || '').trim().toUpperCase();
 }
 
+/** The same label, trimmed for a seat on the bench. "Council Member" is the
+ *  neutral persona's full name and reads fine in a menu, but on a row of
+ *  council seats the first word is true of every one of them and costs the
+ *  width the CLI's name needs. */
+function seatTag(role) {
+  return roleTag(String(role || '').replace(/^council\s+/i, ''));
+}
+
 /** The council strip: one compact button per stage, in a single row above the
  *  thread. Clicking a member opens everything about it — CLI, model, effort
  *  and role — rather than spreading those across chips that widen the strip
  *  until it no longer fits on one line. */
+/** The seating the strip should draw: the live run's if there is one, the
+ *  router's preview of the composer otherwise.
+ *
+ *  A run's own seating always wins. The bench is frozen when a run starts —
+ *  the human approves a council at the gate and must get that one — so
+ *  redrawing the strip from a preview mid-run would show a council that is not
+ *  the one working. */
+function activeSeating() {
+  const run = runOnScreen();
+  if (run && !run.solo && run.seating) return run.seating;
+  return state.seating;
+}
+
+/** Whether the bench is drawn at all. A display choice, toggled from the gear
+ *  beside the composer and kept in the config so it survives a reload. */
+function seatsShown() {
+  return ((state.config || {}).council || {}).show_seats !== false;
+}
+
 function renderStrip() {
   const strip = $('#council-strip');
-  const council = uiMode() === 'council';
-  strip.classList.toggle('hidden', !council);
-  if (!council) { strip.innerHTML = ''; return; }
+  const seating = activeSeating();
+  // Nothing to draw is not the same as switched off, but on screen it is: an
+  // empty bordered row explaining itself is worse than no row. The sentence
+  // that used to live here is the composer's placeholder now.
+  const show = uiMode() === 'council' && seatsShown() && !!seating;
+  strip.classList.toggle('hidden', !show);
+  if (!show) { strip.innerHTML = ''; return; }
 
-  const run = state.run;
+  const run = runOnScreen();
   const providers = (state.config || {}).providers || {};
-  const probeFor = (id) => state.providers.find(p => p.id === id);
+  const seats = [...(seating.members || []), seating.chair].filter(Boolean);
 
-  strip.innerHTML = '<div class="strip-inner">' + ['drafter', 'polisher'].map(id => {
-    const p = providers[id] || {};
-    const stage = run && run.stages ? run.stages[id] : null;
-    const info = probeFor(id);
-    const available = !info || info.available;
+  // Inside a `.column`, so the bench lines up with the composer it seats
+  // rather than being centred on its own and drifting out of step with it.
+  //
+  // The notes go *under* the bench, not beside it. They were siblings of the
+  // row inside a flex container, which laid them out as another column of it -
+  // a paragraph of small print alongside the seats, growing the strip
+  // sideways until the seats themselves had no room left to spell their names.
+  strip.innerHTML =
+    '<div class="column">' +
+      '<div class="strip-inner">' +
+      seats.map(seat => seatHtml(seat, run, providers)).join('') +
+      '</div>' +
+      ((seating.notes || []).length
+        ? `<div class="strip-notes">` +
+            (seating.notes || []).map(n =>
+              `<p class="strip-note-line">${esc(n)}</p>`
+            ).join('') +
+          `</div>`
+        : '') +
+    '</div>';
+  paintUsageBars(strip);
+}
 
-    let st = stage ? stage.state : 'pending';
-    if (run && run.state === 'awaiting_approval' && id === 'polisher') st = 'waiting';
+/** One seat on the strip. Coloured by which CLI is in it rather than by which
+ *  chair it is: the chair moves between runs, and a colour that followed the
+ *  chair would recolour the whole strip every time the routing changed. */
+function seatHtml(seat, run, providers) {
+  const p = providers[seat.provider_id] || {};
+  const stageId = seat.chairman ? 'chair' : seat.id;
+  const stage = run && run.stages ? run.stages[stageId] : null;
+  const info = state.providers.find(x => x.id === seat.provider_id);
+  const available = !info || info.available;
 
-    const initial = (p.label || id).slice(0, 2).toUpperCase();
-    const model = p.model || 'default model';
-    const title =
-      `${p.label || id} — ${p.role || 'no role'} · ${modelDetail(model)}` +
-      (p.effort ? ` · ${p.effort}` : '') +
-      (available ? '' : ` · ${(p.command || [])[0] || 'CLI'} not found`) +
-      '\nClick to change CLI, model, effort or role.';
+  let st = stage ? stage.state : 'pending';
+  if (run && run.state === 'awaiting_approval' && seat.chairman) st = 'waiting';
 
-    return (
-      `<button class="member ${st}${available ? '' : ' unavailable'}" type="button" ` +
-        `data-member="${id}" data-agent="${id}" title="${esc(title)}">` +
-        `<span class="member-mark">${esc(initial)}</span>` +
+  const who = p.label || seat.agent;
+  // Spelled out in the tooltip, where there is room; abbreviated on the seat,
+  // where it is the line under a name that already fills the cell.
+  const model = p.model || 'default';
+  const role = seat.chairman ? 'Chair' : (seat.persona_name || 'Member');
+  const reasons = (seat.reasons || []).join(' · ');
+
+  const title =
+    `${who} — ${role}` +
+    (seat.alias ? ` · appears to its peers as ${seat.alias}` : '') +
+    ` · ${modelDetail(p.model || 'default model')}` +
+    (p.effort ? ` · ${p.effort}` : '') +
+    (available ? '' : ` · ${(p.command || [])[0] || 'CLI'} not found`) +
+    (reasons ? `\n\nSeated because: ${reasons}` : '') +
+    (seat.pinned ? '\nPinned to this seat, so the routing works around it.' : '') +
+    '\n\nClick to seat a CLI here, or to change its model, effort or behaviour.';
+
+  // Stacked in the same order as a project chair's tile - what the seat is,
+  // then who is in it, then the detail - because they are the same question
+  // asked twice and reading them the same way costs nothing. Laid out across
+  // instead, the three competed for one line and the CLI's name was the part
+  // that lost: a bench reading "Cla…, Antigr…, Co…" cannot be checked at a
+  // glance, which is the only thing it is there for.
+  const detail = seat.alias
+    ? `${seat.alias}${p.model ? ` · ${p.model}` : ''}`
+    : model;
+
+  // The seat itself is a wrapper, not a button: the quota chip in its tail is
+  // a button of its own, and a button inside a button is markup no browser
+  // accepts - the parser lifts the inner one back out, the strip's grid hands
+  // it a square of its own, and the bench gains a phantom seat. That only
+  // showed once quota crossed the warning threshold, which is the one moment
+  // the reading matters. Both controls are siblings here instead.
+  return (
+    `<div class="member ${st}${available ? '' : ' unavailable'}` +
+      `${seat.chairman ? ' is-chair' : ''}" ` +
+      `data-member="${esc(seat.provider_id)}" data-agent="${esc(seat.agent)}" ` +
+      `data-seat="${esc(seat.id)}" data-seat-label="${esc(role)}" ` +
+      `title="${esc(title)}">` +
+      `<button class="member-main" type="button">` +
+        `<span class="member-mark">${esc(String(who).slice(0, 2).toUpperCase())}</span>` +
         `<span class="member-body">` +
-          `<span class="member-name">${esc(p.label || id)}</span>` +
-          `<span class="member-model">${esc(model)}</span>` +
+          `<span class="member-role">${esc(seatTag(role))}</span>` +
+          `<span class="member-name">${esc(who)}` +
+            (seat.pinned ? '<span class="member-pin" title="pinned">·</span>' : '') +
+          `</span>` +
+          `<span class="member-model">${esc(detail)}</span>` +
         `</span>` +
-        `<span class="member-tail">` +
-          `<span class="member-role">${esc(roleTag(p.role))}</span>` +
-          memberQuotaHtml(id) +
-          `<span class="member-dot"></span>` +
+      `</button>` +
+      `<span class="member-tail">` +
+        memberQuotaHtml(seat.provider_id) +
+        `<span class="member-dot"></span>` +
+      `</span>` +
+    `</div>`
+  );
+}
+
+/** The three stages, as a stepper. Built from the run's own stage records so
+ *  "6 of 6 answered" is a count of what happened rather than of what was
+ *  planned — a council that lost a member to a timeout says so here. */
+const COUNCIL_STEPS = [
+  { key: 'position', label: 'Independent perspectives', states: ['deliberating'] },
+  { key: 'critique', label: 'Cross-evaluating', states: ['critiquing'] },
+  { key: 'chair', label: 'Synthesising the verdict',
+    states: ['synthesizing', 'awaiting_approval'] },
+];
+
+/** The stages belonging to one step, in the order the run runs them. Read
+ *  through `stage_order` rather than off the object so the breakdown lists the
+ *  seats in the same order the bench above it seats them. */
+function stagesInStep(run, key) {
+  const stages = (run && run.stages) || {};
+  return ((run && run.stage_order) || Object.keys(stages))
+    .map(id => (stages[id] ? Object.assign({}, stages[id], { id }) : null))
+    .filter(s => s && s.kind === key);
+}
+
+// What a stage's state is called in the breakdown. Longer than the words used
+// on a message, because here they are the whole content of a row rather than a
+// footnote to output that is already on screen.
+const STEP_STATE_WORDS = {
+  done: 'answered', failed: 'failed', running: 'working',
+  skipped: 'skipped', pending: 'not started', waiting: 'gated',
+};
+
+function renderCouncilSteps() {
+  const host = $('#council-steps');
+  const run = runOnScreen();
+  const show = uiMode() === 'council' && run && !run.solo && run.seating;
+  host.classList.toggle('hidden', !show);
+  if (!show) {
+    $('.project-strip', host).innerHTML = '';
+    $('#step-detail').innerHTML = '';
+    return;
+  }
+
+  // A step that has nothing under it cannot be opened, and one held open
+  // through a mode switch would reopen against a different run's stages.
+  let open = state.openStep;
+  if (open && !stagesInStep(run, open).length) open = state.openStep = '';
+
+  const stages = Object.values(run.stages || {});
+  $('.project-strip', host).innerHTML = COUNCIL_STEPS.map(step => {
+    const mine = stages.filter(s => s.kind === step.key);
+    const done = mine.filter(s => s.state === 'done').length;
+    const failed = mine.filter(s => s.state === 'failed').length;
+    const skipped = mine.length > 0 && mine.every(s => s.state === 'skipped');
+    const live = step.states.includes(run.state);
+
+    let note;
+    if (skipped) note = 'skipped — nothing to compare';
+    else if (live && step.key === 'chair' && run.state === 'awaiting_approval')
+      note = 'waiting for you';
+    else if (live) note = `${done} of ${mine.length} answered`;
+    else if (mine.length) note = `${done} of ${mine.length}` +
+      (failed ? `, ${failed} failed` : '');
+    else note = 'not reached';
+
+    // A cell with nothing behind it is still drawn, but as a plain cell: a
+    // button that opens an empty panel is worse than one that is not offered.
+    const openable = mine.length > 0;
+    const isOpen = openable && open === step.key;
+    return (
+      `<button class="strip-cell step-cell${live ? ' live' : ''}` +
+        `${skipped ? ' muted' : ''}${failed ? ' has-failure' : ''}` +
+        `${isOpen ? ' open' : ''}" type="button" ` +
+        `data-step="${esc(step.key)}"${openable ? '' : ' disabled'} ` +
+        `aria-expanded="${isOpen ? 'true' : 'false'}" ` +
+        `title="${esc(openable
+          ? `${step.label} — click to see what each agent did here`
+          : `${step.label} — nothing has run here yet`)}">` +
+        `<span class="strip-label">${esc(step.label)}` +
+          (failed ? `<span class="step-fail-dot" title="${failed} failed">` +
+            `${failed}</span>` : '') +
         `</span>` +
+        `<span class="strip-value">${live ? 'Working' : (done ? 'Done' : 'Waiting')}</span>` +
+        `<span class="strip-note">${esc(note)}</span>` +
+        (openable ? `<span class="step-chevron">${isOpen ? '▴' : '▾'}</span>` : '') +
       `</button>`
     );
-  }).join('') + '</div>';
+  }).join('');
+
+  $('#step-detail').innerHTML = open ? stepDetailHtml(run, open) : '';
+}
+
+/** The opened step, agent by agent. One row per seat: who it was, what
+ *  happened to it, and — when it failed — the reason, which is the thing the
+ *  counts on the cell above can only say the number of. */
+function stepDetailHtml(run, key) {
+  const step = COUNCIL_STEPS.find(s => s.key === key);
+  const rows = stagesInStep(run, key);
+
+  return (
+    `<div class="step-panel">` +
+      `<div class="step-panel-head">` +
+        `<span>${esc((step && step.label) || key)}</span>` +
+        `<button class="step-close" type="button" data-step-close="1" ` +
+          `title="Close">×</button>` +
+      `</div>` +
+      rows.map(s => stepRowHtml(s)).join('') +
+    `</div>`
+  );
+}
+
+function stepRowHtml(s) {
+  const st = s.state || 'pending';
+  const who = s.label || s.id;
+  const word = STEP_STATE_WORDS[st] || st;
+  const dur = s.duration ? fmtDuration(s.duration) : '';
+
+  // Why it failed, in the agent's own words where there are any. An exit code
+  // on its own is not a reason, but it is what there is when a CLI dies
+  // without saying anything, and saying nothing at all is worse.
+  const reason = s.error ||
+    (s.exit_code !== null && s.exit_code !== undefined && s.exit_code !== 0
+      ? `The CLI exited ${s.exit_code} without an error message.`
+      : 'No reason was reported.');
+  const excerpt = firstLine(stripTrailer(s.output || ''));
+
+  let line = '';
+  if (st === 'failed') line = `<span class="step-line err">${esc(reason)}</span>`;
+  else if (st === 'skipped')
+    // A skipped stage records why it was passed over — "no position from this
+    // seat, so it had no peers to review". That sentence is the whole reason
+    // the count above says 2 of 3, so it is what the row shows.
+    line = `<span class="step-line muted">${esc(s.error ||
+      'Not run — there was nothing for this seat to do.')}</span>`;
+  else if (st === 'pending')
+    line = `<span class="step-line muted">Queued behind the stage before it.</span>`;
+  else if (excerpt) line = `<span class="step-line">${esc(excerpt)}</span>`;
+  else if (st === 'running')
+    line = `<span class="step-line muted">Working — nothing written yet.</span>`;
+  else line = `<span class="step-line muted">Finished without output.</span>`;
+
+  // Only a stage with a message in the thread can be jumped to. A failed one
+  // has a message too: the reason is rendered as its body.
+  const jumpable = st !== 'pending' || (s.output || '').trim();
+
+  return (
+    `<button class="step-row st-${esc(st)}" type="button" ` +
+      `${jumpable ? `data-jump="${esc(s.id)}"` : 'disabled'} ` +
+      `title="${esc(jumpable ? `${who} — open this answer in the thread`
+                             : `${who} has not run yet`)}">` +
+      `<span class="step-mark">${esc(String(who).slice(0, 2).toUpperCase())}</span>` +
+      `<span class="step-row-body">` +
+        `<span class="step-row-head">` +
+          `<span class="step-who">${esc(who)}</span>` +
+          (s.alias ? `<span class="step-alias" ` +
+            `title="How this seat appeared to its peers">${esc(s.alias)}</span>` : '') +
+          (s.model ? `<span class="step-model">${esc(s.model)}</span>` : '') +
+          `<span class="step-state">${esc(word)}</span>` +
+          (dur ? `<span class="step-dur">${esc(dur)}</span>` : '') +
+        `</span>` +
+        line +
+      `</span>` +
+    `</button>`
+  );
+}
+
+/** The first line worth showing of an answer, as a one-line preview. */
+function firstLine(text) {
+  const line = String(text || '')
+    .split('\n')
+    .map(l => l.replace(/^[#>\s*-]+/, '').trim())
+    .find(l => l.length > 1) || '';
+  return line.length > 160 ? `${line.slice(0, 160)}…` : line;
+}
+
+/** Scroll the thread to a stage's message and flash it, so a row in the
+ *  breakdown lands on the answer it names rather than merely near it. */
+function jumpToStage(id) {
+  const el = $(`#thread .turn:not(.earlier) [data-stage-id="${CSS.escape(id)}"]`);
+  if (!el) { toast('That stage has not written anything yet.'); return; }
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  el.classList.add('flash');
+  setTimeout(() => el.classList.remove('flash'), 1800);
+}
+
+/** Ask the server who would sit for what is in the composer.
+ *
+ *  Debounced, and the answer is dropped if the box has changed since — the
+ *  routing is cheap but not free, and a stale bench arriving late would
+ *  overwrite the right one. */
+let seatingTimer = null;
+let seatingSeq = 0;
+function scheduleSeating() {
+  if (uiMode() !== 'council' || !seatsShown()) return;
+  clearTimeout(seatingTimer);
+  seatingTimer = setTimeout(refreshSeating, 250);
+}
+
+async function refreshSeating() {
+  if (uiMode() !== 'council' || !seatsShown()) return;
+  // An empty box is a real question, not a reason to skip: it asks who the
+  // standing bench is. That answer is what makes the seats clickable before a
+  // word has been typed, which is the only way to pick a council by hand.
+  const task = $('#task-input').value || '';
+  const seq = ++seatingSeq;
+  try {
+    const res = await api('/api/council/route', {
+      method: 'POST', body: { task, incognito: state.incognito },
+    });
+    if (seq !== seatingSeq) return;
+    state.seating = res.seating;
+    renderStrip();
+  } catch (e) {
+    // A routing preview that fails is not worth a toast: the run itself seats
+    // the council again anyway, and the strip simply keeps what it had.
+  }
 }
 
 /** Quota on the strip, shown only once it is worth interrupting for. A chip on
@@ -862,6 +1381,18 @@ function memberQuotaHtml(id) {
 function renderComposerChips() {
   const host = $('#composer-chips');
   if (uiMode() !== 'solo') { host.innerHTML = ''; return; }
+
+  // With Multi-agent answer on, the message does not go to the assistant on
+  // this card at all - it goes to every installed CLI, each running its own
+  // card in Settings. Leaving three pickers here that decide nothing would be
+  // the app lying about where the next answer comes from.
+  if ((state.config || {}).multi_agent) {
+    host.innerHTML =
+      `<span class="composer-note">Multi-agent answer: every installed agent ` +
+      `replies, each with its own default model from Settings &rsaquo; ` +
+      `Agents.</span>`;
+    return;
+  }
 
   const p = ((state.config || {}).providers || {}).solo || {};
   const agent = state.agents.find(a => a.id === agentOf(p));
@@ -951,6 +1482,196 @@ function worstUsageFor(providerIds) {
   return worst;
 }
 
+/** How full each quota bar is drawn. The width is data rather than style, and
+ *  the CSP forbids a `style` attribute, so every bar carries its number as
+ *  `data-fill` and has it applied here once the markup is in the document. */
+function paintUsageBars(root) {
+  (root || document).querySelectorAll('.usage-bar > [data-fill]').forEach(bar => {
+    const pct = Math.max(0, Math.min(100, Number(bar.dataset.fill) || 0));
+    bar.style.width = `${pct}%`;
+  });
+}
+
+/* --------------------------------------------------------------------------
+   The usage panel
+
+   The chip on a member reports one chair mid-run. This reports the
+   subscription: one section per installed CLI, one row per window the vendor
+   named. The windows are not the same shape - Claude rations a 5-hour session
+   *and* a week, Codex reports whatever its last run's log recorded - so they
+   are listed rather than reduced to a single figure, which would be a number
+   no vendor gave.
+   -------------------------------------------------------------------------- */
+
+/** The CLIs this install actually uses: the ones added in Settings → Agents.
+ *
+ *  Every picker in the app filters on this rather than on "has a command",
+ *  which was only ever a way of dropping the custom template from a menu. What
+ *  an agent is *installed* is not the question a picker asks — plenty of
+ *  machines carry all three binaries and a subscription for one, and offering
+ *  a seat to an agent the operator never added is offering a run that fails. */
+function connectedAgents() {
+  return (state.agents || []).filter(a => (a.command || []).length && a.selected);
+}
+
+/** Every agent the panel has a row for: the connected CLIs, minus the custom
+ *  entry, which is a blank template rather than a program with a quota. */
+function usageAgents() {
+  return connectedAgents();
+}
+
+/** The reading for one agent, whichever chair happens to hold it. The council
+ *  seat is the canonical one - every chair pointed at the same binary gets the
+ *  same answer, which is why the poller probes each binary once - but a bench
+ *  that has never been configured still has a chat or project chair to read. */
+function usageForAgent(agentId) {
+  const usage = state.usage || {};
+  const seat = usage[`council_${agentId}`];
+  if (seat) return seat;
+  const providers = (state.config || {}).providers || {};
+  const other = Object.keys(providers)
+    .find(id => usage[id] && agentOf(providers[id]) === agentId);
+  return other ? usage[other] : null;
+}
+
+/** What to call one window. The vendor's own wording, because it is the only
+ *  thing separating two limits of the same length - Claude reports a week for
+ *  all models and can report a second for one of them. The length is used only
+ *  when there is no label to use. */
+function usageWindowLabel(limit) {
+  const label = String(limit.label || '').trim();
+  if (label) return label.charAt(0).toUpperCase() + label.slice(1);
+  const mins = Number(limit.window_minutes);
+  if (!mins) return 'Quota';
+  if (mins >= 10000) return 'Week';
+  if (mins >= 1400) return 'Day';
+  return mins >= 60 ? `${Math.round(mins / 60)}-hour` : `${Math.round(mins)}-minute`;
+}
+
+function usageLimitHtml(limit) {
+  const pct = Math.max(0, Math.min(100, Math.round(Number(limit.percent) || 0)));
+  // Per row rather than per agent: a weekly at 95% has to read as the problem
+  // even while the session beside it sits at 10%.
+  const level = pct >= 90 ? 'crit' : pct >= 75 ? 'warn' : 'ok';
+  const name = usageWindowLabel(limit);
+  return (
+    `<div class="usage-limit ${level}">` +
+      `<div class="usage-limit-head">` +
+        `<span>${esc(name)}</span><strong>${pct}%</strong>` +
+      `</div>` +
+      `<span class="usage-bar" role="progressbar" aria-valuemin="0" ` +
+        `aria-valuemax="100" aria-valuenow="${pct}" ` +
+        `aria-label="${esc(name)} used">` +
+        `<span data-fill="${pct}"></span>` +
+      `</span>` +
+      (limit.resets ? `<span class="usage-reset">resets ${esc(limit.resets)}</span>` : '') +
+    `</div>`
+  );
+}
+
+function usageAgentHtml(agent) {
+  const reading = usageForAgent(agent.id);
+  const head = `<div class="usage-agent-head">${esc(agent.label)}</div>`;
+  const said = text => `<p class="usage-note">${esc(text)}</p>`;
+
+  // Before the first poll there is no entry at all, which is not the same as
+  // an agent that cannot be asked - and neither is a number invented to fill
+  // the gap, which would look exactly like the ones that are real.
+  if (!reading) {
+    return `<section class="usage-agent">${head}` +
+      said('Not checked yet.') + `</section>`;
+  }
+  if (!reading.supported) {
+    return `<section class="usage-agent">${head}` +
+      said(reading.note || 'No quota source known for this CLI.') + `</section>`;
+  }
+  if (!(reading.limits || []).length) {
+    return `<section class="usage-agent">${head}` +
+      said(reading.error || 'Not checked yet.') + `</section>`;
+  }
+
+  // Codex's figure comes from its last run's log rather than a live query, so
+  // it is dated. Say how old once it is old enough to mislead.
+  const asOf = Math.max(...reading.limits.map(l => Number(l.as_of) || 0));
+  const ageMin = asOf ? (Date.now() / 1000 - asOf) / 60 : 0;
+  return (
+    `<section class="usage-agent">` + head +
+      reading.limits.map(usageLimitHtml).join('') +
+      (ageMin > 30 ? said(`measured ${fmtAge(ageMin)} ago`) : '') +
+      (reading.error ? said(`last poll failed: ${reading.error}`) : '') +
+    `</section>`
+  );
+}
+
+function drawUsageMenu(menu) {
+  menu.innerHTML =
+    `<div class="model-menu-head">Agent usage</div>` +
+    usageAgents().map(usageAgentHtml).join('') +
+    `<div class="model-menu-foot">` +
+      `<span class="model-menu-source">Each vendor's own figure — nothing here is estimated.</span>` +
+      `<button class="btn btn-quiet btn-sm model-menu-refresh usage-refresh" type="button">` +
+        `Refresh</button>` +
+    `</div>`;
+  paintUsageBars(menu);
+}
+
+/** The footer button. Its tooltip carries the numbers so the panel is only
+ *  needed for the reset times and the bars — hovering is the cheap look. */
+function renderUsageButton() {
+  const button = $('#usage-btn');
+  if (!button) return;
+
+  const threshold = Number((state.config || {}).usage_warn_percent ?? 85);
+  let low = false;
+  const lines = usageAgents().map(agent => {
+    const reading = usageForAgent(agent.id);
+    if (!reading) return `${agent.label}: not checked yet`;
+    if (!reading.supported) return `${agent.label}: no quota source`;
+    if (!reading.worst) return `${agent.label}: ${reading.error || 'not checked yet'}`;
+    if (reading.worst.percent >= threshold) low = true;
+    return `${agent.label}: ` + reading.limits
+      .map(l => `${usageWindowLabel(l)} ${Math.round(l.percent)}%`).join(' · ');
+  });
+
+  button.classList.toggle('warn', low);
+  button.title = ['Agent usage'].concat(lines).join('\n');
+}
+
+function openUsageMenu(anchor) {
+  closeModelMenu();
+  const menu = document.createElement('div');
+  menu.className = 'model-menu usage-menu';
+  menu.setAttribute('role', 'dialog');
+  menu.setAttribute('aria-label', 'Agent usage');
+  document.body.appendChild(menu);
+  drawUsageMenu(menu);
+  // Anchored below like every other menu, which then flips it above: the
+  // button it hangs off is at the bottom of the column.
+  positionModelMenu(menu, anchor);
+  anchor.setAttribute('aria-expanded', 'true');
+
+  menu.addEventListener('click', (e) => {
+    const again = e.target.closest('.usage-refresh');
+    if (!again) return;
+    again.disabled = true;
+    again.textContent = 'Checking…';
+    api('/api/usage/refresh', { method: 'POST' })
+      .then(d => {
+        state.usage = d.usage || {};
+        renderStrip();
+        renderUsageButton();
+        // Only if it is still open: a poll can take the better part of a
+        // minute, and the operator may have clicked away.
+        if (menu.isConnected) { drawUsageMenu(menu); positionModelMenu(menu, anchor); }
+      })
+      .catch(err => toast(err.message, 'error'));
+  });
+
+  setTimeout(() => {
+    document.addEventListener('click', onDocClickCloseModel, { once: true });
+  }, 0);
+}
+
 
 /* ==========================================================================
    Commit
@@ -979,26 +1700,110 @@ function renderCommitBar() {
   }
 }
 
-async function doCommit() {
-  const message = $('#commit-message').value.trim();
-  if (!message) { toast('A commit message is required.', 'warn'); return; }
-  const btn = $('#commit-btn');
-  btn.disabled = true;
+/** Commit the whole working tree. Shared by the bar under a run's diff and by
+ *  the status bar's chip so the two cannot drift: same refusal on an empty
+ *  message, same summary afterwards, same reload of what the folder now is. */
+async function commitWorkingTree(message, btn) {
+  if (!message) { toast('A commit message is required.', 'warn'); return false; }
+  if (btn) btn.disabled = true;
   try {
     const { commit } = await api('/api/commit', {
       method: 'POST',
       body: { message, workspace: workspacePath() },
     });
-    $('#commit-message').value = '';
     toast(
       `Committed ${commit.short} on ${commit.branch} — ${commit.files} file(s), ` +
       `+${commit.insertions}/-${commit.deletions}`, 'ok', 6000);
     await loadState();
+    return true;
   } catch (err) {
     toast(err.message, 'error', 9000);
+    return false;
   } finally {
-    btn.disabled = false;
+    if (btn) btn.disabled = false;
   }
+}
+
+async function doCommit() {
+  const box = $('#commit-message');
+  if (await commitWorkingTree(box.value.trim(), $('#commit-btn'))) box.value = '';
+}
+
+/* ==========================================================================
+   Uncommitted changes, from the status bar
+   ========================================================================== */
+
+/** One row per changed file, with what happened to it.
+ *  A file can be both staged and modified - staged an hour ago, edited since -
+ *  and that is worth seeing rather than collapsing, because `add -A` is about
+ *  to sweep up both halves. */
+function changedFiles(st) {
+  const rows = new Map();
+  const mark = (path, label) => {
+    const labels = rows.get(path) || [];
+    if (!labels.includes(label)) labels.push(label);
+    rows.set(path, labels);
+  };
+  (st.staged || []).forEach(p => mark(p, 'staged'));
+  (st.modified || []).forEach(p => mark(p, 'modified'));
+  (st.untracked || []).forEach(p => mark(p, 'new'));
+  return [...rows.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+}
+
+/** The chip, opened: what is in the folder right now and one button that
+ *  commits all of it. Deliberately not the run's diff block - that one is
+ *  scoped to what a run changed, and most dirty trees are dirty for other
+ *  reasons. */
+async function openChanges() {
+  const folder = workspacePath();
+  if (!folder) return;
+  $('#changes').classList.remove('hidden');
+  $('#changes-where').textContent = folder;
+  $('#changes-files').innerHTML = '';
+  $('#changes-diff').innerHTML =
+    '<div class="empty-state">Reading the working tree…</div>';
+  renderChangesFoot();
+  $('#changes-message').focus();
+
+  try {
+    const data = await api(
+      `/api/repo?path=${encodeURIComponent(folder)}&diff=1`);
+    const st = data.status || {};
+    const files = changedFiles(st);
+    $('#changes-where').textContent =
+      `${files.length} file${files.length === 1 ? '' : 's'} on ${st.branch || '?'} — ${folder}`;
+    $('#changes-files').innerHTML = files.map(([path, labels]) =>
+      `<div class="changes-row">` +
+        `<span class="changes-path" title="${esc(path)}">${esc(path)}</span>` +
+        labels.map(l => `<span class="changes-tag ${l}">${l}</span>`).join('') +
+      `</div>`
+    ).join('') || '<div class="empty-state">Nothing to commit.</div>';
+    $('#changes-diff').innerHTML = renderDiff(data.diff || '', data.stat);
+  } catch (err) {
+    $('#changes-diff').innerHTML =
+      `<div class="empty-state">${esc(err.message)}</div>`;
+  }
+}
+
+/** Whether committing is on offer, and if not, why not. The server refuses a
+ *  commit under a running agent anyway; saying so here means the refusal is
+ *  read before the button is pressed rather than after. */
+function renderChangesFoot() {
+  const busy = !!state.busy;
+  $('#changes-commit').disabled = busy;
+  $('#changes-note').textContent = busy
+    ? 'A run is in progress. Committing now would capture a tree it is still ' +
+      'editing, so wait for it to finish.'
+    : 'Commits everything the list shows, including new files. Nothing is ' +
+      'pushed.';
+}
+
+async function doChangesCommit() {
+  const box = $('#changes-message');
+  const ok = await commitWorkingTree(box.value.trim(), $('#changes-commit'));
+  if (!ok) return;
+  box.value = '';
+  closeModal('changes');
 }
 
 /* ==========================================================================
@@ -1147,9 +1952,13 @@ function renderWorkspace() {
     chips.push('<span class="chip">no git</span>');
   } else if (st && st.is_repo) {
     chips.push(`<span class="chip">${esc(st.branch || '?')}</span>`);
+    // Dirty is the only one of the three that leads anywhere: there is
+    // something to look at and something to do about it, so it is a button.
     chips.push(st.clean
       ? '<span class="chip clean">clean</span>'
-      : `<span class="chip dirty">${st.dirty_count} uncommitted</span>`);
+      : `<button class="chip dirty chip-btn" id="dirty-chip" type="button" ` +
+        `title="Review the changes and commit them">` +
+        `${st.dirty_count} uncommitted</button>`);
   } else if (st) {
     chips.push('<span class="chip">not a git repository</span>');
   }
@@ -1192,22 +2001,39 @@ function renderMode() {
   // plainly, and worth colouring, rather than leaving to a toggle elsewhere.
   const armed = !!(state.config || {}).zero_touch;
   const sub = $('#hero-sub');
-  sub.textContent = mode === 'solo'
-    ? (armed
-      ? 'One agent, one conversation — and Zero-Touch is on, so it can change files in your working folder.'
-      : 'One agent, one conversation. Read-only: turn Zero-Touch on to let it change files.')
-    : (armed
-      ? 'One agent drafts, the other applies — and Zero-Touch is on, so it will not stop to ask.'
-      : 'One agent drafts, you approve, the other applies.');
-  sub.classList.toggle('armed', armed);
+  // With no folder chosen neither mode writes anything, whatever Zero-Touch
+  // says — a supported way to work rather than a setting left unfinished, so
+  // the strip says what such a run does do: answer. The gear stays armed
+  // below, because the toggle itself is still on for the next folder.
+  sub.textContent = !workspacePath()
+    ? (mode === 'solo'
+      ? 'One agent, one conversation. No working folder, so nothing is written — code comes back in the reply.'
+      : 'Several agents answer, review each other, and a chairman decides. No working folder, so nothing is written — code comes back in the reply.')
+    : (mode === 'solo'
+      ? (armed
+        ? 'One agent, one conversation — and Zero-Touch is on, so it can change files in your working folder.'
+        : 'One agent, one conversation. Read-only: turn Zero-Touch on to let it change files.')
+      : (armed
+        ? 'Several agents answer, review each other, and a chairman applies the outcome — and Zero-Touch is on, so it will not stop to ask.'
+        : 'Several agents answer, review each other, you approve, and a chairman applies the outcome.'));
+  sub.classList.toggle('armed', armed && !!workspacePath());
   $('#gear-btn').classList.toggle('armed', armed);
 
   $('#continue-copy').textContent = mode === 'solo'
     ? 'the assistant will be given that exchange as context.'
     : 'the council will be given that exchange as context.';
-  $('#task-input').placeholder = mode === 'solo'
-    ? 'Ask Theseus AI…'
-    : 'Ask the council…';
+  // Council's placeholder is where the routing is explained, because that is
+  // where the routing is *driven from*: the bench above changes as this box is
+  // typed into. Saying it on the empty strip instead put the sentence in the
+  // one place it could not be acted on.
+  // Before anything else, the first-run answer: with no agent added there is
+  // nobody to ask, and the composer is where that is discovered. Said here
+  // rather than left to the refusal that arrives after the message is sent.
+  $('#task-input').placeholder = !connectedAgents().length
+    ? 'Add an agent first — Settings → Agents…'
+    : mode === 'solo'
+      ? 'Ask Theseus AI…'
+      : 'Describe the task and the council seats itself…';
 }
 
 function renderToggles() {
@@ -1297,27 +2123,133 @@ function userHtml(task) {
     renderMarkdown(task || '(no message)') + '</div></div>';
 }
 
-function messageHtml(reply, id) {
+/** A figure an agent reported about itself, as a chip.
+ *
+ *  Only ever drawn from a number the agent actually stated. A stage that gave
+ *  none renders nothing here, and the verdict card says "not stated" in words
+ *  — this app has no way to measure confidence and must not appear to. */
+function confidenceChip(value, label, why) {
+  if (value === null || value === undefined) return '';
+  const band = value >= 75 ? 'high' : value >= 45 ? 'mid' : 'low';
+  const title = `${label}: ${value}% — the agent's own figure, not measured` +
+    (why ? `\n\nIt said it could be wrong if: ${why}` : '');
+  return (
+    `<span class="conf-chip ${band}" title="${esc(title)}">` +
+      `<span class="conf-label">${esc(label)}</span>` +
+      `<span class="conf-value">${value}%</span>` +
+    `</span>`
+  );
+}
+
+// `retry` is off for the replayed turns of a thread: those stages belong to an
+// earlier run with its own transcript, and the engine only holds this one. The
+// stage ids repeat across turns, so without this every earlier answer would
+// sprout a button that re-ran a different run's seat.
+function messageHtml(reply, id, { retry = false } = {}) {
   const who = reply.label || reply.stage || id || 'Agent';
   const st = reply.state || '';
   const dur = reply.duration ? ` · ${fmtDuration(reply.duration)}` : '';
   const word = STAGE_WORDS[st] || '';
-  const body = renderMarkdown(reply.output || '') ||
+  const chair = reply.kind === 'chair';
+  // The trailer lines are stripped from the body because they are rendered as
+  // chips above it. Left in, the same figure would appear twice — once as a
+  // badge and once as a stray line of prose at the bottom of the card.
+  const body = renderMarkdown(stripTrailer(reply.output || '')) ||
     `<p class="history-none">${esc(reply.error || `(${st || 'no output'})`)}</p>`;
+
   return (
-    `<div class="chat-message assistant-message" data-agent="${esc(id || '')}">` +
+    // `data-stage-id` is what the stepper's breakdown scrolls to. Set from the
+    // stage's own id, so a council of two Claudes still resolves to the seat
+    // that was clicked rather than to whichever of them renders first.
+    `<div class="chat-message assistant-message${chair ? ' verdict' : ''}" ` +
+      `data-stage-id="${esc(id || reply.stage || '')}" ` +
+      `data-agent="${esc(reply.agent || id || '')}">` +
       `<div class="msg-head">` +
         `<span class="msg-mark">${esc(String(who).slice(0, 2).toUpperCase())}</span>` +
         `<span class="msg-who">${esc(who)}</span>` +
         (reply.role ? `<span class="msg-role">${esc(roleTag(reply.role))}</span>` : '') +
+        // Which model answered, on a multi-agent Chat turn only. Three answers
+        // are being compared, and "Claude said X, Codex said Y" is a different
+        // claim depending on which model each was. Blank means the CLI's own
+        // default was used, and no chip is shown rather than one that guesses.
+        (reply.kind === 'chat' && reply.model
+          ? `<span class="msg-model" title="Set for this CLI in Settings › Agents">` +
+            `${esc(reply.model)}</span>`
+          : '') +
+        // The alias is what its peers knew it as. Shown on the member's own
+        // card so a critique that says "Agent B was wrong" can be followed
+        // back to a CLI without reading the transcript.
+        (reply.alias && !chair
+          ? `<span class="msg-alias" title="How this seat appeared to its peers">` +
+            `${esc(reply.alias)}</span>`
+          : '') +
+        (chair && reply.consensus !== null && reply.consensus !== undefined
+          ? confidenceChip(reply.consensus, 'consensus', '')
+          : '') +
+        confidenceChip(reply.confidence, 'confidence', reply.because) +
         `<span class="msg-state${st === 'failed' ? ' failed' : ''}">` +
           `${esc(word)}${esc(dur)}</span>` +
+        (retry ? retryHtml(id || reply.stage || '') : '') +
       `</div>` +
       // `data-live` marks the one body `stage_output` may append to. Only a
       // running stage has it, so a finished message can never be scribbled on.
       `<div class="markdown"${st === 'running' ? ' data-live="1"' : ''}>${body}</div>` +
+      (chair && st === 'done' && (reply.confidence === null ||
+                                  reply.confidence === undefined)
+        ? '<div class="turn-note">The chairman did not state a confidence. ' +
+          'Nothing here fills that in.</div>'
+        : '') +
     `</div>`
   );
+}
+
+/** Remove the contract trailer so it is not shown twice. Matches the parser in
+ *  prompts.py; a line the parser would not have read is left alone. */
+function stripTrailer(text) {
+  return String(text || '')
+    .replace(/^[ \t]*(?:CONFIDENCE|CONSENSUS):[ \t]*\d{1,3}[ \t]*$/gim, '')
+    .replace(/^[ \t]*BECAUSE:[ \t]*.*$/gim, '')
+    .trimEnd();
+}
+
+/** The stages of a turn, grouped under the stage they belong to.
+ *
+ *  Still messages in the conversation rather than a tabbed grid beside it —
+ *  that is how every other agent in this app speaks, and a council that needed
+ *  its own layout would read as a different product bolted on. The headings
+ *  are the only addition, and they exist because seven messages in a row with
+ *  no divisions gives no clue which are positions and which are reviews. */
+const STAGE_HEADINGS = {
+  position: 'Independent positions',
+  critique: 'Peer critique',
+  chair: 'The verdict',
+  // Multi-agent Chat. Named for what it is rather than "the council": nothing
+  // here was anonymised, critiqued or weighed, and reading three answers as a
+  // verdict would be reading something this app did not do.
+  chat: 'What each agent answered',
+};
+
+function councilBodyHtml(run, gated) {
+  const stages = stagesOf(run);
+  let last = null;
+  return stages.map(s => {
+    const heading = (s.kind && s.kind !== last && STAGE_HEADINGS[s.kind])
+      ? `<h4 class="project-head-sm council-divider">${esc(STAGE_HEADINGS[s.kind])}</h4>`
+      : '';
+    last = s.kind || last;
+    // The gate sits immediately before the stage it is gating, which is the
+    // chairman - the only stage that can write. Anchored on the last critique
+    // so it reads as "here is everything the council said; now decide".
+    const gateHere = gated && s.kind === 'chair';
+    return (gateHere ? '<div data-slot="approval-gate"></div>' : '') +
+      heading + messageHtml(s, s.id, { retry: true });
+  }).join('') +
+    // A gated run has not reached the chairman yet, so there is no chair
+    // message to anchor the gate to. It goes at the end of what has been said.
+    (gated && !stages.some(s => s.kind === 'chair')
+      ? '<h4 class="project-head-sm council-divider">The verdict</h4>' +
+        '<div data-slot="approval-gate"></div>'
+      : '');
 }
 
 function renderThread() {
@@ -1344,7 +2276,7 @@ function renderThread() {
 
   // Whichever conversation is on screen: the one opened from history, or the
   // live run. They are the same shape, so one path renders both.
-  const run = (state.openChat && state.openChat.run) || state.run;
+  const run = runOnScreen();
   const live = !state.openChat;
 
   $('#hero').classList.toggle('hidden', !!run);
@@ -1369,19 +2301,37 @@ function renderThread() {
   const current =
     '<div class="turn">' +
       userHtml(run.task) +
-      stagesOf(run).map(s =>
-        messageHtml(s, s.id) +
-        // The gate belongs against the draft it is judging, not at the top of
-        // the screen where it used to sit with nothing to read beside it.
-        (gated && s.id === 'drafter' ? '<div data-slot="approval-gate"></div>' : '')
-      ).join('') +
+      councilBodyHtml(run, gated) +
       (run.reviewer_note
         ? `<div class="turn-note">Your note at the gate: ${esc(run.reviewer_note)}</div>`
         : '') +
       (council && live ? '<div data-slot="console-block"></div>' : '') +
       (hasDiff ? '<div data-slot="diff-block"></div>' : '') +
       (run.rollback_note ? `<div class="turn-note">${esc(run.rollback_note)}</div>` : '') +
-      (run.error ? `<div class="turn-note">${esc(run.error)}</div>` : '') +
+      // The failure, and next to it the way out of it. A Continue button only
+      // in the top bar would be a long way from the thing that failed, which
+      // is where the operator is actually looking.
+      (run.error
+        ? `<div class="turn-note turn-note-fail">${esc(run.error)}` +
+          (run.can_resume
+            ? `<button class="btn btn-quiet btn-sm" type="button" ` +
+              `data-continue title="${esc(continueHint(run))}">Continue</button>`
+            : '') +
+          `</div>`
+        : '') +
+      // A server older than this page answers without the two keys Continue
+      // and "again" are decided from, so both go quiet and the page looks
+      // broken rather than out of date. The browser reloads app.js on its own;
+      // the engine only reloads when the app is restarted, and this says so
+      // rather than leaving the operator hunting for a button that cannot be
+      // drawn. Absence of the key is the signal - `false` is a real answer.
+      (run.state === 'failed' && run.can_resume === undefined
+        ? '<div class="turn-note">This app was started before Continue ' +
+          'existed, so the engine cannot offer it for this run. Restart the ' +
+          'app (<code>./run.sh</code>) and open this conversation again — ' +
+          'the answers it already paid for are on disk and will be reused.' +
+          '</div>'
+        : '') +
     '</div>';
 
   thread.innerHTML = earlier + current;
@@ -1464,13 +2414,53 @@ function renderProjectSetup() {
   const resumable = state.projectResumable && !hasProject();
   $('#project-resume-found').classList.toggle('hidden', !resumable);
 
-  const missing = (state.projectRoles || []).filter(r => !r.available);
-  $('#project-start').disabled = missing.length > 0;
-  $('#project-start-hint').textContent = missing.length
-    ? `${missing.map(r => ROLE_NAMES[r.id] || r.id).join(' and ')} ` +
-      `${missing.length === 1 ? 'has' : 'have'} no CLI installed. ` +
+  // Two ways for a chair to be unfillable, and the server refuses on both, so
+  // the button has to disable on both - a Start that looks pressable and then
+  // refuses is worse than one that says why up front.
+  const unfilled = (state.projectRoles || []).filter(r => !chairFillable(r));
+  const unadded = unfilled.filter(r => r.connected === false).length;
+  const why =
+    unadded === unfilled.length ? 'you have not added'
+    : unadded ? 'you have not added, or whose CLI is not installed'
+    : 'whose CLI is not installed';
+  $('#project-start').disabled = unfilled.length > 0;
+  $('#project-start-hint').textContent = unfilled.length
+    ? `${unfilled.map(r => ROLE_NAMES[r.id] || r.id).join(' and ')} ` +
+      `${unfilled.length === 1 ? 'is' : 'are'} on an agent ${why}. ` +
       `A project runs unattended, so it will not start with a seat it cannot fill.`
-    : '';
+    : doubledChairsHint();
+}
+
+/** Whether one project chair can actually be filled, on the server's terms.
+ *
+ *  Both halves of `probe_all`'s answer: the agent has to be one the operator
+ *  added, and its binary has to resolve. A row the server has not sent yet is
+ *  treated as fillable rather than flashing a refusal at first paint. */
+function chairFillable(info) {
+  return !info || (info.available && info.connected !== false);
+}
+
+/** A warning, never a refusal: two chairs on the same CLI.
+ *
+ *  Allowed, and sometimes what somebody wants — but it costs both of the
+ *  things three seats buy. A hand-off when one agent runs out of context has
+ *  one fewer agent to reach for, and the acceptance turn stops being
+ *  independent of the code it is accepting. */
+function doubledChairsHint() {
+  const seen = {};
+  const doubled = [];
+  for (const role of PROJECT_ROLES) {
+    const p = ((state.config || {}).providers || {})[role] || {};
+    const key = (p.command || []).join(' ');
+    if (!key) continue;
+    if (seen[key]) doubled.push([seen[key], role]);
+    else seen[key] = role;
+  }
+  if (!doubled.length) return '';
+  const [a, b] = doubled[0];
+  return `${ROLE_NAMES[a]} and ${ROLE_NAMES[b]} are the same CLI. It will ` +
+    `run, but one agent checking its own work is not a second opinion, and a ` +
+    `context limit has one fewer chair to hand the turn to.`;
 }
 
 /** The innovation slider: how much the council may invent once the goal is met.
@@ -1504,17 +2494,30 @@ function renderInnovation() {
 function chairHtml(role) {
   const p = ((state.config || {}).providers || {})[role] || {};
   const info = (state.projectRoles || []).find(r => r.id === role);
-  const available = !info || info.available;
+  const available = chairFillable(info);
+  const why = !info || info.connected !== false ? 'not found' : 'not added';
   const agent = state.agents.find(a => a.id === agentOf(p));
   const agentLabel = agent && (agent.command || []).length ? agent.label : 'custom command';
   const model = p.model || 'default model';
   const running = hasProject() && state.projectRunning &&
     state.project.active_agent === role;
 
+  // What the app would put here, and why. Shown only when the chair is on
+  // something else: three "recommended" badges on the three defaults is noise,
+  // and the one case worth a line is the one where the operator has moved a
+  // seat and may want to know what it was picked for.
+  const suggested = info && info.recommended_agent;
+  const offSuggestion = suggested && agentOf(p) !== suggested;
+  const suggestedLabel = offSuggestion
+    ? ((state.agents.find(a => a.id === suggested) || {}).label || suggested)
+    : '';
+
   const title =
     `${ROLE_NAMES[role]} — ${agentLabel} · ${modelDetail(model)}` +
     (p.effort ? ` · ${p.effort}` : '') +
-    (available ? '' : ` · ${(p.command || [])[0] || 'CLI'} not found`) +
+    (available ? '' : ` · ${(p.command || [])[0] || 'CLI'} ${why}`) +
+    ((info && info.summary) ? `\n${info.summary}` : '') +
+    (offSuggestion ? `\nRecommended for this seat: ${suggestedLabel}.` : '') +
     '\nClick to change CLI, model or effort.';
 
   return (
@@ -1523,8 +2526,10 @@ function chairHtml(role) {
       `<span class="chair-mark">${esc(ROLE_NAMES[role].slice(0, 2).toUpperCase())}</span>` +
       `<span class="chair-body">` +
         `<span class="chair-role">${esc(ROLE_NAMES[role])}</span>` +
-        `<span class="chair-agent">${esc(available ? agentLabel : agentLabel + ' — missing')}</span>` +
+        `<span class="chair-agent">${esc(available ? agentLabel : `${agentLabel} — ${why}`)}</span>` +
         `<span class="chair-model">${esc(model)}</span>` +
+        (offSuggestion
+          ? `<span class="chair-note">${esc(suggestedLabel)} recommended</span>` : '') +
       `</span>` +
     `</button>`
   );
@@ -1547,8 +2552,11 @@ function renderProjectLive() {
 
   // Controls. Pause and Resume are the same button's two states rather than
   // two live buttons, so there is never a pair where only one does anything.
+  // Resume doubles as the way back into a run that hit a limit: everything it
+  // built is on disk, and picking it up again is the documented next move.
   $('#project-pause').classList.toggle('hidden', !running || p.paused);
-  $('#project-resume').classList.toggle('hidden', !(running && p.paused));
+  $('#project-resume').classList.toggle('hidden',
+    !((running && p.paused) || (!running && p.status === 'FAILED')));
   $('#project-handoff').classList.toggle('hidden', !running);
   $('#project-stop').classList.toggle('hidden', !running);
   $('#project-new').classList.toggle('hidden', running);
@@ -1608,14 +2616,28 @@ function renderStatusStrip(p, running, done) {
     UNKNOWN: 'changed since anyone last ran it',
   }[health] || '';
 
+  // The other verdict. A green build is three commands exiting zero; this is
+  // whether anybody got the application to do the thing that was asked for,
+  // which is a different question and the one the operator asked.
+  const accepted = p.release_health || 'UNKNOWN';
+  const acceptedClass =
+    accepted === 'PASSING' ? 'ok' : accepted === 'FAILING' ? 'bad' : 'unknown';
+  const acceptedNote = {
+    PASSING: 'QA ran it and it did what you asked',
+    FAILING: 'QA ran it and it did not',
+    UNKNOWN: 'nobody has used it since the last edit',
+  }[accepted] || '';
+
   const last = (p.steps || [])[(p.steps || []).length - 1];
   const who = done
     ? ''
-    : p.paused
-      ? 'Paused'
-      : running
-        ? `${ROLE_NAMES[p.active_agent] || p.active_agent} working`
-        : 'Idle';
+    : p.pausing
+      ? 'Pausing'
+      : p.paused
+        ? 'Paused'
+        : running
+          ? `${ROLE_NAMES[p.active_agent] || p.active_agent} working`
+          : 'Idle';
   const why = !done && running && last ? last.trigger || '' : '';
 
   $('#project-status-strip').innerHTML =
@@ -1623,6 +2645,11 @@ function renderStatusStrip(p, running, done) {
       `<span class="strip-label">Build</span>` +
       `<span class="strip-value">${esc(health.toLowerCase())}</span>` +
       `<span class="strip-note">${esc(healthNote)}</span>` +
+    `</span>` +
+    `<span class="strip-cell strip-health ${acceptedClass}">` +
+      `<span class="strip-label">Works</span>` +
+      `<span class="strip-value">${esc(accepted.toLowerCase())}</span>` +
+      `<span class="strip-note">${esc(acceptedNote)}</span>` +
     `</span>` +
     (who
       ? `<span class="strip-cell${running && !p.paused ? ' live' : ''}">` +
@@ -1704,7 +2731,14 @@ function renderProjectBanner(p, running, done) {
            `the diff first, then .theseus/CRITIQUE.log for what was left open.`;
   } else if (p.status === 'FAILED') {
     kind = 'error';
-    text = p.error || 'The project stopped.';
+    text = (p.error || 'The project stopped.') +
+           ' Everything built so far is on disk — Resume picks up from the ' +
+           'board once you have unstuck it.';
+  } else if (p.pausing) {
+    kind = 'warn';
+    text = 'Pausing. The agent that was running has not exited yet, so the ' +
+           'folder is still being written to — the loop holds as soon as its ' +
+           'turn ends.';
   } else if (p.paused) {
     kind = 'warn';
     text = 'Paused. The agent that was running finished its turn, so the tree ' +
@@ -1726,6 +2760,11 @@ function renderProjectBanner(p, running, done) {
     kind = '';
     text = 'Reading the workspace. This turn runs read-only — it has no write ' +
            'permission at all, so nothing here can change yet.';
+  } else if (p.status === 'ACCEPTING') {
+    kind = '';
+    text = 'Every card is done and the build is green. QA is now starting the ' +
+           'application and using it against the goal — anything it cannot do ' +
+           'comes back as a bug and the loop reopens.';
   } else if (p.status === 'INNOVATING') {
     kind = 'warn';
     text = 'The goal is met and the build is green. The architect is now ' +
@@ -1783,7 +2822,9 @@ function stepHtml(s) {
  *  misclick into a question. */
 async function startProject(resume) {
   const goal = $('#project-goal').value.trim();
-  const folder = workspacePath();
+  // Resuming carries on in the folder the project on screen was built in, not
+  // in whichever one the picker happens to be pointing at.
+  const folder = (resume && (state.project || {}).workspace) || workspacePath();
   const innovation = Math.max(0, Math.min(5,
     parseInt($('#project-innovation').value, 10) || 0));
   const where = folder || `the scratch workspace (${state.scratchWorkspace || 'app folder'})`;
@@ -1803,7 +2844,9 @@ async function startProject(resume) {
         `did not ask for. Set the slider to zero to stop at the goal.`
       : '') +
     (workspaceIsRepo()
-      ? '\n\nA git snapshot is taken first, so the whole build can be undone.'
+      ? '\n\nA git snapshot is taken first and its commit id is recorded on ' +
+        'the board. There is no Project rollback button — undoing this is a ' +
+        'handful of git commands, and the README spells them out.'
       : '\n\nThis is not a git repository, so nothing is snapshotted and ' +
         'there is no way to undo it.')
   )) return;
@@ -1899,9 +2942,14 @@ function renderAll() {
   renderStatus();
   renderMode();
   renderProfile();
+  renderUsageButton();
   renderStrip();
+  renderCouncilSteps();
   renderComposerChips();
   renderWorkspace();
+  // Only when it is open: a run that starts while the changes are on screen
+  // has to take the commit button away, since the server would refuse it.
+  if (!$('#changes').classList.contains('hidden')) renderChangesFoot();
   renderToggles();
   renderThread();
   renderProject();
@@ -1963,6 +3011,11 @@ function clearStream() {
 function closeModelMenu() {
   const open = $('.model-menu');
   if (open) open.remove();
+  // The usage button is the one trigger that advertises whether its panel is
+  // open, so it has to be told when the panel goes - including when it goes
+  // because something else opened.
+  const usage = $('#usage-btn');
+  if (usage) usage.setAttribute('aria-expanded', 'false');
 }
 
 /** Keep what the CLI said an alias resolves to, so the chips and the council
@@ -1976,6 +3029,37 @@ function rememberResolved(map) {
 function modelDetail(model) {
   const points = state.resolvedModels[model];
   return points && points !== model ? `${model} (${points})` : model;
+}
+
+/** Where the last answer for a menu is kept, so reopening it paints on the
+ *  click instead of after a round trip. Keyed by agent rather than by provider
+ *  because the setting is the CLI's: the same list serves the council seat,
+ *  the chat card and every project chair. The server holds the durable copy —
+ *  this is only what saves the second wait.
+ *
+ *  `withModel` for the effort menu: which levels are legal depends on which
+ *  model is pinned, so one entry per CLI would answer the wrong question.
+ *
+ *  `modelOverride` for the Settings form, where the model box may hold a
+ *  choice that has not been saved yet: the levels wanted there are the ones
+ *  for the model on screen, not the one still on disk. Blank is a real
+ *  override - "the CLI's default" is a selection like any other - so the
+ *  absent case is `undefined` rather than a falsy check. */
+function catalogKey(providerId, withModel = false, modelOverride = undefined) {
+  const provider = ((state.config || {}).providers || {})[providerId] || {};
+  const model = modelOverride === undefined
+    ? (provider.model || '') : modelOverride;
+  return agentOf(provider) + (withModel ? `|${model}` : '');
+}
+
+/** "asked just now" or how old the stored answer is, for the menu's footer. A
+ *  catalogued list that says nothing about its age reads as a live one. Blank
+ *  when the request never landed — there is no answer to date. */
+function catalogAge(data) {
+  if (!data || !data.fetched_at) return '';
+  if (!data.cached) return 'asked just now';
+  const mins = Math.max(0, (Date.now() / 1000 - data.fetched_at) / 60);
+  return `saved ${fmtAge(mins)} ago`;
 }
 
 /** Ask once, in the background, so the very first tooltip is already specific.
@@ -2008,80 +3092,86 @@ function positionModelMenu(menu, anchor) {
   }
 }
 
-async function openModelMenu(anchor, providerId) {
+async function openModelMenu(anchor, providerId, refresh = false) {
   closeModelMenu();
   const provider = ((state.config || {}).providers || {})[providerId] || {};
   const current = provider.model || '';
+  const who = provider.label || providerId;
+  const key = catalogKey(providerId);
 
   const menu = document.createElement('div');
   menu.className = 'model-menu';
-  menu.innerHTML =
-    `<div class="model-menu-head">${esc(provider.label || providerId)} model</div>` +
-    `<div class="model-loading">Asking ${esc(provider.label || providerId)}…</div>`;
   document.body.appendChild(menu);
-  positionModelMenu(menu, anchor);
 
-  // Ask the CLI what it can actually run. A list shipped in this app would be
-  // wrong for accounts with different entitlements — a ChatGPT-account Codex
-  // login rejects models an API key would accept, with a 400 at run time.
-  let models = provider.models || [];
-  let source = 'configured in Settings';
-  let error = '';
-  let resolved = {};
-  try {
-    const data = await api(`/api/models?provider=${encodeURIComponent(providerId)}`);
-    if (data.models && data.models.length) {
-      models = data.models;
-      source = data.source || '';
-    }
-    resolved = data.resolved || {};
-    rememberResolved(resolved);
-    error = data.error || '';
-  } catch (err) {
-    error = err.message;
-  }
+  const draw = (data) => {
+    // Everything the CLI reports, then anything saved that it does not: a
+    // model typed into the box below lives in the config and not in the
+    // answer, and replacing one list with the other is what made it vanish
+    // from the picker the moment it was chosen.
+    const listed = (data && data.models) || [];
+    const models = listed.concat(
+      (provider.models || []).filter(m => !listed.includes(m))
+    );
+    const resolved = (data && data.resolved) || {};
+    // Antigravity names each id in its own listing, and the names are the only
+    // thing telling `gemini-3.6-flash-high` from `gemini-3.5-flash-high` at a
+    // glance. Shown as given rather than prettified here.
+    const labels = (data && data.labels) || {};
+    const error = (data && data.error) || '';
+    const source = (data && data.source) || 'configured in Settings';
+    // Redrawing must not swallow what is half-typed into the custom box.
+    const typed = $('.model-custom-input', menu);
+    const pending = typed ? typed.value : (models.includes(current) ? '' : current);
 
-  menu.innerHTML =
-    `<div class="model-menu-head">${esc(provider.label || providerId)} model</div>` +
-    `<button class="model-opt${current ? '' : ' active'}" data-value="">` +
-      `<span class="model-opt-name">CLI default</span>` +
-      `<span class="model-opt-note">whatever the CLI is set to</span>` +
-    `</button>` +
-    models.map(m => {
-      // An alias tracks the newest model in its family, so on its own it does
-      // not say which generation you are about to run. Name the model it
-      // points at right now; a pinned id already names itself.
-      const points = resolved[m] || '';
-      const note = points ? `→ ${points}` : (/^[a-z]+$/.test(m) ? 'alias · always latest' : '');
-      const why = points
-        ? `${m} is an alias — it currently runs ${points}, and will follow that family as it is updated.`
-        : '';
-      return (
-        `<button class="model-opt${m === current ? ' active' : ''}" data-value="${esc(m)}"` +
-          `${why ? ` title="${esc(why)}"` : ''}>` +
-          `<span class="model-opt-name">${esc(m)}</span>` +
-          `<span class="model-opt-note">${esc(note)}</span>` +
-        `</button>`
-      );
-    }).join('') +
-    (error ? `<div class="model-menu-error">${esc(error)}</div>` : '') +
-    `<div class="model-menu-custom">` +
-      `<input class="model-custom-input" placeholder="Other model…" spellcheck="false" ` +
-        `value="${esc(models.includes(current) ? '' : current)}">` +
-      `<button class="btn btn-quiet btn-sm model-custom-apply" type="button">Set</button>` +
-    `</div>` +
-    (source ? `<div class="model-menu-source">${esc(source)}</div>` : '');
+    menu.innerHTML =
+      `<div class="model-menu-head">${esc(who)} model</div>` +
+      `<button class="model-opt${current ? '' : ' active'}" data-value="">` +
+        `<span class="model-opt-name">CLI default</span>` +
+        `<span class="model-opt-note">whatever the CLI is set to</span>` +
+      `</button>` +
+      models.map(m => {
+        // An alias tracks the newest model in its family, so on its own it does
+        // not say which generation you are about to run. Name the model it
+        // points at right now; a pinned id already names itself.
+        const points = resolved[m] || '';
+        const note = points
+          ? `→ ${points}`
+          : (labels[m] || (/^[a-z]+$/.test(m) ? 'alias · always latest' : ''));
+        const why = points
+          ? `${m} is an alias — it currently runs ${points}, and will follow that family as it is updated.`
+          : '';
+        return (
+          `<button class="model-opt${m === current ? ' active' : ''}" data-value="${esc(m)}"` +
+            `${why ? ` title="${esc(why)}"` : ''}>` +
+            `<span class="model-opt-name">${esc(m)}</span>` +
+            `<span class="model-opt-note">${esc(note)}</span>` +
+          `</button>`
+        );
+      }).join('') +
+      (error ? `<div class="model-menu-error">${esc(error)}</div>` : '') +
+      `<div class="model-menu-custom">` +
+        `<input class="model-custom-input" placeholder="Other model…" spellcheck="false" ` +
+          `value="${esc(pending)}">` +
+        `<button class="btn btn-quiet btn-sm model-custom-apply" type="button">Set</button>` +
+      `</div>` +
+      catalogFootHtml(source, data);
+    positionModelMenu(menu, anchor);
+  };
 
-  positionModelMenu(menu, anchor);
-
+  // Bound to the menu itself rather than to what is inside it: the body is
+  // redrawn when the answer lands, and a listener on a button would go with
+  // the button it was bound to.
   const apply = (value) => {
     closeModelMenu();
     setModel(providerId, value);
   };
-
   menu.addEventListener('click', (e) => {
     const opt = e.target.closest('.model-opt');
     if (opt) { apply(opt.dataset.value); return; }
+    if (e.target.closest('.model-menu-refresh')) {
+      openModelMenu(anchor, providerId, true);
+      return;
+    }
     if (e.target.closest('.model-custom-apply')) {
       apply($('.model-custom-input', menu).value.trim());
     }
@@ -2092,10 +3182,53 @@ async function openModelMenu(anchor, providerId) {
     }
   });
 
+  // The list as it was last drawn, straight away. The request below is then a
+  // refresh of something already on screen rather than the thing being waited
+  // for — which is the whole difference from "Asking Antigravity…".
+  const known = refresh ? null : state.modelLists[key];
+  if (known) draw(known);
+  else {
+    menu.innerHTML =
+      `<div class="model-menu-head">${esc(who)} model</div>` +
+      `<div class="model-loading">Asking ${esc(who)}…</div>`;
+    positionModelMenu(menu, anchor);
+  }
+
   // Defer so the click that opened the menu doesn't immediately close it.
   setTimeout(() => {
     document.addEventListener('click', onDocClickCloseModel, { once: true });
   }, 0);
+
+  let data;
+  try {
+    data = await api(
+      `/api/models?provider=${encodeURIComponent(providerId)}` +
+      (refresh ? '&refresh=1' : '')
+    );
+    state.modelLists[key] = data;
+    rememberResolved(data.resolved);
+  } catch (err) {
+    data = { models: [], error: err.message, source: '' };
+  }
+  // The menu may have been closed, or another opened over it, while the
+  // request was in flight. Writing into a detached node would leave the click
+  // that opened it looking like it did nothing at all.
+  if (menu.isConnected) draw(data);
+}
+
+/** The footer both menus share: where the list came from, how old it is, and
+ *  the way to ask again. Refresh is the answer to a probe that was unlucky —
+ *  a signed-out CLI, a machine too busy to reply — which is otherwise stored
+ *  as nothing and re-asked on every open. */
+function catalogFootHtml(source, data) {
+  const provenance = [source, catalogAge(data)].filter(Boolean).join(' · ');
+  return (
+    `<div class="model-menu-foot">` +
+      `<span class="model-menu-source">${esc(provenance)}</span>` +
+      `<button class="btn btn-quiet btn-sm model-menu-refresh" type="button">` +
+        `Refresh</button>` +
+    `</div>`
+  );
 }
 
 function onDocClickCloseModel(e) {
@@ -2110,72 +3243,88 @@ function onDocClickCloseModel(e) {
  *  the same gesture on the same card, and a second set of styles would drift.
  *  No free-text entry here — an effort the CLI does not know is either ignored
  *  with a warning (Claude) or fatal (Codex), and neither is worth offering. */
-async function openEffortMenu(anchor, providerId) {
+async function openEffortMenu(anchor, providerId, refresh = false) {
   closeModelMenu();
   const provider = ((state.config || {}).providers || {})[providerId] || {};
   const current = provider.effort || '';
   const who = provider.label || providerId;
+  const key = catalogKey(providerId, true);
 
   const menu = document.createElement('div');
   menu.className = 'model-menu';
-  menu.innerHTML =
-    `<div class="model-menu-head">${esc(who)} reasoning effort</div>` +
-    `<div class="model-loading">Asking ${esc(who)}…</div>`;
   document.body.appendChild(menu);
-  positionModelMenu(menu, anchor);
 
-  let levels = [], fallback = '', source = '', error = '', model = '';
-  try {
-    const data = await api(`/api/efforts?provider=${encodeURIComponent(providerId)}`);
-    levels = data.levels || [];
-    fallback = data.default || '';
-    source = data.source || '';
-    error = data.error || '';
-    model = data.model || '';
-  } catch (err) {
-    error = err.message;
-  }
+  const draw = (data) => {
+    const levels = (data && data.levels) || [];
+    const fallback = (data && data.default) || '';
+    const error = (data && data.error) || '';
+    const model = (data && data.model) || '';
 
-  menu.innerHTML =
-    `<div class="model-menu-head">${esc(who)} reasoning effort` +
-      // Codex's levels differ per model, so name the one they belong to.
-      (model ? ` · ${esc(model)}` : '') +
-    `</div>` +
-    `<button class="model-opt${current ? '' : ' active'}" data-value="">` +
-      `<span class="model-opt-name">CLI default</span>` +
-      `<span class="model-opt-note">` +
-        `${fallback ? esc(fallback) : 'whatever the CLI is set to'}</span>` +
-    `</button>` +
-    levels.map(l =>
-      `<button class="model-opt${l.effort === current ? ' active' : ''}" ` +
-        `data-value="${esc(l.effort)}" title="${esc(l.description || '')}">` +
-        `<span class="model-opt-name">${esc(l.effort)}</span>` +
-        `<span class="model-opt-note">${esc(l.description || '')}</span>` +
-      `</button>`
-    ).join('') +
-    // A level set before the model changed, or typed into Settings by hand.
-    // Codex fails the run on one it does not recognise, so say so here rather
-    // than letting it surface as a launch error minutes into a task.
-    (current && levels.length && !levels.some(l => l.effort === current)
-      ? `<div class="model-menu-error">` +
-        `${esc(current)} is set but not offered here. It will be rejected at ` +
-        `launch — pick one above.</div>`
-      : '') +
-    (error ? `<div class="model-menu-error">${esc(error)}</div>` : '') +
-    (source ? `<div class="model-menu-source">${esc(source)}</div>` : '');
-
-  positionModelMenu(menu, anchor);
+    menu.innerHTML =
+      `<div class="model-menu-head">${esc(who)} reasoning effort` +
+        // Codex's levels differ per model, so name the one they belong to.
+        (model ? ` · ${esc(model)}` : '') +
+      `</div>` +
+      `<button class="model-opt${current ? '' : ' active'}" data-value="">` +
+        `<span class="model-opt-name">CLI default</span>` +
+        `<span class="model-opt-note">` +
+          `${fallback ? esc(fallback) : 'whatever the CLI is set to'}</span>` +
+      `</button>` +
+      levels.map(l =>
+        `<button class="model-opt${l.effort === current ? ' active' : ''}" ` +
+          `data-value="${esc(l.effort)}" title="${esc(l.description || '')}">` +
+          `<span class="model-opt-name">${esc(l.effort)}</span>` +
+          `<span class="model-opt-note">${esc(l.description || '')}</span>` +
+        `</button>`
+      ).join('') +
+      // A level set before the model changed, or typed into Settings by hand.
+      // Codex fails the run on one it does not recognise, so say so here rather
+      // than letting it surface as a launch error minutes into a task.
+      (current && levels.length && !levels.some(l => l.effort === current)
+        ? `<div class="model-menu-error">` +
+          `${esc(current)} is set but not offered here. It will be rejected at ` +
+          `launch — pick one above.</div>`
+        : '') +
+      (error ? `<div class="model-menu-error">${esc(error)}</div>` : '') +
+      catalogFootHtml((data && data.source) || '', data);
+    positionModelMenu(menu, anchor);
+  };
 
   menu.addEventListener('click', (e) => {
+    if (e.target.closest('.model-menu-refresh')) {
+      openEffortMenu(anchor, providerId, true);
+      return;
+    }
     const opt = e.target.closest('.model-opt');
     if (!opt) return;
     closeModelMenu();
     setEffort(providerId, opt.dataset.value);
   });
 
+  const known = refresh ? null : state.effortLists[key];
+  if (known) draw(known);
+  else {
+    menu.innerHTML =
+      `<div class="model-menu-head">${esc(who)} reasoning effort</div>` +
+      `<div class="model-loading">Asking ${esc(who)}…</div>`;
+    positionModelMenu(menu, anchor);
+  }
+
   setTimeout(() => {
     document.addEventListener('click', onDocClickCloseModel, { once: true });
   }, 0);
+
+  let data;
+  try {
+    data = await api(
+      `/api/efforts?provider=${encodeURIComponent(providerId)}` +
+      (refresh ? '&refresh=1' : '')
+    );
+    state.effortLists[key] = data;
+  } catch (err) {
+    data = { levels: [], error: err.message, source: '' };
+  }
+  if (menu.isConnected) draw(data);
 }
 
 async function setEffort(providerId, value) {
@@ -2188,39 +3337,71 @@ async function setEffort(providerId, value) {
   );
 }
 
-/** Everything about one council member, from one click on it. Each row opens
- *  the menu that already owns that setting rather than reimplementing it here:
- *  four settings, four existing menus, no fifth copy of the model list to drift
- *  out of step with the other one. */
-function openMemberMenu(anchor, providerId, { role = true, note = '' } = {}) {
+/** Everything about one seat, from one click on it. Each row opens the menu
+ *  that already owns that setting rather than reimplementing it here: four
+ *  settings, four existing menus, no fifth copy of the model list to drift out
+ *  of step with the other one. */
+function openMemberMenu(anchor, providerId, { note = '', seat = '', seatLabel = '' } = {}) {
   closeModelMenu();
+  const council = (state.config || {}).council || {};
   const provider = ((state.config || {}).providers || {})[providerId] || {};
   const agent = state.agents.find(a => a.id === agentOf(provider));
   const agentLabel = agent && (agent.command || []).length ? agent.label : 'custom command';
   const hasEffort = (provider.effort_args || []).length > 0;
 
-  // A project chair has no Role row. What it is told to do comes from the
-  // phase it is in — the architect designs in phase 1 and writes the README in
-  // phase 5 — so there is nothing for the Roles catalogue to override, and an
-  // entry that set one would be a setting the engine never reads.
-  const rows = [
+  // A council seat is not the same object as a project chair, and the first
+  // two rows differ because of it:
+  //
+  //  - "Seat" instead of "CLI". A council provider *is* its agent - the id is
+  //    `council_codex` - so rewriting its command to claude's would leave the
+  //    router seating a codex that runs claude. Which CLI sits here is a pin,
+  //    which the router honours and works around.
+  //  - "Behaviour" instead of "Role". A seat's lens comes from the persona the
+  //    router assigns it, held in `council.personas` and read straight off the
+  //    seating - the provider carries no behaviour at all. Wording is still
+  //    the Roles catalogue's.
+  //
+  // A project chair keeps neither: what it is told to do comes from the board.
+  const chair = seat === 'chair';
+  const pinned = (council.pins || {})[seat] || '';
+  const persona = (council.personas || {})[seat] || '';
+  const personaRole = (state.roles || []).find(r => r.id === persona);
+
+  const rows = seat ? [
+    ['seat', 'Seat', pinned ? `${agentLabel} — pinned` : `${agentLabel} — routed`],
+    ['model', 'Model', provider.model ? modelDetail(provider.model) : 'the CLI’s default'],
+    ...(hasEffort ? [['effort', 'Effort', provider.effort || 'the CLI’s default']] : []),
+    ...(chair ? [] : [['persona', 'Behaviour',
+      personaRole ? (personaRole.name || persona) : 'chosen per run']]),
+  ] : [
     ['agent', 'CLI', agentLabel],
     ['model', 'Model', provider.model ? modelDetail(provider.model) : 'the CLI’s default'],
     ...(hasEffort ? [['effort', 'Effort', provider.effort || 'the CLI’s default']] : []),
-    ...(role ? [['role', 'Role', provider.role || 'none']] : []),
   ];
+
+  const head = seat
+    ? `${seatLabel || (chair ? 'Chair' : 'Seat')} — ${provider.label || agentLabel}`
+    : (provider.label || providerId);
 
   const menu = document.createElement('div');
   menu.className = 'model-menu';
   menu.innerHTML =
-    `<div class="model-menu-head">${esc(provider.label || providerId)}</div>` +
+    `<div class="model-menu-head">${esc(head)}</div>` +
     rows.map(([key, label, value]) =>
       `<button class="model-opt" data-open="${key}">` +
         `<span class="model-opt-name">${esc(label)}</span>` +
         `<span class="model-opt-note">${esc(value)}</span>` +
       `</button>`
     ).join('') +
-    `<div class="model-menu-source">${esc(note || 'Applies to this stage only.')}</div>`;
+    `<div class="model-menu-source">` +
+      esc(note || (seat
+        ? (chair
+          ? 'The chair is the only seat that writes. Model and effort apply ' +
+            'wherever this CLI sits.'
+          : 'Pin a seat and the routing works around it. Model and effort ' +
+            'apply wherever this CLI sits.')
+        : 'Model and effort apply wherever this CLI sits.')) +
+    `</div>`;
   document.body.appendChild(menu);
   positionModelMenu(menu, anchor);
 
@@ -2228,9 +3409,10 @@ function openMemberMenu(anchor, providerId, { role = true, note = '' } = {}) {
     const opt = e.target.closest('[data-open]');
     if (!opt) return;
     closeModelMenu();
+    if (opt.dataset.open === 'seat') { openSeatMenu(anchor, seat); return; }
+    if (opt.dataset.open === 'persona') { openPersonaMenu(anchor, seat); return; }
     const open = {
-      agent: openAgentMenu, model: openModelMenu,
-      effort: openEffortMenu, role: openRoleMenu,
+      agent: openAgentMenu, model: openModelMenu, effort: openEffortMenu,
     }[opt.dataset.open];
     if (open) open(anchor, providerId);
   });
@@ -2240,46 +3422,67 @@ function openMemberMenu(anchor, providerId, { role = true, note = '' } = {}) {
   }, 0);
 }
 
-/** Role menu. The catalogue is the server's, the same one Settings edits, so
- *  a role written there is selectable here the moment it is saved. */
-function openRoleMenu(anchor, providerId) {
+/** Write one seat's pin or persona and re-seat.
+ *
+ *  "Auto" is stored as an empty string rather than by dropping the key. The
+ *  config is deep-merged on save — a key left out keeps whatever was there —
+ *  so unpinning by omission would silently do nothing at all. */
+async function patchSeat(field, seatId, value) {
+  if (!seatId) return;
+  await patchConfig({ council: { [field]: { [seatId]: value || '' } } });
+  await refreshSeating();
+}
+
+/** Which CLI holds a seat: the manual half of the routing.
+ *
+ *  This is the pin, not a command swap. Pinning is honoured whether or not the
+ *  routing is on, and the router fills the seats around it — so a bench can be
+ *  set by hand one seat at a time without switching the routing off wholesale.
+ *  Settings → Council still has the switch for freezing all of it. */
+function openSeatMenu(anchor, seatId) {
   closeModelMenu();
-  const provider = ((state.config || {}).providers || {})[providerId] || {};
-  const current = provider.role_template || '';
+  const council = (state.config || {}).council || {};
+  const current = (council.pins || {})[seatId] || '';
+  const manual = String(council.routing || 'auto') === 'manual';
+  const agents = connectedAgents();
 
   const menu = document.createElement('div');
   menu.className = 'model-menu';
   menu.innerHTML =
-    `<div class="model-menu-head">${esc(provider.label || providerId)} role</div>` +
-    (state.roles || []).map(r =>
-      `<button class="model-opt${r.id === current ? ' active' : ''}" ` +
-        `data-value="${esc(r.id)}" title="${esc(r.summary || '')}">` +
-        `<span class="model-opt-name">${esc(r.name || r.id)}</span>` +
-        `<span class="model-opt-note">${r.writes ? 'writes files' : 'read-only'}</span>` +
-      `</button>`
-    ).join('') +
+    `<div class="model-menu-head">` +
+      `${esc(seatId === 'chair' ? 'Chair' : `Seat ${seatId.replace('seat', '')}`)}` +
+    `</div>` +
+    `<button class="model-opt${current ? '' : ' active'}" data-value="">` +
+      `<span class="model-opt-name">Auto</span>` +
+      `<span class="model-opt-note">routed from the prompt</span>` +
+    `</button>` +
+    agents.map(a => {
+      const info = state.providers.find(x => x.id === `council_${a.id}`);
+      const available = !info || info.available;
+      return (
+        `<button class="model-opt${a.id === current ? ' active' : ''}" ` +
+          `data-value="${esc(a.id)}">` +
+          `<span class="model-opt-name">${esc(a.label)}</span>` +
+          `<span class="model-opt-note">` +
+            `${esc(available ? a.command[0] : `${a.command[0]} — not installed`)}` +
+          `</span>` +
+        `</button>`
+      );
+    }).join('') +
     `<div class="model-menu-source">` +
-      (provider.role_system
-        ? 'This stage has edited role text; picking one here replaces it.'
-        : 'Wording is editable in Settings → Roles.') +
+      (manual
+        ? 'The routing is off, so every seat is whatever you pin here.'
+        : 'A pinned seat is fixed; the rest are still routed around it.') +
     `</div>`;
   document.body.appendChild(menu);
   positionModelMenu(menu, anchor);
 
-  menu.addEventListener('click', async (e) => {
+  menu.addEventListener('click', (e) => {
     const opt = e.target.closest('.model-opt');
     if (!opt) return;
     closeModelMenu();
-    const role = (state.roles || []).find(r => r.id === opt.dataset.value);
-    if (!role || role.id === current) return;
-    const roleName = role.name || role.id;
-    // `role_system` blank means "use the template", so it is cleared with the
-    // swap — otherwise the old role's edited text would be sent under the new
-    // role's name, which is the one combination that reads as neither.
-    await patchConfig({ providers: { [providerId]: {
-      role_template: role.id, role: roleName, role_system: '',
-    } } });
-    toast(`${provider.label || providerId} → ${roleName}`, 'ok', 2600);
+    if (opt.dataset.value === current) return;
+    patchSeat('pins', seatId, opt.dataset.value);
   });
 
   setTimeout(() => {
@@ -2287,7 +3490,90 @@ function openRoleMenu(anchor, providerId) {
   }, 0);
 }
 
-/** The gear beside the composer: the two options that get changed per run.
+/** The behaviours a member seat can be given, council lenses first.
+ *
+ *  `council` is set on the shipped catalogue entries: true for a lens that
+ *  composes onto a council stage, false for a standalone role that carries its
+ *  own output contract. A role the operator wrote has neither flag and is
+ *  listed after the lenses without comment — the app does not know which it
+ *  is, and guessing is worse than saying nothing. */
+function seatBehaviours() {
+  const roles = (state.roles || []).filter(r => r.id !== 'chairman');
+  return [...roles.filter(r => r.council), ...roles.filter(r => !r.council)];
+}
+
+/** The one line under a behaviour's name: the mismatch first if there is one,
+ *  otherwise what the behaviour is for. */
+function behaviourNote(r) {
+  if (r.writes) return 'expects to write — this seat cannot';
+  if (r.builtin && !r.council) return 'standalone contract — competes with the stage’s';
+  return r.summary || 'read-only';
+}
+
+/** What a seat is told to be. The list is the Roles catalogue, so a behaviour
+ *  written in Settings → Roles is selectable here the moment it is saved —
+ *  the wording lives in one place and this only chooses between them.
+ *
+ *  The chairman is not offered: it is what the third stage *is*, not a lens a
+ *  member can wear. A behaviour that expects to write says so, because a
+ *  member seat is read-only whatever it is told — the same mismatch Settings
+ *  warns about, reported before it is chosen rather than after.
+ *
+ *  Council lenses come first because they are the ones that compose: a lens
+ *  says what to look at and leaves the reply's shape to the stage. A
+ *  standalone role brings an output contract of its own, and a seat holding
+ *  two contracts answers to neither — still selectable, because the operator
+ *  may want exactly that, but said out loud on the option rather than
+ *  discovered in the transcript. */
+function openPersonaMenu(anchor, seatId) {
+  closeModelMenu();
+  const council = (state.config || {}).council || {};
+  const current = (council.personas || {})[seatId] || '';
+
+  const menu = document.createElement('div');
+  menu.className = 'model-menu';
+  menu.innerHTML =
+    `<div class="model-menu-head">` +
+      `Seat ${esc(seatId.replace('seat', ''))} behaviour` +
+    `</div>` +
+    `<button class="model-opt${current ? '' : ' active'}" data-value="">` +
+      `<span class="model-opt-name">Auto</span>` +
+      `<span class="model-opt-note">a lens the task calls for</span>` +
+    `</button>` +
+    seatBehaviours().map(r =>
+      `<button class="model-opt${r.id === current ? ' active' : ''}" ` +
+        `data-value="${esc(r.id)}" title="${esc(r.summary || '')}">` +
+        `<span class="model-opt-name">${esc(r.name || r.id)}</span>` +
+        `<span class="model-opt-note">${esc(behaviourNote(r))}</span>` +
+      `</button>`
+    ).join('') +
+    `<div class="model-menu-source">` +
+      'Wording is editable in Settings → Roles.' +
+    `</div>`;
+  document.body.appendChild(menu);
+  positionModelMenu(menu, anchor);
+
+  menu.addEventListener('click', (e) => {
+    const opt = e.target.closest('.model-opt');
+    if (!opt) return;
+    closeModelMenu();
+    if (opt.dataset.value === current) return;
+    patchSeat('personas', seatId, opt.dataset.value);
+  });
+
+  setTimeout(() => {
+    document.addEventListener('click', onDocClickCloseModel, { once: true });
+  }, 0);
+}
+
+// The per-provider Role menu is gone with the fixed Stage 1 / Stage 2 pair
+// it belonged to. A council seat's behaviour is its persona, chosen on the
+// seat itself (`openPersonaMenu`) and stored against the seat rather than
+// against the CLI - the same CLI can sit in two seats with two lenses. The
+// wording is still edited in one place: Settings -> Roles.
+
+/** The gear beside the composer, or at the head of Project: the options that
+ *  get changed per mode.
  *  The rest are a click further on, in Settings, because they are decisions
  *  about the project rather than about the message being sent. */
 function openGearMenu(anchor) {
@@ -2296,7 +3582,11 @@ function openGearMenu(anchor) {
   // Both apply in both modes. Zero-Touch means the same thing either way —
   // the CLI gets its auto-approve flags — it is just that Council can also be
   // granted that at the gate, and Chat, having no gate, cannot.
-  const chat = uiMode() === 'solo';
+  const mode = uiMode();
+  const project = mode === 'project';
+  const chat = mode === 'solo';
+  const cavemanMode = project ? 'project' : (chat ? 'chat' : 'council');
+  const efficiencyMode = project ? 'project' : (chat ? 'chat' : 'council');
 
   const row = (key, label, on, danger) =>
     `<button class="menu-toggle${on ? ' on' : ''}${danger ? ' danger' : ''}" ` +
@@ -2306,15 +3596,29 @@ function openGearMenu(anchor) {
   const menu = document.createElement('div');
   menu.className = 'model-menu gear-menu';
   menu.innerHTML =
-    row('zero_touch', 'Zero-Touch mode', !!c.zero_touch, true) +
-    row('pull_request_mode', 'Pull request mode', !!c.pull_request_mode, false) +
+    (project ? '' : row('zero_touch', 'Zero-Touch mode', !!c.zero_touch, true)) +
+    row('caveman', 'Caveman mode', cavemanOn(cavemanMode), false) +
+    row('efficiency', 'Efficiency mode', efficiencyOn(efficiencyMode), false) +
+    // Chat only. Council already asks several agents and then weighs what
+    // came back; this asks them and weighs nothing, which is only a separate
+    // thing to want where there is one agent to begin with.
+    (chat ? row('multi_agent', 'Multi-agent answer', !!c.multi_agent, false) : '') +
+    (project ? '' :
+      row('pull_request_mode', 'Pull request mode', !!c.pull_request_mode, false)) +
+    // Council only: Chat has one agent and no bench to show. It is a display
+    // choice rather than a permission, so unlike the two above it is applied
+    // here directly - there is no confirmation for it to bypass.
+    (chat || project ? '' :
+      row('show_seats', 'Show the council seats', seatsShown(), false)) +
     `<hr>` +
     `<button class="model-opt" data-open="settings">` +
       `<span class="model-opt-name">More…</span>` +
       `<span class="model-opt-note">Settings</span>` +
     `</button>` +
     `<div class="model-menu-source">` +
-      (chat
+      (project
+        ? 'Applies to the Architect, Developer and QA prompts in Projects.'
+        : chat
         ? (c.zero_touch
           ? 'Chat can change files in the working folder.'
           : 'Chat is read-only. Zero-Touch is the only way to let it write, ' +
@@ -2327,12 +3631,37 @@ function openGearMenu(anchor) {
   menu.addEventListener('click', (e) => {
     if (e.target.closest('[data-open="settings"]')) {
       closeModelMenu();
-      $('#settings-btn').click();
+      openSettings(project ? 'run' : 'agents');
       return;
     }
     const btn = e.target.closest('[data-toggle]');
     if (!btn || btn.disabled) return;
     closeModelMenu();
+    if (btn.dataset.toggle === 'caveman') {
+      patchConfig({ caveman: { [cavemanMode]: !cavemanOn(cavemanMode) } });
+      return;
+    }
+    if (btn.dataset.toggle === 'multi_agent') {
+      patchConfig({ multi_agent: !c.multi_agent });
+      return;
+    }
+    if (btn.dataset.toggle === 'efficiency') {
+      patchConfig({
+        efficiency: {
+          [efficiencyMode]: !efficiencyOn(efficiencyMode),
+        },
+      });
+      return;
+    }
+    if (btn.dataset.toggle === 'show_seats') {
+      const show = !seatsShown();
+      // `patchConfig` re-renders, so the strip appears or goes on its own.
+      // The one thing it cannot do is fill a bench that was never asked for:
+      // switched off, the routing preview is skipped.
+      patchConfig({ council: { show_seats: show } })
+        .then(() => { if (show && !activeSeating()) refreshSeating(); });
+      return;
+    }
     // Routed through the real checkbox so the confirmations live in one place:
     // the gear must not be a second, quieter way to switch Zero-Touch on.
     const box = $(btn.dataset.toggle === 'zero_touch' ? '#zero-touch' : '#pull-request-mode');
@@ -2360,7 +3689,7 @@ function openAgentMenu(anchor, providerId) {
     // "Custom command" is what a hand-edited template reads back as, not
     // something this menu can apply: there is no preset behind it. Writing one
     // stays in Settings, where the command itself is.
-    state.agents.filter(a => (a.command || []).length).map(a =>
+    connectedAgents().map(a =>
       `<button class="model-opt${a.id === current ? ' active' : ''}" ` +
         `data-value="${esc(a.id)}">` +
         `<span class="model-opt-name">${esc(a.label)}</span>` +
@@ -2401,17 +3730,20 @@ async function setAgent(providerId, agentId) {
   const now = ((state.config || {}).providers || {})[providerId] || {};
   toast(`${provider.label || providerId} → ${now.label || agentId}`, 'ok', 2600);
   api('/api/usage/refresh', { method: 'POST' })
-    .then(d => { state.usage = d.usage || {}; renderStrip(); })
+    .then(d => { state.usage = d.usage || {}; renderStrip(); renderUsageButton(); })
     .catch(() => {});
 }
 
 async function setModel(providerId, value) {
   const providers = (state.config || {}).providers || {};
   const provider = providers[providerId] || {};
-  // Remember a hand-typed model so it appears in the list next time.
+  // Remember a hand-typed model so it appears in the list next time — and only
+  // that. One the CLI reported is already offered on its own, and saving a
+  // copy beside the list would grow the config on every choice.
   const models = provider.models || [];
+  const known = (state.modelLists[catalogKey(providerId)] || {}).models || [];
   const patch = { providers: { [providerId]: { model: value } } };
-  if (value && !models.includes(value)) {
+  if (value && !models.includes(value) && !known.includes(value)) {
     patch.providers[providerId].models = [...models, value];
   }
   await patchConfig(patch);
@@ -2463,7 +3795,15 @@ async function dropUnsupportedEffort(providerId, provider) {
    ========================================================================== */
 
 function openModal(id) { $(`#${id}`).classList.remove('hidden'); }
-function closeModal(id) { $(`#${id}`).classList.add('hidden'); }
+function closeModal(id) {
+  $(`#${id}`).classList.add('hidden');
+  // Settings is the one dialog reached from a button rather than a row that
+  // has just been replaced, so it is the one that has somewhere to go back to.
+  if (id === 'settings' && settingsOpener && settingsOpener.isConnected) {
+    settingsOpener.focus();
+    settingsOpener = null;
+  }
+}
 
 /* ---- Directory picker ---- */
 
@@ -2518,6 +3858,9 @@ async function selectWorkspace(path) {
       method: 'POST',
       body: { workspace: status.path },
     });
+    if ((workspacePath() || state.scratchWorkspace) !== status.path) {
+      startFreshChat();
+    }
     state.config = config;
     state.workspaceStatus = status;
     renderAll();
@@ -2545,6 +3888,9 @@ async function clearWorkspace() {
       method: 'POST',
       body: { workspace: '' },
     });
+    if ((workspacePath() || state.scratchWorkspace) !== state.scratchWorkspace) {
+      startFreshChat();
+    }
     state.config = config;
     state.workspaceStatus = null;
     renderAll();
@@ -2560,12 +3906,381 @@ async function clearWorkspace() {
 /* ---- Settings ---- */
 
 /** Own selectors, not the output pane's `.tab`: that click handler is bound
- *  document-wide at boot and would fire on these too. */
+ *  document-wide at boot and would fire on these too. `hidden` and
+ *  `aria-selected` move with the class so a screen reader and the roving
+ *  tabstop describe the same panel the eye is on. */
 function switchSettingsTab(name) {
-  $$('.settings-tab').forEach(t =>
-    t.classList.toggle('active', t.dataset.settingsTab === name));
-  $$('.settings-panel').forEach(p =>
-    p.classList.toggle('active', p.dataset.settingsPanel === name));
+  const tabs = $$('.settings-tab');
+  // An unknown destination would otherwise hide every panel and open blank.
+  const wanted = tabs.some(t => t.dataset.settingsTab === name)
+    ? name : tabs[0].dataset.settingsTab;
+  tabs.forEach(t => {
+    const on = t.dataset.settingsTab === wanted;
+    t.classList.toggle('active', on);
+    t.setAttribute('aria-selected', on ? 'true' : 'false');
+    if (on) t.removeAttribute('tabindex'); else t.tabIndex = -1;
+  });
+  $$('.settings-panel').forEach(p => {
+    const on = p.dataset.settingsPanel === wanted;
+    p.classList.toggle('active', on);
+    p.hidden = !on;
+  });
+}
+
+/* --------------------------------------------------------------------------
+   Agent connections
+   --------------------------------------------------------------------------
+   Adding an agent, installing its CLI and signing it in, without leaving the
+   app. Three separate facts per card and never collapsed into one badge:
+   *added* is the operator's answer and the only one that seats anything,
+   *installed* is whether the binary resolves, and *signed in* is what the
+   vendor's own status command says. A setup screen that reports "ready"
+   because `--version` worked is the failure this shape exists to avoid.
+
+   Nothing here handles a credential. Install and Sign in run the vendor's own
+   commands on a terminal the server owns, and the token they produce is
+   written by that CLI into that vendor's config directory.
+   -------------------------------------------------------------------------- */
+
+/** What `/api/agents` last reported, keyed by agent id. Empty until it lands,
+ *  which is why every card renders from `state.agents` first. */
+let agentStatus = {};
+
+function renderAgentConnections() {
+  const host = $('#agent-connections');
+  if (!host) return;
+  const cards = (state.agents || []).filter(a => (a.command || []).length);
+
+  host.innerHTML = cards.map(a => {
+    const info = agentStatus[a.id] || {};
+    const setup = a.setup || {};
+    const known = Object.keys(info).length > 0;
+    const added = info.selected !== undefined ? info.selected : a.selected;
+    const installed = info.installed;
+    // Three-valued on purpose: `null` is "could not be asked", which is what
+    // Antigravity always answers, and rendering that as a cross would claim
+    // the CLI is signed out when nothing knows either way.
+    const signedIn = info.signed_in;
+
+    const cardState =
+      !added ? 'off' : (!known ? 'checking' : (!installed ? 'missing' : 'on'));
+    const label =
+      !added ? 'Not added'
+      : !known ? 'Checking…'
+      : !installed ? 'CLI not installed'
+      : signedIn === true ? 'Signed in'
+      : signedIn === false ? 'Not signed in'
+      : 'CLI found';
+
+    return (
+      `<article class="agent-conn" data-agent="${esc(a.id)}" data-state="${cardState}">` +
+        `<div class="agent-conn-head">` +
+          `<b>${esc(a.label)}</b>` +
+          `<span class="agent-conn-state">${esc(label)}</span>` +
+        `</div>` +
+        `<p class="agent-conn-note">` +
+          (info.detail ? esc(info.detail) + ' · ' : '') +
+          `Uses ${esc(setup.account || 'your own account')}, through ` +
+          `<code>${esc((a.command || [])[0] || a.id)}</code>.` +
+        `</p>` +
+        `<div class="agent-conn-actions">` +
+          `<button class="btn btn-sm ${added ? 'btn-quiet' : 'btn-primary'}" ` +
+            `data-agent-toggle="${esc(a.id)}">${added ? 'Remove' : 'Add'}</button>` +
+          (added && known && !installed
+            ? `<button class="btn btn-quiet btn-sm" data-agent-setup="install" ` +
+              `data-agent="${esc(a.id)}">Install the CLI</button>`
+            : '') +
+          (added && known && installed && signedIn !== true
+            ? (setup.login_tui
+                // No pane pretends to draw a full-screen session. What it can
+                // do is say exactly what to type, which is what a README would
+                // have said anyway.
+                ? `<button class="btn btn-quiet btn-sm" data-agent-copy=` +
+                  `"${esc(setup.login_hint)}">Copy the sign-in command</button>`
+                : `<button class="btn btn-quiet btn-sm" data-agent-setup="login" ` +
+                  `data-agent="${esc(a.id)}">Sign in</button>`)
+            : '') +
+          // No model button here. The card answers whether this CLI is added,
+          // installed and signed in; which model it runs is asked for once, on
+          // its own card under "How each CLI is run" directly below, and two
+          // ways to set one setting is one more than it needs.
+        `</div>` +
+      `</article>`
+    );
+  }).join('') || `<p class="settings-note">No agents are catalogued.</p>`;
+}
+
+async function refreshAgents() {
+  try {
+    const data = await api('/api/agents');
+    agentStatus = {};
+    (data.agents || []).forEach(a => { agentStatus[a.id] = a; });
+    renderAgentConnections();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+/** Add or remove one CLI. The server moves any chair that was holding a
+ *  removed agent, so the whole config comes back rather than one key. */
+async function toggleAgent(id, selected) {
+  try {
+    const data = await api('/api/agents/select', {
+      method: 'POST', body: { agent: id, selected },
+    });
+    const moved = Object.keys(data.moved || {});
+    await loadState();
+    renderSettings();
+    renderAgentConnections();
+    refreshAgents();
+    if (moved.length) {
+      toast(`Reassigned ${moved.join(', ')} to another agent.`, 'info');
+    }
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+/* -- the setup session ---------------------------------------------------- */
+
+let setupTimer = null;
+
+async function startAgentSetup(id, action) {
+  const agent = (state.agents || []).find(a => a.id === id) || {};
+  $('#agent-setup-title').textContent =
+    `${action === 'install' ? 'Installing' : 'Signing in to'} ${agent.label || id}`;
+  $('#agent-setup-note').textContent = action === 'install'
+    ? 'Runs the bundled installer, which fetches the vendor’s own install ' +
+      'script. Nothing is installed system-wide and no password is needed.'
+    : 'Runs the vendor’s own sign-in command. Your account details go to them, ' +
+      'not to this app — it never sees the token that comes back.';
+  $('#agent-setup-output').textContent = '';
+  $('#agent-setup-url').classList.add('hidden');
+  $('#agent-setup-input').value = '';
+  openModal('agent-setup');
+  try {
+    const data = await api('/api/agents/setup', {
+      method: 'POST', body: { agent: id, action },
+    });
+    renderSetupSession(data.session || {});
+    pollAgentSetup();
+  } catch (err) {
+    closeModal('agent-setup');
+    toast(err.message, 'error', 9000);
+  }
+}
+
+function renderSetupSession(session) {
+  const out = $('#agent-setup-output');
+  const wasAtEnd = out.scrollTop + out.clientHeight >= out.scrollHeight - 24;
+  out.textContent = session.output || '';
+  if (wasAtEnd) out.scrollTop = out.scrollHeight;
+  const link = $('#agent-setup-url');
+  // The URL is the one line of a sign-in that has to be acted on, and it is
+  // rarely the last one printed — so it is lifted out of the scrollback.
+  link.classList.toggle('hidden', !session.url);
+  if (session.url) link.href = session.url;
+  $('#agent-setup-cancel').disabled = !session.running;
+  $('#agent-setup-input').disabled = !session.running;
+}
+
+function pollAgentSetup() {
+  clearTimeout(setupTimer);
+  setupTimer = setTimeout(async () => {
+    if ($('#agent-setup').classList.contains('hidden')) return;
+    try {
+      const data = await api('/api/agents/setup');
+      const session = data.session || {};
+      renderSetupSession(session);
+      if (session.running) return pollAgentSetup();
+      // Finished: what changed is on the far side of a subprocess, so ask
+      // rather than assume it worked.
+      refreshAgents();
+      refreshDoctor();
+      toast(
+        session.exit_code === 0
+          ? 'Setup finished. Re-checking the agent…'
+          : `Setup exited with status ${session.exit_code}.`,
+        session.exit_code === 0 ? 'ok' : 'error'
+      );
+    } catch (err) {
+      toast(err.message, 'error');
+    }
+  }, 1200);
+}
+
+/** Whatever opened the dialog, so closing it puts the keyboard back there
+ *  rather than at the top of the document. */
+let settingsOpener = null;
+
+function openSettings(tab = 'agents') {
+  // Reached from the composer gear as well as the button, and that menu has
+  // already closed by now — so the button is the fallback, not the body.
+  const from = document.activeElement;
+  settingsOpener = from && from !== document.body ? from : $('#settings-btn');
+  renderSettings();
+  renderRoleList();
+  renderHistoryCounts();
+  switchSettingsTab(tab);
+  openModal('settings');
+  $('.settings-tab.active').focus();
+  // Both of these shell out once per agent, so they are slower than the dialog
+  // needs to be: show the settings, fill the reports in when they land.
+  renderAgentConnections();
+  refreshAgents();
+  refreshDoctor(true);
+}
+
+/** Writing modes are scoped to 'council', 'chat' or 'project'. Each mode gets
+ *  its own switches because what brevity costs differs — a Chat answer is read
+ *  and discarded, a council deliberation is the record of a change. */
+function cavemanOn(mode) {
+  return !!((state.config || {}).caveman || {})[mode];
+}
+
+/** Concise normal prose, independently selectable for every app mode. */
+function efficiencyOn(mode) {
+  return !!((state.config || {}).efficiency || {})[mode];
+}
+
+/** The options for a card's model box: everything the CLI reported, then
+ *  anything configured that it did not, then the saved value if it is in
+ *  neither — a model chosen before the catalogue was fetched must not be
+ *  dropped by the form that shows it. Blank first, because "whatever the CLI
+ *  is set to" is a real answer and the one a fresh install gives. */
+function modelOptionsHtml(providerId, provider) {
+  const listed = (state.modelLists[catalogKey(providerId)] || {}).models || [];
+  const models = listed.concat(
+    (provider.models || []).filter(m => !listed.includes(m))
+  );
+  const current = provider.model || '';
+  if (current && !models.includes(current)) models.push(current);
+  return (
+    `<option value=""${current ? '' : ' selected'}>the CLI's default</option>` +
+    models.map(m =>
+      `<option value="${esc(m)}"${m === current ? ' selected' : ''}>` +
+        `${esc(modelDetail(m))}</option>`
+    ).join('')
+  );
+}
+
+/** Ask each CLI what it can run, once, and refill its box in place.
+ *
+ *  The panel paints from whatever the pickers last cached, which on a fresh
+ *  load is nothing — a list is only ever fetched when something asks for it.
+ *  So the boxes go up immediately with the CLI default and what is saved, and
+ *  the account-scoped list lands underneath them a moment later. Nothing is
+ *  catalogued here: the models are the CLI's to name. */
+function hydrateModelSelects() {
+  const asked = new Set();
+  $$('.provider-form select[data-field="model"]').forEach(select => {
+    const providerId = select.closest('.provider-form').dataset.provider;
+    const key = catalogKey(providerId);
+    // An empty answer is not one worth keeping: a CLI that was signed out when
+    // it was asked has a list once it is not, so a catalogue with nothing in
+    // it is asked for again the next time the panel opens.
+    const cached = state.modelLists[key];
+    if (asked.has(key) || (cached && (cached.models || []).length)) return;
+    asked.add(key);
+    api(`/api/models?provider=${encodeURIComponent(providerId)}`)
+      .then(data => {
+        state.modelLists[key] = data;
+        rememberResolved(data.resolved);
+        redrawModelSelects(key);
+      })
+      // A box that already offers the CLI default and the saved model is not
+      // worth a toast for; the command line below says which binary failed.
+      .catch(() => {});
+  });
+}
+
+/** Repaint the boxes fed by one CLI's catalogue, keeping a choice made while
+ *  the request was in flight — the list arriving is not a reason to undo it. */
+function redrawModelSelects(key) {
+  const providers = (state.config || {}).providers || {};
+  $$('.provider-form select[data-field="model"]').forEach(select => {
+    const form = select.closest('.provider-form');
+    const providerId = form.dataset.provider;
+    if (catalogKey(providerId) !== key) return;
+    const chosen = select.value;
+    select.innerHTML = modelOptionsHtml(
+      providerId, { ...(providers[providerId] || {}), model: chosen }
+    );
+    select.value = chosen;
+  });
+}
+
+/** The options for a card's reasoning-effort box, the same argument as the
+ *  model list beside it: an effort typed by hand is a guess, and the CLI knows
+ *  the answer. Which levels are legal depends on the model, so the list is
+ *  asked for per model - `model` here is the one in the form, which may not be
+ *  the saved one yet.
+ *
+ *  A configured level the CLI does not offer is kept and labelled rather than
+ *  dropped: opening Settings must not silently rewrite a setting, and Codex
+ *  rejects an unknown level at launch, so it is worth saying so here. */
+function effortOptionsHtml(providerId, provider, model) {
+  const data = state.effortLists[catalogKey(providerId, true, model)];
+  const levels = (data && data.levels) || [];
+  const fallback = (data && data.default) || '';
+  const current = provider.effort || '';
+  const offered = levels.some(l => l.effort === current);
+  return (
+    `<option value=""${current ? '' : ' selected'}>` +
+      `the CLI's default${fallback ? ` — ${esc(fallback)}` : ''}</option>` +
+    levels.map(l =>
+      `<option value="${esc(l.effort)}"` +
+        `${l.effort === current ? ' selected' : ''}>${esc(l.effort)}` +
+        `${l.description ? ` — ${esc(l.description)}` : ''}</option>`
+    ).join('') +
+    (current && !offered
+      ? `<option value="${esc(current)}" selected>${esc(current)}` +
+          `${levels.length ? ' — not offered for this model' : ''}</option>`
+      : '')
+  );
+}
+
+/** Refill one effort box from the levels its CLI reports for the model the
+ *  form is currently showing, asking for them if they have not been asked for.
+ *
+ *  Unlike the model list, an empty answer is kept: `agy` refuses `--effort`
+ *  beside a model whose name already carries the level, and asking again on
+ *  every repaint would be asking a question already answered. */
+function hydrateEffortSelect(select) {
+  const form = select.closest('.provider-form');
+  const providerId = form.dataset.provider;
+  const saved = ((state.config || {}).providers || {})[providerId] || {};
+  const model = ($('[data-field="model"]', form) || {}).value || '';
+  const key = catalogKey(providerId, true, model);
+
+  const draw = () => {
+    const chosen = select.value;
+    select.innerHTML = effortOptionsHtml(
+      providerId, { ...saved, effort: chosen }, model
+    );
+    select.value = chosen;
+  };
+
+  draw();
+  if (state.effortLists[key]) return;
+  api(`/api/efforts?provider=${encodeURIComponent(providerId)}` +
+      `&for_model=1&model=${encodeURIComponent(model)}`)
+    .then(data => {
+      state.effortLists[key] = data;
+      // The panel may have been closed, or the model changed again while this
+      // was in flight - either way these levels are no longer the ones this
+      // box is asking about.
+      if (!select.isConnected) return;
+      if ((($('[data-field="model"]', form) || {}).value || '') !== model) return;
+      draw();
+    })
+    // As with the model boxes: one that already offers the CLI default and
+    // what is saved is not worth a toast.
+    .catch(() => {});
+}
+
+function hydrateEffortSelects() {
+  $$('.provider-form select[data-field="effort"]').forEach(hydrateEffortSelect);
 }
 
 function renderSettings() {
@@ -2577,15 +4292,28 @@ function renderSettings() {
   // half of the form each one gets, because what a chair is *told to do*
   // arrives differently in each of the three:
   //
-  //   stage    a council stage is assigned a role here;
+  //   seat     a council CLI. It is told what to be by the persona its seat
+  //            carries, which is routed per run and pinned in the Council
+  //            panel - so there is no role box here. What is here is the CLI
+  //            itself: its command, model, effort and ceiling, wherever it
+  //            ends up sitting.
   //   chat     the assistant gets only a behaviour the operator typed, and
   //            picks its agent from its own card rather than from this panel;
   //   project  a project chair gets neither - its instruction comes from the
   //            phase it is in, so a role box here would be a setting nothing
   //            reads.
+  //
+  // There is no Stage 1 / Stage 2 pair any more. `drafter` and `polisher`
+  // survive in the config so archived transcripts still render, but they are
+  // not chairs anybody sits in, and a form for them would be one that decided
+  // nothing about the next run.
   const FORMS = [
-    { id: 'drafter', num: 'Stage 1', kind: 'stage' },
-    { id: 'polisher', num: 'Stage 2', kind: 'stage' },
+    // One card per CLI, not per chair. It is labelled "Agent" rather than
+    // "Council" because two things read it now: the council when it seats
+    // this CLI, and Chat's multi-agent answer when it asks every CLI at once.
+    ...connectedAgents().map(a => ({
+      id: `council_${a.id}`, num: 'Agent', kind: 'seat', name: a.label,
+    })),
     { id: 'solo', num: 'Chat', kind: 'chat' },
     { id: 'architect', num: 'Project', kind: 'project', name: 'Architect' },
     { id: 'coder', num: 'Project', kind: 'project', name: 'Developer' },
@@ -2593,76 +4321,74 @@ function renderSettings() {
   ];
 
   host.innerHTML = FORMS.map(({ id, num, kind, name }) => {
-    const council = kind === 'stage';
     const p = providers[id] || {};
-    const info = state.providers.find(x => x.id === id);
-    const probeHtml = info
-      ? `<span class="probe ${info.available ? 'ok' : 'miss'}">` +
-        `${info.available ? 'found' : 'not found'}</span>`
-      : '';
+    // Filled by `renderProbeBadges` when the probe lands, which is after this
+    // panel is on screen.
+    const probeHtml = `<span class="probe" data-probe="${id}"></span>`;
     return (
       `<div class="provider-form" data-provider="${id}" data-kind="${kind}">` +
         `<h4><span class="stage-num">${esc(num)}</span> ` +
-          `${esc(name || p.role || (council ? id : 'Assistant'))} ${probeHtml}</h4>` +
+          `${esc(name || p.label || 'Assistant')} ${probeHtml}</h4>` +
         (kind === 'project'
           ? `<p class="settings-note">` +
-              `Its agent, model and reasoning depth are set in the Projects ` +
-              `tab's matrix. There is no role to choose: what this chair is ` +
+              `Its agent is set in the Projects tab's matrix; the model and ` +
+              `reasoning depth are that CLI's own, shared with every other ` +
+              `place it sits. There is no role to choose: what this chair is ` +
               `told to do comes from the phase it is in.</p>`
           : '') +
-        (council
+        (kind === 'seat'
+          ? `<p class="settings-note">` +
+              `How this CLI runs wherever it is used: whenever the council ` +
+              `seats it, whenever Chat's <b>Multi-agent answer</b> asks every ` +
+              `agent at once, and whenever it holds a project chair. The ` +
+              `model and reasoning depth below are the CLI's own and are ` +
+              `shared by all three. Which council seat it holds, ` +
+              `and what it is told to be, are decided per run &mdash; pin ` +
+              `either on the <b>Council</b> tab or on the bench above the ` +
+              `composer. Members are read-only; only the chair writes.</p>`
+          : '') +
+        // Nobody picks an agent here. Chat's is the chip on its card, a
+        // project chair's is its tile in the matrix, and a council seat's card
+        // *is* one CLI — rewriting `council_codex` to run claude would leave
+        // the router seating a codex that is not one. Two places to pick it
+        // would be two apparent sources of truth, and the modal is the slower.
+        `<div class="field">` +
+          `<label>Display name ` +
+            (kind === 'seat'
+              ? `<span class="field-hint">— what this CLI is called on the ` +
+                `bench</span>`
+              : `<span class="field-hint">— the agent itself is picked on ` +
+                `${kind === 'project' ? "the Projects tab" : 'the Assistant card'}` +
+                `</span>`) +
+            `</label>` +
+          `<input type="text" data-field="label" value="${esc(p.label || '')}">` +
+        `</div>` +
+        // The default model for this agent, on the card rather than folded
+        // away with the command line: it is the setting an operator comes to
+        // this panel to change, and a multi-agent Chat answer is three CLIs
+        // running exactly what is typed here.
+        (kind === 'seat'
           ? `<div class="field-row">` +
               `<div class="field">` +
-                `<label>Agent ` +
-                  `<span class="field-hint">— swaps command and flags</span></label>` +
-                `<select data-field="agent">` +
-                  state.agents.map(a =>
-                    `<option value="${esc(a.id)}"` +
-                    `${a.id === agentOf(p) ? ' selected' : ''}>${esc(a.label)}</option>`
-                  ).join('') +
-                `</select>` +
+                `<label>Default model ` +
+                  `<span class="field-hint">— what this CLI reports it can ` +
+                  `run for your account</span>` +
+                  `</label>` +
+                `<select data-field="model">${modelOptionsHtml(id, p)}</select>` +
               `</div>` +
               `<div class="field">` +
-                `<label>Display name</label>` +
-                `<input type="text" data-field="label" value="${esc(p.label || '')}">` +
+                `<label>Reasoning effort ` +
+                  `<span class="field-hint">— blank uses the CLI's own</span>` +
+                  `</label>` +
+                `<select data-field="effort">` +
+                  `${effortOptionsHtml(id, p, p.model || '')}</select>` +
               `</div>` +
             `</div>`
-          // Chat's agent is the chip on its card, and a project chair's is its
-          // tile in the matrix. Two places to pick it would be two apparent
-          // sources of truth, and the modal is the slower one.
-          : `<div class="field">` +
-              `<label>Display name ` +
-                `<span class="field-hint">— the agent itself is picked on ` +
-                `${kind === 'project' ? "the Projects tab" : 'the Assistant card'}` +
-                `</span></label>` +
-              `<input type="text" data-field="label" value="${esc(p.label || '')}">` +
-            `</div>`) +
-        (council
-          ? `<div class="field">` +
-              `<label>Role — what this stage is told to do` +
-                `<span class="field-hint"> — the shipped text is a starting point</span>` +
-              `</label>` +
-              `<select data-field="role_template">` +
-                (state.roles || []).map(r =>
-                  `<option value="${esc(r.id)}"${r.id === (p.role_template || '') ? ' selected' : ''}>` +
-                    `${esc(r.name)} — ${esc(r.summary)}</option>`
-                ).join('') +
-              `</select>` +
-            `</div>` +
-            `<div class="field">` +
-              `<label>Behaviour ` +
-                `<button class="link-btn" type="button" data-reset-role="${id}">` +
-                  `reset to the template</button>` +
-              `</label>` +
-              `<textarea rows="5" class="role-system" data-field="role_system" ` +
-                `placeholder="Using the template above. Type here to override it.">` +
-                `${esc(p.role_system || '')}</textarea>` +
-              `<span class="field-hint" data-role-warn="${id}"></span>` +
-            `</div>`
-          // No role, no template and no fallback: blank here means blank, so a
-          // new Solo conversation reaches the CLI as the message alone. A
-          // project chair gets neither box - see FORMS.
-          : kind === 'chat'
+          : '') +
+        // No role, no template and no fallback: blank here means blank, so a
+        // new Solo conversation reaches the CLI as the message alone. A
+        // council seat and a project chair get neither box — see FORMS.
+        (kind === 'chat'
           ? `<div class="field">` +
               `<label>Behaviour ` +
                 `<span class="field-hint">— optional; blank sends your message ` +
@@ -2686,16 +4412,20 @@ function renderSettings() {
               `<label>Auto-approve arguments (added only when execution is approved)</label>` +
               `<textarea rows="2" data-field="auto_approve_args">${esc((p.auto_approve_args || []).join('\n'))}</textarea>` +
             `</div>` +
-            // Only Chat is ever invoked read-only. A council stage's
-            // permission is decided at the gate, and a project chair always
-            // writes - showing the field on either would offer a setting
-            // nothing sends.
-            (kind === 'chat'
+            // Chat and council seats are both invoked read-only; a project
+            // chair always writes, so showing the field there would offer a
+            // setting nothing sends.
+            (kind === 'chat' || kind === 'seat'
               ? `<div class="field">` +
                 `<label>Read-only arguments ` +
-                  `<span class="field-hint">— added whenever Chat is ` +
-                  `read-only, which is any run with Zero-Touch off. With it on, ` +
-                  `the auto-approve arguments are sent instead</span></label>` +
+                  (kind === 'seat'
+                    ? `<span class="field-hint">— added to every deliberating ` +
+                      `and critiquing seat. Only the chair is invoked without ` +
+                      `them, and only once approved</span>`
+                    : `<span class="field-hint">— added whenever Chat is ` +
+                      `read-only, which is any run with Zero-Touch off. With ` +
+                      `it on, the auto-approve arguments are sent instead</span>`) +
+                  `</label>` +
                 `<textarea rows="2" data-field="read_only_args">` +
                   `${esc((p.read_only_args || []).join('\n'))}</textarea>` +
               `</div>`
@@ -2707,10 +4437,16 @@ function renderSettings() {
               `<textarea rows="2" data-field="stream_args">${esc((p.stream_args || []).join('\n'))}</textarea>` +
             `</div>` +
             `<div class="field-row">` +
-              `<div class="field">` +
-                `<label>Model (blank = the CLI's own default)</label>` +
-                `<input type="text" data-field="model" value="${esc(p.model || '')}">` +
-              `</div>` +
+              // A seat's model and effort are its defaults for every use of
+              // this CLI, so they are asked for on the card itself rather than
+              // in here with the plumbing. One input each, never two: a second
+              // box bound to the same field would save whichever the form
+              // happened to read last.
+              (kind === 'seat' ? '' :
+                `<div class="field">` +
+                  `<label>Model (blank = the CLI's own default)</label>` +
+                  `<input type="text" data-field="model" value="${esc(p.model || '')}">` +
+                `</div>`) +
               `<div class="field">` +
                 `<label>Model flag (<code>{model}</code> substituted)</label>` +
                 `<input type="text" data-field="model_args" ` +
@@ -2719,14 +4455,16 @@ function renderSettings() {
             `</div>` +
             `<div class="field">` +
               `<label>Selectable models, one per line ` +
-                `<span class="field-hint">— shown in the picker on the agent card</span></label>` +
+                `<span class="field-hint">— offered wherever this CLI's model ` +
+                `is chosen, alongside the ones it reports itself</span></label>` +
               `<textarea rows="4" data-field="models">${esc((p.models || []).join('\n'))}</textarea>` +
             `</div>` +
             `<div class="field-row">` +
-              `<div class="field">` +
-                `<label>Reasoning effort (blank = the CLI's own default)</label>` +
-                `<input type="text" data-field="effort" value="${esc(p.effort || '')}">` +
-              `</div>` +
+              (kind === 'seat' ? '' :
+                `<div class="field">` +
+                  `<label>Reasoning effort (blank = the CLI's own default)</label>` +
+                  `<input type="text" data-field="effort" value="${esc(p.effort || '')}">` +
+                `</div>`) +
               `<div class="field">` +
                 `<label>Effort flag (<code>{effort}</code> substituted)</label>` +
                 `<input type="text" data-field="effort_args" ` +
@@ -2751,8 +4489,11 @@ function renderSettings() {
       `</div>`
     );
   }).join('');
+  // After the forms are in the document, not before: the boxes are refilled in
+  // place when the answers land.
+  hydrateModelSelects();
+  hydrateEffortSelects();
 
-  $$('.provider-form').forEach(updateRoleWarning);
   $('#house-rules').value = conf.house_rules || '';
   $('#display-name').value = conf.display_name || '';
   $('#port-input').value = conf.port || 8760;
@@ -2762,41 +4503,177 @@ function renderSettings() {
   $('#project-max-steps').value = proj.max_steps ?? 40;
   $('#project-max-fixes').value = proj.max_fix_attempts ?? 3;
   $('#project-innovation-default').value = proj.innovation_rounds ?? 2;
+
+  renderCouncilSettings();
 }
 
-/** Flag a behaviour whose write expectation disagrees with the stage's actual
- *  permission. Not resolved automatically: guessing which of the two the
- *  operator meant is how a safety setting stops being trustworthy. */
-function updateRoleWarning(form) {
-  // Only a council stage has both a role and a permission that can disagree
-  // with it. Chat has no role; a project chair has no role either, and always
-  // writes - there is no mismatch available to either of them.
-  if (!form || form.dataset.kind !== 'stage') return;
-  const id = form.dataset.provider;
-  const chosen = $('[data-field="role_template"]', form).value;
-  const role = (state.roles || []).find(r => r.id === chosen);
-  const note = $(`[data-role-warn="${id}"]`, form.parentElement) || $(`[data-role-warn="${id}"]`);
-  if (!note || !role) return;
+/* ---- Council settings --------------------------------------------------- */
 
-  // Today permission is per stage: the drafter is read-only, the polisher
-  // writes once approved.
-  const stageWrites = id === 'polisher';
-  if (role.writes && !stageWrites) {
-    note.textContent = `"${role.name}" expects to modify files, but this stage `
-      + `is read-only — it will produce a proposal, not changes.`;
-    note.className = 'field-hint warn';
-  } else if (!role.writes && stageWrites) {
-    note.textContent = `"${role.name}" is a report-only behaviour, but this `
-      + `stage may write once approved. It will be told not to.`;
-    note.className = 'field-hint warn';
-  } else {
-    note.textContent = '';
-    note.className = 'field-hint';
-  }
+/** What each strictness step actually changes, in words. The number alone
+ *  says nothing about the thing worth knowing: how hard will they be on each
+ *  other, and will the chairman tell me when they disagreed? */
+const STRICTNESS_NOTES = [
+  ['Collegial', 'Members raise only what would change the outcome, and the ' +
+    'chair prefers whatever they converged on.'],
+  ['Measured', 'Adds anything that would mislead a reader of the final answer.'],
+  ['Balanced', 'Every factual claim about the code gets checked. The chair ' +
+    'says plainly when the council was split.'],
+  ['Exacting', 'Peers are assumed wrong until verified against the code, and ' +
+    'the chair implements the conservative option where they were not.'],
+  ['Adversarial', 'Members actively try to construct the input each position ' +
+    'fails on. Unrefuted is treated as unproven, not correct.'],
+  ['Hostile', 'The default verdict is that the peer is wrong. Nothing enters ' +
+    'the verdict that the chair did not verify itself.'],
+];
+
+/** The axes a capability profile is scored on. Mirrors router.DIMENSIONS —
+ *  the server is the authority, this is only what to label the sliders. */
+const CAPABILITY_AXES = [
+  ['implementation', 'Building'],
+  ['debugging', 'Debugging'],
+  ['review', 'Reviewing'],
+  ['security', 'Security'],
+  ['architecture', 'Architecture'],
+  ['analysis', 'Analysis'],
+];
+
+function renderCouncilSettings() {
+  const conf = state.config || {};
+  const council = conf.council || {};
+
+  $('#council-seats').value = council.seat_count ?? 3;
+  $('#council-chair-timeout').value = council.chair_timeout_seconds ?? 1800;
+  $('#council-deliberation-effort').value = council.deliberation_effort || '';
+  $('#council-routing').checked = (council.routing || 'auto') !== 'manual';
+  $('#council-chair-deliberates').checked = council.chair_deliberates !== false;
+  $('#council-strictness').value = council.strictness ?? 2;
+  updateStrictnessNote();
+
+  // Seating. One row per seat: which CLI holds it, and what it is told to be.
+  // The same two choices the strip offers on a click - this is the whole bench
+  // at once, and there it is one seat at a time.
+  //
+  // The chair has no behaviour column: the chairman is what the third stage
+  // is, not a lens over it.
+  const seats = ['chair'];
+  for (let i = 1; i <= (Number(council.seat_count) || 3); i++) seats.push(`seat${i}`);
+  const pins = council.pins || {};
+  const personas = council.personas || {};
+  const agents = connectedAgents();
+  // Same list, same order and same warning as the popover on the seat itself.
+  const behaviours = seatBehaviours();
+
+  $('#council-pins').innerHTML = seats.map(id => {
+    const label = id === 'chair' ? 'Chair' : `Seat ${id.replace('seat', '')}`;
+    return (
+      `<div class="council-pin-row">` +
+        `<span class="council-pin-label">${esc(label)}</span>` +
+        `<select data-pin="${esc(id)}" aria-label="${esc(label)} CLI">` +
+          `<option value=""${pins[id] ? '' : ' selected'}>Auto — routed per run</option>` +
+          agents.map(a =>
+            `<option value="${esc(a.id)}"${pins[id] === a.id ? ' selected' : ''}>` +
+            `${esc(a.label)}</option>`
+          ).join('') +
+        `</select>` +
+        (id === 'chair'
+          ? `<span class="council-pin-fixed">Chairman</span>`
+          : `<select data-persona="${esc(id)}" aria-label="${esc(label)} behaviour">` +
+              `<option value=""${personas[id] ? '' : ' selected'}>` +
+                `Auto — a lens the task calls for</option>` +
+              behaviours.map(r =>
+                `<option value="${esc(r.id)}"${personas[id] === r.id ? ' selected' : ''} ` +
+                `title="${esc(behaviourNote(r))}">` +
+                `${esc(r.name || r.id)}` +
+                `${r.builtin && !r.council ? ' — standalone' : ''}</option>`
+              ).join('') +
+            `</select>`) +
+      `</div>`
+    );
+  }).join('');
+
+  // Capability profiles.
+  const caps = council.capabilities || {};
+  $('#council-capabilities').innerHTML = agents.map(a => {
+    const mine = caps[a.id] || {};
+    return (
+      `<div class="council-cap" data-cap-agent="${esc(a.id)}">` +
+        `<h5 class="council-cap-name">${esc(a.label)}</h5>` +
+        CAPABILITY_AXES.map(([axis, name]) => {
+          // Blank means "use the shipped profile", and the server decides what
+          // that is. An empty box here is therefore a real value, not a gap.
+          const value = mine[axis];
+          return (
+            `<label class="council-cap-row">` +
+              `<span class="council-cap-axis">${esc(name)}</span>` +
+              `<input type="range" min="0" max="100" step="5" ` +
+                `data-cap-axis="${esc(axis)}" ` +
+                `value="${value === undefined ? '' : Math.round(value * 100)}"` +
+                `${value === undefined ? ' data-unset="1"' : ''}>` +
+              `<output>${value === undefined ? 'default' : Math.round(value * 100)}</output>` +
+            `</label>`
+          );
+        }).join('') +
+      `</div>`
+    );
+  }).join('');
 }
+
+function updateStrictnessNote() {
+  const level = Number($('#council-strictness').value);
+  const [name, note] = STRICTNESS_NOTES[level] || STRICTNESS_NOTES[2];
+  $('#council-strictness-out').textContent = name;
+  $('#council-strictness-hint').textContent = note;
+}
+
+/** The council block, read back off the panel. */
+function readCouncilSettings() {
+  // "Auto" is written as an empty string rather than by leaving the key out.
+  // The server deep-merges a saved config, so an omitted seat keeps the pin it
+  // already had - setting one back to Auto would appear to work and change
+  // nothing. An empty value overwrites; the router reads it as unpinned.
+  const pins = {};
+  const personas = {};
+  $$('#council-pins [data-pin]').forEach(sel => { pins[sel.dataset.pin] = sel.value; });
+  $$('#council-pins [data-persona]').forEach(sel => {
+    personas[sel.dataset.persona] = sel.value;
+  });
+
+  const capabilities = {};
+  $$('#council-capabilities .council-cap').forEach(card => {
+    const agent = card.dataset.capAgent;
+    const axes = {};
+    $$('input[data-cap-axis]', card).forEach(input => {
+      // Untouched sliders stay absent so the server keeps using its shipped
+      // profile. Writing 0.6 for every axis the operator never looked at
+      // would freeze today's defaults into their config for good.
+      if (input.dataset.unset) return;
+      axes[input.dataset.capAxis] = Number(input.value) / 100;
+    });
+    if (Object.keys(axes).length) capabilities[agent] = axes;
+  });
+
+  return {
+    seat_count: Number($('#council-seats').value) || 3,
+    chair_timeout_seconds: Number($('#council-chair-timeout').value) || 1800,
+    deliberation_effort: $('#council-deliberation-effort').value,
+    routing: $('#council-routing').checked ? 'auto' : 'manual',
+    chair_deliberates: $('#council-chair-deliberates').checked,
+    strictness: Number($('#council-strictness').value),
+    pins,
+    personas,
+    capabilities,
+  };
+}
+
+// The write-expectation warning that used to live here belonged to the fixed
+// Stage 1 / Stage 2 pair, where a stage's permission was known from its id. It
+// is not: a seat's permission comes from where it sits, so the same check now
+// runs where the behaviour is *chosen* — see `openPersonaMenu`, which marks a
+// behaviour that expects to write as one this seat cannot honour.
 
 async function saveSettings() {
   const providers = {};
+  let firstInvalid = null;
   let valid = true;
 
   $$('.provider-form').forEach(form => {
@@ -2813,6 +4690,7 @@ async function saveSettings() {
       // see is not a validation message - open it so the toast has a referent.
       const advanced = cmdInput.closest('.advanced');
       if (advanced) advanced.open = true;
+      if (!firstInvalid) firstInvalid = cmdInput;
       valid = false;
     } else {
       cmdInput.classList.remove('invalid');
@@ -2820,12 +4698,9 @@ async function saveSettings() {
 
     providers[id] = {
       id,
-      // The server expands this into the agent's command and permission
-      // flags when it differs from what the stage runs today, and ignores it
-      // otherwise - so a hand-edited command below still wins. Solo has no
-      // field here: it picks its agent on its card, and a stale value carried
-      // by this form would quietly undo that on the next save.
-      ...(field('agent') ? { agent: field('agent').value } : {}),
+      // No `agent` key from this panel. Every card here is one CLI already,
+      // and a stale value carried by the form would quietly undo a choice made
+      // on the card or the bench at the next save.
       label: field('label').value.trim() || id,
       command,
       auto_approve_args: lines('auto_approve_args'),
@@ -2835,10 +4710,7 @@ async function saveSettings() {
       // in. Writing another kind's keys would leave a dead setting behind that
       // still reads as though it decided something.
       ...({
-        stage: () => ({
-          role_template: field('role_template').value,
-          role_system: field('role_system').value.trim(),
-        }),
+        seat: () => ({ read_only_args: lines('read_only_args') }),
         chat: () => ({
           behavior: field('behavior').value.trim(),
           read_only_args: lines('read_only_args'),
@@ -2857,7 +4729,11 @@ async function saveSettings() {
   });
 
   if (!valid) {
-    toast('Every stage needs a command.', 'error');
+    // The cards are on one tab, and Save is reachable from all of them: a
+    // toast about a field on a panel that is not on screen names nothing.
+    switchSettingsTab('agents');
+    firstInvalid.focus();
+    toast('Every agent needs a command.', 'error');
     return;
   }
 
@@ -2866,7 +4742,12 @@ async function saveSettings() {
       method: 'POST',
       body: {
         providers,
+        council: readCouncilSettings(),
         house_rules: $('#house-rules').value,
+        // Caveman and Efficiency are absent on purpose: all three modes set
+        // them from their composer gear, which patches the one leaf it owns.
+        // Posting them from here too would let a stale form overwrite a
+        // toggle flipped after Settings was opened.
         display_name: $('#display-name').value.trim(),
         port: parseInt($('#port-input').value, 10) || 8760,
         open_browser: $('#open-browser').checked,
@@ -2885,6 +4766,9 @@ async function saveSettings() {
     await refreshDoctor();
     renderAll();
     closeModal('settings');
+    // The bench depends on every one of those settings, so the strip on screen
+    // is now describing a council that would no longer be seated.
+    refreshSeating();
     toast('Settings saved.', 'ok', 3000);
   } catch (err) {
     toast(err.message, 'error');
@@ -2896,18 +4780,34 @@ async function refreshDoctor(show = false) {
     const data = await api('/api/doctor');
     state.providers = data.providers || [];
     if (show) {
+      // Three marks, matching `./run.sh --doctor`: an agent that is installed
+      // but not added is not a problem to fix by installing something, and
+      // reporting it as missing would send the operator looking for a binary
+      // that is already there.
       const lines = data.providers.map(p =>
-        `${p.available ? '[ OK ]' : '[MISS]'} ${p.label.padEnd(8)} ${p.executable.padEnd(10)} ` +
+        `${p.connected === false ? '[OFF ]' : p.available ? '[ OK ]' : '[MISS]'} ` +
+        `${p.label.padEnd(8)} ${p.executable.padEnd(10)} ` +
         `${p.path || 'not on PATH'}${p.version ? '  ' + p.version : ''}`
       );
       lines.push('', `config: ${data.config_path}`, `runs:   ${data.runs_path}`);
       $('#doctor-out').textContent = lines.join('\n');
     }
     renderStrip();
-    if (show) renderSettings();
+    renderProbeBadges();
   } catch (err) {
     toast(err.message, 'error');
   }
+}
+
+/** The one part of a provider card the probe decides. Patched in place rather
+ *  than re-rendering the panel: the probe lands after Settings is on screen,
+ *  and a re-render would take back whatever had been typed by then. */
+function renderProbeBadges() {
+  $$('[data-probe]').forEach(el => {
+    const info = state.providers.find(x => x.id === el.dataset.probe);
+    el.className = info ? `probe ${info.available ? 'ok' : 'miss'}` : 'probe';
+    el.textContent = info ? (info.available ? 'found' : 'not found') : '';
+  });
 }
 
 /* ---- Conversations ---- */
@@ -2989,7 +4889,12 @@ function renderChats() {
         `title="${esc(c.workspace || 'Scratch workspace')}">` +
         `<span class="chat-row-title">${esc(c.title || c.task || '(no task)')}</span>` +
         `<span class="chat-row-meta">${esc(chatWhen(c.created_at))}` +
-          `${c.zero_touch ? ' · zero-touch' : ''}</span>` +
+          `${c.zero_touch ? ' · zero-touch' : ''}` +
+          // The row a quota wall left behind looks like any other row, and the
+          // operator who needs this most is the one scanning the list for the
+          // run they gave up on. Said here so it is findable without opening
+          // every failed conversation to check.
+          `${c.can_resume ? ' · <b>can continue</b>' : ''}</span>` +
       `</button>` +
       // Outside the row's own button, not inside it: a button within a button
       // is invalid HTML and the browser hoists it out, which lands it in the
@@ -3010,6 +4915,7 @@ async function openChat(file) {
   // screen from this, and an event arriving mid-load would otherwise drop the
   // live run on top of the conversation being opened.
   state.openChat = { file, run: null };
+  state.freshChat = false;
   state.tab = '';
   renderChats();
 
@@ -3069,7 +4975,7 @@ async function deleteChat(file) {
     await api('/api/history/delete', { method: 'POST', body: { file } });
     // It may be the one on screen, or the one the composer is attached to.
     if (state.openChat && state.openChat.file === file) closeChat();
-    if (state.continueFrom === file) clearContinuation();
+    if (state.continueFrom === file) startFreshChat();
     await loadChats();
     toast('Conversation deleted.', 'ok', 2600);
   } catch (err) {
@@ -3091,8 +4997,7 @@ async function clearHistory(mode) {
   try {
     const { deleted } = await api('/api/history/delete',
       { method: 'POST', body: { all: true, mode } });
-    closeChat();
-    clearContinuation();
+    startFreshChat();
     await loadChats();
     renderHistoryCounts();
     toast(`${deleted} conversation${deleted === 1 ? '' : 's'} deleted.`, 'ok');
@@ -3106,8 +5011,7 @@ async function clearHistory(mode) {
  *  necessary in the first place. */
 function closeChat() {
   if (!state.openChat) return;
-  state.openChat = null;
-  clearContinuation();
+  startFreshChat();
   renderAll();
   renderChats();
 }
@@ -3156,6 +5060,7 @@ function connect() {
   on('run_started', (d) => {
     state.run = d.run;
     state.busy = true;
+    state.freshChat = false;
     // A conversation opened from history is on screen where the answer is
     // about to render, and a run starting is where attention belongs.
     state.openChat = null;
@@ -3199,6 +5104,11 @@ function connect() {
     // when the conversation list can show it — and when a follow-up has folded
     // its parent into itself and must replace it there.
     if (!state.busy) {
+      // Keep the conversation in the composer as well as on screen. Without
+      // this, `startRun` cleared the attachment accepted for the previous
+      // message and every ordinary next message became a new sidebar row.
+      // "New chat" remains the explicit way to detach.
+      restoreContinuation();
       loadChats();
       // The run has just written to the working tree, so the git status the
       // status bar and the commit bar are drawn from is now a run out of date.
@@ -3222,12 +5132,9 @@ function connect() {
 
   on('stage_output', (d) => {
     if (state.run && state.run.solo) {
-      // Progressive, and provisional: `stage_finished` replaces this with the
-      // CLI's own final answer, which is prose rather than a transcript of it.
-      // Written straight into the live message, which no render between here
-      // and `stage_finished` rebuilds.
-      const live = $('#thread .assistant-message .markdown[data-live]');
-      if (live) live.textContent += `${d.line}\n`;
+      // Chat shows the answer, not the agent's working transcript. The stage
+      // header already says "working"; `stage_finished` renders the CLI's
+      // final answer when it is ready.
       return;
     }
     // Tag with the stage's own label: either agent can hold either job, so a
@@ -3340,6 +5247,11 @@ function connect() {
   on('usage', (d) => {
     state.usage = d.usage || {};
     renderStrip();
+    renderUsageButton();
+    // Redrawn in place rather than closed: a poll landing while the panel is
+    // open is the one moment its numbers are worth watching.
+    const panel = $('.usage-menu');
+    if (panel) drawUsageMenu(panel);
   });
 
   on('config', (d) => {
@@ -3384,6 +5296,7 @@ async function loadState() {
     state.scratchWorkspace = data.scratch_workspace || '';
     state.usage = data.usage || {};
     state.user = data.user || '';
+    restoreContinuation();
     renderAll();
   } catch (err) {
     toast(err.message, 'error', 12000);
@@ -3391,7 +5304,9 @@ async function loadState() {
 }
 
 async function startRun() {
-  const task = $('#task-input').value.trim();
+  const input = $('#task-input');
+  const submittedValue = input.value;
+  const task = submittedValue.trim();
   if (!task) return;
   const conf = state.config || {};
 
@@ -3399,7 +5314,12 @@ async function startRun() {
 
   // Quota warning. Advisory only: the reading is a snapshot, and only the
   // operator knows whether this particular task is worth the remaining budget.
-  const worst = worstUsageFor(solo ? ['solo'] : ['drafter', 'polisher']);
+  // Every council provider is checked because the bench is routed per run —
+  // which CLIs will be seated is not known until the run starts.
+  const worst = worstUsageFor(
+    solo ? ['solo'] : Object.keys(conf.providers || {})
+      .filter(id => id.startsWith('council_'))
+  );
   const threshold = Number(conf.usage_warn_percent ?? 85);
   if (worst && worst.percent >= threshold) {
     const ok = confirm(
@@ -3411,12 +5331,15 @@ async function startRun() {
     if (!ok) return;
   }
 
-  if (!solo && conf.zero_touch) {
+  // Only when there is a folder to modify. With none chosen the run writes
+  // nothing whatever Zero-Touch says, so warning about files it will change
+  // would be asking the operator to approve something that cannot happen.
+  if (!solo && conf.zero_touch && workspacePath()) {
     const ok = confirm(
       'Zero-Touch Mode is ON.\n\n' +
       'The pipeline will run to completion without pausing, and the senior ' +
       'stage will modify files in:\n\n' +
-      (workspacePath() || `${state.scratchWorkspace} (scratch workspace)`) +
+      workspacePath() +
       (workspaceIsRepo() ? '' :
         '\n\nThat folder is not a git repository, so this run cannot be ' +
         'rolled back.') +
@@ -3425,24 +5348,54 @@ async function startRun() {
     if (!ok) return;
   }
   try {
-    await api('/api/start', {
+    const { run: acceptedRun } = await api('/api/start', {
       method: 'POST',
       body: {
         task,
         workspace: workspacePath(),
         continue_from: state.continueFrom,
         compact_context: state.compactContext,
+        incognito: state.incognito,
       },
     });
+    state.freshChat = false;
     // Only once the server has accepted it: a rejected start leaves the
-    // attachment in place so the operator can fix the task and try again.
-    clearContinuation();
+    // message and attachment in place so the operator can fix them and retry.
+    // Preserve anything typed while the request was in flight.
+    if (input.value === submittedValue) {
+      input.value = '';
+      input.dispatchEvent(new Event('input'));
+    }
+    // A very fast agent can finish, publish its terminal event and attach its
+    // new transcript before this POST response arrives. Do not let the older
+    // request cleanup detach that freshly completed conversation.
+    const alreadyAttachedLatest = acceptedRun && state.run &&
+      state.run.id === acceptedRun.id &&
+      ['complete', 'failed', 'cancelled'].includes(state.run.state);
+    if (!alreadyAttachedLatest) clearContinuation();
   } catch (err) {
     toast(err.message, 'error', 9000);
   }
 }
 
+// The sidebar collapses to a rail of icons. Held in the page rather than in
+// the config: it is how the window is being looked at right now, not a setting
+// the session should carry to the next one.
+function setSidebarCollapsed(collapsed) {
+  const toggle = $('#sidebar-toggle');
+  const label = collapsed ? 'Expand chat history' : 'Collapse chat history';
+  $('#app').classList.toggle('sidebar-collapsed', collapsed);
+  toggle.setAttribute('aria-expanded', String(!collapsed));
+  toggle.setAttribute('aria-label', label);
+  toggle.title = label;
+}
+
 function wire() {
+  // -- sidebar ----------------------------------------------------------
+  $('#sidebar-toggle').addEventListener('click', () => {
+    setSidebarCollapsed(!$('#app').classList.contains('sidebar-collapsed'));
+  });
+
   // -- mode -------------------------------------------------------------
   $('#mode-switch').addEventListener('click', async (e) => {
     const btn = e.target.closest('[data-mode]');
@@ -3464,8 +5417,7 @@ function wire() {
     // A conversation belongs to the mode it was started in, so switching
     // detaches whatever is attached rather than continuing it in the other.
     if (want !== selectedMode()) {
-      if (state.continueFrom) clearContinuation();
-      closeChat();
+      startFreshChat();
       // Awaited: the sidebar lists one mode's conversations, and `loadChats`
       // reads the mode back out of the config it is about to be given. Fired
       // without waiting, it asks for the list of the mode being left.
@@ -3474,6 +5426,10 @@ function wire() {
     } else {
       renderAll();
     }
+    // Arriving in Council with an empty box: ask who the standing bench is,
+    // so the seats are there to be clicked rather than appearing on the first
+    // keystroke.
+    refreshSeating();
   });
 
   // -- composer ---------------------------------------------------------
@@ -3484,7 +5440,25 @@ function wire() {
     input.style.height = 'auto';
     input.style.height = `${input.scrollHeight}px`;
   };
-  input.addEventListener('input', () => { autosize(); renderStatus(); });
+  // The council is seated from what is in this box, so the strip follows it.
+  input.addEventListener('input', () => {
+    autosize(); renderStatus(); scheduleSeating();
+  });
+
+  // -- council settings --------------------------------------------------
+  $('#council-strictness').addEventListener('input', updateStrictnessNote);
+  // Changing the member count adds or removes a row in the seating list, so
+  // the list is rebuilt rather than left showing chairs that no longer exist.
+  $('#council-seats').addEventListener('change', renderCouncilSettings);
+  $('#council-capabilities').addEventListener('input', (e) => {
+    const slider = e.target.closest('input[data-cap-axis]');
+    if (!slider) return;
+    // Touching a slider is what turns "use the shipped profile" into a value
+    // of the operator's own. Until then it is left unset on purpose.
+    delete slider.dataset.unset;
+    const out = slider.parentElement.querySelector('output');
+    if (out) out.textContent = slider.value;
+  });
   input.addEventListener('keydown', (e) => {
     // Enter sends, as in every chat box; Shift+Enter is the newline. Ctrl+Enter
     // still works, because that is what the old composer taught.
@@ -3501,6 +5475,13 @@ function wire() {
     if ($('.model-menu')) { closeModelMenu(); return; }
     openGearMenu($('#gear-btn'));
   });
+  $$('.project-gear-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if ($('.model-menu')) { closeModelMenu(); return; }
+      openGearMenu(btn);
+    });
+  });
 
   // -- projects ---------------------------------------------------------
   // The agent matrix. A chair is the same provider object the council strip
@@ -3512,8 +5493,12 @@ function wire() {
     e.stopPropagation();
     if ($('.model-menu')) { closeModelMenu(); return; }
     openMemberMenu(chair, chair.dataset.chair, {
-      role: false,
-      note: 'What this chair is told to do comes from the board, not a role.',
+      // Both halves matter here: a project chair has no role, and its model
+      // and effort are the CLI's everywhere rather than this chair's. A
+      // project already running keeps the ones it started with.
+      note: 'What this chair is told to do comes from the board, not a role. ' +
+        'Model and effort apply wherever this CLI sits; a running project ' +
+        'keeps what it started with.',
     });
   });
 
@@ -3536,9 +5521,17 @@ function wire() {
     api('/api/project/pause', { method: 'POST' })
       .then(loadProject).catch(e => toast(e.message, 'error')));
 
-  $('#project-resume').addEventListener('click', () =>
-    api('/api/project/resume', { method: 'POST' })
-      .then(loadProject).catch(e => toast(e.message, 'error')));
+  // Two jobs, because the button has two meanings: releasing a pause is a
+  // control on a live loop, and picking a stopped project back up is a fresh
+  // start against the board it left behind.
+  $('#project-resume').addEventListener('click', () => {
+    if (state.projectRunning) {
+      api('/api/project/resume', { method: 'POST' })
+        .then(loadProject).catch(e => toast(e.message, 'error'));
+    } else {
+      startProject(true);
+    }
+  });
 
   $('#project-stop').addEventListener('click', async () => {
     if (!confirm(
@@ -3562,8 +5555,23 @@ function wire() {
   });
 
   // Clearing the tab is what puts the initializer back. The project on disk is
-  // untouched — this is closing the report, not deleting the build.
-  $('#project-new').addEventListener('click', () => {
+  // untouched — this is closing the report, not deleting the build. It has to
+  // go through the server: the engine holds the finished project in memory and
+  // finds its board again on disk, so clearing it here alone lasts exactly
+  // until the next reload.
+  $('#project-new').addEventListener('click', async () => {
+    const p = state.project || {};
+    if (state.projectResumable && !confirm(
+      'Close this project?\n\n' +
+      'It has not finished, so this gives up the offer to resume it. ' +
+      'Nothing in the folder is deleted.'
+    )) return;
+    try {
+      await api('/api/project/dismiss', {
+        method: 'POST',
+        body: { workspace: p.workspace || workspacePath() },
+      });
+    } catch (err) { toast(err.message, 'error'); return; }
     state.project = null;
     state.projectResumable = false;
     renderProject();
@@ -3574,14 +5582,33 @@ function wire() {
   $('#cancel-btn').addEventListener('click', () =>
     api('/api/cancel', { method: 'POST' }).catch(e => toast(e.message, 'error')));
 
+  $('#continue-btn').addEventListener('click', resumeRun);
+
   $('#rollback-btn').addEventListener('click', async () => {
     if (!confirm(
       'Roll back?\n\nThis resets the working tree to the snapshot taken before ' +
-      'the senior stage ran. Any change made during this run is discarded.'
+      'anything was allowed to write. Any change made during this run is ' +
+      'discarded.'
     )) return;
     try {
       await api('/api/rollback', { method: 'POST' });
     } catch (err) { toast(err.message, 'error', 9000); }
+  });
+
+  $('#incognito-btn').addEventListener('click', () => {
+    state.incognito = !state.incognito;
+    sessionStorage.setItem('ac_incognito', state.incognito ? '1' : '0');
+    renderIncognito();
+    // The bench narrows to the CLIs that can be told not to save, so the strip
+    // has to be asked again or it would keep showing a seat this run cannot use.
+    refreshSeating();
+    toast(
+      state.incognito
+        ? 'Incognito on. Nothing from here is written to the Chats list or the ' +
+          'agents’ own history.'
+        : 'Incognito off. Conversations are saved again.',
+      'ok',
+    );
   });
 
   $('#pr-btn').addEventListener('click', () => {
@@ -3638,6 +5665,14 @@ function wire() {
     patchConfig({ pull_request_mode: e.target.checked });
   });
 
+  // Delegated: the thread is rewritten on every state change, so the Continue
+  // button beside a failure cannot carry a listener of its own.
+  $('#thread').addEventListener('click', (e) => {
+    if (e.target.closest('[data-continue]')) { resumeRun(); return; }
+    const again = e.target.closest('[data-retry]');
+    if (again) retryStage(again.dataset.retry);
+  });
+
   // -- agent, model, effort and role pickers ----------------------------
   // Delegated: both hosts are re-rendered on every state change. A member on
   // the strip opens one menu covering all four settings; Chat's chips in the
@@ -3648,7 +5683,7 @@ function wire() {
       e.stopPropagation();
       chip.classList.add('checking');
       api('/api/usage/refresh', { method: 'POST' })
-        .then(d => { state.usage = d.usage || {}; renderStrip(); })
+        .then(d => { state.usage = d.usage || {}; renderStrip(); renderUsageButton(); })
         .catch(err => toast(err.message, 'error'));
       return;
     }
@@ -3656,7 +5691,30 @@ function wire() {
     if (!member) return;
     e.stopPropagation();
     if ($('.model-menu')) { closeModelMenu(); return; }  // toggle
-    openMemberMenu(member, member.dataset.member);
+    // The seat id is what turns this into a bench editor: with it the menu
+    // offers which CLI sits here and what it is told to be, both of which are
+    // council settings rather than provider ones.
+    openMemberMenu(member, member.dataset.member, {
+      seat: member.dataset.seat || '',
+      seatLabel: member.dataset.seatLabel || '',
+    });
+  });
+
+  // -- the stepper --------------------------------------------------------
+  // Delegated for the same reason: a live run re-renders these cells on every
+  // event, so a listener bound to one of them would not survive the next.
+  $('#council-steps').addEventListener('click', (e) => {
+    const jump = e.target.closest('[data-jump]');
+    if (jump) { jumpToStage(jump.dataset.jump); return; }
+    if (e.target.closest('[data-step-close]')) {
+      state.openStep = '';
+      renderCouncilSteps();
+      return;
+    }
+    const cell = e.target.closest('[data-step]');
+    if (!cell || cell.disabled) return;
+    state.openStep = state.openStep === cell.dataset.step ? '' : cell.dataset.step;
+    renderCouncilSteps();
   });
 
   $('#composer-chips').addEventListener('click', (e) => {
@@ -3695,36 +5753,39 @@ function wire() {
     if (btn) selectWorkspace(btn.dataset.workspace);
   });
 
-  // -- settings ---------------------------------------------------------
-  $('#settings-btn').addEventListener('click', async () => {
-    await refreshDoctor(true);
-    renderSettings();
-    renderRoleList();
-    renderHistoryCounts();
-    switchSettingsTab('stages');
-    openModal('settings');
+  // -- usage --------------------------------------------------------------
+  // Click rather than hover: the panel carries a Refresh button and reset
+  // times worth reading, and a card that vanishes when the pointer leaves the
+  // button is neither reachable by keyboard nor usable on a touchscreen. The
+  // hover answer is the button's own tooltip, which already has the numbers.
+  $('#usage-btn').addEventListener('click', (e) => {
+    if ($('.model-menu')) { closeModelMenu(); return; }  // toggle
+    openUsageMenu(e.currentTarget);
   });
+
+  // -- settings ---------------------------------------------------------
+  $('#settings-btn').addEventListener('click', () => openSettings('agents'));
   $('#clear-council').addEventListener('click', () => clearHistory('council'));
   $('#clear-chat').addEventListener('click', () => clearHistory('solo'));
   $('.settings-tabs').addEventListener('click', (e) => {
     const tab = e.target.closest('.settings-tab');
     if (tab) switchSettingsTab(tab.dataset.settingsTab);
   });
-  $('#provider-forms').addEventListener('click', (e) => {
-    const reset = e.target.closest('[data-reset-role]');
-    if (!reset) return;
-    const form = reset.closest('.provider-form');
-    $('[data-field="role_system"]', form).value = '';
-    updateRoleWarning(form);
-    toast('Back to the template text.', 'ok', 2400);
+  // Arrow keys move between tabs, as they do in any other tablist: with one
+  // tabstop on the strip, Tab has to reach the fields rather than walk the
+  // five destinations first.
+  $('.settings-tabs').addEventListener('keydown', (e) => {
+    const step = { ArrowRight: 1, ArrowLeft: -1, Home: 'first', End: 'last' }[e.key];
+    if (step === undefined) return;
+    e.preventDefault();
+    const tabs = $$('.settings-tab');
+    const here = tabs.findIndex(t => t.classList.contains('active'));
+    const next = step === 'first' ? 0
+      : step === 'last' ? tabs.length - 1
+      : (here + step + tabs.length) % tabs.length;
+    switchSettingsTab(tabs[next].dataset.settingsTab);
+    tabs[next].focus();
   });
-
-  $('#provider-forms').addEventListener('change', (e) => {
-    if (e.target.matches('[data-field="role_template"]')) {
-      updateRoleWarning(e.target.closest('.provider-form'));
-    }
-  });
-
   $('#commit-btn').addEventListener('click', doCommit);
   $('#commit-message').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') doCommit();
@@ -3738,36 +5799,65 @@ function wire() {
 
   $('#save-settings').addEventListener('click', saveSettings);
 
-  // Picking a council stage's agent fills in its command and flags straight
-  // away, so the form shows what will actually be saved. The server performs
-  // the same swap on save; this is the preview, not the source of truth.
-  // Delegated because the provider forms are rebuilt every time Settings opens.
+  // Delegated, because the forms are rebuilt every time the panel opens.
+  // Which reasoning levels are legal is the chosen model's answer, not the
+  // CLI's, so a model picked here changes what the box beside it may offer -
+  // and it says so before the save rather than after it.
   $('#provider-forms').addEventListener('change', (e) => {
-    if (e.target.dataset.field !== 'agent') return;
-    const preset = state.agents.find(a => a.id === e.target.value);
-    if (!preset || !(preset.command || []).length) return;  // "Custom": leave it
-    const form = e.target.closest('.provider-form');
-    $('[data-field="label"]', form).value = preset.label;
-    $('[data-field="command"]', form).value = preset.command.join('\n');
-    $('[data-field="auto_approve_args"]', form).value =
-      (preset.auto_approve_args || []).join('\n');
-    $('[data-field="stream_args"]', form).value =
-      (preset.stream_args || []).join('\n');
-    // No read-only arguments to preview: they are Solo's, and Solo picks its
-    // agent on its card. The server still swaps them there, in one step with
-    // the command, which is the pairing that has to stay honest.
-    $('[data-field="model_args"]', form).value = (preset.model_args || []).join(' ');
-    $('[data-field="effort_args"]', form).value = (preset.effort_args || []).join(' ');
-    // Neither model names nor effort levels are interchangeable between CLIs.
-    $('[data-field="model"]', form).value = '';
-    $('[data-field="models"]', form).value = '';
-    $('[data-field="effort"]', form).value = '';
+    if (!e.target.matches('select[data-field="model"]')) return;
+    const effort = $('select[data-field="effort"]',
+                     e.target.closest('.provider-form'));
+    if (effort) hydrateEffortSelect(effort);
   });
 
-  // The probe results print into the Stages panel, so show it.
-  $('#run-doctor').addEventListener('click', () => {
-    switchSettingsTab('stages');
-    refreshDoctor(true);
+  // No agent picker lives on these forms any more, so there is nothing here to
+  // preview a swap for. Every card is one CLI: Chat's is chosen on its card,
+  // a project chair's in the matrix, and a council seat's card *is* the CLI.
+  // The server still pairs a command with its permission flags on the paths
+  // that do swap - that pairing is the part that has to stay honest.
+
+  // The button sits in the Agents panel, beside the report it prints into.
+  $('#run-doctor').addEventListener('click', () => refreshDoctor(true));
+
+  // -- agent connections -------------------------------------------------
+  // Delegated: the cards are rebuilt every time a status lands.
+  $('#agents-refresh').addEventListener('click', refreshAgents);
+  $('#agent-connections').addEventListener('click', (e) => {
+    const toggle = e.target.closest('[data-agent-toggle]');
+    if (toggle) {
+      const id = toggle.dataset.agentToggle;
+      const added = (agentStatus[id] || {}).selected
+        ?? ((state.agents || []).find(a => a.id === id) || {}).selected;
+      // Removing is not destructive — the CLI, its login and this agent's
+      // model and effort all stay — so it does not ask twice.
+      return toggleAgent(id, !added);
+    }
+    const setup = e.target.closest('[data-agent-setup]');
+    if (setup) return startAgentSetup(setup.dataset.agent, setup.dataset.agentSetup);
+    const copy = e.target.closest('[data-agent-copy]');
+    if (copy) {
+      return navigator.clipboard.writeText(copy.dataset.agentCopy).then(
+        () => toast(`Copied — run \`${copy.dataset.agentCopy}\` in a terminal.`, 'ok', 9000),
+        () => toast(`Run \`${copy.dataset.agentCopy}\` in a terminal.`, 'info', 9000)
+      );
+    }
+  });
+
+  $('#agent-setup-cancel').addEventListener('click', async () => {
+    try {
+      renderSetupSession((await api('/api/agents/setup/cancel', { method: 'POST' })).session || {});
+    } catch (err) { toast(err.message, 'error'); }
+  });
+  $('#agent-setup-input').addEventListener('keydown', async (e) => {
+    if (e.key !== 'Enter') return;
+    const field = e.currentTarget;
+    const text = field.value;
+    field.value = '';
+    try {
+      renderSetupSession((await api('/api/agents/setup/input', {
+        method: 'POST', body: { text },
+      })).session || {});
+    } catch (err) { toast(err.message, 'error'); }
   });
   $('#reset-config').addEventListener('click', async () => {
     if (!confirm('Reset every setting to its default?')) return;
@@ -3775,6 +5865,9 @@ function wire() {
       const { config } = await api('/api/config/reset', { method: 'POST' });
       state.config = config;
       renderSettings();
+      // Roles are part of what was reset, and the dialog is still open on
+      // whichever tab was being read.
+      renderRoleList();
       renderAll();
       toast('Settings reset.', 'ok');
     } catch (err) { toast(err.message, 'error'); }
@@ -3790,9 +5883,7 @@ function wire() {
   });
   $('#new-chat').addEventListener('click', () => {
     state.tab = '';
-    state.run = null;
-    clearContinuation();
-    closeChat();
+    startFreshChat();
     renderAll();
     renderChats();
     $('#task-input').focus();
@@ -3800,8 +5891,9 @@ function wire() {
 
   // -- continuation -----------------------------------------------------
   $('#continue-clear').addEventListener('click', () => {
-    clearContinuation();
-    closeChat();
+    startFreshChat();
+    renderAll();
+    renderChats();
   });
   // Compaction applies to the run about to start; the transcript on disk is
   // never rewritten, so the full text of every turn stays readable in its own
@@ -3822,16 +5914,27 @@ function wire() {
     );
   });
 
+  // -- uncommitted changes ----------------------------------------------
+  // Delegated: the chip is rebuilt by `renderWorkspace` on every state poll,
+  // so a listener bound to the element itself would be thrown away with it.
+  $('#workspace-git').addEventListener('click', (e) => {
+    if (e.target.closest('#dirty-chip')) openChanges();
+  });
+  $('#changes-commit').addEventListener('click', doChangesCommit);
+  $('#changes-message').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doChangesCommit(); }
+  });
+
   // -- modal dismissal --------------------------------------------------
   $$('[data-close]').forEach(btn =>
     btn.addEventListener('click', () => closeModal(btn.dataset.close)));
   $$('.modal').forEach(modal => modal.addEventListener('click', (e) => {
-    if (e.target === modal) modal.classList.add('hidden');
+    if (e.target === modal) closeModal(modal.id);
   }));
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       closeModelMenu();
-      $$('.modal').forEach(m => m.classList.add('hidden'));
+      $$('.modal').forEach(m => closeModal(m.id));
     }
   });
 
@@ -3860,12 +5963,14 @@ function wire() {
 }
 
 async function boot() {
+  await claimSession();
   if (!TOKEN) {
     document.body.innerHTML =
       '<div class="boot-error">' +
       '<h2>Missing session token</h2>' +
       '<p>Open the dashboard using the URL the launcher ' +
-      'printed &mdash; it carries a one-time token for this session.</p></div>';
+      'printed &mdash; it carries a one-time ticket for this session, and a ' +
+      'ticket can only be claimed once.</p></div>';
     return;
   }
   wire();
@@ -3874,6 +5979,8 @@ async function boot() {
   await loadChats();
   connect();
   prefetchResolvedModels();
+  // After `refreshDoctor`, which is what decides who is available to seat.
+  refreshSeating();
   // A project outlives the window it was started from, so the tab is opened
   // for you when one is still running - the alternative is an app that looks
   // idle while three agents rewrite a folder.

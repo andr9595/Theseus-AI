@@ -30,6 +30,30 @@ from aicouncil.providers import (  # noqa: E402
     stream_reader_for,
 )
 
+
+def setUpModule():
+    """Keep the discovery catalogue out of the operator's real config dir.
+
+    Discovery writes what it learns to `catalog.json` beside the config, and a
+    test run that asked a stub binary for its models would otherwise leave the
+    answer sitting in the machine's own catalogue.
+    """
+    global _CATALOG_HOME, _OLD_XDG
+    _CATALOG_HOME = tempfile.mkdtemp(prefix="aicouncil-catalog-")
+    _OLD_XDG = os.environ.get("XDG_CONFIG_HOME")
+    os.environ["XDG_CONFIG_HOME"] = _CATALOG_HOME
+    providers._CATALOG = None
+
+
+def tearDownModule():
+    if _OLD_XDG is None:
+        os.environ.pop("XDG_CONFIG_HOME", None)
+    else:
+        os.environ["XDG_CONFIG_HOME"] = _OLD_XDG
+    providers._CATALOG = None
+    shutil.rmtree(_CATALOG_HOME, ignore_errors=True)
+
+
 CLAUDE = {
     "id": "polisher",
     "command": ["claude", "-p", "{prompt}"],
@@ -177,6 +201,63 @@ class TestBuildArgv(unittest.TestCase):
         argv, _ = build_argv(provider, "hi", auto_approve=False, read_only=True)
         self.assertIn("plan", argv)
         self.assertNotIn("--dangerously-skip-permissions", argv)
+
+    def test_incognito_flags_are_absent_unless_asked_for(self):
+        provider = dict(CODEX, incognito_args=["--ephemeral"])
+        argv, _ = build_argv(provider, "explain this", auto_approve=False)
+        self.assertNotIn("--ephemeral", argv)
+
+    def test_incognito_flags_precede_the_prompt(self):
+        provider = dict(CODEX, incognito_args=["--ephemeral"])
+        argv, _ = build_argv(
+            provider, "explain this", auto_approve=False, incognito=True
+        )
+        self.assertEqual(argv, ["codex", "exec", "--ephemeral", "explain this"])
+
+    def test_incognito_and_read_only_are_independent_grants(self):
+        # What a run may write to the working folder and what the CLI writes to
+        # its own history are different questions, and a private run is not
+        # thereby a read-only one.
+        provider = dict(
+            CODEX,
+            incognito_args=["--ephemeral"],
+            read_only_args=["--sandbox", "read-only"],
+        )
+        argv, _ = build_argv(
+            provider, "hi", auto_approve=False, read_only=True, incognito=True
+        )
+        self.assertIn("--ephemeral", argv)
+        self.assertIn("read-only", argv)
+
+    def test_a_provider_with_no_incognito_flags_is_refused(self):
+        # Not run without them: the operator was told nothing would be saved,
+        # and the trace would land in the CLI's own history where this app
+        # could not even find it afterwards.
+        provider = dict(AGY, label="Antigravity")
+        with self.assertRaises(ProviderUnavailable) as ctx:
+            build_argv(provider, "hi", auto_approve=False, incognito=True)
+        self.assertIn("Antigravity", str(ctx.exception))
+        self.assertIn("incognito", str(ctx.exception))
+
+    def test_blank_incognito_entries_do_not_count_as_support(self):
+        # The same rule the appender uses: an empty entry is not a flag, so a
+        # provider carrying only empty ones has declared nothing.
+        provider = dict(CLAUDE, incognito_args=["", ""])
+        self.assertFalse(providers.supports_incognito(provider))
+        with self.assertRaises(ProviderUnavailable):
+            build_argv(provider, "hi", auto_approve=False, incognito=True)
+
+    def test_the_catalogue_carries_each_cli_s_own_no_save_flag(self):
+        # Read off the shipped presets rather than a local copy: these are the
+        # flags the installed binaries document, and one that drifts fails the
+        # run instead of protecting it.
+        self.assertEqual(AGENTS["codex"]["incognito_args"], ["--ephemeral"])
+        self.assertEqual(
+            AGENTS["claude"]["incognito_args"], ["--no-session-persistence"]
+        )
+        # Antigravity has no such flag, and declaring one it does not know
+        # would be worse than declaring none.
+        self.assertEqual(AGENTS["agy"]["incognito_args"], [])
 
     def test_blank_auto_approve_entries_are_dropped(self):
         provider = dict(CLAUDE, auto_approve_args=["", "  ", "--yes"])
@@ -602,6 +683,43 @@ class TestRunnerConfiguration(unittest.TestCase):
         self.assertIn("positive", result.error)
 
 
+class TestSilentSuccess(unittest.TestCase):
+    """Exit 0, nothing on stdout, an explanation on stderr.
+
+    How `agy` ends a run whose tools were auto-denied. The status says fine,
+    the output says nothing, and the only account of what happened is the
+    sentence on stderr - so that sentence has to survive onto the result even
+    though nothing here calls the run a failure.
+    """
+
+    def run_sh(self, script):
+        provider = {
+            "id": "seat2", "command": ["sh", "-c", script, "sh"], "timeout_seconds": 60,
+        }
+        return ProviderRunner(provider, lambda *_: None).run(
+            "hi", cwd=str(Path(__file__).parent), auto_approve=False
+        )
+
+    def test_the_reason_on_stderr_is_kept(self):
+        result = self.run_sh('echo "a tool was auto-denied" >&2')
+        self.assertTrue(result.ok)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("auto-denied", result.error)
+
+    def test_a_clean_silent_run_reports_no_reason(self):
+        result = self.run_sh("true")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.error, "")
+
+    def test_stderr_beside_real_output_is_not_an_error(self):
+        # Progress notes and deprecation warnings go to stderr all the time.
+        # Only a run that produced nothing at all has anything to explain.
+        result = self.run_sh('echo warning >&2; echo "the answer"')
+        self.assertTrue(result.ok)
+        self.assertEqual(result.stdout, "the answer")
+        self.assertEqual(result.error, "")
+
+
 class TestResolveBinary(unittest.TestCase):
     def test_finds_an_executable_on_path(self):
         self.assertIsNotNone(resolve_binary(["sh"]))
@@ -827,8 +945,26 @@ class TestAntigravityAgent(unittest.TestCase):
         self.assertNotIn("plan", granted)
 
         withheld, _ = build_argv(AGY, "task", auto_approve=False, read_only=True)
-        self.assertEqual(withheld[-3:-1], ["--mode", "plan"])
-        self.assertNotIn("--dangerously-skip-permissions", withheld)
+        self.assertIn("--mode", withheld)
+        self.assertEqual(withheld[withheld.index("--mode") + 1], "plan")
+
+    def test_read_only_still_lets_it_read(self):
+        # The asymmetry with Claude and Codex, and the reason every Antigravity
+        # seat used to fail: `agy --print` cannot ask a permission question, so
+        # it auto-denies one - including the `read_file` a read-only stage is
+        # entirely built around. Plan mode is what withholds the write; without
+        # the approval beside it the stage reads nothing, answers nothing, and
+        # exits 0.
+        withheld, _ = build_argv(AGY, "task", auto_approve=False, read_only=True)
+        self.assertIn("--mode", withheld)
+        self.assertIn("--dangerously-skip-permissions", withheld)
+
+    def test_nothing_is_granted_without_a_grant(self):
+        # Neither grant means neither flag: the approval only ever arrives
+        # attached to one of them, never on its own.
+        argv, _ = build_argv(AGY, "task", auto_approve=False, read_only=False)
+        self.assertNotIn("--dangerously-skip-permissions", argv)
+        self.assertNotIn("--mode", argv)
 
     def test_nothing_is_granted_by_default(self):
         argv, _ = build_argv(AGY, "task", auto_approve=False)
@@ -854,14 +990,17 @@ class TestAntigravityAgent(unittest.TestCase):
 class TestAntigravityDiscovery(unittest.TestCase):
     """What `agy` can run, asked of `agy`."""
 
+    # Transcribed from `agy models` on Antigravity CLI 1.1.10: one line per
+    # model, the id and the human-readable name separated by a tab. The
+    # heading and the blank line are there because dropping them is this
+    # parser's other job.
     MODELS_STUB = (
         "#!/usr/bin/env python3\n"
         "import sys\n"
         "if sys.argv[1:2] == ['models']:\n"
         "    print('Available models:')\n"
-        "    print('gemini-3.6-flash-high')\n"
-        "    print('claude-sonnet-4-6')\n"
-        "    print('Gemini 3.6 Flash (High)')\n"
+        "    print('gemini-3.6-flash-high\\tGemini 3.6 Flash (High)')\n"
+        "    print('claude-sonnet-4-6\\tClaude Sonnet 4.6 (Thinking)')\n"
         "    print('')\n"
         "else:\n"
         "    sys.stderr.write('Error: invalid model selection "
@@ -890,10 +1029,19 @@ class TestAntigravityDiscovery(unittest.TestCase):
 
     def test_model_ids_are_taken_and_prose_is_left(self):
         r = discover_models(self._stub(self.MODELS_STUB))
-        # The heading and the human-readable form of a model name are both
-        # dropped without this code having to know either was coming.
+        # The heading is dropped without this code having to know it was
+        # coming. The regression this guards: every line of the real listing
+        # carries a tab and a display name, and judging the whole line rather
+        # than the id threw all of them away - the Antigravity picker showed no
+        # models at all, on every tab, however many times it was opened.
         self.assertEqual(r["models"], ["gemini-3.6-flash-high", "claude-sonnet-4-6"])
         self.assertFalse(r["error"])
+
+    def test_the_name_beside_each_id_is_kept(self):
+        # `gemini-3.6-flash-high` and `gemini-3.5-flash-high` are one character
+        # apart. The CLI names both, so the picker does not have to guess.
+        r = discover_models(self._stub(self.MODELS_STUB))
+        self.assertEqual(r["labels"]["claude-sonnet-4-6"], "Claude Sonnet 4.6 (Thinking)")
 
     def test_being_signed_out_is_reported_in_the_clis_own_words(self):
         r = discover_models(self._stub(self.SIGNED_OUT_STUB))
@@ -933,6 +1081,128 @@ class TestAntigravityDiscovery(unittest.TestCase):
         r = discover_models(dict(AGY, command=["agy-not-installed"]))
         self.assertEqual(r["models"], [])
         self.assertIn("PATH", r["error"])
+
+
+class TestDiscoveryCatalogue(unittest.TestCase):
+    """Asking a CLI what it can run is a process launch; opening a menu is a
+    click, and it was paying for one every time.
+
+    `agy models` takes seconds on a cold start and up to a minute on a loaded
+    machine, which is what put "Asking Antigravity…" in front of every picker
+    in the app. The answer is kept beside the config instead, and re-asked
+    only when the binary changes or the operator asks for it.
+    """
+
+    STUB = (
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "open(sys.argv[0] + '.calls', 'a').write('x')\n"
+        "if 'models' in sys.argv:\n"
+        "    print('Available models:')\n"
+        "    print('gemini-3.6-flash-high')\n"
+        "else:\n"
+        "    sys.stderr.write('Error: invalid model selection "
+        "(--effort \"?ask\"): invalid --effort \"?ask\" "
+        "(valid: low, medium, high)\\n')\n"
+    )
+
+    SIGNED_OUT_STUB = (
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "open(sys.argv[0] + '.calls', 'a').write('x')\n"
+        "sys.stderr.write('Error: Please sign in to view available models.\\n')\n"
+        "sys.exit(1)\n"
+    )
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-catalogued-"))
+        self.path = self.tmp / "agy"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _stub(self, body=None, **extra):
+        self.path.write_text(body or self.STUB)
+        self.path.chmod(0o755)
+        return dict(AGY, command=[str(self.path), "--prompt={prompt}"], **extra)
+
+    def _calls(self):
+        marker = Path(str(self.path) + ".calls")
+        return len(marker.read_text()) if marker.exists() else 0
+
+    def test_a_second_menu_does_not_launch_the_cli_again(self):
+        provider = self._stub()
+        first = discover_models(provider)
+        second = discover_models(provider)
+        self.assertEqual(second["models"], first["models"])
+        self.assertEqual(self._calls(), 1)
+        # The menu says which it is showing, so a stored list cannot pass for
+        # one that was just asked for.
+        self.assertFalse(first["cached"])
+        self.assertTrue(second["cached"])
+
+    def test_it_survives_a_restart(self):
+        provider = self._stub()
+        discover_models(provider)
+        providers._CATALOG = None  # what a fresh process starts with
+        again = discover_models(provider)
+        self.assertEqual(again["models"], ["gemini-3.6-flash-high"])
+        self.assertTrue(again["cached"])
+        self.assertEqual(self._calls(), 1)
+
+    def test_an_upgraded_cli_is_asked_again(self):
+        # A new binary can run new models, and nothing else would ever expire
+        # the entry - the catalogue would otherwise describe the old one until
+        # someone thought to press Refresh.
+        provider = self._stub()
+        discover_models(provider)
+        self._stub(self.STUB + "# rebuilt\n")
+        discover_models(provider)
+        self.assertEqual(self._calls(), 2)
+
+    def test_refresh_asks_again_regardless(self):
+        provider = self._stub()
+        discover_models(provider)
+        discover_models(provider, refresh=True)
+        self.assertEqual(self._calls(), 2)
+
+    def test_a_signed_out_cli_is_not_remembered(self):
+        # Signing in does not touch the binary, so a stored refusal would
+        # outlive its cause and never be re-asked.
+        provider = self._stub(self.SIGNED_OUT_STUB)
+        first = discover_models(provider)
+        second = discover_models(provider)
+        self.assertIn("sign in", first["error"])
+        self.assertIn("sign in", second["error"])
+        self.assertEqual(self._calls(), 2)
+
+    def test_the_fallback_effort_set_is_shown_but_not_stored(self):
+        # The levels below are this app's transcription, not the CLI's answer.
+        # Stored, one busy moment would stop it ever asking again.
+        provider = dict(AGY, command=[str(self.tmp / "agy-not-installed")])
+        first = discover_efforts(provider)
+        second = discover_efforts(provider)
+        self.assertEqual([lv["effort"] for lv in first["levels"]],
+                         ["low", "medium", "high"])
+        self.assertFalse(second["cached"])
+
+    def test_effort_levels_are_kept_per_model(self):
+        # `agy` refuses --effort beside a model it lists and accepts one beside
+        # a base name it does not. One entry per CLI would answer whichever
+        # question was asked first, for both.
+        listed = discover_efforts(self._stub(model="gemini-3.6-flash-high"))
+        base = discover_efforts(self._stub(model="gemini-3.6-flash"))
+        self.assertTrue(listed["conflicts_with_model"])
+        self.assertEqual([lv["effort"] for lv in base["levels"]],
+                         ["low", "medium", "high"])
+
+    def test_the_effort_menu_reuses_the_stored_model_list(self):
+        # It has to know whether the model is one `agy models` lists. Asking
+        # for that list again would be a second process behind one dropdown.
+        provider = self._stub(model="gemini-3.6-flash-high")
+        discover_models(provider)
+        discover_efforts(provider)
+        self.assertEqual(self._calls(), 1)
 
 
 class TestEffortDiscovery(unittest.TestCase):
