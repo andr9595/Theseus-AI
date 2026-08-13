@@ -25,7 +25,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 GIT_TIMEOUT = 60
 # Pushing and talking to GitHub crosses the network, so they get their own,
