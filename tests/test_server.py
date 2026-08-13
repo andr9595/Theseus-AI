@@ -144,6 +144,112 @@ class TestLaunchTicket(ServerTestBase):
         self.assertEqual(status, 401)
 
 
+class TestLanAllowlist(ServerTestBase):
+    """AI_COUNCIL_ALLOWED_HOSTS, the opt-in for a deployment reachable by more
+    than one name - a LAN IP, a `.local` name, a reverse proxy's domain.
+
+    Read per-request rather than cached, so these mutate the environment
+    against the one server ``ServerTestBase`` already started rather than
+    spinning up a second one.
+    """
+
+    def setUp(self):
+        self._previous = os.environ.get("AI_COUNCIL_ALLOWED_HOSTS")
+
+    def tearDown(self):
+        if self._previous is None:
+            os.environ.pop("AI_COUNCIL_ALLOWED_HOSTS", None)
+        else:
+            os.environ["AI_COUNCIL_ALLOWED_HOSTS"] = self._previous
+
+    def test_an_unlisted_host_is_still_rejected(self):
+        status, _ = self.request("/api/state", headers={"Host": "tower.local"})
+        self.assertEqual(status, 403)
+
+    def test_a_listed_host_is_accepted(self):
+        os.environ["AI_COUNCIL_ALLOWED_HOSTS"] = "tower.local"
+        status, data = self.request("/api/state", headers={"Host": "tower.local"})
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+
+    def test_matching_is_case_insensitive(self):
+        os.environ["AI_COUNCIL_ALLOWED_HOSTS"] = "Tower.Local"
+        status, _ = self.request("/api/state", headers={"Host": "tower.local"})
+        self.assertEqual(status, 200)
+
+    def test_several_hosts_can_be_listed(self):
+        os.environ["AI_COUNCIL_ALLOWED_HOSTS"] = "tower.local, 192.168.1.50 ,ai.example.com"
+        for host in ("tower.local", "192.168.1.50", "ai.example.com"):
+            status, _ = self.request("/api/state", headers={"Host": host})
+            self.assertEqual(status, 200, host)
+
+    def test_the_origin_check_honours_it_too(self):
+        os.environ["AI_COUNCIL_ALLOWED_HOSTS"] = "tower.local"
+        status, _ = self.request(
+            "/api/state", headers={"Origin": "http://tower.local"}
+        )
+        self.assertEqual(status, 200)
+
+    def test_loopback_still_works_alongside_it(self):
+        os.environ["AI_COUNCIL_ALLOWED_HOSTS"] = "tower.local"
+        status, data = self.request("/api/state")
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+
+    def test_an_unrelated_host_is_not_let_in_by_accident(self):
+        os.environ["AI_COUNCIL_ALLOWED_HOSTS"] = "tower.local"
+        status, _ = self.request(
+            "/api/state", headers={"Host": "attacker.example.com"}
+        )
+        self.assertEqual(status, 403)
+
+
+class TestPersistentToken(unittest.TestCase):
+    """`make_server(..., token=...)` is what a container passes so the
+    printed URL survives a restart - see AppState in server.py."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-token-"))
+        self._previous_xdg = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = str(self.tmp / "xdg")
+        self.store = ConfigStore(self.tmp / "config.json")
+
+    def tearDown(self):
+        if self._previous_xdg is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = self._previous_xdg
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_server(self, **kwargs):
+        server, state, url = make_server(self.store, port=0, **kwargs)
+        self.addCleanup(server.server_close)
+        return server, state, url
+
+    def test_without_a_token_the_ticket_is_still_one_shot(self):
+        _, state, _ = self._make_server()
+        ticket = state.ticket
+        self.assertEqual(state.redeem_ticket(ticket), state.token)
+        self.assertIsNone(state.redeem_ticket(ticket))
+
+    def test_a_supplied_token_becomes_the_session_token(self):
+        _, state, url = self._make_server(token="my-fixed-secret")
+        self.assertEqual(state.token, "my-fixed-secret")
+        self.assertIn("ticket=my-fixed-secret", url)
+
+    def test_a_supplied_token_never_expires_the_ticket(self):
+        _, state, _ = self._make_server(token="my-fixed-secret")
+        # Simulates a container restarting and the operator reusing the same
+        # bookmarked URL - or two tabs opening it at once.
+        for _ in range(3):
+            self.assertEqual(state.redeem_ticket("my-fixed-secret"), "my-fixed-secret")
+
+    def test_a_0_0_0_0_bind_is_not_printed_as_the_url(self):
+        _, _, url = self._make_server(host="0.0.0.0")
+        self.assertNotIn("0.0.0.0", url)
+        self.assertIn("localhost", url)
+
+
 class TestStaticFiles(ServerTestBase):
     def test_index_is_served_without_a_token(self):
         with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:

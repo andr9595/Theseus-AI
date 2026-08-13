@@ -147,11 +147,75 @@ one you never added is not a problem to fix by installing something.
 | Flag | Effect |
 |---|---|
 | `--doctor` | Report environment and CLI availability, then exit |
-| `--host IP` | Bind address, default `127.0.0.1`. Loopback only — `127.0.0.1`, `localhost` and `::1` are accepted and anything else exits with status 2, because the app can run an agent with auto-approve flags. |
+| `--host IP` | Bind address, default `127.0.0.1`. Loopback only unless `--allow-lan` is also given, because the app can run an agent with auto-approve flags. Env: `AI_COUNCIL_HOST`. |
+| `--allow-lan` | Permit a non-loopback `--host`. Meant for a container whose network Docker already isolates — see [Docker / unraid](#docker--unraid). Env: `AI_COUNCIL_ALLOW_LAN=1`. |
 | `--no-browser` | Start the server without opening a window |
-| `--port N` | Preferred port (falls back to a free one if taken) |
+| `--port N` | Preferred port (falls back to a free one if taken). Env: `AI_COUNCIL_PORT`. |
 | `--print-url` | Print only the dashboard URL, then serve |
 | `--version` | Print the version, then exit |
+
+Two more are environment-only, since a secret and a hostname list have no
+business on a command line another local user can read with `ps`:
+`AI_COUNCIL_TOKEN` and `AI_COUNCIL_ALLOWED_HOSTS`, both covered below.
+
+---
+
+## Docker / unraid
+
+The image is `ghcr.io/andr9595/ai-council`, built by
+[`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml)
+on every push to `main` and tagged `latest`. It is the same stdlib-only app -
+the image installs nothing beyond `git`, `openssh-client` and `curl`, which
+the app itself already shells out to. The agent CLIs are **not** baked in:
+install them from Settings → Agents once the container is running, the same
+button that works on a bare-metal install, so their own updaters keep
+working rather than being frozen at whatever the image had on build day.
+
+### Running it
+
+```bash
+docker run -d --name ai-council \
+  -p 8760:8760 \
+  -v ai-council-home:/home/aicouncil \
+  -v /mnt/user/projects:/workspace \
+  -e PUID=99 -e PGID=100 \
+  -e AI_COUNCIL_TOKEN="$(openssl rand -hex 24)" \
+  -e AI_COUNCIL_ALLOWED_HOSTS="192.168.1.50,ai-council.local" \
+  ghcr.io/andr9595/ai-council:latest
+```
+
+Or `docker compose up -d` with the [`docker-compose.yml`](docker-compose.yml)
+in this repo, which documents the same volumes and variables. On unraid,
+either add the container from **Docker → Add Container** using
+[`unraid/ai-council.xml`](unraid/ai-council.xml) as a starting template, or
+add `ghcr.io/andr9595/ai-council` as the repository by hand and fill in the
+variables below yourself.
+
+| Variable | Required | What it does |
+|---|---|---|
+| `PUID`, `PGID` | recommended | The entrypoint `usermod`/`groupmod`s the in-image user to match, then `chown`s the home volume — files it writes belong to your array's uid, not the image's. unraid's own `nobody:users` is `99:100`. |
+| `AI_COUNCIL_TOKEN` | recommended | A secret you choose (`openssl rand -hex 24`). Without it, a fresh one-time login ticket is generated every start and read from `docker logs` — workable, but a container that restarts often makes that tedious. With it, `http://<host>:8760/?ticket=<the same value>` is a permanent bookmark; the bare URL still shows *Missing session token* by design. |
+| `AI_COUNCIL_ALLOWED_HOSTS` | **yes**, for LAN access | Comma-separated hostnames/IPs you will actually browse to. Requests claiming any other `Host` are rejected — this is the DNS-rebinding defence described in [server.py](aicouncil/server.py), and it stays an explicit allowlist rather than "anything, once off loopback" even inside a container. |
+
+The one volume that matters is the home directory (`/home/aicouncil` above):
+the app's config, and — once installed from Settings → Agents inside the
+running container — the CLIs themselves and their logins (`~/.codex`,
+`~/.claude`, `~/.config/gh`, `~/.local/bin`) all live under it. Mount whatever
+folder(s) you want the council editing separately, and point the app at them
+from its own folder picker; `/workspace` above is just a convention, not
+something the app expects by name.
+
+### What Docker does and does not solve
+
+Publishing GitHub over the token flow in [Connecting GitHub](#connecting-github)
+is genuinely container-friendly — no browser, works headless. The agent CLIs
+are the part that stays a manual step: `codex` and `claude` log in through a
+browser callback, which a container has no browser to receive, and
+Antigravity's sign-in is a full-screen TUI this app deliberately does not
+attempt to drive headlessly. The practical path is signing in once — on this
+machine, or with `docker exec -it ai-council bash` against a real terminal —
+and letting the persisted home volume carry that login across restarts and
+image updates.
 
 ---
 

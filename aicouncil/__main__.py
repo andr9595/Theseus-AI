@@ -9,6 +9,7 @@ gets a plain new window, since it removed ``-app`` support.
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -153,13 +154,54 @@ def _print_doctor(store: cfg.ConfigStore) -> int:
     return 0
 
 
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _bind_refusal(host: str, allow_lan: bool) -> Optional[str]:
+    """Why ``host`` should not be bound, or None if it is fine to.
+
+    A pure check so the container and the desktop path share one rule rather
+    than one refusing on faith that the other agrees. This app can execute a
+    coding agent with auto-approve flags, so leaving loopback is a real change
+    in exposure - the flag is the operator saying that is intended, not a
+    default anything can flip on for them.
+    """
+    if host in LOOPBACK_HOSTS:
+        return None
+    if not allow_lan:
+        return (
+            f"Refusing to bind to {host!r}. This app can execute a coding agent "
+            f"with auto-approve flags and stays on the loopback interface "
+            f"unless told otherwise. Pass --allow-lan (or set "
+            f"AI_COUNCIL_ALLOW_LAN=1) to bind elsewhere - meant for a container "
+            f"whose network Docker already isolates, not for a bare host."
+        )
+    return None
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="aicouncil",
         description=f"{APP_NAME} - a local, deliberating multi-agent coding council.",
     )
-    parser.add_argument("--port", type=int, default=None, help="preferred port")
-    parser.add_argument("--host", default="127.0.0.1", help="bind address (loopback only)")
+    parser.add_argument(
+        "--port", type=int,
+        default=int(os.environ["AI_COUNCIL_PORT"]) if os.environ.get("AI_COUNCIL_PORT") else None,
+        help="preferred port (env: AI_COUNCIL_PORT)",
+    )
+    parser.add_argument(
+        "--host", default=os.environ.get("AI_COUNCIL_HOST", "127.0.0.1"),
+        help="bind address - loopback unless --allow-lan (env: AI_COUNCIL_HOST)",
+    )
+    parser.add_argument(
+        "--allow-lan", action="store_true",
+        default=_truthy_env("AI_COUNCIL_ALLOW_LAN"),
+        help="permit a non-loopback --host (env: AI_COUNCIL_ALLOW_LAN=1)",
+    )
     parser.add_argument("--no-browser", action="store_true", help="do not open a window")
     parser.add_argument(
         "--print-url", action="store_true", help="print only the URL, then serve"
@@ -173,17 +215,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.doctor:
         return _print_doctor(store)
 
-    if args.host not in ("127.0.0.1", "localhost", "::1"):
-        print(
-            f"Refusing to bind to {args.host!r}. This app can execute a coding "
-            f"agent with auto-approve flags and must stay on the loopback "
-            f"interface.",
-            file=sys.stderr,
-        )
+    refusal = _bind_refusal(args.host, args.allow_lan)
+    if refusal:
+        print(refusal, file=sys.stderr)
         return 2
 
+    # A token supplied this way survives a restart with the same URL, which is
+    # what makes a container's WebUI link stable - see AppState in server.py
+    # for what "persistent" changes about the ticket. Never a CLI flag: argv
+    # is world-readable via `ps` for as long as the process runs.
+    token = os.environ.get("AI_COUNCIL_TOKEN") or None
+
     try:
-        server, state, url = make_server(store, args.port, args.host)
+        server, state, url = make_server(store, args.port, args.host, token=token)
     except OSError as exc:
         print(f"Could not start the server: {exc}", file=sys.stderr)
         return 1
@@ -196,6 +240,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"  Dashboard : {url}")
         print(f"  Config    : {store.path}")
         print(f"  Zero-Touch: {'ON' if store.get('zero_touch') else 'off'}")
+        if args.host not in LOOPBACK_HOSTS:
+            allowed = os.environ.get("AI_COUNCIL_ALLOWED_HOSTS", "")
+            print(f"  Bound     : {args.host} (LAN-reachable)")
+            print(
+                f"  Reachable as: {allowed}" if allowed else
+                "  AI_COUNCIL_ALLOWED_HOSTS is not set - only loopback names "
+                "will be accepted even though the socket is open. Set it to "
+                "the hostname or IP you will actually browse to."
+            )
         print("\n  Press Ctrl+C to stop.\n")
 
     if not args.no_browser and store.get("open_browser", True):

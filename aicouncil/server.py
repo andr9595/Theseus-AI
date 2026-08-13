@@ -2,20 +2,30 @@
 
 Security posture
 ----------------
-The server binds to 127.0.0.1 only, but "localhost" is not a security boundary
-on a multi-user or browser-hosting machine: any page you visit can issue
-requests to http://127.0.0.1:8760, and any local process can too. Since this
-app's API can execute a coding agent with ``--dangerously-skip-permissions``,
+The server binds to 127.0.0.1 by default, but "localhost" is not a security
+boundary on a multi-user or browser-hosting machine: any page you visit can
+issue requests to http://127.0.0.1:8760, and any local process can too. Since
+this app's API can execute a coding agent with ``--dangerously-skip-permissions``,
 three defences are layered on:
 
-1. **Session token.** Generated per launch, never persisted. Every ``/api/``
-   request must present it. The token never reaches a command line: the
-   launcher's URL carries a single-use *ticket*, which the page trades for the
-   token through ``POST /api/session`` before its first real request.
+1. **Session token.** Generated per launch, never persisted, unless the
+   caller explicitly supplies one (``AI_COUNCIL_TOKEN`` - see ``main`` in
+   ``__main__.py`` and ``AppState`` below), which is what a headless
+   deployment needs for its URL to survive a restart. The token never reaches
+   a command line: the launcher's URL carries a *ticket*, which the page
+   trades for the token through ``POST /api/session`` before its first real
+   request - one-time unless a supplied token made it persistent.
 2. **Origin / Host validation.** Requests whose ``Origin`` is a real remote
-   site are rejected, which blocks the drive-by CSRF case, and a non-loopback
-   ``Host`` header is rejected, which blocks DNS rebinding.
+   site are rejected, which blocks the drive-by CSRF case, and a ``Host`` not
+   on the allowlist is rejected, which blocks DNS rebinding. The allowlist is
+   loopback names by default and only grows via ``AI_COUNCIL_ALLOWED_HOSTS``
+   (see ``_allowed_hosts``) - an operator naming exactly what they will
+   browse to, never "accept anything once off loopback".
 3. **No shell.** See ``providers.py`` - argv lists, never a shell string.
+
+Binding off loopback at all requires ``--allow-lan`` (or
+``AI_COUNCIL_ALLOW_LAN=1``) in ``__main__.py`` - meant for a container whose
+network Docker already isolates, not for a bare host process.
 """
 
 from __future__ import annotations
@@ -55,10 +65,31 @@ MAX_BODY_BYTES = 4 * 1024 * 1024
 ALLOWED_HOSTS = {"localhost", "127.0.0.1", "[::1]", "::1"}
 
 
+def _allowed_hosts() -> frozenset:
+    """The loopback set, plus whatever ``AI_COUNCIL_ALLOWED_HOSTS`` adds.
+
+    Read on every call rather than cached at import time, so a container's
+    environment is picked up the moment it is set and tests can change it
+    without reimporting the module. The extra names are for a deployment
+    reachable by more than one hostname - a LAN IP, a `.local` name, a reverse
+    proxy's domain - and they are additions, never a replacement: loopback
+    keeps working so a tunnel or a proxy on the same host is unaffected.
+
+    This is still an explicit allowlist, not "trust any Host header once
+    bound non-locally" - that would defeat the DNS-rebinding defence this
+    check exists for, since a rebinding attack's Host and Origin are
+    internally consistent with each other and only wrong compared to what the
+    operator actually intended to be reachable.
+    """
+    extra = os.environ.get("AI_COUNCIL_ALLOWED_HOSTS", "")
+    names = {h.strip().lower() for h in extra.split(",") if h.strip()}
+    return frozenset(ALLOWED_HOSTS) | names
+
+
 class AppState:
     """Container for the objects every request handler needs."""
 
-    def __init__(self, store: cfg.ConfigStore) -> None:
+    def __init__(self, store: cfg.ConfigStore, token: Optional[str] = None) -> None:
         self.store = store
         self.bus = EventBus()
         self.pipeline = Pipeline(store, self.bus)
@@ -74,7 +105,18 @@ class AppState:
         # started on an earlier request, and a handler-scoped one would be a
         # process nothing could reach a second later.
         self.setup = connections.SetupManager()
-        self.token = secrets.token_urlsafe(24)
+        # `token` is normally generated fresh per launch and never persisted -
+        # right for a desktop app where the same person starts it and opens
+        # the browser a second later. A headless container has nobody to hand
+        # a ticket to at start-up and no browser to race the accept loop, so
+        # the caller (`main`, reading `AI_COUNCIL_TOKEN`) can supply a token of
+        # its own instead. When it does, the "ticket" *is* that token, and
+        # redeeming it does not consume it - the same URL keeps working after
+        # a restart, which is what makes a stable WebUI link possible. This is
+        # a real relaxation of the one-shot model, and it is opt-in for
+        # exactly that reason.
+        self.token = token or secrets.token_urlsafe(24)
+        self._persistent = bool(token)
         # The launcher has no way to hand a browser a secret except on its
         # command line, where every other user on the machine can read it out
         # of the process table for as long as the window stays open. So the
@@ -82,7 +124,7 @@ class AppState:
         # present it is given the token in a response body and the ticket dies
         # on the spot, which narrows the exposure from the whole session to
         # however long the browser takes to start.
-        self._ticket = secrets.token_urlsafe(24)
+        self._ticket = self.token if self._persistent else secrets.token_urlsafe(24)
         self._ticket_lock = threading.Lock()
         self.started_at = time.time()
         # Publishing on the bus means every open tab updates together, and a
@@ -116,7 +158,8 @@ class AppState:
                 return None
             if not secrets.compare_digest(supplied, self._ticket):
                 return None
-            self._ticket = ""
+            if not self._persistent:
+                self._ticket = ""
             return self.token
 
     def _agent_quota(self) -> Dict[str, Optional[float]]:
@@ -167,8 +210,9 @@ class Handler(BaseHTTPRequestHandler):
             super().log_message(fmt, *args)
 
     def _origin_ok(self) -> bool:
-        host = (self.headers.get("Host") or "").split(":")[0].strip()
-        if host and host not in ALLOWED_HOSTS:
+        allowed = _allowed_hosts()
+        host = (self.headers.get("Host") or "").split(":")[0].strip().lower()
+        if host and host not in allowed:
             return False
         origin = self.headers.get("Origin")
         if origin:
@@ -176,7 +220,7 @@ class Handler(BaseHTTPRequestHandler):
                 parsed = urllib.parse.urlparse(origin)
             except ValueError:
                 return False
-            if parsed.hostname not in ALLOWED_HOSTS:
+            if (parsed.hostname or "").lower() not in allowed:
                 return False
         return True
 
@@ -1092,10 +1136,11 @@ def make_server(
     store: Optional[cfg.ConfigStore] = None,
     port: Optional[int] = None,
     host: str = "127.0.0.1",
+    token: Optional[str] = None,
 ) -> Tuple[Server, AppState, str]:
     """Build a ready-to-serve instance. Returns ``(server, state, url)``."""
     store = store or cfg.ConfigStore()
-    state = AppState(store)
+    state = AppState(store, token=token)
     # `port is None` means "unset, use the configured default". Port 0 is a
     # real request for an OS-assigned ephemeral port, so `port or default`
     # would be wrong - it treats 0 as unset.
@@ -1104,7 +1149,15 @@ def make_server(
 
     handler = type("BoundHandler", (Handler,), {"app": state})
     server = Server((host, chosen), handler)
-    url = f"http://{host}:{chosen}/?ticket={urllib.parse.quote(state.ticket)}"
+    # `0.0.0.0` is a bind address, not something a browser can be pointed at -
+    # printing it verbatim would hand back a URL that cannot work. `localhost`
+    # is always true of the machine running the process, which is the best
+    # guess this function can make without asking the network who it is; the
+    # caller (`main`) prints the real story for a LAN deployment.
+    display_host = host if host not in ("0.0.0.0", "::") else "localhost"
+    url = (
+        f"http://{display_host}:{chosen}/?ticket={urllib.parse.quote(state.ticket)}"
+    )
     return server, state, url
 
 

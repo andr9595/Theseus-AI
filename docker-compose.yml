@@ -1,0 +1,37 @@
+# Reference compose file - unraid's own Docker tab does not read this, but
+# it is the fastest way to try the image on any other machine, and it
+# documents the exact volumes and env vars the unraid template also sets.
+#
+#   docker compose up -d
+#   docker compose logs -f    # first URL (with its login ticket) is printed here
+services:
+  ai-council:
+    image: ghcr.io/andr9595/ai-council:latest
+    # build: .   # uncomment to build from source instead of pulling
+    container_name: ai-council
+    ports:
+      - "8760:8760"
+    volumes:
+      # Everything persistent lives under one directory: the app's own
+      # config, and - once installed from Settings -> Agents inside the
+      # running container - the CLIs themselves and their logins
+      # (~/.codex, ~/.claude, ~/.config/gh, ~/.local/bin).
+      - ai-council-home:/home/aicouncil
+      # The folder(s) you want the council working in. Add as many
+      # `- /host/path:/container/path` lines as you need; point the app at
+      # whichever one you're using from Settings -> Working folder.
+      - ./projects:/workspace
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      # A stable secret so the dashboard URL survives a container restart.
+      # Generate one with: openssl rand -hex 24
+      AI_COUNCIL_TOKEN: "change-me-to-a-random-secret"
+      # Every hostname or IP you will actually type into a browser to reach
+      # this container, comma-separated. Requests claiming to be any other
+      # Host are rejected - this is the DNS-rebinding defence, not red tape.
+      AI_COUNCIL_ALLOWED_HOSTS: "192.168.1.50,ai-council.local"
+    restart: unless-stopped
+
+volumes:
+  ai-council-home:

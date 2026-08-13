@@ -1,0 +1,64 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>ai-council</Name>
+  <Repository>ghcr.io/andr9595/ai-council:latest</Repository>
+  <Registry>https://github.com/andr9595/AI-Council/pkgs/container/ai-council</Registry>
+  <Network>bridge</Network>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/andr9595/AI-Council</Support>
+  <Project>https://github.com/andr9595/AI-Council</Project>
+  <Overview>
+Theseus AI (ai-council) - a local, deliberating multi-agent coding council that
+runs your own subscription-authenticated CLIs (Claude, Codex, Antigravity),
+not per-token API keys.
+
+First run:
+1. Start the container, then check its log for the dashboard URL - it carries
+   a one-time login ticket.
+2. Set AI_COUNCIL_TOKEN below to a secret of your choosing (openssl rand -hex
+   24) so that URL stays valid across restarts, then bookmark
+   http://YOUR-UNRAID-IP:8760/?ticket=THE-SAME-SECRET - that is your
+   permanent dashboard link. The bare WebUI button will show "Missing session
+   token" by design; it is not a broken build, it is what a link with no
+   ticket does.
+3. Set AI_COUNCIL_ALLOWED_HOSTS to every hostname/IP you will actually browse
+   to (your unraid IP, a .local name, a reverse-proxy domain). Requests
+   claiming any other Host are rejected - this is a DNS-rebinding defence,
+   and it is deliberately not permissive-by-default even though the socket
+   itself is LAN-reachable.
+4. Open Settings -> Agents inside the dashboard to install whichever CLIs you
+   use (Claude, Codex, Antigravity) and sign them in - nothing is baked into
+   the image, so their own updaters keep working exactly as on a bare-metal
+   install. Do the same for GitHub under the connections card if you want the
+   commit button to push.
+
+The one volume (Appdata) is where all of that persists: the app's config, the
+installed CLIs, and their logins. Add further volumes for whichever working
+folder(s) you want the council editing.
+  </Overview>
+  <Category>Tools: Productivity:</Category>
+  <WebUI>http://[IP]:[PORT:8760]/</WebUI>
+  <Icon></Icon>
+  <!-- No icon shipped yet - unraid falls back to a generic one. Point this at
+       a 512x512 PNG in the repo (raw.githubusercontent.com URL) once one
+       exists. -->
+  <ExtraParams></ExtraParams>
+  <DonateText></DonateText>
+  <DonateLink></DonateLink>
+  <Date></Date>
+  <Description>A local, deliberating multi-agent coding council - Claude, Codex and Antigravity critique each other's answers before anything is written to disk.</Description>
+
+  <Config Name="WebUI Port" Target="8760" Default="8760" Mode="tcp" Description="The dashboard's port." Type="Port" Display="always" Required="true" Mask="false">8760</Config>
+
+  <Config Name="Appdata" Target="/home/aicouncil" Default="/mnt/user/appdata/ai-council" Mode="rw" Description="App config, installed agent CLIs, and their logins - everything that has to survive a restart." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/ai-council</Config>
+
+  <Config Name="Workspace" Target="/workspace" Default="/mnt/user/projects" Mode="rw" Description="The working folder the council edits. Point the app at /workspace from its own folder picker. Add more Path entries for more than one project." Type="Path" Display="always" Required="false" Mask="false">/mnt/user/projects</Config>
+
+  <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User id files are written as - 99 is unraid's own 'nobody'." Type="Variable" Display="always" Required="true" Mask="false">99</Config>
+
+  <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group id files are written as - 100 is unraid's own 'users'." Type="Variable" Display="always" Required="true" Mask="false">100</Config>
+
+  <Config Name="AI_COUNCIL_TOKEN" Target="AI_COUNCIL_TOKEN" Default="" Mode="" Description="A secret of your own choosing (openssl rand -hex 24). Makes the dashboard URL survive a restart - see the Overview above. Leave blank and a one-time login is generated fresh on every start instead, readable from this container's log." Type="Variable" Display="always" Required="false" Mask="true"></Config>
+
+  <Config Name="AI_COUNCIL_ALLOWED_HOSTS" Target="AI_COUNCIL_ALLOWED_HOSTS" Default="" Mode="" Description="Comma-separated hostnames/IPs you will browse to - your unraid IP, a .local name, a reverse-proxy domain. Required for the dashboard to accept any request that isn't loopback." Type="Variable" Display="always" Required="true" Mask="false"></Config>
+</Container>
