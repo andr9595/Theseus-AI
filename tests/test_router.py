@@ -71,8 +71,37 @@ class TestSeating(unittest.TestCase):
     def test_a_security_prompt_seats_a_security_voice(self):
         seating = router.route("is this auth check exploitable?", ALL, run_id="a")
         self.assertIn(
-            "security_review", [s.persona for s in seating.members]
+            "threat_model", [s.persona for s in seating.members]
         )
+
+    def test_every_persona_the_router_can_pick_is_a_council_lens(self):
+        # A seat's persona is composed *onto* the stage contract. A standalone
+        # role brings an output contract of its own, and a seat handed both
+        # answers to neither - which is what routing to `security_review` and
+        # `adversarial_review` used to do on every review and security task.
+        for axis, persona in router.PERSONA_FOR_AXIS.items():
+            with self.subTest(axis=axis):
+                role = prompts.ROLE_TEMPLATES.get(persona)
+                self.assertIsNotNone(role, f"{persona} is not a role at all")
+                self.assertTrue(
+                    role.get("council"),
+                    f"{persona} is a standalone role, not a council lens",
+                )
+
+    def test_a_council_lens_carries_no_output_contract_of_its_own(self):
+        # The lens says what to look at. What the reply looks like is the
+        # stage's to say, and a lens that also asks for headings competes with
+        # it - so no lens quotes a Markdown heading or a report field.
+        lenses = [
+            (key, tpl) for key, tpl in prompts.ROLE_TEMPLATES.items()
+            if tpl.get("council")
+        ]
+        self.assertTrue(lenses)
+        for key, tpl in lenses:
+            with self.subTest(role=key):
+                text = tpl["system"]
+                self.assertNotIn("##", text)
+                self.assertNotIn("**Where:**", text)
 
     def test_every_seat_explains_itself(self):
         seating = router.route("refactor the pipeline module", ALL, run_id="a")
@@ -140,14 +169,24 @@ class TestSeating(unittest.TestCase):
 
     def test_a_council_never_falls_below_two_members(self):
         # One member has no peer to review, and the critique stage would have
-        # nothing to do.
+        # nothing to do. Two is the floor wherever a second CLI exists to hold
+        # the seat.
         seating = router.route("anything", ALL, run_id="a", seat_count=1)
         self.assertGreaterEqual(len(seating.members), 2)
 
-    def test_one_installed_cli_still_seats_a_council_and_says_what_it_cost(self):
+    def test_one_installed_cli_seats_one_member_and_says_what_it_cost(self):
+        # The floor of two was manufacturing a peer out of the only CLI
+        # installed: two correlated positions and two critiques of its own
+        # work, four calls before the chairman, and a quorum the pipeline
+        # refuses anyway. One seat is what the machine can seat.
         seating = router.route("anything", ["claude"], run_id="a")
-        self.assertTrue(seating.members)
+        self.assertEqual(len(seating.members), 1)
         self.assertTrue(any("one CLI" in n for n in seating.notes))
+
+    def test_a_second_cli_is_enough_for_a_second_seat(self):
+        seating = router.route("anything", ["claude", "codex"], run_id="a")
+        self.assertEqual(len(seating.members), 2)
+        self.assertEqual(len({s.agent for s in seating.members}), 2)
 
     def test_no_installed_cli_refuses_rather_than_seating_nobody(self):
         with self.assertRaises(ValueError):
@@ -201,7 +240,7 @@ class TestSeating(unittest.TestCase):
         # seat is a suggestion box.
         task = "is this auth check exploitable?"
         routed = router.route(task, ALL, run_id="a")
-        self.assertEqual(routed.members[0].persona, "security_review")
+        self.assertEqual(routed.members[0].persona, "threat_model")
 
         pinned = router.route(task, ALL, run_id="a", personas={"seat1": "visionary"})
         self.assertEqual(pinned.members[0].persona, "visionary")
@@ -380,6 +419,34 @@ class TestCouncilPrompts(unittest.TestCase):
                                            house_rules="y" * 50_000)
         self.assertLess(len(text), ARGV_PROMPT_LIMIT)
         self.assertIn("CONFIDENCE:", text)
+
+    def test_a_long_task_keeps_the_middle_the_council_was_asked_about(self):
+        # The project constants at the bottom of `prompts` reassigned
+        # MAX_TASK_CHARS to 2,000 for the whole module, so a request longer
+        # than that reached every seat with its middle replaced by the
+        # truncation marker - and a requirement stated in the part that went
+        # missing was one no member could have answered.
+        marker = "REQUIREMENT-IN-THE-MIDDLE"
+        task = ("a" * 5_000) + marker + ("b" * 5_000)
+        positions = [{"alias": "Agent A", "output": "answer"}]
+
+        for name, text in (
+            ("member", prompts.build_member_prompt(task, "/tmp")),
+            ("critique", prompts.build_critique_prompt(
+                task, [{"alias": "Agent B", "output": "peer"}], "/tmp")),
+            ("chairman", prompts.build_chairman_prompt(
+                task, positions, [], "/tmp")),
+        ):
+            with self.subTest(prompt=name):
+                self.assertIn(marker, text)
+
+    def test_clipping_spends_the_marker_out_of_the_budget(self):
+        # Every budget in `prompts` is spent as though `clip` were a bound,
+        # and the chairman's last clip is the guarantee that the prompt fits
+        # the argv it travels in.
+        for limit in (10, 40, 100, 4_000):
+            with self.subTest(limit=limit):
+                self.assertLessEqual(len(prompts.clip("x" * 50_000, limit)), limit)
 
     def test_a_critic_is_shown_its_own_answer_as_context_not_as_a_target(self):
         # Every stage is a fresh process with no memory of the last one, so

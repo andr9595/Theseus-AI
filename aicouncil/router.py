@@ -510,11 +510,18 @@ ALIASES = tuple(chr(ord("A") + i) for i in range(26))
 
 # Which persona a seat is given when the router picks one for it. Ordered by
 # axis, and consulted only for axes this task actually loads - a task with no
-# security content should not seat a Security Reviewer just to fill a chair.
+# security content should not seat a Threat Modeller just to fill a chair.
+#
+# Every value here must be a *council lens* (`council: True` in
+# prompts.ROLE_TEMPLATES): a seat's lens is composed onto the stage contract,
+# not in place of it, so a standalone role with an output contract of its own
+# leaves the seat holding two. This used to route to `security_review` and
+# `adversarial_review`, and what came back was a review in the shape those
+# prompts ask for rather than an answer to the task the council was given.
 PERSONA_FOR_AXIS: Dict[str, str] = {
-    "security": "security_review",
-    "review": "adversarial_review",
-    "debugging": "adversarial_review",
+    "security": "threat_model",
+    "review": "adversary",
+    "debugging": "adversary",
     "implementation": "council_member",
     "architecture": "council_member",
     "analysis": "council_member",
@@ -567,8 +574,8 @@ def _persona_for(profile: TaskProfile, taken: Iterable[str]) -> Tuple[str, str]:
     """Pick a persona for a seat, preferring one this task calls for.
 
     ``taken`` is the personas already seated, so a three-agent council does not
-    end up as three Adversarial Reviewers. Falls back to the plain council
-    member, which is the neutral behaviour and always available.
+    end up as three Adversaries. Falls back to the plain council member, which
+    is the neutral behaviour and always available.
     """
     taken = set(taken)
     for axis in profile.dominant:
@@ -709,7 +716,14 @@ def route(
     # with three CLIs installed buys three correlated answers at six times the
     # quota, so the request is reduced - and said out loud, because a Members
     # setting that quietly means something else is a setting nobody can trust.
-    seated = min(wanted, max(2, len(pool)))
+    #
+    # The floor of two holds only while there is a second CLI to fill it. Where
+    # there is not, the second seat is the same agent answering the same
+    # question twice and then reviewing itself under an alias: four calls
+    # before the chairman, no second opinion in any of them, and a quorum the
+    # pipeline refuses anyway. One seat is what the machine can seat, and the
+    # note below says so.
+    seated = min(wanted, max(2, len(pool))) if len(pool) > 1 else 1
     if seated < wanted:
         notes.append(
             f"{wanted} members were asked for, but only {len(pool)} CLI(s) are "
@@ -778,8 +792,9 @@ def route(
     if len(set(used)) == 1 and len(field_agents) == 1:
         notes.append(
             f"Only {field_agents[0]} is installed, so the whole council is one "
-            f"CLI. The stages still run, but the peer critique is that agent "
-            f"reviewing its own work."
+            f"CLI and the bench is a single seat. A second seat would be that "
+            f"agent answering twice and then reviewing itself, so the peer "
+            f"critique is skipped and the chairman is told it heard one voice."
         )
     elif chair_agent in used:
         notes.append(

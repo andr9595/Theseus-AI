@@ -1322,18 +1322,29 @@ agent is — Settings → **Council → Seating**, or left on **Auto** for the
 router to pick one the task calls for. The catalogue of personas is edited
 under Settings → **Roles**:
 
-| Template | Behaviour | Writes |
-|---|---|---|
-| Council Member | The neutral lens — what an unrouted seat gets | no |
-| Pragmatist | Smallest change that works, shipped today | no |
-| Visionary | The longer view, and what this decision costs later | no |
-| Adversarial Reviewer | Hunts for defects, fixes nothing | no |
-| Test Writer | Writes tests that would have caught real bugs | yes |
-| Security Reviewer | Findings with a real attacker and a real path | no |
-| Direct Implementer | Works the task directly, nothing to review | yes |
-| Chairman | Weighs the bench and applies the outcome | yes |
-| Junior Draft *(legacy)* | Surveys the repo, proposes a change | no |
-| Senior Polish *(legacy)* | Verifies a draft, corrects it, applies it | yes |
+| Template | Behaviour | Lens | Writes |
+|---|---|---|---|
+| Council Member | The neutral lens — what an unrouted seat gets | yes | no |
+| Pragmatist | Smallest change that works, shipped today | yes | no |
+| Visionary | The longer view, and what this decision costs later | yes | no |
+| Adversary | Doubts the code and the framing, answers anyway | yes | no |
+| Threat Modeller | Who is on the other side of the boundary, and what they gain | yes | no |
+| Adversarial Reviewer | Hunts for defects, fixes nothing | no | no |
+| Test Writer | Writes tests that would have caught real bugs | no | yes |
+| Security Reviewer | Findings with a real attacker and a real path | no | no |
+| Direct Implementer | Works the task directly, nothing to review | no | yes |
+| Chairman | Weighs the bench and applies the outcome | no | yes |
+| Junior Draft *(legacy)* | Surveys the repo, proposes a change | no | no |
+| Senior Polish *(legacy)* | Verifies a draft, corrects it, applies it | no | yes |
+
+**Lens** is whether the template composes onto a council stage. A lens says
+what to *look at* and leaves the shape of the reply to the stage; the templates
+marked `no` are standalone roles carrying an output contract of their own, and
+a seat handed one holds two contracts and answers to neither. Auto only ever
+picks a lens — a security question seats the **Threat Modeller**, a review or a
+bug seats the **Adversary**. The standalone roles stay selectable by hand, at
+the top of the list after the lenses and labelled *standalone*, because the
+operator may want exactly that.
 
 **Writes** is what the persona *expects to do*, not what its seat is allowed to
 do. It is advisory metadata on the template — it grants nothing and blocks
@@ -1353,8 +1364,8 @@ to go back. Blank means "use the template", so clearing the box restores the
 default rather than sending an empty prompt.
 
 Combined with agent assignment, that already covers a lot: pin one seat to
-Claude as an **Adversarial Reviewer** and leave the rest on Auto, and
-Claude is no longer the final voice.
+Claude as an **Adversary** and leave the rest on Auto, and Claude is no longer
+the final voice.
 
 **A caveat the UI states rather than hides.** Permission is still granted *per
 seat* — a member or critique seat is read-only, the chairman writes once
@@ -1585,6 +1596,14 @@ So there are two knobs, and they are meant to be used together:
   With three agents added that costs a position: the member pool excludes the
   chair, so a bench of three becomes a bench of two. The seating says so when
   it happens. It is the bigger single saving and the bigger single loss.
+
+There is also a saving nobody has to choose. A machine with **one CLI
+installed** seats one member, not two: a second seat is the same agent
+answering the same question twice and then critiquing itself under an alias —
+four launches before the chairman, and no second opinion in any of them. The
+peer critique is skipped whenever every surviving position came from the same
+CLI, however the seats were filled, and the run still stops at the gate,
+because one voice was never a quorum.
 
 Neither is measured by guesswork. `scripts/council-cost.py` joins a finished
 transcript to the logs the CLIs write for themselves and prints the run seat by

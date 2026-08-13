@@ -1415,9 +1415,11 @@ class TestFailureHandling(PipelineTestBase):
         for stage in self.critique_stages(run):
             self.assertIn(stage.state, ("skipped", "failed"))
 
-    def test_two_seats_on_one_cli_are_not_a_quorum(self):
-        # A machine with one CLI installed gets two seats on it, which is two
-        # correlated answers rather than two votes. Zero-Touch stops for a
+    def test_a_bench_of_one_cli_is_one_seat_and_not_a_quorum(self):
+        # A machine with one CLI installed used to get two seats on it: two
+        # correlated answers rather than two votes, and then two critiques of
+        # its own work. It is seated once now, the critique stage is skipped
+        # rather than run against itself, and Zero-Touch still stops for a
         # human rather than writing on a council that never disagreed.
         self.store.update({
             "zero_touch": True,
@@ -1434,7 +1436,37 @@ class TestFailureHandling(PipelineTestBase):
             lambda: run.state == "awaiting_approval", what="the quorum gate"
         )
         self.assertEqual({s.agent for s in run.seating.members}, {"codex"})
+        self.assertEqual(len(run.seating.members), 1)
+        # The calls that are not made are the point: one member and no
+        # critique, rather than two of each through the same CLI.
+        for stage in self.critique_stages(run):
+            self.assertIn(stage.state, ("pending", "skipped"))
         self.assertFalse((self.repo / "AI_COUNCIL_DEMO.md").exists())
+        self.pipeline.reject()
+        self.wait_terminal()
+
+    def test_seats_pinned_to_the_same_cli_do_not_review_each_other(self):
+        # The router will not duplicate a CLI on its own any more, but a pin
+        # will, and a pin is the operator's to make. What it must not buy is a
+        # peer-review stage in which one model reviews the answer it would
+        # have written itself: same weights, same blind spots, full price.
+        self.store.update({
+            "zero_touch": True,
+            "council": {
+                "seat_count": 2,
+                "chair_deliberates": False,
+                "pins": {"seat1": "codex", "seat2": "codex", "chair": "claude"},
+            },
+        })
+        run = self.pipeline.start("two seats, one voice", str(self.repo))
+        self.wait_for(
+            lambda: run.state == "awaiting_approval", what="the quorum gate"
+        )
+
+        self.assertEqual({s.agent for s in run.seating.members}, {"codex"})
+        self.assertEqual(len(self.member_stages(run)), 2)
+        for stage in self.critique_stages(run):
+            self.assertIn(stage.state, ("pending", "skipped"))
         self.pipeline.reject()
         self.wait_terminal()
 

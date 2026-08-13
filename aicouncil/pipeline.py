@@ -2154,6 +2154,11 @@ class Pipeline:
                 ),
             )
 
+        # The CLIs actually behind the surviving answers, which is not the same
+        # as how many of them there are: two seats on one agent are two
+        # positions and one voice.
+        voices = {p["seat"].agent for p in positions}
+
         if not positions:
             degraded = True
             self.bus.publish(
@@ -2169,7 +2174,7 @@ class Pipeline:
                     )
                 ),
             )
-        elif len({p["seat"].agent for p in positions}) < 2:
+        elif len(voices) < 2:
             # One voice is not a quorum however many chairs were laid out. It
             # happens two ways: seats duplicated onto the only installed CLI,
             # and everyone but one member failing. Either way what reaches the
@@ -2181,9 +2186,9 @@ class Pipeline:
                 "log",
                 level="warn",
                 message=(
-                    f"Only one CLI ({positions[0]['seat'].agent}) produced an "
-                    f"answer, so there was no second opinion to weigh it "
-                    f"against. "
+                    f"One CLI ({positions[0]['seat'].agent}) is behind every "
+                    f"position that survived, so there is no second opinion to "
+                    f"weigh it against. "
                     + (
                         "Pausing for approval rather than writing on one "
                         "voice unattended."
@@ -2194,12 +2199,15 @@ class Pipeline:
             )
 
         # ---- Stage 2: peer critique --------------------------------------
-        # Skipped when there are not two positions to compare: a lone member
+        # Skipped when there are not two *voices* to compare. A lone member
         # handed its own answer back under an alias would be reviewing itself
-        # while believing it was reviewing a colleague, which is worse than
-        # not running the stage at all.
+        # while believing it was reviewing a colleague, and two seats on one
+        # CLI is the same thing wearing two badges: the same model, the same
+        # blind spots, reviewing the answer it would have written. Counting
+        # positions instead of agents bought a stage of that at full price on
+        # every machine with one CLI installed.
         critiques: List[Dict[str, Any]] = []
-        if len(positions) >= 2:
+        if len(voices) >= 2:
             self._set_state(run, CRITIQUING)
             critique_results = self._run_parallel(
                 run,
@@ -2258,8 +2266,13 @@ class Pipeline:
                     "log",
                     level="info",
                     message=(
-                        "Only one position survived, so there was nothing to "
+                        "One position survived, so there was nothing to "
                         "peer-review. Going straight to the chairman."
+                        if len(positions) == 1
+                        else f"Every surviving position came from the same CLI "
+                             f"({positions[0]['seat'].agent}), so peer review "
+                             f"would be that agent reviewing itself. Skipped, "
+                             f"and the calls it would have cost with it."
                     ),
                 )
 

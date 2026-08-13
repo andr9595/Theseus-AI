@@ -3482,6 +3482,26 @@ function openSeatMenu(anchor, seatId) {
   }, 0);
 }
 
+/** The behaviours a member seat can be given, council lenses first.
+ *
+ *  `council` is set on the shipped catalogue entries: true for a lens that
+ *  composes onto a council stage, false for a standalone role that carries its
+ *  own output contract. A role the operator wrote has neither flag and is
+ *  listed after the lenses without comment — the app does not know which it
+ *  is, and guessing is worse than saying nothing. */
+function seatBehaviours() {
+  const roles = (state.roles || []).filter(r => r.id !== 'chairman');
+  return [...roles.filter(r => r.council), ...roles.filter(r => !r.council)];
+}
+
+/** The one line under a behaviour's name: the mismatch first if there is one,
+ *  otherwise what the behaviour is for. */
+function behaviourNote(r) {
+  if (r.writes) return 'expects to write — this seat cannot';
+  if (r.builtin && !r.council) return 'standalone contract — competes with the stage’s';
+  return r.summary || 'read-only';
+}
+
 /** What a seat is told to be. The list is the Roles catalogue, so a behaviour
  *  written in Settings → Roles is selectable here the moment it is saved —
  *  the wording lives in one place and this only chooses between them.
@@ -3489,7 +3509,14 @@ function openSeatMenu(anchor, seatId) {
  *  The chairman is not offered: it is what the third stage *is*, not a lens a
  *  member can wear. A behaviour that expects to write says so, because a
  *  member seat is read-only whatever it is told — the same mismatch Settings
- *  warns about, reported before it is chosen rather than after. */
+ *  warns about, reported before it is chosen rather than after.
+ *
+ *  Council lenses come first because they are the ones that compose: a lens
+ *  says what to look at and leaves the reply's shape to the stage. A
+ *  standalone role brings an output contract of its own, and a seat holding
+ *  two contracts answers to neither — still selectable, because the operator
+ *  may want exactly that, but said out loud on the option rather than
+ *  discovered in the transcript. */
 function openPersonaMenu(anchor, seatId) {
   closeModelMenu();
   const council = (state.config || {}).council || {};
@@ -3505,13 +3532,11 @@ function openPersonaMenu(anchor, seatId) {
       `<span class="model-opt-name">Auto</span>` +
       `<span class="model-opt-note">a lens the task calls for</span>` +
     `</button>` +
-    (state.roles || []).filter(r => r.id !== 'chairman').map(r =>
+    seatBehaviours().map(r =>
       `<button class="model-opt${r.id === current ? ' active' : ''}" ` +
         `data-value="${esc(r.id)}" title="${esc(r.summary || '')}">` +
         `<span class="model-opt-name">${esc(r.name || r.id)}</span>` +
-        `<span class="model-opt-note">` +
-          `${esc(r.writes ? 'expects to write — this seat cannot' : (r.summary || 'read-only'))}` +
-        `</span>` +
+        `<span class="model-opt-note">${esc(behaviourNote(r))}</span>` +
       `</button>`
     ).join('') +
     `<div class="model-menu-source">` +
@@ -4527,7 +4552,8 @@ function renderCouncilSettings() {
   const pins = council.pins || {};
   const personas = council.personas || {};
   const agents = connectedAgents();
-  const behaviours = (state.roles || []).filter(r => r.id !== 'chairman');
+  // Same list, same order and same warning as the popover on the seat itself.
+  const behaviours = seatBehaviours();
 
   $('#council-pins').innerHTML = seats.map(id => {
     const label = id === 'chair' ? 'Chair' : `Seat ${id.replace('seat', '')}`;
@@ -4547,8 +4573,10 @@ function renderCouncilSettings() {
               `<option value=""${personas[id] ? '' : ' selected'}>` +
                 `Auto — a lens the task calls for</option>` +
               behaviours.map(r =>
-                `<option value="${esc(r.id)}"${personas[id] === r.id ? ' selected' : ''}>` +
-                `${esc(r.name || r.id)}</option>`
+                `<option value="${esc(r.id)}"${personas[id] === r.id ? ' selected' : ''} ` +
+                `title="${esc(behaviourNote(r))}">` +
+                `${esc(r.name || r.id)}` +
+                `${r.builtin && !r.council ? ' — standalone' : ''}</option>`
               ).join('') +
             `</select>`) +
       `</div>`

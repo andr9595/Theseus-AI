@@ -264,6 +264,11 @@ independently. You cannot see their work and they cannot see yours. That is \
 deliberate: the council wants genuinely independent judgement first, so that \
 agreement later means something. Answer as though yours were the only reply.
 
+Nobody reads this but the chairman, and it reads every member at once under a \
+hard character budget. Past that budget the middle of your reply is cut out \
+and lost, so length is not a way to be heard here: what reaches the decision \
+is what was short enough to arrive and specific enough to check.
+
 RULES - these are strict:
 1. DO NOT modify, create or delete any file. Do not run commands that write to \
 disk, stage changes, or commit. This stage is read-only. A later stage applies \
@@ -276,6 +281,11 @@ pass, and a sweep of the tree is not grounding. Stop when what you are about \
 to say is grounded.
 3. Where you are uncertain, say so in the place where it matters rather than \
 in a disclaimer at the end.
+4. Give the chairman only what it cannot get without you: the reading you did \
+and the judgement you formed. It already has the task, the folder and the \
+other members. Do not restate the task, do not narrate the search that got \
+you there, and do not pad a section to fill it - a section with nothing in it \
+is one line saying so.
 
 Structure your reply as Markdown:
 
@@ -283,13 +293,16 @@ Structure your reply as Markdown:
 Your answer to the task, stated plainly in a few sentences. Lead with it.
 
 ## Grounding
-The specific files, functions and call sites that support your position. Quote \
-the few lines that matter. If you could not find something you expected, say \
-so explicitly instead of assuming it exists.
+The specific files, functions and call sites that support your position, cited \
+as `path/file.py:LINE`. Quote only the lines that carry the decision: the \
+chairman can open the file, so a long excerpt is worth less than the sentence \
+saying what is wrong with it. If you could not find something you expected, \
+say so explicitly instead of assuming it exists.
 
 ## Proposal
-What you would actually do. For code changes, a fenced block per file, \
-labelled with the path. For a question, the recommendation and its \
+What you would actually do, in the order you would do it. Include code only \
+where the change is not clear without it - the chairman writes the patch, and \
+a full one here is paid for twice. For a question, the recommendation and its \
 consequences.
 
 ## Where I could be wrong
@@ -316,16 +329,26 @@ below - every one of them is somebody else's. Judge the argument, not its \
 author.
 4. Do not invent disagreement. If a peer is right, saying so - once, briefly - \
 is a real contribution, because it tells the chairman the point is settled.
+5. Do not summarise a peer back to the chairman. It is holding their full \
+answer next to yours. The only thing you can add is what reading the code \
+told you that reading their reply would not.
 
-For each peer, under a heading with their name:
+For each peer, under a heading with their name. Give only the sections that \
+have something in them - an empty heading is a line the chairman pays for and \
+learns nothing from:
 
 ### Agent <letter>
 **Hallucinations:** anything asserted about the code that is not true. Name \
-the file you checked. This section is the reason the stage exists - do it \
-first and do it properly.
+the file you checked and what it actually says. This section is the reason \
+the stage exists - do it first and do it properly.
 **Errors:** where the reasoning breaks, with the specific mechanism.
 **Missing:** what the task needed that they did not address.
-**Sound:** what they got right that the chairman should keep.\
+**Sound:** what they got right that the chairman should keep - named, in a \
+line, not re-explained.
+
+Where a peer has nothing wrong with it that would change what the chairman \
+does, the whole entry is a single line: "Nothing material - <what you \
+checked>." That is a real finding, and that is the correct length for one.\
 """
 
 
@@ -514,6 +537,43 @@ discount you accordingly.\
 """
 
 
+# The two lenses the router reaches for on review, debugging and security
+# tasks. They exist because the standalone roles that used to fill those seats
+# - `adversarial_review` and `security_review` - are whole role prompts with
+# their own output contract, and a seat handed one of those under the council's
+# contract is told to file a per-finding report *and* to answer in Position /
+# Grounding / Proposal. What came back did both, or neither, and cost the
+# chairman a page either way. A lens says what to look at and nothing about
+# what shape the reply takes.
+ADVERSARY_SYSTEM = """\
+Your lens on this council is DOUBT.
+
+Assume the code is wrong until you have read the implementation that says \
+otherwise - names, comments and docstrings are claims, not evidence. Assume \
+the same of the task's own framing: the described fault may not be the fault, \
+and the requested change may not be the fix.
+
+You are still answering the task, not filing a review. A defect belongs in \
+your answer in as far as it changes what the council should do about the task \
+it was given; rank what you report by what it would cost if it shipped.\
+"""
+
+
+THREAT_MODEL_SYSTEM = """\
+Your lens on this council is the ATTACKER'S.
+
+For what the task touches, ask who is on the other side of the trust \
+boundary, what they control, and what they gain. Trace untrusted input from \
+where it enters to where it does damage, and cite where you read it.
+
+Say plainly when there is no untrusted input: a finding with no plausible \
+attacker is not one, and generic best-practice advice reported as a finding \
+is worse than silence. Where the task is not about security, your \
+contribution is the security consequence of the answer the council is about \
+to give - not a review in place of one.\
+"""
+
+
 # The role catalogue. Each entry is a starting point the operator can edit -
 # the shipped text is a default, not a law.
 #
@@ -523,18 +583,29 @@ discount you accordingly.\
 # that nonetheless *may*. The UI flags that mismatch rather than silently
 # resolving it, because guessing which of the two the operator meant is exactly
 # the kind of quiet reinterpretation that makes a safety setting untrustworthy.
+#
+# ``council`` records whether the text is a *lens* - something that says what
+# to look at and leaves the reply's shape to the stage - or a standalone role
+# with an output contract of its own. Only a lens can be composed onto a
+# council stage, because the stage already said what the reply must look like
+# and two contracts in one prompt produce a reply that satisfies neither. The
+# router will never auto-assign a non-lens, and the seat picker flags one that
+# is chosen by hand, on the same principle as ``writes``: reported, not
+# silently overruled.
 ROLE_TEMPLATES: Dict[str, Dict] = {
     "junior_draft": {
         "name": "Junior Draft",
         "summary": "Surveys the repo and proposes a change. Never writes.",
         "system": DRAFT_SYSTEM,
         "writes": False,
+        "council": False,
     },
     "senior_polish": {
         "name": "Senior Polish",
         "summary": "Verifies the draft against the code, corrects it, applies it.",
         "system": POLISH_SYSTEM,
         "writes": True,
+        "council": False,
     },
     # Named for what it does rather than for Solo Mode, which no longer has a
     # role at all - this is a council behaviour for a stage asked to work
@@ -544,24 +615,28 @@ ROLE_TEMPLATES: Dict[str, Dict] = {
         "summary": "Works the task directly, with no draft to review.",
         "system": DIRECT_SYSTEM,
         "writes": True,
+        "council": False,
     },
     "adversarial_review": {
         "name": "Adversarial Reviewer",
         "summary": "Hunts for defects and reports them. Fixes nothing.",
         "system": REVIEWER_SYSTEM,
         "writes": False,
+        "council": False,
     },
     "test_writer": {
         "name": "Test Writer",
         "summary": "Writes tests that would have caught real bugs.",
         "system": TEST_WRITER_SYSTEM,
         "writes": True,
+        "council": False,
     },
     "security_review": {
         "name": "Security Reviewer",
         "summary": "Reports findings with a real attacker and a real path.",
         "system": SECURITY_SYSTEM,
         "writes": False,
+        "council": False,
     },
     # -- the deliberating council -----------------------------------------
     # `council_member` is the neutral seat: no lens beyond answering well. It
@@ -571,24 +646,42 @@ ROLE_TEMPLATES: Dict[str, Dict] = {
         "summary": "Answers independently, then critiques its peers. Never writes.",
         "system": NEUTRAL_MEMBER_SYSTEM,
         "writes": False,
+        "council": True,
     },
     "pragmatist": {
         "name": "Pragmatist",
         "summary": "Prices the change. Smallest thing that actually solves it.",
         "system": PRAGMATIST_SYSTEM,
         "writes": False,
+        "council": True,
     },
     "visionary": {
         "name": "Visionary",
         "summary": "Argues from where the code should end up, not where it is.",
         "system": VISIONARY_SYSTEM,
         "writes": False,
+        "council": True,
+    },
+    "adversary": {
+        "name": "Adversary",
+        "summary": "Doubts the code and the framing. Answers anyway.",
+        "system": ADVERSARY_SYSTEM,
+        "writes": False,
+        "council": True,
+    },
+    "threat_model": {
+        "name": "Threat Modeller",
+        "summary": "Asks who is on the other side of the boundary.",
+        "system": THREAT_MODEL_SYSTEM,
+        "writes": False,
+        "council": True,
     },
     "chairman": {
         "name": "Chairman",
         "summary": "Weighs the council, decides, and applies the outcome.",
         "system": CHAIRMAN_SYSTEM,
         "writes": True,
+        "council": False,
     },
 }
 
@@ -643,6 +736,11 @@ def role_catalog(stored: Optional[Dict[str, Dict]] = None) -> List[Dict]:
             "summary": saved.get("summary") or "",
             "system": saved.get("system") or "",
             "writes": bool(saved.get("writes")),
+            # A role the operator wrote is not claimed to be a council lens:
+            # nothing here has read it. It is listed after the shipped lenses
+            # and left uncommented rather than warned about, because the app
+            # does not know which it is and guessing would be worse.
+            "council": bool(saved.get("council")),
             "builtin": False,
             "edited": False,
         })
@@ -662,12 +760,21 @@ def clip(text: str, limit: int) -> str:
 
     That is where the signal is - the opening states the intent and the closing
     states the caveats; the middle is usually bulk code listing.
+
+    The marker is paid for out of ``limit`` rather than added on top of it.
+    Every budget in this module is spent as though ``clip`` were a bound, and
+    the chairman's final clip is the one hard guarantee that a prompt fits in
+    the argv it travels in - a result 34 characters over the number it was
+    given makes that guarantee false everywhere it is relied on.
     """
     if len(text) <= limit:
         return text
-    head = text[: limit // 2]
-    tail = text[-limit // 2 :]
-    return f"{head}\n\n... [truncated for length] ...\n\n{tail}"
+    marker = "\n\n... [truncated for length] ...\n\n"
+    if limit <= len(marker):
+        return text[:limit]
+    room = limit - len(marker)
+    head = room // 2
+    return f"{text[:head]}{marker}{text[head - room:]}"
 
 
 def _workspace_block(workspace: str, workspace_status: Optional[Dict]) -> str:
@@ -1556,7 +1663,13 @@ MAX_BOARD_CHARS = 8_000
 MAX_SPEC_CHARS = 14_000
 MAX_ERROR_CHARS = 6_000
 MAX_DIFF_CHARS = 8_000
-MAX_TASK_CHARS = 2_000
+# One card's own text, which is a line or two of intent rather than a request.
+# Named apart from the council's MAX_TASK_CHARS above and not spelled the same
+# on purpose: this module is imported once, so a second `MAX_TASK_CHARS = ...`
+# down here does not shadow the first *locally* - it replaces it for the whole
+# module, and every council prompt built afterwards clipped its task to 2,000
+# characters while the constant at the top said 24,000.
+MAX_CARD_TASK_CHARS = 2_000
 
 
 # What every project agent must end its turn with. One contract, quoted into
@@ -1858,8 +1971,8 @@ def _goal_block(goal: str) -> str:
 def _card_block(card: Dict[str, Any]) -> str:
     """One card, as the developer is handed it."""
     title = str(card.get("title") or card.get("id") or "").strip()
-    detail = clip(str(card.get("detail") or "").strip(), MAX_TASK_CHARS)
-    note = clip(str(card.get("note") or "").strip(), MAX_TASK_CHARS)
+    detail = clip(str(card.get("detail") or "").strip(), MAX_CARD_TASK_CHARS)
+    note = clip(str(card.get("note") or "").strip(), MAX_CARD_TASK_CHARS)
     kind = str(card.get("kind") or "task")
 
     lines = [f"`{card.get('id')}` ({kind}) - {title}"]
