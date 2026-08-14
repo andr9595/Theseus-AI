@@ -1772,6 +1772,19 @@ html, body {
 }
 #agent-setup-url { display: inline-block; margin-bottom: 12px; }
 
+/* A real terminal (xterm.js) for the one sign-in that draws its own screen -
+   see openTuiTerminal in app.js. A fixed height, not max-height: fitAddon
+   reads the container's actual box to compute rows/cols, and a height that
+   only grows with content would make that computation chase its own tail. */
+.setup-term {
+  height: 22rem; margin: 0 0 12px; padding: 8px;
+  background: #0d0f14;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.setup-term .xterm-viewport { border-radius: var(--radius-sm); }
+
 .provider-form {
   margin-bottom: 16px; padding: 14px;
   background: var(--bg-2);

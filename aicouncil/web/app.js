@@ -3854,6 +3854,11 @@ function closeModal(id) {
     settingsOpener.focus();
     settingsOpener = null;
   }
+  // The session itself is left running - Stop is a separate, explicit act -
+  // but the terminal emulator attached to it is this dialog's own, and has
+  // to go so a later reattach (showRunningSetupSession) opens a fresh one
+  // rather than writing into a disposed instance.
+  if (id === 'agent-setup') closeTuiTerminal();
 }
 
 /* ---- Directory picker ---- */
@@ -4042,14 +4047,12 @@ function renderAgentConnections() {
               `data-agent="${esc(a.id)}">Install the CLI</button>`
             : '') +
           (added && known && installed && signedIn !== true
-            ? (setup.login_tui
-                // No pane pretends to draw a full-screen session. What it can
-                // do is say exactly what to type, which is what a README would
-                // have said anyway.
-                ? `<button class="btn btn-quiet btn-sm" data-agent-copy=` +
-                  `"${esc(setup.login_hint)}">Copy the sign-in command</button>`
-                : `<button class="btn btn-quiet btn-sm" data-agent-setup="login" ` +
-                  `data-agent="${esc(a.id)}">Sign in</button>`)
+            // A full-screen sign-in (setup.login_tui) gets the same button:
+            // startAgentSetup opens a real terminal emulator for those
+            // instead of the plain-text pane, rather than punting the
+            // operator out to a terminal of their own.
+            ? `<button class="btn btn-quiet btn-sm" data-agent-setup="login" ` +
+              `data-agent="${esc(a.id)}">Sign in</button>`
             : '') +
           // No model button here. The card answers whether this CLI is added,
           // installed and signed in; which model it runs is asked for once, on
@@ -4247,13 +4250,28 @@ async function toggleAgent(id, selected) {
 
 let setupTimer = null;
 
+/** Whether `id`/`action` opens a full-screen sign-in - the one kind that gets
+ *  a real terminal (openTuiTerminal) instead of the plain-text pane. Only
+ *  `login` ever can: an install is always a script printing lines. */
+function isTuiSetup(id, action) {
+  if (action !== 'login') return false;
+  const agent = (state.agents || []).find(a => a.id === id) || {};
+  return !!(agent.setup && agent.setup.login_tui);
+}
+
 async function startAgentSetup(id, action) {
   const agent = (state.agents || []).find(a => a.id === id) || {};
+  const tui = isTuiSetup(id, action);
   $('#agent-setup-title').textContent =
     `${action === 'install' ? 'Installing' : 'Signing in to'} ${agent.label || id}`;
   $('#agent-setup-note').textContent = action === 'install'
     ? 'Runs the bundled installer, which fetches the vendor’s own install ' +
       'script. Nothing is installed system-wide and no password is needed.'
+    : tui
+    ? 'Runs the vendor’s own sign-in session, right here in a real terminal ' +
+      '— this one draws its own screen rather than printing lines, so the ' +
+      'plain pane every other CLI uses cannot show it. Your account details ' +
+      'go to them, not to this app.'
     : 'Runs the vendor’s own sign-in command. Your account details go to them, ' +
       'not to this app — it never sees the token that comes back. Open the ' +
       'link below on any device; some CLIs then show a short code on that ' +
@@ -4261,14 +4279,23 @@ async function startAgentSetup(id, action) {
       'page instead — either way, this pane is not where an account ' +
       'password goes.';
   $('#agent-setup-output').textContent = '';
+  $('#agent-setup-output').classList.toggle('hidden', tui);
+  $('#agent-setup-term').classList.toggle('hidden', !tui);
+  // A real terminal reads every keystroke itself; the line-at-a-time box
+  // underneath it would just be a second, conflicting way to type into the
+  // same session.
+  $('#agent-setup-input-row').classList.toggle('hidden', tui);
   $('#agent-setup-url').classList.add('hidden');
   $('#agent-setup-input').value = '';
+  if (!tui) closeTuiTerminal();
   openModal('agent-setup');
   try {
     const data = await api('/api/agents/setup', {
       method: 'POST', body: { agent: id, action },
     });
-    renderSetupSession(data.session || {});
+    const session = data.session || {};
+    renderSetupSession(session);
+    if (tui) await openTuiTerminal(session);
     pollAgentSetup();
   } catch (err) {
     // Only one setup session runs at a time, server-wide - so "already
@@ -4297,13 +4324,23 @@ async function showRunningSetupSession() {
   const session = data.session || {};
   if (!session.running) return false;
   const owner = (state.agents || []).find(a => a.id === session.agent);
+  const tui = isTuiSetup(session.agent, session.action);
   $('#agent-setup-title').textContent =
     `${session.action === 'install' ? 'Installing' : 'Signing in to'} ` +
     `${owner ? owner.label : session.agent} — already running`;
   $('#agent-setup-note').textContent =
     'This was started earlier and is still going. Stop it here if you want ' +
     'to try something else, or wait for it to finish.';
+  $('#agent-setup-output').classList.toggle('hidden', tui);
+  $('#agent-setup-term').classList.toggle('hidden', !tui);
+  $('#agent-setup-input-row').classList.toggle('hidden', tui);
+  // Populates the Stop button's state and the URL button (still useful in
+  // terminal mode - a one-click alternative to reading the address out of
+  // the rendered screen) immediately, rather than waiting for the first poll
+  // tick. Harmless either way: the plain-text pane it also writes into is
+  // the one #agent-setup-output hides in this mode.
   renderSetupSession(session);
+  if (tui) await openTuiTerminal(session);
   pollAgentSetup();
   return true;
 }
@@ -4320,6 +4357,108 @@ function renderSetupSession(session) {
   if (session.url) link.href = session.url;
   $('#agent-setup-cancel').disabled = !session.running;
   $('#agent-setup-input').disabled = !session.running;
+}
+
+/* -- the embedded terminal, for a sign-in that draws its own screen -------
+   Vendored xterm.js (web/vendor/xterm) renders it; the pty on the other end
+   is the same one SetupSession always opens, in connections.py - a login_tui
+   agent no longer refuses to run interactively, it just gets a real terminal
+   instead of the scrollback pane the rest of Settings uses. */
+
+let term = null;
+let fitAddon = null;
+let termResizeObserver = null;
+let tuiSessionId = null;
+let tuiRawSeq = 0;
+let xtermLoad = null;
+
+/** Fetches the vendored bundle on first use - nothing needs its ~480KB until
+ *  a full-screen sign-in is actually opened. Memoized: a second open reuses
+ *  the same load rather than re-fetching or re-declaring the globals. */
+function ensureXterm() {
+  if (window.Terminal && window.FitAddon) return Promise.resolve();
+  if (xtermLoad) return xtermLoad;
+  const loadScript = (src) => new Promise((resolve, reject) => {
+    const el = document.createElement('script');
+    el.src = src;
+    el.onload = () => resolve();
+    el.onerror = () => reject(new Error(`Could not load ${src}`));
+    document.head.appendChild(el);
+  });
+  xtermLoad = loadScript('/vendor/xterm/xterm.js')
+    .then(() => loadScript('/vendor/xterm/addon-fit.js'));
+  return xtermLoad;
+}
+
+/** Opens a live terminal for `session` - a fresh start or a reattach to one
+ *  already running. `raw_output` backfills whatever it already printed in
+ *  one write; live bytes then arrive as "pty" bus events, matched by session
+ *  id and sequence number (see SetupSession.to_dict in connections.py) so a
+ *  reattach can neither repeat anything nor miss anything between the
+ *  backfill and the first live event. */
+async function openTuiTerminal(session) {
+  try {
+    await ensureXterm();
+  } catch (err) {
+    toast(err.message, 'error', 9000);
+    return;
+  }
+  closeTuiTerminal();
+  tuiSessionId = session.id;
+  tuiRawSeq = session.raw_seq || 0;
+
+  term = new Terminal({
+    fontSize: 13,
+    fontFamily: 'var(--mono)',
+    cursorBlink: true,
+    convertEol: true,
+    scrollback: 5000,
+    theme: { background: '#0d0f14' },
+  });
+  fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  term.open($('#agent-setup-term'));
+  if (session.raw_output) term.write(session.raw_output);
+
+  const resize = () => {
+    if (!term) return;
+    fitAddon.fit();
+    api('/api/agents/setup/resize', {
+      method: 'POST', body: { rows: term.rows, cols: term.cols },
+    }).catch(() => {});
+  };
+  // Called directly, not deferred to requestAnimationFrame: by the time this
+  // runs the modal has been visible for a full network round trip (the POST
+  // that started the session), so the container's layout is already settled
+  // - and rAF is not guaranteed to fire promptly in every context a browser
+  // tab can be in, which a deferred first fit would then silently miss.
+  resize();
+  termResizeObserver = new ResizeObserver(resize);
+  termResizeObserver.observe($('#agent-setup-term'));
+
+  term.onData((data) => {
+    api('/api/agents/setup/raw', { method: 'POST', body: { data } }).catch(() => {});
+  });
+  term.focus();
+}
+
+function closeTuiTerminal() {
+  if (termResizeObserver) { termResizeObserver.disconnect(); termResizeObserver = null; }
+  if (term) { term.dispose(); term = null; }
+  fitAddon = null;
+  tuiSessionId = null;
+  tuiRawSeq = 0;
+}
+
+/** A chunk of raw pty bytes, published the instant SetupSession reads them -
+ *  see SetupManager.start in connections.py. Filtered to the terminal that
+ *  is actually open, and to bytes past what the last backfill or event
+ *  already rendered, so a stale session's tail cannot bleed into a new one. */
+function handlePtyEvent(d) {
+  if (!term || d.session !== tuiSessionId) return;
+  if (d.seq <= tuiRawSeq) return;
+  tuiRawSeq = d.seq;
+  term.write(d.data);
 }
 
 function pollAgentSetup() {
@@ -5418,6 +5557,8 @@ function connect() {
     loadState();
   });
 
+  on('pty', handlePtyEvent);
+
   on('rolled_back', (d) => {
     state.run = d.run;
     pushLine('warn', 'system', d.message);
@@ -6084,13 +6225,6 @@ function wire() {
     }
     const setup = e.target.closest('[data-agent-setup]');
     if (setup) return startAgentSetup(setup.dataset.agent, setup.dataset.agentSetup);
-    const copy = e.target.closest('[data-agent-copy]');
-    if (copy) {
-      return navigator.clipboard.writeText(copy.dataset.agentCopy).then(
-        () => toast(`Copied — run \`${copy.dataset.agentCopy}\` in a terminal.`, 'ok', 9000),
-        () => toast(`Run \`${copy.dataset.agentCopy}\` in a terminal.`, 'info', 9000)
-      );
-    }
   });
 
   // -- GitHub ------------------------------------------------------------

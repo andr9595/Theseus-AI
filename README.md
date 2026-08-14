@@ -207,15 +207,19 @@ something the app expects by name.
 
 ### What Docker does and does not solve
 
-Publishing GitHub over the token flow in [Connecting GitHub](#connecting-github)
-is genuinely container-friendly — no browser, works headless. The agent CLIs
-are the part that stays a manual step: `codex` and `claude` log in through a
-browser callback, which a container has no browser to receive, and
-Antigravity's sign-in is a full-screen TUI this app deliberately does not
-attempt to drive headlessly. The practical path is signing in once — on this
-machine, or with `docker exec -it ai-council bash` against a real terminal —
-and letting the persisted home volume carry that login across restarts and
-image updates.
+All three agent logins, and GitHub's, work the same way in a container as on
+a desktop install: click **Sign in** in Settings, do whatever it asks in the
+dialog that opens, done. See [Add, install, sign in](#add-install-sign-in)
+below for what that looks like per CLI - none of it needs `docker exec`, a
+published port for a callback, or a terminal of your own.
+
+That was not true of a plain `codex login` (needed a browser sharing the
+container's loopback interface, which a remote browser never does) - fixed by
+switching to `codex login --device-auth`, completed from any device, no
+callback. And it was not true of Antigravity's full-screen sign-in either -
+fixed by giving the setup dialog a real terminal (vendored `xterm.js`, see
+`web/vendor/xterm`) for that one case, wired to the same pty the plain-text
+pane uses for everything else.
 
 ---
 
@@ -270,10 +274,13 @@ one — but it does not unset yours either, because a key you exported on purpos
 is not this app's to remove. Sign in through the panel and leave those unset if
 zero per-token cost is the point.
 
-> Antigravity is the exception to step 4: `agy` 1.1.12 has no `auth` subcommand
-> and signs in inside its full-screen session, which a scrollback pane cannot
-> honestly draw. Its card hands you the command to paste into a terminal
-> instead of pretending otherwise.
+> Antigravity is the exception to step 4's plain-text pane, not to step 4
+> itself: `agy` 1.1.12 has no `auth` subcommand and signs in inside its
+> full-screen session, which the scrollback view every other CLI uses cannot
+> honestly draw. Its **Sign in** button opens a real terminal in the dialog
+> instead - vendored `xterm.js` (see `web/vendor/xterm`), driving the same pty
+> every other sign-in runs on - so the session is completed right there rather
+> than in a terminal of your own.
 
 ### Or from the terminal
 

@@ -7,10 +7,12 @@ they get direct coverage.
 
 import json
 import os
+import queue
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -577,6 +579,13 @@ class TestStaticFiles(ServerTestBase):
         with urllib.request.urlopen(f"{self.base}/", timeout=15) as res:
             csp = res.headers.get("Content-Security-Policy")
             self.assertIn("default-src 'none'", csp)
+            # script-src is the directive that actually stops injected script
+            # from running, and nothing loosens it - `style-src` carries
+            # `'unsafe-inline'` for the vendored terminal emulator's own
+            # stylesheet (see server.py), but that must never spread to
+            # script-src by a careless future edit.
+            self.assertIn("script-src 'self';", csp)
+            self.assertNotIn("script-src 'self' 'unsafe-inline'", csp)
             self.assertEqual(res.headers.get("X-Content-Type-Options"), "nosniff")
 
     def test_path_traversal_is_blocked(self):
@@ -1224,13 +1233,120 @@ class TestAgentEndpoints(ServerTestBase):
             status, _ = self.request("/api/agents/setup", method="POST", body=body)
             self.assertEqual(status, 400, body)
 
-    def test_a_full_screen_sign_in_is_offered_as_a_command_instead(self):
-        status, data = self.request(
-            "/api/agents/setup", method="POST",
-            body={"agent": "agy", "action": "login"},
+    def test_a_full_screen_sign_in_starts_a_real_session(self):
+        # login_tui used to be a refusal here; it is now only what tells the
+        # browser to draw a terminal instead of the plain-text pane, so the
+        # session itself has to actually start like any other. A fake `agy`
+        # on an isolated PATH, never the real installed CLI - this must not
+        # spawn Antigravity's real interactive sign-in as a side effect of
+        # the test suite.
+        stub_dir = Path(tempfile.mkdtemp(prefix="aicouncil-agy-stub-"))
+        stub = stub_dir / "agy"
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "print('\\x1b[36mSign in with Google\\x1b[0m')\n"
         )
-        self.assertEqual(status, 400)
-        self.assertIn("terminal", data["error"])
+        stub.chmod(0o755)
+        previous_path = os.environ["PATH"]
+        os.environ["PATH"] = f"{stub_dir}{os.pathsep}{previous_path}"
+        try:
+            status, data = self.request(
+                "/api/agents/setup", method="POST",
+                body={"agent": "agy", "action": "login"},
+            )
+            self.assertEqual(status, 200, data)
+            self.assertEqual(data["session"]["agent"], "agy")
+            self.assertTrue(data["session"]["command"].endswith("/agy"))
+        finally:
+            self.request("/api/agents/setup/cancel", method="POST")
+            os.environ["PATH"] = previous_path
+            shutil.rmtree(stub_dir, ignore_errors=True)
+
+    def test_raw_keystrokes_and_resize_reach_the_session(self):
+        stub_dir = Path(tempfile.mkdtemp(prefix="aicouncil-agy-stub-"))
+        stub = stub_dir / "agy"
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, tty\n"
+            "tty.setcbreak(sys.stdin.fileno())\n"
+            "print('ready')\n"
+            "key = sys.stdin.read(1)\n"
+            "print(f'got {key!r}')\n"
+        )
+        stub.chmod(0o755)
+        previous_path = os.environ["PATH"]
+        os.environ["PATH"] = f"{stub_dir}{os.pathsep}{previous_path}"
+        try:
+            self.request(
+                "/api/agents/setup", method="POST",
+                body={"agent": "agy", "action": "login"},
+            )
+            deadline = time.monotonic() + 5
+            while True:
+                _, data = self.request("/api/agents/setup")
+                if "ready" in data["session"].get("raw_output", ""):
+                    break
+                self.assertLess(time.monotonic(), deadline, "no output arrived")
+                time.sleep(0.02)
+
+            status, data = self.request(
+                "/api/agents/setup/resize", method="POST",
+                body={"rows": 40, "cols": 120},
+            )
+            self.assertEqual(status, 200, data)
+
+            status, data = self.request(
+                "/api/agents/setup/raw", method="POST", body={"data": "q"},
+            )
+            self.assertEqual(status, 200, data)
+            deadline = time.monotonic() + 5
+            while "got 'q'" not in data["session"].get("raw_output", ""):
+                self.assertLess(time.monotonic(), deadline, "the keystroke never landed")
+                time.sleep(0.02)
+                _, data = self.request("/api/agents/setup")
+        finally:
+            self.request("/api/agents/setup/cancel", method="POST")
+            os.environ["PATH"] = previous_path
+            shutil.rmtree(stub_dir, ignore_errors=True)
+
+    def test_a_tui_sessions_output_reaches_the_apps_event_bus(self):
+        # The wiring the browser's terminal actually depends on: AppState
+        # hands its SetupManager the same bus every open tab subscribes to
+        # via /api/events, so this subscribes to it directly rather than
+        # parsing the SSE wire format to prove the same thing indirectly.
+        stub_dir = Path(tempfile.mkdtemp(prefix="aicouncil-agy-stub-"))
+        stub = stub_dir / "agy"
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "print('\\x1b[36mSign in with Google\\x1b[0m')\n"
+        )
+        stub.chmod(0o755)
+        previous_path = os.environ["PATH"]
+        os.environ["PATH"] = f"{stub_dir}{os.pathsep}{previous_path}"
+        q = self.state.bus.subscribe()
+        try:
+            self.request(
+                "/api/agents/setup", method="POST",
+                body={"agent": "agy", "action": "login"},
+            )
+            deadline = time.monotonic() + 5
+            event = None
+            while time.monotonic() < deadline:
+                try:
+                    candidate = q.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if candidate["kind"] == "pty":
+                    event = candidate
+                    break
+            self.assertIsNotNone(event, "no pty event reached the bus")
+            self.assertIn("Sign in with Google", event["data"])
+            self.assertEqual(event["seq"], 1)
+        finally:
+            self.state.bus.unsubscribe(q)
+            self.request("/api/agents/setup/cancel", method="POST")
+            os.environ["PATH"] = previous_path
+            shutil.rmtree(stub_dir, ignore_errors=True)
 
 
 class TestApi(ServerTestBase):

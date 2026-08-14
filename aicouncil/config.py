@@ -443,7 +443,6 @@ def agent_catalog() -> List[Dict[str, Any]]:
                 "can_check": bool(setup.get("status_command")),
                 "docs_url": str(setup.get("docs_url") or ""),
                 "account": str(setup.get("account") or ""),
-                "login_hint": " ".join(setup.get("login_command") or []),
                 "install_hint": " ".join(install_command(name)),
             },
         ))

@@ -28,16 +28,21 @@ a way to end up signed in as neither.
 
 from __future__ import annotations
 
+import codecs
+import fcntl
+import itertools
 import json
 import os
 import re
 import shutil
 import signal
+import struct
 import subprocess
+import termios
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from . import config as cfg
 from .providers import resolve_binary
@@ -155,7 +160,6 @@ def agent_status(conf: Dict[str, Any], agent: str) -> Dict[str, Any]:
         "login_tui": bool(setup.get("login_tui")),
         "docs_url": str(setup.get("docs_url") or ""),
         "account": str(setup.get("account") or ""),
-        "login_hint": " ".join(setup.get("login_command") or []),
         "install_hint": " ".join(cfg.install_command(agent)),
         **status,
     }
@@ -463,16 +467,27 @@ class SetupSession:
     A pipe is not good enough here. Both vendors' login commands check whether
     they are talking to a terminal and take the quiet, non-interactive path
     when they are not - which for a sign-in means refusing rather than printing
-    the URL that is the whole point. So the child gets a real pty, and the
-    output is stripped of its escape sequences on the way back up.
+    the URL that is the whole point. So the child gets a real pty.
 
-    What is streamed back is therefore *readable* rather than *rendered*. That
-    is fine for a flow that prints a URL and waits, and it is not fine for one
-    that draws a menu - which is why `AGENT_SETUP` marks the second kind and
-    Settings offers those as a command to run in a terminal instead.
+    Two views of that pty are kept side by side. `output` is stripped of its
+    escape sequences - readable rather than rendered, which is fine for a flow
+    that prints a URL and waits and is the one every non-terminal caller still
+    polls. `raw_output` keeps them, for the one case that needs to actually
+    render a screen rather than read lines - see `on_raw` and `openTuiTerminal`
+    in app.js, which feeds it to a real terminal emulator. Sequence-numbered so
+    a browser that missed some of it (a closed tab, a reconnect) can ask for
+    exactly the bytes it does not have rather than replaying blind.
     """
 
-    def __init__(self, agent: str, action: str, argv: List[str]) -> None:
+    def __init__(
+        self,
+        agent: str,
+        action: str,
+        argv: List[str],
+        id: int,
+        on_raw: Optional[Callable[[str, int], None]] = None,
+    ) -> None:
+        self.id = id
         self.agent = agent
         self.action = action
         self.command = list(argv)
@@ -480,6 +495,9 @@ class SetupSession:
         self.finished_at = 0.0
         self.exit_code: Optional[int] = None
         self._buffer = ""
+        self._raw_buffer = ""
+        self._raw_seq = 0
+        self._on_raw = on_raw
         self._lock = threading.Lock()
         self._master = -1
         self._proc: Optional[subprocess.Popen] = None
@@ -516,6 +534,12 @@ class SetupSession:
         ).start()
 
     def _pump(self) -> None:
+        # One incremental decoder for the life of the session: a pty read can
+        # split a multi-byte UTF-8 character across two chunks (a box-drawing
+        # glyph, an emoji in a spinner), and decoding each chunk on its own -
+        # the previous behaviour - would corrupt exactly that character rather
+        # than carrying its other half over to the next read.
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         while True:
             try:
                 chunk = os.read(self._master, 4096)
@@ -523,7 +547,11 @@ class SetupSession:
                 break  # the child exited and the pty closed under us
             if not chunk:
                 break
-            self._append(_sanitize(chunk.decode("utf-8", "replace")))
+            text = decoder.decode(chunk)
+            if not text:
+                continue
+            self._append(_sanitize(text))
+            self._append_raw(text)
         proc = self._proc
         if proc is not None:
             try:
@@ -541,6 +569,14 @@ class SetupSession:
         with self._lock:
             self._buffer = (self._buffer + text)[-OUTPUT_LIMIT:]
 
+    def _append_raw(self, text: str) -> None:
+        with self._lock:
+            self._raw_buffer = (self._raw_buffer + text)[-OUTPUT_LIMIT:]
+            self._raw_seq += 1
+            seq = self._raw_seq
+        if self._on_raw is not None:
+            self._on_raw(text, seq)
+
     # -- interaction -------------------------------------------------------
 
     def write(self, text: str) -> None:
@@ -551,6 +587,36 @@ class SetupSession:
             os.write(self._master, (text + "\n").encode("utf-8"))
         except OSError as exc:
             raise ValueError(f"Could not reach the setup session: {exc}") from None
+
+    def write_raw(self, data: str) -> None:
+        """Send bytes exactly as given - a keystroke, not a line.
+
+        The terminal's counterpart to `write`: that one is for the
+        line-oriented "type an answer" box and always appends a newline. A
+        real terminal decides for itself when a carriage return means
+        anything - arrow keys, Ctrl+C and every other control sequence are
+        not lines and must not become one by having a newline forced onto
+        them.
+        """
+        if not self.running:
+            raise ValueError("That setup session has already finished.")
+        try:
+            os.write(self._master, data.encode("utf-8"))
+        except OSError as exc:
+            raise ValueError(f"Could not reach the setup session: {exc}") from None
+
+    def resize(self, rows: int, cols: int) -> None:
+        """Tell the pty its new size. The kernel delivers SIGWINCH for us -
+        nothing here has to signal the child directly."""
+        if not self.running or self._master < 0:
+            return
+        try:
+            fcntl.ioctl(
+                self._master, termios.TIOCSWINSZ,
+                struct.pack("HHHH", max(1, rows), max(1, cols), 0, 0),
+            )
+        except OSError:
+            pass
 
     def cancel(self) -> None:
         proc = self._proc
@@ -574,8 +640,11 @@ class SetupSession:
     def to_dict(self) -> Dict[str, Any]:
         with self._lock:
             output = self._buffer
+            raw_output = self._raw_buffer
+            raw_seq = self._raw_seq
         urls = _URL.findall(output)
         return {
+            "id": self.id,
             "agent": self.agent,
             "action": self.action,
             "command": " ".join(self.command),
@@ -586,15 +655,29 @@ class SetupSession:
             # the operator has to act on, and it is usually not the last one.
             "url": urls[-1] if urls else "",
             "elapsed": round(time.time() - self.started_at, 1),
+            # For a terminal that just opened or reattached: one write of
+            # this brings its screen to the current state, then live "pty"
+            # events (tagged with a seq past this one) carry the rest - see
+            # `raw_seq` and openTuiTerminal in app.js.
+            "raw_output": raw_output,
+            "raw_seq": raw_seq,
         }
 
 
 class SetupManager:
     """The one setup session that may be running, and how it is reached."""
 
-    def __init__(self) -> None:
+    def __init__(self, bus: Optional[Any] = None) -> None:
         self._lock = threading.Lock()
         self._session: Optional[SetupSession] = None
+        # Optional: an EventBus to publish raw pty bytes on, for the one kind
+        # of session (a full-screen sign-in) a browser has to actually render
+        # rather than read. None is a legitimate value - `SetupManager()` on
+        # its own still runs every session, it just cannot offer a live
+        # terminal for the TUI ones, which is exactly the situation the
+        # non-terminal test fakes in test_connections.py want.
+        self._bus = bus
+        self._next_id = itertools.count(1)
 
     def start(self, agent: str, action: str) -> Dict[str, Any]:
         argv = self._argv(agent, action)
@@ -607,7 +690,15 @@ class SetupManager:
                         f"cancel it before starting another."
                     )
                 current.cancel()
-            session = SetupSession(agent, action, argv)
+            sid = next(self._next_id)
+            bus = self._bus
+            on_raw = (
+                (lambda text, seq, _sid=sid: bus.publish(
+                    "pty", session=_sid, seq=seq, data=text
+                ))
+                if bus is not None else None
+            )
+            session = SetupSession(agent, action, argv, id=sid, on_raw=on_raw)
             session.start()
             self._session = session
             return session.to_dict()
@@ -648,13 +739,13 @@ class SetupManager:
             return ["bash", *argv]
         if action == "login":
             setup = cfg.AGENT_SETUP[agent]
-            if setup.get("login_tui"):
-                raise ValueError(
-                    f"{agent} signs in inside its own full-screen session, "
-                    f"which this pane cannot draw. Run `"
-                    f"{' '.join(setup.get('login_command') or [])}` in a "
-                    f"terminal instead."
-                )
+            # `login_tui` used to be a refusal here - "this pane cannot draw a
+            # full-screen session, run it in a terminal yourself" - because the
+            # scrollback pane genuinely could not. It is not a refusal any
+            # more: the frontend opens a real terminal emulator instead of the
+            # plain-text pane for exactly these sessions (see `openTuiTerminal`
+            # in app.js), fed from the same pty this starts either way. The
+            # flag now only tells the browser which view to draw.
             argv = list(setup.get("login_command") or [])
             path = resolve_binary(argv)
             if not path:
@@ -678,6 +769,20 @@ class SetupManager:
         if session is None:
             raise ValueError("No setup session is open.")
         session.write(text)
+        return session.to_dict()
+
+    def write_raw(self, data: str) -> Dict[str, Any]:
+        session = self.current()
+        if session is None:
+            raise ValueError("No setup session is open.")
+        session.write_raw(data)
+        return session.to_dict()
+
+    def resize(self, rows: int, cols: int) -> Dict[str, Any]:
+        session = self.current()
+        if session is None:
+            return {}
+        session.resize(rows, cols)
         return session.to_dict()
 
     def cancel(self) -> Dict[str, Any]:

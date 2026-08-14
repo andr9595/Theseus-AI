@@ -103,8 +103,11 @@ class AppState:
         # Installs and sign-ins started from Settings. One at a time, and owned
         # here rather than by a request handler: the browser polls a session it
         # started on an earlier request, and a handler-scoped one would be a
-        # process nothing could reach a second later.
-        self.setup = connections.SetupManager()
+        # process nothing could reach a second later. Handed the same bus every
+        # other tab already listens on, so a full-screen sign-in's raw pty
+        # bytes reach a terminal emulator in the browser as a "pty" event
+        # rather than needing a stream of their own.
+        self.setup = connections.SetupManager(self.bus)
         # `token` is normally generated fresh per launch and never persisted -
         # right for a desktop app where the same person starts it and opens
         # the browser a second later. A headless container has nobody to hand
@@ -247,9 +250,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
         # The UI ships entirely from disk with no remote assets; a strict CSP
         # means an agent's Markdown output can never pull in a third party.
+        # `script-src` stays `'self'` with no `'unsafe-inline'` - that is the
+        # directive that actually stops injected script from running, and
+        # nothing here loosens it. `style-src` carries `'unsafe-inline'`
+        # because the one vendored dependency in this app, xterm.js (see
+        # web/vendor/xterm), injects a small stylesheet of its own for cursor
+        # blink and selection colour and ships no build of this version with
+        # a CSP nonce hook to satisfy a strict style-src instead. A blocked
+        # style is a purely cosmetic failure - the terminal it is styling
+        # still renders and takes input - but broken on sight is a bad first
+        # impression for the one login flow this exists to make less painful.
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'none'; script-src 'self'; style-src 'self'; "
+            "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data:; font-src 'self'; connect-src 'self'; "
             "base-uri 'none'; form-action 'none'",
         )
@@ -411,6 +424,8 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True, "session": self.app.setup.status()
             },
             ("POST", "/api/agents/setup/input"): self._api_agent_setup_input,
+            ("POST", "/api/agents/setup/raw"): self._api_agent_setup_raw,
+            ("POST", "/api/agents/setup/resize"): self._api_agent_setup_resize,
             ("POST", "/api/agents/setup/cancel"): lambda p: {
                 "ok": True, "session": self.app.setup.cancel()
             },
@@ -767,6 +782,29 @@ class Handler(BaseHTTPRequestHandler):
     def _api_agent_setup_input(self, params: Dict[str, list]) -> Dict[str, Any]:
         body = self._read_body()
         return {"ok": True, "session": self.app.setup.write(str(body.get("text") or ""))}
+
+    def _api_agent_setup_raw(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """A terminal emulator's keystrokes, sent exactly as typed.
+
+        The counterpart to `_api_agent_setup_input` for a full-screen sign-in:
+        that one submits a whole line on Enter, this one forwards every key as
+        it is pressed, because a real terminal needs arrow keys, Ctrl+C and
+        partial escape sequences to reach the child, not a line at a time.
+        """
+        body = self._read_body()
+        return {
+            "ok": True,
+            "session": self.app.setup.write_raw(str(body.get("data") or "")),
+        }
+
+    def _api_agent_setup_resize(self, params: Dict[str, list]) -> Dict[str, Any]:
+        body = self._read_body()
+        try:
+            rows = int(body.get("rows") or 0)
+            cols = int(body.get("cols") or 0)
+        except (TypeError, ValueError):
+            raise ValueError("`rows` and `cols` must be numbers.")
+        return {"ok": True, "session": self.app.setup.resize(rows, cols)}
 
     def _api_github_connect(self, params: Dict[str, list]) -> Dict[str, Any]:
         """Hand a pasted token to `gh`. The only request that carries a secret.

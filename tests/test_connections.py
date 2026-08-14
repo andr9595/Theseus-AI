@@ -59,6 +59,23 @@ if sys.argv[1:] == ["auth", "status"]:
 sys.exit(2)
 '''
 
+# A stand-in for a full-screen TUI sign-in: colour codes it would draw a menu
+# with, and a single keystroke read raw rather than as a line. `setcbreak` is
+# what a real TUI does on its own stdin so a keypress arrives immediately
+# instead of waiting on the pty's line discipline for Enter - without it this
+# fake could not tell a real single-key send from `write` forcing a newline.
+FAKE_AGY = '''#!/usr/bin/env python3
+import sys
+import tty
+
+sys.stdout.write("\\x1b[2J\\x1b[1;1H\\x1b[36mSign in with Google\\x1b[0m\\r\\n")
+sys.stdout.flush()
+tty.setcbreak(sys.stdin.fileno())
+key = sys.stdin.read(1)
+sys.stdout.write(f"\\r\\ngot key: {key!r}\\r\\n")
+sys.exit(0)
+'''
+
 
 # A stand-in for the GitHub CLI that behaves like the real one in the two ways
 # that matter here: it takes the token on *stdin* rather than in an argument,
@@ -111,6 +128,23 @@ def write_fake(directory, name, body):
     return path
 
 
+class _FakeBus:
+    """Stands in for EventBus.publish - records calls, does not fan them out.
+
+    SetupManager only ever calls the one method a real EventBus offers here;
+    testing against a fake rather than a real EventBus keeps this module free
+    of a dependency on aicouncil.events for what is a one-line contract.
+    """
+
+    def __init__(self, sink):
+        self._sink = sink
+
+    def publish(self, kind, **payload):
+        event = {"kind": kind, **payload}
+        self._sink.append(event)
+        return event
+
+
 class ConnectionsTestBase(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-conn-"))
@@ -118,6 +152,7 @@ class ConnectionsTestBase(unittest.TestCase):
         self.bin.mkdir()
         write_fake(self.bin, "codex", FAKE_CODEX)
         write_fake(self.bin, "claude", FAKE_CLAUDE)
+        write_fake(self.bin, "agy", FAKE_AGY)
         self._previous_path = os.environ["PATH"]
         os.environ["PATH"] = f"{self.bin}{os.pathsep}{self._previous_path}"
 
@@ -238,11 +273,65 @@ class TestSetupSessions(ConnectionsTestBase):
             self.setup.start("codex", "login")
         self.assertIn("not installed", str(caught.exception))
 
-    def test_a_full_screen_sign_in_is_refused_with_the_command_to_type(self):
-        with self.assertRaises(ValueError) as caught:
-            self.setup.start("agy", "login")
-        self.assertIn("agy", str(caught.exception))
-        self.assertIn("terminal", str(caught.exception))
+    def test_a_full_screen_sign_in_runs_like_any_other(self):
+        # No more refusal: the browser draws a real terminal for this one
+        # instead of the plain-text pane, but the session itself starts the
+        # same way regardless of what login_tui says.
+        self.setup.start("agy", "login")
+        deadline = time.monotonic() + 5
+        while "Sign in with Google" not in self.setup.status().get("raw_output", ""):
+            self.assertLess(time.monotonic(), deadline, "no TUI output arrived")
+            time.sleep(0.02)
+
+    def test_write_raw_sends_no_trailing_newline(self):
+        # The whole reason it exists rather than reusing `write`: a single
+        # keystroke - an arrow key, Ctrl+C - is not a line and must not be
+        # turned into one.
+        self.setup.start("agy", "login")
+        deadline = time.monotonic() + 5
+        while "Sign in with Google" not in self.setup.status().get("raw_output", ""):
+            self.assertLess(time.monotonic(), deadline, "no TUI output arrived")
+            time.sleep(0.02)
+        self.setup.write_raw("q")
+        session = self.drain()
+        self.assertIn("got key: 'q'", session["raw_output"])
+
+    def test_raw_output_keeps_escape_codes_the_sanitized_output_strips(self):
+        self.setup.start("agy", "login")
+        deadline = time.monotonic() + 5
+        while not self.setup.status().get("raw_output"):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+        session = self.setup.status()
+        self.assertIn("\x1b[36m", session["raw_output"])
+        self.assertNotIn("\x1b[36m", session["output"])
+
+    def test_resize_does_not_raise_even_without_a_running_session(self):
+        self.setup.resize(24, 80)  # nothing running; must be a no-op, not a crash
+
+    def test_every_session_gets_a_distinct_id(self):
+        first = self.setup.start("codex", "login")
+        self.setup.cancel()
+        self.drain()
+        second = self.setup.start("codex", "login")
+        self.assertNotEqual(first["id"], second["id"])
+
+    def test_a_bus_is_told_about_raw_bytes_as_they_arrive(self):
+        received = []
+        manager = connections.SetupManager(bus=_FakeBus(received))
+        session = manager.start("agy", "login")
+        deadline = time.monotonic() + 5
+        while not received:
+            self.assertLess(time.monotonic(), deadline, "no pty event was published")
+            time.sleep(0.02)
+        self.assertEqual(received[0]["session"], session["id"])
+        self.assertEqual(received[0]["seq"], 1)
+        self.assertIn("Sign in with Google", received[0]["data"])
+        manager.cancel()
+        deadline = time.monotonic() + 5
+        while manager.status().get("running"):
+            self.assertLess(time.monotonic(), deadline, "the fake never exited")
+            time.sleep(0.02)
 
 
 VALID_TOKEN = "ghp_valid0000000000000000000000000000"
