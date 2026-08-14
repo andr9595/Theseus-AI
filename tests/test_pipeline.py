@@ -3837,6 +3837,114 @@ class TestPushFromTheApp(PipelineTestBase):
         self.assertEqual(gitutil.remote_web_url(self.repo), "")
 
 
+class TestCloneFromGitHub(unittest.TestCase):
+    """Picking a repo from GitHub instead of browsing to a local folder.
+
+    ``base_url`` stands a local bare repo in for github.com - fake the
+    vendor, not the plumbing, same as the setup-session tests. No test here
+    touches the real network.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-clone-"))
+        self.fake_github = self.tmp / "fake-github"
+        self.owner_dir = self.fake_github / "octocat"
+        self.owner_dir.mkdir(parents=True)
+        self.bare = self.owner_dir / "Hello-World.git"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(self.bare)],
+                       check=True, capture_output=True)
+        # A bare repo with no commits has no default branch a clone can check
+        # out - seed one the way a real GitHub repo always has at least one.
+        seed = self.tmp / "seed"
+        git(["clone", "-q", str(self.bare), str(seed)], self.tmp)
+        git(["config", "user.email", "o@example.test"], seed)
+        git(["config", "user.name", "Octocat"], seed)
+        (seed / "README.md").write_text("hello\n")
+        git(["add", "-A"], seed)
+        git(["commit", "-qm", "initial"], seed)
+        git(["push", "-q", "origin", "main"], seed)
+        self.base_url = f"file://{self.fake_github}"
+        self.dest_root = self.tmp / "clones"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_clones_into_an_owner_slash_name_nesting(self):
+        result = gitutil.clone_repo("octocat/Hello-World", self.dest_root,
+                                    base_url=self.base_url)
+        dest = self.dest_root / "octocat" / "Hello-World"
+        self.assertEqual(result["path"], str(dest))
+        self.assertTrue((dest / "README.md").exists())
+        self.assertTrue(result["is_repo"])
+        self.assertTrue(result["clean"])
+
+    def test_selecting_the_same_repo_again_reuses_the_clone(self):
+        gitutil.clone_repo("octocat/Hello-World", self.dest_root, base_url=self.base_url)
+        dest = self.dest_root / "octocat" / "Hello-World"
+        (dest / "in_progress.txt").write_text("do not lose me\n")
+
+        result = gitutil.clone_repo("octocat/Hello-World", self.dest_root,
+                                    base_url=self.base_url)
+        self.assertEqual(result["path"], str(dest))
+        # Reused, not re-cloned over the top - the file is still there.
+        self.assertTrue((dest / "in_progress.txt").exists())
+
+    def test_a_destination_holding_a_different_repo_is_refused(self):
+        other_bare = self.owner_dir / "Other.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(other_bare)],
+                       check=True, capture_output=True)
+        dest = self.dest_root / "octocat" / "Hello-World"
+        dest.mkdir(parents=True)
+        git(["init", "-q", str(dest)], self.tmp)
+        git(["remote", "add", "origin", f"{self.base_url}/octocat/Other.git"], dest)
+
+        with self.assertRaises(gitutil.GitError) as ctx:
+            gitutil.clone_repo("octocat/Hello-World", self.dest_root, base_url=self.base_url)
+        self.assertIn("already exists", str(ctx.exception))
+
+    def test_a_repo_that_does_not_exist_is_surfaced_as_a_git_error(self):
+        # The exact wording git uses for "no such repo" differs by transport
+        # (file:// here vs GitHub's own HTTPS phrasing) - _clone_failure's
+        # recognition of GitHub's specific wording is covered directly in
+        # TestCloneFailureMessages. What matters here is that a missing repo
+        # raises rather than hangs or leaves a half-cloned directory behind.
+        with self.assertRaises(gitutil.GitError):
+            gitutil.clone_repo("octocat/does-not-exist", self.dest_root,
+                               base_url=self.base_url)
+        self.assertFalse((self.dest_root / "octocat" / "does-not-exist").exists())
+
+    def test_invalid_owner_repo_never_reaches_git(self):
+        for bad in ("-x/evil", "no-slash-here", "a/b/c", "", "a//b", "a/"):
+            with self.assertRaises(gitutil.GitError):
+                gitutil.clone_repo(bad, self.dest_root, base_url=self.base_url)
+        # Nothing was created - the rejection happened before any git command.
+        self.assertFalse(self.dest_root.exists())
+
+
+class TestCloneFailureMessages(unittest.TestCase):
+    """`_clone_failure` turns git's own stderr into something worth reading -
+    pure string handling, no process involved."""
+
+    def test_auth_failure_points_at_connect_github(self):
+        msg = gitutil._clone_failure(
+            "remote: Invalid username or token.\nfatal: Authentication failed",
+            "octocat/private-repo",
+        )
+        self.assertIn("Connect", msg)
+        self.assertIn("octocat/private-repo", msg)
+
+    def test_a_404_reads_as_not_found(self):
+        msg = gitutil._clone_failure(
+            "remote: Repository not found.\nfatal: repository not found",
+            "octocat/typo-repo",
+        )
+        self.assertIn("not found", msg.lower())
+
+    def test_an_unrecognised_failure_falls_back_to_gits_own_last_line(self):
+        msg = gitutil._clone_failure("fatal: unable to access: SSL error", "a/b")
+        self.assertIn("SSL error", msg)
+
+
 class TestWorkspaceMigration(unittest.TestCase):
     """A config written when the folder was a mandatory repository still works.
 

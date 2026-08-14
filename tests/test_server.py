@@ -1747,6 +1747,77 @@ class TestCommitRoute(ServerTestBase):
         self.assertEqual(branches, "")
 
 
+class TestGitHubRepoRoutes(ServerTestBase):
+    """The "GitHub repo" half of the working-folder picker, over the real
+    socket. No test here touches the real network - see gitutil's own
+    TestCloneFromGitHub for the clone mechanics against a local fake origin;
+    what matters here is that the HTTP layer wires it correctly."""
+
+    def test_lists_repos_from_a_stubbed_gh(self):
+        # A real `gh` on this machine's PATH would be genuinely authenticated
+        # - this must not make a real call against the operator's own GitHub
+        # account as a side effect of the test suite, so it isolates PATH the
+        # same way the agy sign-in tests do.
+        stub_dir = Path(tempfile.mkdtemp(prefix="aicouncil-gh-stub-"))
+        stub = stub_dir / "gh"
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "if sys.argv[1:3] == ['repo', 'list']:\n"
+            "    print(json.dumps([{'nameWithOwner': 'octocat/Hello-World', "
+            "'description': 'demo', 'updatedAt': '2026-01-01T00:00:00Z', "
+            "'isPrivate': False, 'defaultBranchRef': {'name': 'main'}}]))\n"
+            "    sys.exit(0)\n"
+            "sys.exit(2)\n"
+        )
+        stub.chmod(0o755)
+        previous_path = os.environ["PATH"]
+        os.environ["PATH"] = f"{stub_dir}{os.pathsep}{previous_path}"
+        try:
+            status, data = self.request("/api/github/repos")
+            self.assertEqual(status, 200, data)
+            self.assertTrue(data["connected"])
+            self.assertEqual(data["repos"][0]["repo"], "octocat/Hello-World")
+        finally:
+            os.environ["PATH"] = previous_path
+            shutil.rmtree(stub_dir, ignore_errors=True)
+
+    def test_clone_requires_a_repo(self):
+        status, data = self.request(
+            "/api/github/repos/clone", method="POST", body={})
+        self.assertEqual(status, 400)
+        self.assertIn("repo", data["error"].lower())
+
+    def test_an_invalid_owner_repo_is_rejected_before_touching_git(self):
+        status, data = self.request(
+            "/api/github/repos/clone", method="POST",
+            body={"repo": "not-a-valid-shape/../etc"})
+        self.assertEqual(status, 500)
+        self.assertIn("not a valid owner/repo", data["error"])
+
+    def test_selecting_an_already_cloned_repo_reuses_it(self):
+        # Exercises the real success path with zero network access: a repo
+        # already sitting where clone_repo would put it is reused as-is (see
+        # gitutil.clone_repo's idempotent-reuse branch), which only reads a
+        # local .git/config - the same shape a fresh clone response has,
+        # without needing an actual clone of anything real to prove it.
+        dest = cfg.repos_dir() / "octocat" / "Hello-World"
+        dest.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", str(dest)],
+                       check=True, capture_output=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin",
+             "https://github.com/octocat/Hello-World.git"],
+            cwd=dest, check=True, capture_output=True)
+
+        status, data = self.request(
+            "/api/github/repos/clone", method="POST",
+            body={"repo": "octocat/Hello-World"})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["status"]["path"], str(dest))
+        self.assertTrue(data["status"]["is_repo"])
+
+
 class TestProjectRoutes(ServerTestBase):
     """The Projects tab's endpoints, over the same real socket."""
 

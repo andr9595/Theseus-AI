@@ -436,6 +436,10 @@ class Handler(BaseHTTPRequestHandler):
             ("POST", "/api/github/disconnect"): lambda p: {
                 "ok": True, "github": connections.github_disconnect()
             },
+            ("GET", "/api/github/repos"): lambda p: {
+                "ok": True, **connections.github_repos()
+            },
+            ("POST", "/api/github/repos/clone"): self._api_github_clone,
         }
 
         handler = routes.get((method, path))
@@ -820,6 +824,22 @@ class Handler(BaseHTTPRequestHandler):
             "ok": True,
             "github": connections.github_connect(str(body.get("token") or "")),
         }
+
+    def _api_github_clone(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Clone (or reuse) a repo picked from the "GitHub repo" tab.
+
+        Once this returns, the result is exactly what `/api/repo` reports for
+        any other folder - the browser calls the same `selectWorkspace` it
+        already uses for one browsed to locally, and everything downstream
+        (diff, commit, push, pull-request mode) is the machinery that already
+        exists for a local folder. Cloning is the only new part.
+        """
+        body = self._read_body()
+        repo = str(body.get("repo") or "").strip()
+        if not repo:
+            raise ValueError("`repo` (owner/name) is required.")
+        status = gitutil.clone_repo(repo, cfg.repos_dir())
+        return {"ok": True, "status": status}
 
     def _api_usage_refresh(self, params: Dict[str, list]) -> Dict[str, Any]:
         self.app.usage.poll_once()

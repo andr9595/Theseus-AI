@@ -117,6 +117,28 @@ if args[:2] == ["auth", "logout"]:
         sys.exit(1)
     os.remove(state)
     sys.exit(0)
+if args[:2] == ["repo", "list"]:
+    import json
+    if os.environ.get("FAKE_GH_REPO_LIST_FAIL"):
+        sys.stderr.write("error connecting to api.github.com\\n")
+        sys.exit(1)
+    print(json.dumps([
+        {
+            "nameWithOwner": "octocat/Hello-World",
+            "description": "My first repository",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "isPrivate": False,
+            "defaultBranchRef": {"name": "main"},
+        },
+        {
+            "nameWithOwner": "octocat/Secret-Project",
+            "description": None,
+            "updatedAt": "2026-02-02T00:00:00Z",
+            "isPrivate": True,
+            "defaultBranchRef": {"name": "main"},
+        },
+    ]))
+    sys.exit(0)
 sys.exit(2)
 '''
 
@@ -498,6 +520,51 @@ class TestGitHubConnection(ConnectionsTestBase):
         self.assertNotIn("ghp_a", cleaned)
         self.assertNotIn("github_pat_b", cleaned)
         self.assertEqual(cleaned.count("[redacted]"), 2)
+
+
+class TestGitHubRepoListing(ConnectionsTestBase):
+    """The "GitHub repo" half of the working-folder picker - what it has to
+    show before anything is cloned."""
+
+    def setUp(self):
+        super().setUp()
+        write_fake(self.bin, "gh", FAKE_GH)
+        # FAKE_GH logs every call's argv to this path regardless of which
+        # subcommand it is - unset, it KeyErrors before reaching `repo list`.
+        os.environ["FAKE_GH_STATE"] = str(self.tmp / "gh-state")
+
+    def tearDown(self):
+        os.environ.pop("FAKE_GH_STATE", None)
+        super().tearDown()
+
+    def test_lists_what_gh_reports(self):
+        found = connections.github_repos()
+        self.assertTrue(found["connected"])
+        self.assertEqual(found["error"], "")
+        repos = {r["repo"]: r for r in found["repos"]}
+        self.assertEqual(
+            repos["octocat/Hello-World"]["description"], "My first repository"
+        )
+        self.assertFalse(repos["octocat/Hello-World"]["private"])
+        self.assertTrue(repos["octocat/Secret-Project"]["private"])
+        # `gh` reports null, not "", for a repo with no description - the UI
+        # needs a string to render, not a value it has to guard against.
+        self.assertEqual(repos["octocat/Secret-Project"]["description"], "")
+
+    def test_a_missing_gh_is_not_reported_as_connected(self):
+        os.environ["PATH"] = str(self.tmp / "empty")
+        found = connections.github_repos()
+        self.assertFalse(found["connected"])
+        self.assertEqual(found["repos"], [])
+        self.assertIn("not installed", found["error"])
+
+    def test_a_failed_call_reports_the_error_not_an_empty_list(self):
+        self.addCleanup(os.environ.pop, "FAKE_GH_REPO_LIST_FAIL", None)
+        os.environ["FAKE_GH_REPO_LIST_FAIL"] = "1"
+        found = connections.github_repos()
+        self.assertFalse(found["connected"])
+        self.assertEqual(found["repos"], [])
+        self.assertTrue(found["error"])
 
 
 class TestGitHubSetupRouting(ConnectionsTestBase):

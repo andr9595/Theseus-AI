@@ -3864,6 +3864,12 @@ function closeModal(id) {
 /* ---- Directory picker ---- */
 
 let pickerPath = '';
+let pickerMode = 'folder';
+let pickerGithubRepo = '';
+// Fetched once per picker session, not once per keystroke in the search box -
+// gh talks to GitHub over the network, and a list that only changes when you
+// push somewhere new does not need to be re-fetched to be re-filtered.
+let githubReposCache = null;
 
 async function loadPicker(path) {
   const listing = await api(`/api/fs?path=${encodeURIComponent(path)}`)
@@ -3956,6 +3962,111 @@ async function clearWorkspace() {
     toast(`No working folder. Runs now happen in ${where}.`, 'ok', 5200);
   } catch (err) {
     toast(err.message, 'error');
+  }
+}
+
+/* ---- GitHub repo tab: pick one, clone it, then hand off to
+   selectWorkspace exactly like a browsed-to folder would. ---- */
+
+/** Switches the picker between browsing a folder and browsing GitHub repos.
+ *  Always called on open too, so the modal never remembers the tab a
+ *  previous visit left it on - the folder tab is the default every time. */
+function setPickerTab(mode) {
+  pickerMode = mode;
+  pickerGithubRepo = '';
+  $$('.picker-tab').forEach(t =>
+    t.classList.toggle('active', t.dataset.pickerTab === mode));
+  $('#picker-folder').classList.toggle('hidden', mode !== 'folder');
+  $('#picker-github').classList.toggle('hidden', mode !== 'github');
+  $('#picker-select').textContent = mode === 'github' ? 'Clone & work here' : 'Work here';
+  $('#picker-select').disabled = mode === 'github';
+  if (mode === 'github') {
+    $('#picker-status').textContent = '';
+    loadGithubPickerRepos();
+  }
+}
+
+/** Fetches the repo list once and caches it; `force` re-fetches (the
+ *  Refresh button) for when something was just pushed to GitHub that isn't
+ *  in the cached list yet. */
+async function loadGithubPickerRepos(force = false) {
+  if (githubReposCache && !force) return renderGithubPickerList();
+  $('#picker-github-list').innerHTML =
+    '<div class="picker-empty">Loading your repositories&hellip;</div>';
+  try {
+    const data = await api('/api/github/repos');
+    githubReposCache = data;
+    renderGithubPickerList();
+  } catch (err) {
+    githubReposCache = { connected: false, repos: [], error: err.message };
+    renderGithubPickerList();
+  }
+}
+
+function renderGithubPickerList() {
+  const list = $('#picker-github-list');
+  const cache = githubReposCache || { connected: false, repos: [], error: '' };
+  if (!cache.connected) {
+    list.innerHTML =
+      `<div class="picker-empty">` +
+        `${esc(cache.error || 'GitHub is not connected.')}<br>` +
+        `<button class="btn btn-quiet btn-sm" id="picker-github-connect" type="button">` +
+          `Connect GitHub in Settings</button>` +
+      `</div>`;
+    return;
+  }
+  const q = $('#picker-github-search').value.trim().toLowerCase();
+  const repos = cache.repos.filter(r =>
+    !q || r.repo.toLowerCase().includes(q) || r.description.toLowerCase().includes(q));
+  if (!repos.length) {
+    list.innerHTML = `<div class="picker-empty">${
+      cache.repos.length ? 'No repositories match.' : 'No repositories found.'
+    }</div>`;
+    return;
+  }
+  list.innerHTML = repos.map(r => `
+    <button class="picker-row github-row ${r.repo === pickerGithubRepo ? 'selected' : ''}"
+      type="button" data-repo="${esc(r.repo)}">
+      <span class="name">${esc(r.repo)}</span>
+      ${r.private ? '<span class="repo-badge">private</span>' : ''}
+      ${r.description ? `<span class="github-repo-desc">${esc(r.description)}</span>` : ''}
+    </button>
+  `).join('');
+}
+
+function selectPickerGithubRow(repo) {
+  pickerGithubRepo = repo;
+  renderGithubPickerList();
+  $('#picker-select').disabled = false;
+  $('#picker-status').textContent = `Cloning ${repo} places it under this app's own ` +
+    `storage, then works there exactly like any other folder.`;
+}
+
+/** The "Clone & work here" action. Cloning re-uses whatever is already there
+ *  (see clone_repo's idempotent-reuse in gitutil.py), so picking the same
+ *  repo again is instant and never throws away uncommitted work in it. */
+async function cloneAndSelectGithubRepo() {
+  if (!pickerGithubRepo) return;
+  const btn = $('#picker-select');
+  btn.disabled = true;
+  btn.textContent = 'Cloning…';
+  try {
+    const { status } = await api('/api/github/repos/clone', {
+      method: 'POST', body: { repo: pickerGithubRepo },
+    });
+    await selectWorkspace(status.path);
+    if (!(state.config || {}).pull_request_mode) {
+      toast(
+        'Pull-request mode is off — turn it on in Settings so runs here ' +
+        'push a branch and open a PR instead of committing straight to it.',
+        'info', 9000
+      );
+    }
+  } catch (err) {
+    toast(err.message, 'error', 9000);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Clone & work here';
   }
 }
 
@@ -5895,6 +6006,7 @@ function wire() {
 
   // One folder picker for the whole app: a project builds where runs run.
   $('#project-folder').addEventListener('click', () => {
+    setPickerTab('folder');
     loadPicker(workspacePath() || undefined);
     openModal('picker');
   });
@@ -6122,6 +6234,7 @@ function wire() {
   // -- working-folder picker --------------------------------------------
   $('#workspace-btn').addEventListener('click', () => {
     openModal('picker');
+    setPickerTab('folder');
     loadPicker(workspacePath() || '~');
   });
   $('#picker-up').addEventListener('click', () => {
@@ -6136,8 +6249,23 @@ function wire() {
     const row = e.target.closest('.picker-row');
     if (row) loadPicker(row.dataset.path);
   });
-  $('#picker-select').addEventListener('click', () => selectWorkspace(pickerPath));
+  $('#picker-select').addEventListener('click', () =>
+    pickerMode === 'github' ? cloneAndSelectGithubRepo() : selectWorkspace(pickerPath));
   $('#picker-clear').addEventListener('click', clearWorkspace);
+
+  $$('[data-picker-tab]').forEach(tab =>
+    tab.addEventListener('click', () => setPickerTab(tab.dataset.pickerTab)));
+  $('#picker-github-search').addEventListener('input', renderGithubPickerList);
+  $('#picker-github-refresh').addEventListener('click', () => loadGithubPickerRepos(true));
+  $('#picker-github-list').addEventListener('click', (e) => {
+    if (e.target.closest('#picker-github-connect')) {
+      closeModal('picker');
+      openSettings('agents');
+      return;
+    }
+    const row = e.target.closest('.github-row');
+    if (row) selectPickerGithubRow(row.dataset.repo);
+  });
 
   $('#recent-workspaces').addEventListener('click', (e) => {
     const btn = e.target.closest('.recent-item');

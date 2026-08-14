@@ -424,19 +424,44 @@
 </div>
 
 <!-- ================= Directory picker ================= -->
+<!-- Two ways into the same place: workspacePath() is a filesystem path
+     either way. A repo picked here is cloned first (see selectGithubRepo in
+     app.js) and then handed to the exact same selectWorkspace() a browsed-to
+     folder uses - nothing downstream (diff, commit, push, pull-request mode)
+     knows or cares which tab it came from. -->
 <div id="picker" class="modal hidden" role="dialog" aria-modal="true" aria-label="Choose a working folder">
   <div class="modal-card modal-card-tall">
     <header class="modal-head">
       <h3>Choose a working folder</h3>
       <button class="icon-btn" data-close="picker" type="button" aria-label="Close">&times;</button>
     </header>
-    <div class="picker-bar">
-      <button id="picker-up" class="btn btn-quiet btn-sm" type="button">&uarr; Up</button>
-      <button id="picker-home" class="btn btn-quiet btn-sm" type="button">Home</button>
-      <input id="picker-path" class="picker-path" spellcheck="false" aria-label="Current path">
+    <div class="picker-tabs" role="tablist" aria-label="Working folder source">
+      <button class="picker-tab active" type="button" role="tab" data-picker-tab="folder"
+        aria-selected="true">Folder</button>
+      <button class="picker-tab" type="button" role="tab" data-picker-tab="github"
+        aria-selected="false">GitHub repo</button>
     </div>
-    <div id="picker-list" class="picker-list"></div>
-    <div id="recent-workspaces" class="recent"></div>
+    <div id="picker-folder">
+      <div class="picker-bar">
+        <button id="picker-up" class="btn btn-quiet btn-sm" type="button">&uarr; Up</button>
+        <button id="picker-home" class="btn btn-quiet btn-sm" type="button">Home</button>
+        <input id="picker-path" class="picker-path" spellcheck="false" aria-label="Current path">
+      </div>
+      <div id="picker-list" class="picker-list"></div>
+      <div id="recent-workspaces" class="recent"></div>
+    </div>
+    <!-- Cloned into this app's own storage (~/.config/ai-council/repos), not
+         wherever the operator happens to be browsing - see repos_dir() in
+         config.py. Picking the same repo again reuses that clone rather than
+         starting over. -->
+    <div id="picker-github" class="hidden">
+      <div class="picker-bar">
+        <input id="picker-github-search" class="picker-path" spellcheck="false"
+          placeholder="Search your repositories&hellip;" aria-label="Search repositories">
+        <button id="picker-github-refresh" class="btn btn-quiet btn-sm" type="button">Refresh</button>
+      </div>
+      <div id="picker-github-list" class="picker-list"></div>
+    </div>
     <footer class="modal-foot">
       <button id="picker-clear" class="btn btn-quiet" type="button">Use no folder</button>
       <span id="picker-status" class="picker-status"></span>

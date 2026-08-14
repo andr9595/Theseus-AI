@@ -456,6 +456,62 @@ def github_disconnect() -> Dict[str, Any]:
     return github_status()
 
 
+# How many repositories the picker's GitHub tab asks for in one call. One
+# request, filtered afterwards in the browser as the operator types - not a
+# `gh` call per keystroke.
+REPO_LIST_LIMIT = 100
+REPO_LIST_TIMEOUT = 20.0
+
+
+def github_repos() -> Dict[str, Any]:
+    """Repositories the connected login can see - for the "GitHub repo" half
+    of the working-folder picker, the alternative to browsing to a local one.
+
+    `gh repo list` with no owner argument lists the authenticated user's own
+    repositories, which is exactly "somewhere I could point the council at",
+    not every repository on GitHub. Connection status is reported the same
+    three-valued way as everything else GitHub-shaped in this module: not
+    installed, not connected, or here is what was found.
+    """
+    if not _gh_binary():
+        return {
+            "connected": False, "repos": [],
+            "error": "The GitHub CLI (`gh`) is not installed.",
+        }
+    try:
+        proc = _run_gh(
+            [
+                "repo", "list", "--limit", str(REPO_LIST_LIMIT), "--json",
+                "nameWithOwner,description,updatedAt,isPrivate,defaultBranchRef",
+            ],
+            timeout=REPO_LIST_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        return {"connected": False, "repos": [], "error": redact(f"Could not ask gh: {exc}")}
+    if proc.returncode != 0:
+        detail = redact((proc.stderr or proc.stdout or "").strip())
+        return {
+            "connected": False, "repos": [],
+            "error": detail.splitlines()[-1] if detail else "gh repo list failed.",
+        }
+    try:
+        raw = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError:
+        raw = []
+    repos = [
+        {
+            "repo": r.get("nameWithOwner", ""),
+            "description": r.get("description") or "",
+            "updated_at": r.get("updatedAt", ""),
+            "private": bool(r.get("isPrivate")),
+            "default_branch": (r.get("defaultBranchRef") or {}).get("name", ""),
+        }
+        for r in raw
+        if isinstance(r, dict) and r.get("nameWithOwner")
+    ]
+    return {"connected": True, "repos": repos, "error": ""}
+
+
 # --------------------------------------------------------------------------
 # Setup sessions
 # --------------------------------------------------------------------------

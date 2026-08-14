@@ -461,6 +461,40 @@ done there cannot be rolled back.
 > diff, the snapshot and the delivery branch all operate on the root. Picking
 > `project/src` and picking `project` are the same choice.
 
+### Picking a GitHub repo instead of browsing to one
+
+The picker opened by the working-folder button has two tabs: **Folder**, the
+browsable listing above, and **GitHub repo** — repositories the connected
+GitHub login can see (`gh repo list`), searchable, no path of your own to
+find or mount first. Picking one clones it under this app's own storage
+(`~/.config/ai-council/repos/<owner>/<name>`) and then hands off to the exact
+same working-folder machinery a browsed-to folder uses — there is no separate
+"GitHub mode"; it is a convenience clone that lands you on an ordinary git
+repository, with everything in the table above.
+
+This is the container-friendly path: a Docker deployment has no desktop full
+of already-cloned repos to browse to, and mounting a volume for every project
+you might want to hand to the council does not scale the way it does on a
+desktop install. Picking the same repo again reuses the existing clone rather
+than starting over, so it is safe to select one you were already working in.
+
+Cloning rides whatever credential [Connect GitHub](#connecting-your-agents)
+already set up — HTTPS, not SSH, so no key has to be provisioned separately.
+A repo the connected login cannot see fails with a clear "not found or no
+access" rather than a generic git error; a private repo before GitHub is
+connected fails the same way `git push` would, with a message pointing at the
+Connect button rather than a wall of git's own credential-helper output.
+
+Because the clone lives in the container, not somewhere you would otherwise
+be looking at it, **pull-request mode** (below) is what "you can approve them
+in git" means in practice: turn it on in Settings and a run pushes a branch
+and opens a PR instead of committing straight to the clone, so review happens
+on GitHub rather than by reading the container's filesystem. Nothing forces
+this — a repo picked this way behaves like any other folder if you leave
+pull-request mode off — but the app suggests it the first time, since a
+container-local commit with nowhere else to look at it is easy to forget
+about.
+
 ### Commit &amp; push
 
 The commit bar under a run's diff, and the **N uncommitted** chip in the status

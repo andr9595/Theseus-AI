@@ -119,6 +119,18 @@ def workspace_dir() -> Path:
     return private_dir(config_dir() / "workspace")
 
 
+def repos_dir() -> Path:
+    """Where a repository picked from GitHub is cloned to.
+
+    Under the same config directory as everything else this app persists -
+    the point of cloning here rather than somewhere the operator names is that
+    it survives exactly as long as the app's own config does, which in a
+    container is the one volume that is actually mounted. Desktop and Docker
+    both get a real, findable path either way.
+    """
+    return private_dir(config_dir() / "repos")
+
+
 # --------------------------------------------------------------------------
 # Agents
 # --------------------------------------------------------------------------

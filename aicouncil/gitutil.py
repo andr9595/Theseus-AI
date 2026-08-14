@@ -1066,3 +1066,94 @@ def push_head(path: str | Path, remote: str = "origin") -> Dict[str, Any]:
         "url": f"{web}/compare/{branch}?expand=1" if web else "",
         "repo_url": web,
     }
+
+
+# --------------------------------------------------------------------------
+# Cloning a repository picked from GitHub
+# --------------------------------------------------------------------------
+
+CLONE_TIMEOUT = 900
+
+# owner/repo only - never a URL, never a flag. Anchored, so a leading '-'
+# (which `git clone` would read as an option) can never match.
+_OWNER_REPO = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
+    r"/[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$"
+)
+
+
+def _clone_failure(detail: str, owner_repo: str) -> str:
+    low = detail.lower()
+    if (
+        "could not read username" in low
+        or "authentication failed" in low
+        or "invalid username or token" in low
+        or "403" in low
+    ):
+        return (
+            f"GitHub refused to clone {owner_repo} - if it is private, connect "
+            f"GitHub in Settings first. Connect GitHub runs `gh auth setup-git`, "
+            f"which is what teaches git to authenticate as you."
+        )
+    if "not found" in low or "repository not found" in low:
+        return f"{owner_repo} was not found, or you do not have access to it."
+    return f"git clone failed: {detail.splitlines()[-1] if detail else 'unknown error'}"
+
+
+def clone_repo(
+    owner_repo: str, dest_root: str | Path, base_url: str = "https://github.com"
+) -> Dict[str, Any]:
+    """Clone (or reuse) a GitHub repository under ``dest_root``.
+
+    ``owner_repo`` is exactly ``owner/name`` - never a URL, never a flag -
+    validated before it ever reaches a command line, the same discipline
+    ``SetupManager._argv`` uses for setup sessions.
+
+    HTTPS, not SSH: it rides whatever credential ``gh auth setup-git``
+    already taught git, which is the same login the GitHub connection card
+    uses everywhere else in this app. Nothing here asks for a key or a token
+    of its own.
+
+    Idempotent: a destination that already holds a clone of the same repo is
+    reused as-is - selecting a repo a second time does not throw away work
+    already sitting there uncommitted.
+
+    ``base_url`` exists for tests - a local bare repo standing in for GitHub,
+    the same "fake the vendor, not the plumbing" approach the setup-session
+    tests use - and is never something a caller in this app overrides.
+    """
+    if not _OWNER_REPO.match(owner_repo or ""):
+        raise GitError(
+            f"{owner_repo!r} is not a valid owner/repo - expected something "
+            f"like 'octocat/Hello-World'."
+        )
+    owner, name = owner_repo.split("/", 1)
+    dest = Path(dest_root).expanduser() / owner / name
+
+    if dest.is_dir():
+        existing = repo_root(dest)
+        if existing:
+            remote = _run(
+                ["remote", "get-url", "origin"], existing, check=False
+            ).stdout.strip().rstrip("/")
+            if remote.lower().endswith(".git"):
+                remote = remote[: -len(".git")]
+            if remote.lower().endswith(f"/{owner}/{name}".lower()):
+                return status(existing).to_dict()
+        raise GitError(
+            f"{dest} already exists and is not a clone of {owner_repo}. Remove "
+            f"it by hand first - cloning will not overwrite what might be "
+            f"unpushed work there."
+        )
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    url = f"{base_url}/{owner}/{name}.git"
+    proc = _run(
+        ["clone", "--", url, str(dest)], dest.parent,
+        check=False, timeout=CLONE_TIMEOUT,
+    )
+    if proc.returncode != 0:
+        detail = _scrub((proc.stderr or proc.stdout or "").strip())
+        raise GitError(_clone_failure(detail, owner_repo))
+
+    return status(dest).to_dict()
