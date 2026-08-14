@@ -10,7 +10,7 @@ FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="Theseus AI" \
       org.opencontainers.image.description="A local, deliberating multi-agent coding council" \
-      org.opencontainers.image.source="https://github.com/andr9595/AI-Council" \
+      org.opencontainers.image.source="https://github.com/andr9595/Theseus-AI" \
       org.opencontainers.image.licenses="MIT"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

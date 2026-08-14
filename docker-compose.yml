@@ -5,10 +5,10 @@
 #   docker compose up -d
 #   docker compose logs -f    # first URL (with its login ticket) is printed here
 services:
-  ai-council:
-    image: ghcr.io/andr9595/ai-council:latest
+  theseus-ai:
+    image: ghcr.io/andr9595/theseus-ai:latest
     # build: .   # uncomment to build from source instead of pulling
-    container_name: ai-council
+    container_name: theseus-ai
     ports:
       - "8760:8760"
     volumes:
@@ -16,7 +16,7 @@ services:
       # config, and - once installed from Settings -> Agents inside the
       # running container - the CLIs themselves and their logins
       # (~/.codex, ~/.claude, ~/.config/gh, ~/.local/bin).
-      - ai-council-home:/home/aicouncil
+      - theseus-ai-home:/home/aicouncil
       # The folder(s) you want the council working in. Add as many
       # `- /host/path:/container/path` lines as you need; point the app at
       # whichever one you're using from Settings -> Working folder.
@@ -30,8 +30,8 @@ services:
       # Every hostname or IP you will actually type into a browser to reach
       # this container, comma-separated. Requests claiming to be any other
       # Host are rejected - this is the DNS-rebinding defence, not red tape.
-      AI_COUNCIL_ALLOWED_HOSTS: "192.168.1.50,ai-council.local"
+      AI_COUNCIL_ALLOWED_HOSTS: "192.168.1.50,theseus-ai.local"
     restart: unless-stopped
 
 volumes:
-  ai-council-home:
+  theseus-ai-home:

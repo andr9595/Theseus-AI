@@ -1,16 +1,16 @@
 <?xml version="1.0"?>
 <Container version="2">
-  <Name>ai-council</Name>
-  <Repository>ghcr.io/andr9595/ai-council:latest</Repository>
-  <Registry>https://github.com/andr9595/AI-Council/pkgs/container/ai-council</Registry>
+  <Name>theseus-ai</Name>
+  <Repository>ghcr.io/andr9595/theseus-ai:latest</Repository>
+  <Registry>https://github.com/andr9595/Theseus-AI/pkgs/container/theseus-ai</Registry>
   <Network>bridge</Network>
   <Privileged>false</Privileged>
-  <Support>https://github.com/andr9595/AI-Council</Support>
-  <Project>https://github.com/andr9595/AI-Council</Project>
+  <Support>https://github.com/andr9595/Theseus-AI</Support>
+  <Project>https://github.com/andr9595/Theseus-AI</Project>
   <Overview>
-Theseus AI (ai-council) - a local, deliberating multi-agent coding council that
-runs your own subscription-authenticated CLIs (Claude, Codex, Antigravity),
-not per-token API keys.
+Theseus AI - a local, deliberating multi-agent coding council that runs your
+own subscription-authenticated CLIs (Claude, Codex, Antigravity), not
+per-token API keys.
 
 First run:
 1. Start the container, then check its log for the dashboard URL - it carries
@@ -50,7 +50,7 @@ folder(s) you want the council editing.
 
   <Config Name="WebUI Port" Target="8760" Default="8760" Mode="tcp" Description="The dashboard's port." Type="Port" Display="always" Required="true" Mask="false">8760</Config>
 
-  <Config Name="Appdata" Target="/home/aicouncil" Default="/mnt/user/appdata/ai-council" Mode="rw" Description="App config, installed agent CLIs, and their logins - everything that has to survive a restart." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/ai-council</Config>
+  <Config Name="Appdata" Target="/home/aicouncil" Default="/mnt/user/appdata/theseus-ai" Mode="rw" Description="App config, installed agent CLIs, and their logins - everything that has to survive a restart." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/theseus-ai</Config>
 
   <Config Name="Workspace" Target="/workspace" Default="/mnt/user/projects" Mode="rw" Description="The working folder the council edits. Point the app at /workspace from its own folder picker. Add more Path entries for more than one project." Type="Path" Display="always" Required="false" Mask="false">/mnt/user/projects</Config>
 

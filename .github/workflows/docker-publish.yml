@@ -20,13 +20,13 @@ jobs:
       # and answer a request, the same proof the plain-Python smoke test in
       # tests.yml asks of a bare `python -m aicouncil`.
       - name: Build the image
-        run: docker build -t ai-council:smoke .
+        run: docker build -t theseus-ai:smoke .
 
       - name: Smoke test - the container serves the dashboard
         run: |
           docker run -d --name smoke -p 18760:8760 \
             -e AI_COUNCIL_TOKEN=smoke-test-token \
-            ai-council:smoke
+            theseus-ai:smoke
           for i in $(seq 1 30); do
             code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18760/ || true)
             [ "$code" = "200" ] && break

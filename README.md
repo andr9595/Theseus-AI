@@ -81,8 +81,8 @@ the [bundled mock agent](#trying-it-without-the-clis).
 ## Quick start
 
 ```bash
-git clone https://github.com/andr9595/ai-council.git
-cd ai-council
+git clone https://github.com/andr9595/Theseus-AI.git
+cd Theseus-AI
 ./run.sh
 ```
 
@@ -162,7 +162,7 @@ business on a command line another local user can read with `ps`:
 
 ## Docker / unraid
 
-The image is `ghcr.io/andr9595/ai-council`, built by
+The image is `ghcr.io/andr9595/theseus-ai`, built by
 [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml)
 on every push to `main` and tagged `latest`. It is the same stdlib-only app -
 the image installs nothing beyond `git`, `openssh-client` and `curl`, which
@@ -174,21 +174,21 @@ working rather than being frozen at whatever the image had on build day.
 ### Running it
 
 ```bash
-docker run -d --name ai-council \
+docker run -d --name theseus-ai \
   -p 8760:8760 \
-  -v ai-council-home:/home/aicouncil \
+  -v theseus-ai-home:/home/aicouncil \
   -v /mnt/user/projects:/workspace \
   -e PUID=99 -e PGID=100 \
   -e AI_COUNCIL_TOKEN="$(openssl rand -hex 24)" \
-  -e AI_COUNCIL_ALLOWED_HOSTS="192.168.1.50,ai-council.local" \
-  ghcr.io/andr9595/ai-council:latest
+  -e AI_COUNCIL_ALLOWED_HOSTS="192.168.1.50,theseus-ai.local" \
+  ghcr.io/andr9595/theseus-ai:latest
 ```
 
 Or `docker compose up -d` with the [`docker-compose.yml`](docker-compose.yml)
 in this repo, which documents the same volumes and variables. On unraid,
 either add the container from **Docker → Add Container** using
-[`unraid/ai-council.xml`](unraid/ai-council.xml) as a starting template, or
-add `ghcr.io/andr9595/ai-council` as the repository by hand and fill in the
+[`unraid/theseus-ai.xml`](unraid/theseus-ai.xml) as a starting template, or
+add `ghcr.io/andr9595/theseus-ai` as the repository by hand and fill in the
 variables below yourself.
 
 | Variable | Required | What it does |
