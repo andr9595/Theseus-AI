@@ -23,7 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # A non-root user to drop into once the entrypoint has fixed ownership on the
 # mounted volume - see docker-entrypoint.sh. The uid/gid here are only the
-# image's own default; PUID/PGID at runtime is what unraid actually uses.
+# image's own default; PUID/PGID at runtime is what the host actually uses.
 RUN useradd --create-home --uid 1000 --user-group aicouncil
 
 WORKDIR /app

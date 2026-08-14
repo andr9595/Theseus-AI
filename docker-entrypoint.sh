@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Reconciles the image's built-in user with the PUID/PGID the operator wants
-# files owned by - the unraid convention, so a share mounted at
-# /home/aicouncil is written by the same uid the rest of the array uses,
-# not by whatever uid this image happened to pick.
+# files owned by - the linuxserver.io convention most NAS Docker UIs (unraid,
+# Synology, TrueNAS) expose, so a mounted volume is written by the uid the
+# rest of the host expects, not by whatever uid this image happened to pick.
 #
 # This has to run as root (the image's default user) and then hand off,
 # because changing another user's uid/gid is not a thing a non-root process

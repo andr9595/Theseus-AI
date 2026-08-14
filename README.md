@@ -148,7 +148,7 @@ one you never added is not a problem to fix by installing something.
 |---|---|
 | `--doctor` | Report environment and CLI availability, then exit |
 | `--host IP` | Bind address, default `127.0.0.1`. Loopback only unless `--allow-lan` is also given, because the app can run an agent with auto-approve flags. Env: `AI_COUNCIL_HOST`. |
-| `--allow-lan` | Permit a non-loopback `--host`. Meant for a container whose network Docker already isolates — see [Docker / unraid](#docker--unraid). Env: `AI_COUNCIL_ALLOW_LAN=1`. |
+| `--allow-lan` | Permit a non-loopback `--host`. Meant for a container whose network Docker already isolates — see [Docker](#docker). Env: `AI_COUNCIL_ALLOW_LAN=1`. |
 | `--no-browser` | Start the server without opening a window |
 | `--port N` | Preferred port (falls back to a free one if taken). Env: `AI_COUNCIL_PORT`. |
 | `--print-url` | Print only the dashboard URL, then serve |
@@ -160,7 +160,7 @@ business on a command line another local user can read with `ps`:
 
 ---
 
-## Docker / unraid
+## Docker
 
 The image is `ghcr.io/andr9595/theseus-ai`, built by
 [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml)
@@ -171,29 +171,35 @@ install them from Settings → Agents once the container is running, the same
 button that works on a bare-metal install, so their own updaters keep
 working rather than being frozen at whatever the image had on build day.
 
+This is a plain Docker image with no host-specific assumptions baked in - it
+runs the same way on a bare Linux box, a Synology, a TrueNAS jail with Docker
+support, or unraid. The one unraid-specific thing in this repo is the
+Community Applications template in [`unraid/`](unraid), because that XML
+format only means anything to unraid's Docker tab; everywhere else, the
+`docker run`/`docker compose` path below is all there is.
+
 ### Running it
 
 ```bash
 docker run -d --name theseus-ai \
   -p 8760:8760 \
   -v theseus-ai-home:/home/aicouncil \
-  -v /mnt/user/projects:/workspace \
-  -e PUID=99 -e PGID=100 \
+  -v /path/to/your/projects:/workspace \
+  -e PUID=1000 -e PGID=1000 \
   -e AI_COUNCIL_TOKEN="$(openssl rand -hex 24)" \
   -e AI_COUNCIL_ALLOWED_HOSTS="192.168.1.50,theseus-ai.local" \
   ghcr.io/andr9595/theseus-ai:latest
 ```
 
 Or `docker compose up -d` with the [`docker-compose.yml`](docker-compose.yml)
-in this repo, which documents the same volumes and variables. On unraid,
-either add the container from **Docker → Add Container** using
-[`unraid/theseus-ai.xml`](unraid/theseus-ai.xml) as a starting template, or
-add `ghcr.io/andr9595/theseus-ai` as the repository by hand and fill in the
-variables below yourself.
+in this repo, which documents the same volumes and variables. On unraid
+specifically, add the container from **Docker → Add Container** using
+[`unraid/theseus-ai.xml`](unraid/theseus-ai.xml) as a starting template
+instead of typing the fields in by hand.
 
 | Variable | Required | What it does |
 |---|---|---|
-| `PUID`, `PGID` | recommended | The entrypoint `usermod`/`groupmod`s the in-image user to match, then `chown`s the home volume — files it writes belong to your array's uid, not the image's. unraid's own `nobody:users` is `99:100`. |
+| `PUID`, `PGID` | recommended | The entrypoint `usermod`/`groupmod`s the in-image user to match, then `chown`s the home volume — files it writes belong to whatever uid your host expects, not the image's default. The convention (and the env var names) come from [linuxserver.io](https://docs.linuxserver.io/general/understanding-puid-and-pgid/) and are widely supported across NAS platforms; unraid's own `nobody:users` is `99:100` if that's what you're on. |
 | `AI_COUNCIL_TOKEN` | recommended | A secret you choose (`openssl rand -hex 24`). Without it, a fresh one-time login ticket is generated every start and read from `docker logs` — workable, but a container that restarts often makes that tedious. With it, `http://<host>:8760/?ticket=<the same value>` is a permanent bookmark; the bare URL still shows *Missing session token* by design. |
 | `AI_COUNCIL_ALLOWED_HOSTS` | **yes**, for LAN access | Comma-separated hostnames/IPs you will actually browse to. Requests claiming any other `Host` are rejected — this is the DNS-rebinding defence described in [server.py](aicouncil/server.py), and it stays an explicit allowlist rather than "anything, once off loopback" even inside a container. |
 
