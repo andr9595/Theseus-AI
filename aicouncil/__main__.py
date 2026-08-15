@@ -92,14 +92,21 @@ def _print_doctor(store: cfg.ConfigStore) -> int:
     workspace = store.get("workspace") or ""
     print(f"  workspace   : {workspace or f'{cfg.workspace_dir()} (scratch)'}")
     if store.get("pull_request_mode"):
-        # PR mode's dependencies (a remote, `gh`, a git identity) are exactly
-        # the kind of thing this command exists to find before a run does.
-        blocker = (
-            gitutil.pull_request_blocker(workspace)
-            if workspace
-            else "the scratch workspace is not a git repository"
-        )
-        print(f"  pull request: ON - {blocker or 'ready'}")
+        if store.get("zero_touch"):
+            # Never actually reached: Zero-Touch ignores the toggle and pushes
+            # directly instead. Worth saying here, since the setting still
+            # reads as ON everywhere else in this printout.
+            print("  pull request: ON, but ignored - Zero-Touch pushes directly")
+        else:
+            # PR mode's dependencies (a remote, `gh`, a git identity) are
+            # exactly the kind of thing this command exists to find before a
+            # run does.
+            blocker = (
+                gitutil.pull_request_blocker(workspace)
+                if workspace
+                else "the scratch workspace is not a git repository"
+            )
+            print(f"  pull request: ON - {blocker or 'ready'}")
     else:
         print("  pull request: off")
     print("\nProviders:")

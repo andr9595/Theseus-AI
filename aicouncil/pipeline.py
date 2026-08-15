@@ -353,8 +353,10 @@ def _context_summary(
     return out
 
 
-def _pull_request_text(run: Run) -> Tuple[str, str]:
-    """The commit subject and pull-request body for a finished run.
+def _run_report_lines(run: Run) -> Tuple[str, List[str]]:
+    """The commit subject and the body lines a finished run's own account
+    opens with - shared by pull-request mode and Zero-Touch's direct push,
+    which each append their own closing line before joining it.
 
     The senior stage's own summary is quoted rather than paraphrased: it is the
     only account of what was changed and why that was written by whoever made
@@ -383,6 +385,12 @@ def _pull_request_text(run: Run) -> Tuple[str, str]:
         ]
     if summary:
         lines += ["**What the chairman reported**", "", summary, ""]
+    return title, lines
+
+
+def _pull_request_text(run: Run) -> Tuple[str, str]:
+    """The commit subject and pull-request body for a finished run."""
+    title, lines = _run_report_lines(run)
     lines += [
         "---",
         "",
@@ -390,6 +398,21 @@ def _pull_request_text(run: Run) -> Tuple[str, str]:
         f"review the diff before it reaches `{run.base_branch}`.",
     ]
     return title, "\n".join(lines)
+
+
+def _auto_commit_message(run: Run, branch: str) -> str:
+    """The commit message Zero-Touch's direct push writes with nobody typing
+    one - the same account a pull request would have opened with, closed with
+    the fact that this landed unattended instead of the PR disclaimer.
+    """
+    title, lines = _run_report_lines(run)
+    lines += [
+        "---",
+        "",
+        f"Committed and pushed by Theseus AI, run `{run.id}`, under "
+        f"Zero-Touch Mode. Nobody reviewed this before it reached `{branch}`.",
+    ]
+    return title + "\n\n" + "\n".join(lines)
 
 
 @dataclass
@@ -512,10 +535,18 @@ class Run:
     mode: str = "council"  # "council" | "solo"
     # Pull-request delivery. The branch is named at start but only created
     # after write permission is granted, so a rejected run leaves no trace.
+    # Never true alongside Zero-Touch - see the note where this is decided in
+    # `start()`.
     pull_request_mode: bool = False
     base_branch: str = ""
     work_branch: str = ""
     pull_request: Optional[gitutil.PullRequest] = None
+    # Zero-Touch's own delivery: commit and push straight to whatever branch
+    # was checked out, decided once at start alongside `pull_request_mode` and
+    # mutually exclusive with it. There is no human left to open a pull
+    # request for, so this is what "unattended" actually delivers as.
+    auto_push: bool = False
+    pushed: Optional[Dict[str, Any]] = None
     # Whether this run will have a rollback point. Decided once at start, from
     # the frozen config and the folder - the toggle is worth nothing without a
     # git repository to anchor to - because the approval gate quotes it, and
@@ -672,6 +703,8 @@ class Run:
             "base_branch": self.base_branch,
             "work_branch": self.work_branch,
             "pull_request": self.pull_request.to_dict() if self.pull_request else None,
+            "auto_push": self.auto_push,
+            "pushed": self.pushed,
             "snapshot_planned": self.snapshot_planned,
             "state": self.state,
             "created_at": self.created_at,
@@ -698,14 +731,16 @@ class Run:
             "diff": self.diff,
             "diff_stat": self.diff_stat,
             "snapshot": self.snapshot.to_dict() if self.snapshot else None,
-            # Not offered once a pull request exists: rollback restores a
-            # worktree, and the branch this run's work now lives on has already
-            # been pushed. Undoing half of that and calling it a rollback is
-            # worse than saying plainly that the PR has to be closed by hand.
+            # Not offered once a pull request exists, or Zero-Touch has already
+            # pushed: rollback restores a worktree, and either way this run's
+            # work is already on the remote. Undoing the local half and calling
+            # it a rollback is worse than saying plainly that it has to be
+            # undone by hand from here.
             "can_rollback": (
                 bool(self.snapshot)
                 and self.state in TERMINAL_STATES
                 and self.pull_request is None
+                and self.pushed is None
             ),
             "reviewer_note": self.reviewer_note,
             "error": self.error,
@@ -905,7 +940,27 @@ class Pipeline:
         # Delivery protects a run that writes. On a read-only conversation
         # there is nothing to branch, nothing to commit, and refusing to start
         # because the tree is dirty would be absurd.
-        pull_request_mode = writes and bool(conf.get("pull_request_mode"))
+        #
+        # Pull-request mode and Zero-Touch are mutually exclusive by design,
+        # not merely by which one happens to run first: pull-request mode
+        # exists to put a human between the work and the base branch, and
+        # Zero-Touch means there is no human there to put. Stacking the two
+        # would leave a PR nobody was ever going to look at stranded on
+        # GitHub, so Zero-Touch overrides the toggle rather than obeying it -
+        # `_push_unattended` is what it delivers as instead, once the run
+        # ends. (For Chat this is absolute: writing at all already requires
+        # Zero-Touch, so pull-request mode can never apply there any more.)
+        pull_request_mode = writes and not zero_touch and bool(conf.get("pull_request_mode"))
+        # Needs nothing but a git repository - unlike pull-request mode, direct
+        # push is not the operator opting into a delivery mechanism, it is
+        # Zero-Touch's unattended stand-in for the Commit & Push button, so it
+        # asks the same of the workspace: something to commit and somewhere to
+        # push it. A repository with no remote is a normal, common way to work
+        # - the manual button leaves that case alone rather than failing on
+        # it, and so does this: no remote means Zero-Touch just writes, the
+        # same as it always has, and the diff is left for a human to commit by
+        # hand later.
+        auto_push = writes and zero_touch and bool(gitutil.status(root).remote)
         if pull_request_mode:
             # Stricter than the toggle below and checked whether or not it is
             # on: every precondition for committing, pushing and opening the PR
@@ -989,6 +1044,7 @@ class Pipeline:
                 work_branch=(
                     gitutil.branch_for(run_id, task) if pull_request_mode else ""
                 ),
+                auto_push=auto_push,
                 snapshot_planned=(
                     writes
                     and bool(conf.get("safety_snapshot", True))
@@ -1917,6 +1973,9 @@ class Pipeline:
         elif writes and run.pull_request_mode:
             self._publish(run)
             self._set_state(run, FAILED if run.error else COMPLETE)
+        elif writes and run.auto_push:
+            self._push_unattended(run)
+            self._set_state(run, FAILED if run.error else COMPLETE)
         else:
             self._set_state(run, COMPLETE)
 
@@ -2405,6 +2464,9 @@ class Pipeline:
         elif run.pull_request_mode:
             self._publish(run)
             self._set_state(run, FAILED if run.error else COMPLETE)
+        elif run.auto_push:
+            self._push_unattended(run)
+            self._set_state(run, FAILED if run.error else COMPLETE)
         else:
             self._set_state(run, COMPLETE)
 
@@ -2529,6 +2591,58 @@ class Pipeline:
                     f"failed ({exc}). You may still be on {run.work_branch}."
                 ),
             )
+
+    def _push_unattended(self, run: Run) -> None:
+        """Zero-Touch's own delivery: commit and push straight to whatever
+        branch is checked out. Records failure on the run; never raises.
+
+        The unattended equivalent of the Commit & Push button - same two git
+        calls, timed to fire the moment the run ends instead of the moment a
+        human clicks it, because under Zero-Touch there is no human left to
+        click it. No branch, no pull request: opening one that only a human
+        could merge would just strand the work Zero-Touch was asked to land.
+        """
+        try:
+            st = gitutil.status(run.workspace)
+        except (gitutil.GitError, OSError) as exc:
+            run.error = f"Could not read the working tree to push it: {exc}"
+            return
+
+        # An agent that commits its own work leaves a clean tree with HEAD
+        # moved past the snapshot - the same case `_publish` tolerates for
+        # pull-request delivery. Recognised here so it still gets pushed
+        # rather than mistaken for "nothing happened".
+        self_committed = bool(
+            run.snapshot and st.head and st.head != run.snapshot.head
+        )
+        if st.clean and not self_committed:
+            # Nothing landed - most often a read that decided no change was
+            # needed. Pushing here would either no-op or, on a workspace with
+            # no remote configured, fail a run that never touched git.
+            return
+
+        if not st.clean:
+            try:
+                gitutil.commit_all(run.workspace, _auto_commit_message(run, st.branch))
+            except gitutil.GitError as exc:
+                run.error = str(exc)
+                return
+
+        try:
+            run.pushed = gitutil.push_head(run.workspace)
+        except gitutil.GitError as exc:
+            run.error = f"Changes are committed locally, but the push failed: {exc}"
+            return
+
+        self.bus.publish(
+            "log",
+            level="info",
+            message=(
+                f"Zero-Touch pushed straight to "
+                f"{run.pushed.get('upstream') or run.pushed.get('branch') or 'the remote'} "
+                f"- no pull request, nothing to merge."
+            ),
+        )
 
     # -- helpers -----------------------------------------------------------
 

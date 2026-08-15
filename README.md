@@ -448,8 +448,10 @@ None of that is enforced by refusing to start. The status bar says which
 features the current folder is buying, a run with no diff to show names the
 reason rather than implying it did nothing, and the approval gate tells you
 before you approve whether a rollback point will exist. The one thing that *is* refused up
-front is pull-request mode without a repository to branch from — checked before
-either agent spends any quota.
+front is pull-request mode without a GitHub-hosted repository to branch
+from — checked before either agent spends any quota, and skipped rather than
+refused for a run that has Zero-Touch on instead (see
+[Zero-Touch mode](#zero-touch-mode)).
 
 The scratch workspace is a real directory you can open, not a temporary one.
 Projects is the one mode that still builds in it with no folder chosen — a
@@ -485,15 +487,18 @@ access" rather than a generic git error; a private repo before GitHub is
 connected fails the same way `git push` would, with a message pointing at the
 Connect button rather than a wall of git's own credential-helper output.
 
-Because the clone lives in the container, not somewhere you would otherwise
-be looking at it, **pull-request mode** (below) is what "you can approve them
-in git" means in practice: turn it on in Settings and a run pushes a branch
-and opens a PR instead of committing straight to the clone, so review happens
-on GitHub rather than by reading the container's filesystem. Nothing forces
-this — a repo picked this way behaves like any other folder if you leave
-pull-request mode off — but the app suggests it the first time, since a
-container-local commit with nowhere else to look at it is easy to forget
-about.
+Because the clone lives in the container, not somewhere you would otherwise be
+looking at it, **pull-request mode** (below) is what "you can approve them in
+git" means in practice: turn it on in Settings and a human-supervised run
+pushes a branch and opens a PR instead of committing straight to the clone, so
+review happens on GitHub rather than by reading the container's filesystem.
+Nothing forces this — a repo picked this way behaves like any other folder if
+you leave pull-request mode off — but the app suggests it the first time,
+since a container-local commit with nowhere else to look at it is easy to
+forget about. The suggestion is skipped if Zero-Touch is already on: it
+ignores the toggle regardless (see [Zero-Touch mode](#zero-touch-mode)) and
+pushes straight to the clone's checked-out branch instead of opening anything
+to approve.
 
 ### Commit &amp; push
 
@@ -738,6 +743,18 @@ permission. That is deliberate: it means "what does this repo do?" is safe to
 ask by default, and arming it is a single, visible decision. The greeting says
 which of the two you are in and turns amber when it is armed.
 
+**Zero-Touch also decides delivery, and overrides [pull-request
+mode](#other-toggles) when it does.** Pull-request mode exists to put a human
+between the work and the base branch; Zero-Touch means there is no human there
+to put. Stacking the two would open a pull request nobody was ever going to
+look at, so a Zero-Touch run ignores the toggle — on or off — and instead
+commits and pushes straight to whichever branch was checked out, the moment
+the run ends, with no branch of its own and nothing to merge. This needs a git
+repository with a remote; without one, Zero-Touch writes exactly as it always
+has and leaves the diff for you to commit by hand. (Because Chat's only source
+of write permission *is* Zero-Touch, this also means Chat can never deliver as
+a pull request — it either pushes directly or doesn't write at all.)
+
 Four properties hold throughout, and they are covered by tests:
 
 - **A member or critique seat never receives an auto-approve flag.** They are
@@ -837,7 +854,7 @@ no gate and no branch for them to decide anything about.
 
 | Toggle | Group | Effect |
 |---|---|---|
-| **Pull request** | Delivery | Deliver the run on a branch of its own and open a GitHub PR instead of writing to the checked-out branch. See below. |
+| **Pull request** | Delivery | Deliver the run on a branch of its own and open a GitHub PR instead of writing to the checked-out branch. Needs a GitHub-hosted `origin` remote, and is ignored while Zero-Touch is on — see [Zero-Touch mode](#zero-touch-mode). See below. |
 | **Require clean tree** | Delivery | Refuse to start if the repo has uncommitted changes. Pull-request mode enforces this itself, on or off. |
 | **Safety snapshot** | Delivery | Capture the worktree before the chairman writes so **Roll back** works. Leave on. |
 
@@ -1274,8 +1291,14 @@ rather than to believe it.
 ## Pull-request mode
 
 Off by default. On, a run never writes to the branch you started on — it
-delivers to a branch of its own and leaves the merge to you, which is what
-makes a protected `main` workable with Zero-Touch on:
+delivers to a branch of its own and leaves the merge to you. This is what
+makes a protected `main` workable for a council run a human still supervises
+at the approval gate.
+
+> **Only applies with Zero-Touch off.** A Zero-Touch run ignores this toggle
+> entirely and pushes straight to the checked-out branch instead — there is no
+> human left for a pull request to wait on. See
+> [Zero-Touch mode](#zero-touch-mode) for what it does instead.
 
 ```text
 main (untouched)  ──────────────────────────────────────────>
@@ -1288,9 +1311,9 @@ main (untouched)  ────────────────────�
 
 1. **Before anything starts**, every precondition is checked: a clean tree, a
    commit to branch from, a named branch (not a detached HEAD), a git identity
-   to commit with, an `origin` remote, `gh` on `PATH`, and `gh auth status`
-   passing. Failing late — after the chairman has spent its quota — would
-   strand the work on a branch nobody asked for.
+   to commit with, an `origin` remote that is actually GitHub, `gh` on `PATH`,
+   and `gh auth status` passing. Failing late — after the chairman has spent
+   its quota — would strand the work on a branch nobody asked for.
 
    The last two are what **Settings → Agents → GitHub** is for: it installs
    `gh` into `~/.local/bin` without sudo, and connects it. See

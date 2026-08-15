@@ -1170,7 +1170,19 @@ class TestPullRequestMode(PipelineTestBase):
     GitHub CLI is a stand-in - it is the one part of this that cannot be run in
     a temporary directory - and it records its argv so the tests can check what
     it was actually asked to open.
+
+    Pull-request mode now also requires the remote to actually be GitHub, so
+    ``origin`` is given a URL that says ``github.com`` - what
+    ``remote_is_github`` reads - with a ``pushInsteadOf`` rewrite (not
+    ``insteadOf``, which ``git remote get-url`` would also apply and give the
+    rewrite away) redirecting the real push to the local bare repo transparently.
+
+    Pull-request mode is also mutually exclusive with Zero-Touch now, so this
+    class runs with it off and stops at the approval gate like any other
+    council run - ``approve_at_gate`` is the one line most tests add for that.
     """
+
+    GITHUB_URL = "https://github.com/example/project.git"
 
     def setUp(self):
         super().setUp()
@@ -1178,7 +1190,11 @@ class TestPullRequestMode(PipelineTestBase):
         self.origin = self.tmp / "origin.git"
         self.origin.mkdir()
         git(["init", "--bare", "-q"], self.origin)
-        git(["remote", "add", "origin", str(self.origin)], self.repo)
+        git(["remote", "add", "origin", self.GITHUB_URL], self.repo)
+        git(
+            ["config", f"url.{self.origin}.pushInsteadOf", self.GITHUB_URL],
+            self.repo,
+        )
 
         bindir = self.tmp / "bin"
         bindir.mkdir()
@@ -1190,7 +1206,16 @@ class TestPullRequestMode(PipelineTestBase):
         self.set_env("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
         self.set_env("FAKE_GH_LOG", str(self.gh_log))
 
-        self.store.update({"zero_touch": True, "pull_request_mode": True})
+        self.store.update({"pull_request_mode": True})
+
+    def approve_at_gate(self, run):
+        """Pass the approval gate a non-Zero-Touch council run stops at.
+
+        Pull-request mode no longer implies Zero-Touch, so every test that
+        expects work to actually land calls this once the run is started.
+        """
+        self.wait_for(lambda: run.state == "awaiting_approval", what="the gate")
+        self.pipeline.approve()
 
     def set_env(self, name, value):
         previous = os.environ.get(name)
@@ -1215,6 +1240,7 @@ class TestPullRequestMode(PipelineTestBase):
     def test_the_base_branch_is_left_exactly_as_it_was(self):
         head_before = git_out(["rev-parse", "main"], self.repo)
         run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.approve_at_gate(run)
         self.wait_terminal()
 
         self.assertEqual(run.state, "complete", run.error)
@@ -1228,6 +1254,7 @@ class TestPullRequestMode(PipelineTestBase):
 
     def test_the_work_reaches_the_branch_and_the_remote(self):
         run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.approve_at_gate(run)
         self.wait_terminal()
         self.assertEqual(run.state, "complete", run.error)
 
@@ -1244,6 +1271,7 @@ class TestPullRequestMode(PipelineTestBase):
 
     def test_the_pull_request_targets_the_branch_that_was_checked_out(self):
         run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.approve_at_gate(run)
         self.wait_terminal()
         self.assertEqual(run.state, "complete", run.error)
 
@@ -1261,6 +1289,7 @@ class TestPullRequestMode(PipelineTestBase):
         # The worktree diff is empty once the work is committed; what the tab
         # must show from then on is the branch against its base.
         run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.approve_at_gate(run)
         self.wait_terminal()
         self.assertEqual(run.state, "complete", run.error)
         self.assertIn("AI_COUNCIL_DEMO.md", run.diff)
@@ -1269,6 +1298,7 @@ class TestPullRequestMode(PipelineTestBase):
     def test_rollback_is_not_offered_once_a_pull_request_exists(self):
         # Restoring the worktree would not close the PR or unpush the branch.
         run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.approve_at_gate(run)
         self.wait_terminal()
         self.assertIsNotNone(run.snapshot)
         self.assertFalse(run.to_dict()["can_rollback"])
@@ -1294,8 +1324,64 @@ class TestPullRequestMode(PipelineTestBase):
             self.pipeline.start("add a demo artifact", str(self.repo))
         self.assertEqual(self.branches(), ["main"])
 
+    def test_a_non_github_remote_is_refused(self):
+        # Present, just not GitHub - opening the PR would fail at the very
+        # end, after an agent already spent its quota, without this check.
+        git(
+            ["remote", "set-url", "origin",
+             "https://gitlab.example.com/example/project.git"],
+            self.repo,
+        )
+        with self.assertRaisesRegex(ValueError, "not on GitHub"):
+            self.pipeline.start("add a demo artifact", str(self.repo))
+
+    # -- Zero-Touch overrides it -------------------------------------------
+
+    def test_zero_touch_ignores_pull_request_mode_and_pushes_directly(self):
+        self.store.update({"zero_touch": True})
+        head_before = git_out(["rev-parse", "main"], self.repo)
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        # The toggle is still on in Settings - it is this run that ignored it.
+        self.assertFalse(run.pull_request_mode)
+        self.assertTrue(run.auto_push)
+        self.assertIsNone(run.pull_request)
+        self.assertNotIn("pr create", " ".join(self.gh_calls()))
+
+        # No delivery branch: the work landed straight on the branch that was
+        # already checked out.
+        self.assertEqual(self.branches(), ["main"])
+        self.assertEqual(gitutil.status(self.repo).branch, "main")
+        self.assertNotEqual(git_out(["rev-parse", "main"], self.repo), head_before)
+        self.assertTrue(gitutil.status(self.repo).clean)
+
+        # Pushed for real, to the same remote pull-request mode would have
+        # used.
+        self.assertEqual(
+            git_out(["rev-parse", "refs/heads/main"], self.origin),
+            git_out(["rev-parse", "main"], self.repo),
+        )
+        self.assertIsNotNone(run.pushed)
+        self.assertFalse(run.to_dict()["can_rollback"])
+
+    def test_zero_touch_pushes_directly_even_with_pull_request_mode_off(self):
+        # "Ignores it" cuts both ways: Zero-Touch delivers by direct push
+        # whether or not the toggle happens to be on.
+        self.store.update({"zero_touch": True, "pull_request_mode": False})
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertTrue(run.auto_push)
+        self.assertIsNotNone(run.pushed)
+        self.assertEqual(
+            git_out(["rev-parse", "refs/heads/main"], self.origin),
+            git_out(["rev-parse", "main"], self.repo),
+        )
+
     def test_rejecting_at_the_gate_creates_no_branch(self):
-        self.store.update({"zero_touch": False})
         run = self.pipeline.start("add a demo artifact", str(self.repo))
         self.wait_for(lambda: run.state == "awaiting_approval")
         self.pipeline.reject()
@@ -1310,6 +1396,7 @@ class TestPullRequestMode(PipelineTestBase):
     def test_a_failed_publish_says_where_the_work_is(self):
         self.set_env("FAKE_GH_FAIL", "1")
         run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.approve_at_gate(run)
         self.wait_terminal()
 
         self.assertEqual(run.state, "failed")
@@ -1324,6 +1411,7 @@ class TestPullRequestMode(PipelineTestBase):
     def test_a_chairman_that_changes_nothing_opens_no_pull_request(self):
         self.pin_chair("claude", mock_council("claude", ["--fail"]))
         run = self.pipeline.start("do nothing at all", str(self.repo))
+        self.approve_at_gate(run)
         self.wait_terminal()
 
         self.assertEqual(run.state, "failed")
@@ -1339,6 +1427,74 @@ class TestPullRequestMode(PipelineTestBase):
         )
         # A task with nothing nameable in it still yields a valid ref.
         self.assertEqual(gitutil.branch_for("abc123", "!!!"), "ai-council/abc123")
+
+
+class TestZeroTouchDirectPush(PipelineTestBase):
+    """Zero-Touch's own delivery: commit and push with nobody watching.
+
+    Plain git, no GitHub CLI anywhere near it and no pull request at any
+    point - unlike pull-request mode this needs nothing but *a* remote, so the
+    stand-in origin here is a bare repo at a local path rather than something
+    dressed up to look like GitHub.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.origin = self.tmp / "origin.git"
+        self.origin.mkdir()
+        git(["init", "--bare", "-q"], self.origin)
+        git(["remote", "add", "origin", str(self.origin)], self.repo)
+        self.store.update({"zero_touch": True})
+
+    def test_a_zero_touch_run_commits_and_pushes_without_asking(self):
+        head_before = git_out(["rev-parse", "main"], self.repo)
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertTrue(run.auto_push)
+        self.assertFalse(run.pull_request_mode)
+        self.assertIsNone(run.pull_request)
+        self.assertTrue(gitutil.status(self.repo).clean)
+        self.assertNotEqual(git_out(["rev-parse", "main"], self.repo), head_before)
+        self.assertEqual(
+            git_out(["rev-parse", "refs/heads/main"], self.origin),
+            git_out(["rev-parse", "main"], self.repo),
+        )
+        self.assertIsNotNone(run.pushed)
+        self.assertTrue(run.pushed["pushed"])
+
+    def test_rollback_is_not_offered_once_zero_touch_has_pushed(self):
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+        self.assertIsNotNone(run.snapshot)
+        self.assertFalse(run.to_dict()["can_rollback"])
+
+    def test_a_chat_turn_under_zero_touch_also_pushes(self):
+        # Chat's only source of write permission is Zero-Touch, so it can
+        # never reach pull-request mode - it delivers by direct push or not
+        # at all.
+        assistant = mock_provider("solo", "Assistant")
+        assistant["read_only_args"] = ["--read-only"]
+        assistant["behavior"] = ""
+        self.store.update({"mode": "solo", "providers": {"solo": assistant}})
+        run = self.pipeline.start("add a demo artifact", str(self.repo))
+        self.wait_terminal()
+        self.assertEqual(run.state, "complete", run.error)
+        self.assertTrue(run.auto_push)
+        self.assertFalse(run.pull_request_mode)
+        self.assertIsNotNone(run.pushed)
+
+    def test_push_unattended_is_a_no_op_when_nothing_changed(self):
+        # A read that decided no change was needed must not attempt a commit
+        # or a push at all - there is nothing here for either to act on.
+        run = Run(
+            id="abc123", task="t", workspace=str(self.repo), zero_touch=True,
+            mode="council", auto_push=True,
+        )
+        self.pipeline._push_unattended(run)
+        self.assertEqual(run.error, "")
+        self.assertIsNone(run.pushed)
 
 
 class TestFailureHandling(PipelineTestBase):

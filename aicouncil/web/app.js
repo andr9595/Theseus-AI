@@ -721,6 +721,7 @@ function renderStatus() {
     if ((run.styles || {}).caveman) meta.push('CAVEMAN');
     if ((run.styles || {}).efficiency) meta.push('EFFICIENCY');
     if (run.work_branch) meta.push(run.work_branch);
+    if (run.pushed) meta.push(`pushed → ${run.pushed.branch || 'remote'}`);
     if (run.diff_stat && run.diff_stat.files) {
       meta.push(`${run.diff_stat.files} file(s) +${run.diff_stat.insertions}/-${run.diff_stat.deletions}`);
     }
@@ -738,6 +739,7 @@ function renderStatus() {
   if (resumable) $('#continue-btn').title = continueHint(run);
   $('#rollback-btn').classList.toggle('hidden', !(run && run.can_rollback));
   $('#pr-btn').classList.toggle('hidden', !(run && run.pull_request && run.pull_request.url));
+  $('#push-btn').classList.toggle('hidden', !(run && run.pushed && run.pushed.repo_url));
   renderContinuation();
 
   const runBtn = $('#run-btn');
@@ -2089,35 +2091,53 @@ function renderMode() {
 
 function renderToggles() {
   const c = state.config || {};
-  $('#zero-touch').checked = !!c.zero_touch;
+  const zeroTouch = !!c.zero_touch;
+  $('#zero-touch').checked = zeroTouch;
   $('#safety-snapshot').checked = c.safety_snapshot !== false;
   $('#clean-worktree').checked = !!c.require_clean_worktree;
   $('#pull-request-mode').checked = !!c.pull_request_mode;
-  $('#zero-touch-warning').classList.toggle('hidden', !c.zero_touch);
+  $('#zero-touch-warning').classList.toggle('hidden', !zeroTouch);
 
-  // All three delivery toggles are git features. Left on and left silent in a
-  // folder with no git, they read as protection that is switched on — and the
-  // pull-request one turns into a run refused after the operator has already
-  // typed the task. They stay operable: this says what they are worth here,
-  // rather than deciding for the operator which of the two to change.
+  // Left on and left silent in a folder with no git, this reads as protection
+  // that is switched on — and it turns into a run refused after the operator
+  // has already typed the task. It stays operable: this says what it is worth
+  // here, rather than deciding for the operator whether to change it.
   const note = $('#no-git-warning');
   note.classList.toggle('hidden', workspaceIsRepo());
   note.textContent =
     (workspacePath() ? 'This folder' : 'The scratch workspace') +
     ' is not a git repository, so there is no diff, no snapshot and nothing ' +
-    'to roll back to. Pull request mode will refuse to start.';
+    'to roll back to. Pull request mode will refuse to start, and a ' +
+    'Zero-Touch run will not push anywhere.';
 
-  // Pull-request mode changes what the other two delivery toggles are worth,
-  // and neither one is switched off for you: it enforces a clean tree itself
-  // whatever "Require clean tree" says, and it takes rollback away the moment
-  // the PR exists - but not before, which is exactly when publishing fails.
-  const pr = !!c.pull_request_mode;
-  $('#clean-tree-note').textContent = pr
+  // Pull-request mode only ever actually delivers when Zero-Touch is off — a
+  // Zero-Touch run ignores the toggle and pushes directly instead, whatever
+  // it says — so the other two delivery toggles' wording, and the note under
+  // the toggle itself, follow that effective state rather than the raw one.
+  const remoteIsGithub = !!(state.workspaceStatus && state.workspaceStatus.remote_is_github);
+  const prNote = $('#pull-request-note');
+  if (zeroTouch) {
+    prNote.classList.remove('hidden');
+    prNote.textContent = 'Ignored while Zero-Touch is on: a Zero-Touch run ' +
+      'commits and pushes straight to the branch it found instead, with no ' +
+      'pull request to merge.';
+  } else if (workspaceIsRepo() && !remoteIsGithub) {
+    prNote.classList.remove('hidden');
+    prNote.textContent = "This repository's origin remote is not on GitHub, " +
+      'so pull request mode will refuse to start.';
+  } else {
+    prNote.classList.add('hidden');
+  }
+
+  const effectivePr = !!c.pull_request_mode && !zeroTouch;
+  $('#clean-tree-note').textContent = effectivePr
     ? 'Enforced by Pull request mode regardless'
     : 'Refuse to run on uncommitted work';
-  $('#snapshot-note').textContent = pr
+  $('#snapshot-note').textContent = effectivePr
     ? 'Rollback until the pull request is open'
-    : 'Enable one-click rollback';
+    : zeroTouch
+      ? 'Rollback until Zero-Touch pushes it'
+      : 'Enable one-click rollback';
 }
 
 /* ---- The thread --------------------------------------------------------
@@ -3654,8 +3674,15 @@ function openGearMenu(anchor) {
     // came back; this asks them and weighs nothing, which is only a separate
     // thing to want where there is one agent to begin with.
     (chat ? row('multi_agent', 'Multi-agent answer', !!c.multi_agent, false) : '') +
-    (project ? '' :
-      row('pull_request_mode', 'Pull request mode', !!c.pull_request_mode, false)) +
+    // Chat's only source of write permission is Zero-Touch, and pull-request
+    // mode never applies under Zero-Touch - so the toggle can never actually
+    // do anything for Chat, and is left off this menu rather than shown inert.
+    (chat || project ? '' :
+      row(
+        'pull_request_mode',
+        c.zero_touch ? 'Pull request mode (ignored under Zero-Touch)' : 'Pull request mode',
+        !!c.pull_request_mode, false,
+      )) +
     // Council only: Chat has one agent and no bench to show. It is a display
     // choice rather than a permission, so unlike the two above it is applied
     // here directly - there is no confirmation for it to bypass.
@@ -4055,7 +4082,10 @@ async function cloneAndSelectGithubRepo() {
       method: 'POST', body: { repo: pickerGithubRepo },
     });
     await selectWorkspace(status.path);
-    if (!(state.config || {}).pull_request_mode) {
+    const conf = state.config || {};
+    // Moot while Zero-Touch is on: it ignores the toggle and pushes directly
+    // either way, so suggesting it here would be advice this run cannot use.
+    if (!conf.pull_request_mode && !conf.zero_touch) {
       toast(
         'Pull-request mode is off — turn it on in Settings so runs here ' +
         'push a branch and open a PR instead of committing straight to it.',
@@ -6119,6 +6149,11 @@ function wire() {
     if (pr && pr.url) window.open(pr.url, '_blank', 'noopener');
   });
 
+  $('#push-btn').addEventListener('click', () => {
+    const pushed = state.run && state.run.pushed;
+    if (pushed && pushed.repo_url) window.open(pushed.repo_url, '_blank', 'noopener');
+  });
+
   $('#approve-btn').addEventListener('click', async () => {
     try {
       await api('/api/approve', { method: 'POST', body: { note: $('#approval-note').value } });
@@ -6142,9 +6177,11 @@ function wire() {
         'to the CLI. Files will be created, modified and deleted without ' +
         'asking you first.\n\n' +
         '· Council runs will not stop at the approval gate.\n' +
-        '· Chat stops being read-only and can change files too.\n\n' +
+        '· Chat stops being read-only and can change files too.\n' +
+        '· Changes are committed and pushed straight to the remote - pull ' +
+        'request mode is ignored, and nothing waits for you to merge.\n\n' +
         'This applies in both modes. Keep "Safety snapshot" on so you can ' +
-        'roll back.'
+        'roll back until it pushes.'
       );
       if (!ok) { e.target.checked = false; return; }
     }
@@ -6161,7 +6198,9 @@ function wire() {
         'Each run will start from a clean tree, work on a branch of its own, ' +
         'then commit, push to origin and open a PR with the GitHub CLI. The ' +
         'branch you started on is never written to, and nothing is merged ' +
-        'for you.'
+        'for you.\n\n' +
+        "Needs a GitHub-hosted 'origin' remote. Ignored while Zero-Touch is " +
+        'on - a Zero-Touch run pushes straight to the branch instead.'
       );
       if (!ok) { e.target.checked = false; return; }
     }

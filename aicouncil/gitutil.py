@@ -12,7 +12,11 @@ The snapshot is written with ``git stash create``-style plumbing rather than
 Pull-request mode is the other half of that safety model: instead of leaving
 the senior stage's work uncommitted on whatever branch is checked out, it moves
 to a branch of its own, commits, pushes and opens a pull request - so the base
-branch only ever changes when a human merges it.
+branch only ever changes when a human merges it. It only makes sense against a
+GitHub remote, since opening the PR rides the GitHub CLI, and it is skipped
+outright under Zero-Touch: a run with nobody watching the diff would just
+leave the PR stranded for nobody to merge, so Zero-Touch delivers straight to
+the branch it found instead - see ``push_head`` and ``pipeline._push_unattended``.
 """
 
 from __future__ import annotations
@@ -176,6 +180,11 @@ class RepoStatus:
     head: str = ""
     head_subject: str = ""
     remote: str = ""
+    # Whether `remote` is a GitHub URL, not merely present. Pull-request mode
+    # is only ever offered against this - the UI reads it to decide whether
+    # the toggle applies here at all rather than leaving that to discover at
+    # the run's own precondition check.
+    remote_is_github: bool = False
     clean: bool = True
     staged: List[str] = field(default_factory=list)
     modified: List[str] = field(default_factory=list)
@@ -190,6 +199,7 @@ class RepoStatus:
             "head": self.head,
             "head_subject": self.head_subject,
             "remote": self.remote,
+            "remote_is_github": self.remote_is_github,
             "clean": self.clean,
             "staged": self.staged,
             "modified": self.modified,
@@ -197,6 +207,21 @@ class RepoStatus:
             "dirty_count": len(self.staged) + len(self.modified) + len(self.untracked),
             "error": self.error,
         }
+
+
+# Matches a GitHub-hosted remote in any form git accepts: SSH shorthand
+# (`git@github.com:owner/repo.git`), an explicit `ssh://` URL, or `https://`
+# - with or without embedded credentials. Anchored to the start so a lookalike
+# host like `github.com.evil.example` cannot slip past it: everything up to
+# the optional userinfo has to be exactly this, not merely contain it.
+_GITHUB_REMOTE = re.compile(
+    r"^(?:https?://|ssh://|git://)?(?:[^@/\s]+@)?github\.com[:/]", re.IGNORECASE
+)
+
+
+def remote_is_github(remote: str) -> bool:
+    """Whether a remote URL points at github.com, in any form git accepts."""
+    return bool(remote) and bool(_GITHUB_REMOTE.match(remote.strip()))
 
 
 def repo_root(path: str | Path) -> Optional[str]:
@@ -247,6 +272,7 @@ def status(path: str | Path) -> RepoStatus:
         remote = _run(["remote", "get-url", "origin"], root, check=False)
         if remote.returncode == 0:
             st.remote = remote.stdout.strip()
+            st.remote_is_github = remote_is_github(st.remote)
 
         # -z gives NUL-separated records, immune to spaces and quoting.
         porcelain = _run(["status", "--porcelain=v1", "-z"], root).stdout
@@ -690,8 +716,15 @@ def pull_request_blocker(path: str | Path) -> str:
         )
     if not st.remote:
         return (
-            "Pull-request mode pushes to a remote named 'origin', and this "
-            "repository has none."
+            "Pull-request mode pushes to a remote named 'origin' on GitHub, "
+            "and this repository has none."
+        )
+    if not st.remote_is_github:
+        return (
+            f"Pull-request mode opens the PR through the GitHub CLI, and this "
+            f"repository's 'origin' remote ({_scrub(st.remote)}) is not on "
+            f"GitHub. Point origin at a GitHub repository, or turn the toggle "
+            f"off."
         )
     if shutil.which("gh") is None:
         return (

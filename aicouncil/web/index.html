@@ -110,6 +110,7 @@
         <button id="continue-btn" class="btn btn-quiet btn-sm hidden" type="button">Continue</button>
         <button id="rollback-btn" class="btn btn-quiet btn-sm hidden" type="button">Roll back</button>
         <button id="pr-btn" class="btn btn-quiet btn-sm hidden" type="button">View pull request</button>
+        <button id="push-btn" class="btn btn-quiet btn-sm hidden" type="button">View on GitHub</button>
         <!-- Last in the row, so it holds the top-right corner whether or not
              the run controls beside it are showing. Dim is off and bright is
              on: the state has to be readable at a glance from across the room,
@@ -693,7 +694,9 @@
           auto-approve flags. Council can also be granted that at the approval
           gate, so it writes either way; Chat has no gate, so Zero-Touch is the
           only thing that lets it change files, and without it a chat is
-          read-only. Everything below protects whichever one is writing.
+          read-only. Zero-Touch also decides delivery: with nobody watching, it
+          commits and pushes straight to the branch it found instead of opening
+          a pull request. Everything below protects whichever one is writing.
         </p>
 
         <label class="toggle toggle-danger" for="zero-touch">
@@ -706,7 +709,8 @@
         </label>
         <div id="zero-touch-warning" class="inline-warning hidden">
           Auto-approve flags will be passed to the CLI. Files change without
-          confirmation.
+          confirmation, and changes push straight to the remote with no pull
+          request to review first.
         </div>
 
         <h4 class="settings-head">Delivery &amp; recovery</h4>
@@ -720,6 +724,7 @@
             <em>Commit to a new branch and open a PR to merge yourself</em>
           </span>
         </label>
+        <div id="pull-request-note" class="inline-note hidden"></div>
 
         <label class="toggle" for="clean-worktree">
           <input type="checkbox" id="clean-worktree">
