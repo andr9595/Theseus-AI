@@ -1131,6 +1131,107 @@ def push_head(path: str | Path, remote: str = "origin") -> Dict[str, Any]:
     }
 
 
+def _fetch_failure(proc: subprocess.CompletedProcess) -> str:
+    """Turn a failed fetch into something worth reading, the same way
+    `_push_failure` does for a push - fetching hits the same two credential
+    failures a push does, before it ever gets far enough to conflict.
+    """
+    detail = _scrub((proc.stderr or proc.stdout or "").strip())
+    low = detail.lower()
+    if (
+        "authentication failed" in low
+        or "could not read username" in low
+        or "permission denied" in low
+        or "invalid username or token" in low
+        or "403" in low
+    ):
+        return (
+            "Could not fetch: no usable credentials. For an https remote, use "
+            "Connect GitHub in Settings; for ssh, load the key in an "
+            "ssh-agent first."
+        )
+    if "host key verification failed" in low:
+        return (
+            "Could not fetch: ssh does not recognise this host. Run `ssh -T "
+            "git@github.com` once in a terminal to accept the host key, then "
+            "try again."
+        )
+    return "Could not fetch: " + (
+        detail.splitlines()[-1] if detail else "git fetch failed."
+    )
+
+
+def pull_head(path: str | Path, remote: str = "origin") -> Dict[str, Any]:
+    """Fetch and rebase the checked-out branch onto its remote counterpart.
+
+    Rebase, not merge: a delivery branch's history is meant to read as one
+    line per change, the same reasoning pull-request mode's own branch
+    already follows. If replaying the local commit(s) on top of what is now
+    on the remote conflicts, the rebase is aborted automatically rather than
+    left half-finished - there is no merge-conflict UI here to resolve it in,
+    so a conflict is reported and handed back to a real git client instead of
+    left mid-rebase for the next command to trip over.
+
+    Raises GitError with a recoverable message. Never leaves the repository
+    mid-rebase, whatever happens.
+    """
+    root = repo_root(path)
+    if root is None:
+        raise GitError(f"{path!r} is not a git repository.")
+
+    st = status(root)
+    if not st.branch or st.branch == "HEAD":
+        raise GitError(
+            "This repository is on a detached HEAD, so there is no branch to "
+            "pull onto. Check out a branch first."
+        )
+    if not st.remote:
+        raise GitError(
+            f"This repository has no remote named {remote!r}, so there is "
+            f"nothing to pull from."
+        )
+    if not st.clean:
+        raise GitError(
+            f"Pulling replays commits onto the working tree, and this one has "
+            f"{len(st.staged) + len(st.modified) + len(st.untracked)} "
+            f"uncommitted change(s). Commit or stash them first."
+        )
+
+    branch = st.branch
+    fetch = _run(["fetch", remote, branch], root, check=False, timeout=REMOTE_TIMEOUT)
+    if fetch.returncode != 0:
+        raise GitError(_fetch_failure(fetch))
+
+    target = f"{remote}/{branch}"
+    behind = _run(
+        ["rev-list", "--count", f"HEAD..{target}"], root, check=False
+    ).stdout.strip()
+    if behind in ("", "0"):
+        # Nothing new on the remote - the rejection this fixes is stale, or
+        # the branch has no remote counterpart yet.
+        return {"pulled": False, "up_to_date": True, "branch": branch}
+
+    before = _run(["rev-parse", "HEAD"], root).stdout.strip()
+    rebase = _run(["rebase", target], root, check=False, timeout=GIT_TIMEOUT)
+    if rebase.returncode != 0:
+        _run(["rebase", "--abort"], root, check=False)
+        raise GitError(
+            "Fetched, but replaying your commit onto the new history "
+            "conflicts, and there is nothing here that can resolve that for "
+            "you. Nothing changed - the rebase was aborted, and your commit "
+            f"is exactly where it was. Resolve it from a shell: "
+            f"`git -C {root} rebase {target}`, fix the conflict, then push."
+        )
+
+    return {
+        "pulled": True,
+        "up_to_date": False,
+        "branch": branch,
+        "before": before,
+        "after": _run(["rev-parse", "HEAD"], root).stdout.strip(),
+    }
+
+
 # --------------------------------------------------------------------------
 # Cloning a repository picked from GitHub
 # --------------------------------------------------------------------------

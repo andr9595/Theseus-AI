@@ -3993,6 +3993,117 @@ class TestPushFromTheApp(PipelineTestBase):
         self.assertEqual(gitutil.remote_web_url(self.repo), "")
 
 
+class TestPullFromTheApp(PipelineTestBase):
+    """Recovering from a push the remote rejected - fetch, rebase, and try
+    again - without a shell into the container.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.origin = self.tmp / "origin.git"
+
+    def _add_origin(self):
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main",
+                        str(self.origin)], check=True, capture_output=True)
+        git(["remote", "add", "origin", str(self.origin)], self.repo)
+
+    def _push_from_elsewhere(self, filename, content):
+        """A second clone commits and pushes - the way another device, or an
+        edit made straight on GitHub, would - leaving this repo's next push
+        rejected without it having done anything wrong."""
+        other = self.tmp / "other"
+        subprocess.run(["git", "clone", "-q", str(self.origin), str(other)],
+                       check=True, capture_output=True)
+        git(["config", "user.email", "other@example.com"], other)
+        git(["config", "user.name", "Other"], other)
+        (other / filename).write_text(content)
+        git(["add", "-A"], other)
+        git(["commit", "-qm", f"add {filename}"], other)
+        git(["push", "-q", "origin", "main"], other)
+
+    def test_pulling_replays_the_local_commit_onto_the_new_remote_history(self):
+        self._add_origin()
+        (self.repo / "a.txt").write_text("1\n")
+        gitutil.commit_all(self.repo, "first")
+        gitutil.push_head(self.repo)
+
+        self._push_from_elsewhere("theirs.txt", "theirs\n")
+
+        (self.repo / "b.txt").write_text("2\n")
+        mine = gitutil.commit_all(self.repo, "mine")
+        with self.assertRaises(gitutil.GitError):
+            gitutil.push_head(self.repo)
+
+        result = gitutil.pull_head(self.repo)
+        self.assertTrue(result["pulled"])
+        self.assertFalse(result["up_to_date"])
+        # Both files are here: the remote's, and the local commit rebased on
+        # top of it.
+        self.assertTrue((self.repo / "theirs.txt").exists())
+        self.assertTrue((self.repo / "b.txt").exists())
+        # Rebased onto a new parent, so it is a new commit, not the original.
+        self.assertNotEqual(gitutil.status(self.repo).head, mine["commit"])
+
+        # And now an ordinary push succeeds.
+        push = gitutil.push_head(self.repo)
+        self.assertTrue(push["pushed"])
+
+    def test_a_real_conflict_is_reported_and_the_rebase_is_aborted(self):
+        self._add_origin()
+        (self.repo / "shared.txt").write_text("original\n")
+        gitutil.commit_all(self.repo, "add shared file")
+        gitutil.push_head(self.repo)
+
+        self._push_from_elsewhere("shared.txt", "theirs\n")
+
+        (self.repo / "shared.txt").write_text("mine\n")
+        mine = gitutil.commit_all(self.repo, "edit shared file")
+
+        with self.assertRaises(gitutil.GitError) as ctx:
+            gitutil.pull_head(self.repo)
+        self.assertIn("conflict", str(ctx.exception).lower())
+
+        # Left exactly as it was - not mid-rebase, and the commit intact.
+        st = gitutil.status(self.repo)
+        self.assertEqual(st.head, mine["commit"])
+        self.assertEqual(st.branch, "main")
+        self.assertTrue(st.clean)
+        self.assertFalse((self.repo / ".git" / "rebase-merge").exists())
+        self.assertFalse((self.repo / ".git" / "rebase-apply").exists())
+
+    def test_already_up_to_date_is_a_no_op(self):
+        self._add_origin()
+        (self.repo / "a.txt").write_text("1\n")
+        gitutil.commit_all(self.repo, "first")
+        gitutil.push_head(self.repo)
+
+        result = gitutil.pull_head(self.repo)
+        self.assertFalse(result["pulled"])
+        self.assertTrue(result["up_to_date"])
+
+    def test_no_remote_is_explained_rather_than_dumped(self):
+        (self.repo / "x.txt").write_text("y\n")
+        gitutil.commit_all(self.repo, "local only")
+        with self.assertRaises(gitutil.GitError) as ctx:
+            gitutil.pull_head(self.repo)
+        self.assertIn("no remote named 'origin'", str(ctx.exception))
+
+    def test_a_dirty_tree_is_refused_before_fetching(self):
+        self._add_origin()
+        (self.repo / "dirty.txt").write_text("uncommitted\n")
+        with self.assertRaises(gitutil.GitError) as ctx:
+            gitutil.pull_head(self.repo)
+        self.assertIn("uncommitted", str(ctx.exception))
+
+    def test_a_detached_head_has_nothing_to_pull_onto(self):
+        self._add_origin()
+        head = gitutil.status(self.repo).head
+        git(["checkout", "-q", head], self.repo)
+        with self.assertRaises(gitutil.GitError) as ctx:
+            gitutil.pull_head(self.repo)
+        self.assertIn("detached", str(ctx.exception))
+
+
 class TestGlobalGitIdentity(unittest.TestCase):
     """``git config --global`` writes to the real ``$HOME`` unless it is
     pointed elsewhere - every test here gets its own, so nothing lands in

@@ -402,6 +402,7 @@ class Handler(BaseHTTPRequestHandler):
             ("POST", "/api/retry"): self._api_retry,
             ("POST", "/api/rollback"): self._api_rollback,
             ("POST", "/api/commit"): self._api_commit,
+            ("POST", "/api/pull"): self._api_pull,
             ("GET", "/api/project"): self._api_project,
             ("POST", "/api/project/start"): self._api_project_start,
             ("POST", "/api/project/pause"): self._api_project_pause,
@@ -938,6 +939,30 @@ class Handler(BaseHTTPRequestHandler):
         result["push"] = self._push_after_commit(workspace, body)
         self.app.bus.publish("committed", commit=result, workspace=workspace)
         return {"ok": True, "commit": result}
+
+    def _api_pull(self, params: Dict[str, list]) -> Dict[str, Any]:
+        """Fetch, rebase onto the remote, and push - the retry a rejected
+        push asks for, without needing a shell into the container.
+
+        A conflict `pull_head` cannot resolve raises, same as a bad commit
+        message would: the working tree is exactly as it was, so there is
+        nothing here worth reporting as a partial success. Only the push
+        afterward is tolerant of failing on its own - the pull already
+        landed by then, same reasoning as `_api_commit`.
+        """
+        body = self._read_body()
+        workspace = self._workspace_from(body)
+        if not workspace:
+            raise ValueError(
+                "No working folder is selected, so there is nothing to pull."
+            )
+        if self.app.pipeline.is_busy() or self.app.projects.is_running():
+            raise ValueError(
+                "A run or project is in progress. Wait for it to finish."
+            )
+        pull = gitutil.pull_head(workspace)
+        push = self._push_after_commit(workspace, body)
+        return {"ok": True, "pull": pull, "push": push}
 
     def _push_after_commit(
         self, workspace: str, body: Dict[str, Any]

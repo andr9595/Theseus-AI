@@ -1747,6 +1747,84 @@ class TestCommitRoute(ServerTestBase):
         self.assertEqual(branches, "")
 
 
+class TestPullRoute(ServerTestBase):
+    """The "Pull & push" retry a rejected push offers, end to end."""
+
+    def setUp(self):
+        self.work = Path(tempfile.mkdtemp(prefix="aicouncil-pull-", dir=self.tmp))
+        self.repo = self.work / "repo"
+        self.origin = self.work / "origin.git"
+        self.repo.mkdir()
+        self._git(["init", "-q", "-b", "main"], self.repo)
+        self._git(["config", "user.email", "test@example.com"], self.repo)
+        self._git(["config", "user.name", "Test"], self.repo)
+        (self.repo / "README.md").write_text("# fixture\n")
+        self._git(["add", "-A"], self.repo)
+        self._git(["commit", "-qm", "initial"], self.repo)
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main",
+                        str(self.origin)], check=True, capture_output=True)
+        self._git(["remote", "add", "origin", str(self.origin)], self.repo)
+        self._git(["push", "-q", "origin", "main"], self.repo)
+
+    def _git(self, args, cwd):
+        subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+    def _push_from_elsewhere(self, filename, content):
+        other = self.work / "other"
+        subprocess.run(["git", "clone", "-q", str(self.origin), str(other)],
+                       check=True, capture_output=True)
+        self._git(["config", "user.email", "other@example.com"], other)
+        self._git(["config", "user.name", "Other"], other)
+        (other / filename).write_text(content)
+        self._git(["add", "-A"], other)
+        self._git(["commit", "-qm", f"add {filename}"], other)
+        self._git(["push", "-q", "origin", "main"], other)
+
+    def test_pull_and_push_recovers_from_a_rejected_push(self):
+        self._push_from_elsewhere("theirs.txt", "theirs\n")
+        (self.repo / "mine.txt").write_text("mine\n")
+        self._git(["add", "-A"], self.repo)
+        self._git(["commit", "-qm", "mine"], self.repo)
+
+        status, data = self.request("/api/pull", method="POST", body={
+            "workspace": str(self.repo),
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(data["pull"]["pulled"])
+        self.assertTrue(data["push"]["pushed"])
+        on_origin = subprocess.run(
+            ["git", "rev-parse", "main"], cwd=self.origin,
+            capture_output=True, text=True, check=True).stdout.strip()
+        local_head = subprocess.run(
+            ["git", "rev-parse", "main"], cwd=self.repo,
+            capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(on_origin, local_head)
+        self.assertTrue((self.repo / "theirs.txt").exists())
+
+    def test_a_conflict_is_reported_not_hidden_behind_a_generic_failure(self):
+        (self.repo / "README.md").write_text("mine\n")
+        self._git(["add", "-A"], self.repo)
+        self._git(["commit", "-qm", "edit locally"], self.repo)
+        self._push_from_elsewhere("README.md", "theirs\n")
+
+        status, data = self.request("/api/pull", method="POST", body={
+            "workspace": str(self.repo),
+        })
+        self.assertEqual(status, 500)
+        self.assertIn("conflict", data["error"].lower())
+        # Not left mid-rebase - the working tree still reads as a normal,
+        # clean repository on its own commit.
+        st = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=self.repo,
+            capture_output=True, text=True, check=True).stdout
+        self.assertEqual(st, "")
+
+    def test_no_working_folder_is_a_clear_refusal(self):
+        status, data = self.request("/api/pull", method="POST", body={})
+        self.assertEqual(status, 400)
+        self.assertIn("No working folder", data["error"])
+
+
 class TestGitHubRepoRoutes(ServerTestBase):
     """The "GitHub repo" half of the working-folder picker, over the real
     socket. No test here touches the real network - see gitutil's own

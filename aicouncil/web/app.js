@@ -1834,12 +1834,50 @@ function renderPushOutcome(push) {
   }
   host.classList.remove('hidden');
   host.classList.toggle('warn', !push.pushed);
-  host.innerHTML = push.pushed
-    ? `Pushed to ${esc(push.upstream)}.` + (push.url
-        ? ` <a href="${esc(push.url)}" target="_blank" rel="noopener">` +
-          `Open it on GitHub</a> to merge it.`
-        : '')
-    : esc(push.error);
+  if (push.pushed) {
+    host.innerHTML = `Pushed to ${esc(push.upstream)}.` + (push.url
+      ? ` <a href="${esc(push.url)}" target="_blank" rel="noopener">` +
+        `Open it on GitHub</a> to merge it.`
+      : '');
+    return;
+  }
+  // A rejected push - the remote has commits this clone does not - is the
+  // one push failure this app can retry for you rather than just explain.
+  // Matched on the message `push_head` actually raises, not re-derived here.
+  const rejected = /has commits this branch does not/i.test(push.error || '');
+  host.innerHTML = esc(push.error) + (rejected
+    ? ` <button class="btn btn-quiet btn-sm" id="pull-push-btn" type="button">` +
+      `Pull &amp; push</button>`
+    : '');
+}
+
+/** The retry a rejected push asks for, in one click: fetch, rebase onto the
+ *  remote, then push again. A conflict `pull_head` cannot resolve throws,
+ *  same as any other git failure here - reported and left exactly as it
+ *  was, with the fix named rather than attempted. */
+async function doPullAndPush() {
+  const folder = workspacePath();
+  if (!folder) return;
+  const btn = $('#pull-push-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Pulling…'; }
+  try {
+    const { pull, push } = await api('/api/pull', {
+      method: 'POST', body: { workspace: folder },
+    });
+    toast(
+      pull.up_to_date
+        ? 'Already up to date — retrying the push.'
+        : `Pulled onto ${pull.branch}.`,
+      'ok', 4000,
+    );
+    await openChanges();
+    renderPushOutcome(push);
+  } catch (err) {
+    toast(err.message, 'error', 12000);
+    // openChanges()/renderPushOutcome did not run on this path, so the
+    // button that was clicked is still on screen and still disabled.
+    if (btn) { btn.disabled = false; btn.textContent = 'Pull & push'; }
+  }
 }
 
 async function doChangesCommit() {
@@ -6494,6 +6532,11 @@ function wire() {
   $('#changes-commit').addEventListener('click', doChangesCommit);
   $('#changes-message').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doChangesCommit(); }
+  });
+  // Delegated: the button only exists after a rejected push re-renders
+  // `#changes-pushed` with one in it.
+  $('#changes-pushed').addEventListener('click', (e) => {
+    if (e.target.closest('#pull-push-btn')) doPullAndPush();
   });
 
   // -- modal dismissal --------------------------------------------------

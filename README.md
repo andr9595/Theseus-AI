@@ -522,6 +522,16 @@ The two halves are reported separately, because they fail separately:
 Nothing is pushed underneath a running agent: committing mid-run captures a
 tree the agent is still editing, so the bar hides and the endpoint refuses.
 
+**A rejected push** — origin has commits this clone does not, most often
+because something else pushed to the same branch meanwhile — offers **Pull &
+push** right beside the error in the Uncommitted changes view. It fetches,
+rebases the local commit onto the new remote history, and pushes again, all
+in one click; no shell into the container needed. A real conflict is not
+something this app can resolve for you — there is no merge-conflict view
+here — so the rebase is aborted automatically and the working tree is left
+exactly as it was, with the fix named: resolve it with a real git client,
+then push by hand.
+
 ---
 
 ## Continuing a run
