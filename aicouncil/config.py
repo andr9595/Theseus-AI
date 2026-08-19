@@ -1072,6 +1072,7 @@ def _migrate(merged: Dict[str, Any], raw: Dict[str, Any]) -> Dict[str, Any]:
         merged["mode"] = "council"
     _repair_agy_read_only(merged)
     _repair_incognito_args(merged, raw)
+    _repair_stale_timeout_defaults(merged, raw)
     _adopt_agent_settings(merged, raw)
     _adopt_agent_selection(merged, raw)
     _apply_agent_settings(merged)
@@ -1219,6 +1220,58 @@ def _repair_agy_read_only(merged: Dict[str, Any]) -> None:
             continue
         if list(provider.get("read_only_args") or []) == _BROKEN_AGY_READ_ONLY:
             provider["read_only_args"] = list(AGENTS["agy"]["read_only_args"])
+
+
+# Timeout ceilings this app used to ship as defaults, before a real agentic
+# turn - a large repo, a build, a fix-and-retest loop - turned out to run
+# past them more often than not (chair, drafter, polisher, architect, coder,
+# qa) or too fast for how long a real one can run (the council seats, 1200).
+# Matched exactly, on the same trade `_repair_agy_read_only` above makes: a
+# stored config already has a concrete number here whether or not the
+# operator ever touched it, because `_write` persists the whole merged file
+# and `_deep_merge` alone cannot tell "never touched" from "chose the same
+# round number this app used to ship with" apart. Landing on one of this
+# app's own old, since-abandoned defaults is treated as the former - the
+# failure mode being guarded against is a run still getting cut off after an
+# image update that was supposed to fix exactly that, not an operator's
+# deliberate choice becoming a few times more generous than they asked for.
+_STALE_PROVIDER_TIMEOUTS = {
+    "solo": 1800, "drafter": 900, "polisher": 1800,
+    "architect": 1800, "coder": 2700, "qa": 1800,
+}
+
+
+def _repair_stale_timeout_defaults(merged: Dict[str, Any], raw: Dict[str, Any]) -> None:
+    """Adopt a raised default timeout even for a config already on disk.
+
+    See `_STALE_PROVIDER_TIMEOUTS` for why a stored value is not simply
+    trusted to mean "the operator chose this".
+    """
+    stored = raw.get("providers")
+    stored = stored if isinstance(stored, dict) else {}
+    stale = dict(_STALE_PROVIDER_TIMEOUTS)
+    stale.update({council_provider_id(a): 1200 for a in AGENTS})
+    for pid, old_default in stale.items():
+        provider = (merged.get("providers") or {}).get(pid)
+        before = stored.get(pid)
+        if not isinstance(provider, dict) or not isinstance(before, dict):
+            continue
+        if before.get("timeout_seconds") != old_default:
+            continue
+        fresh = ((DEFAULTS.get("providers") or {}).get(pid) or {}).get(
+            "timeout_seconds"
+        )
+        if fresh is not None:
+            provider["timeout_seconds"] = fresh
+
+    stored_council = raw.get("council")
+    if (
+        isinstance(stored_council, dict)
+        and stored_council.get("chair_timeout_seconds") == 1800
+    ):
+        merged.setdefault("council", {})["chair_timeout_seconds"] = (
+            DEFAULTS["council"]["chair_timeout_seconds"]
+        )
 
 
 def _repair_incognito_args(merged: Dict[str, Any], raw: Dict[str, Any]) -> None:

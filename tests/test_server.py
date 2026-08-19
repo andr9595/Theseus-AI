@@ -1076,6 +1076,85 @@ class TestSoloConfigMigration(unittest.TestCase):
         )
 
 
+class TestStaleTimeoutMigration(unittest.TestCase):
+    """A config saved under an old default timeout adopts a raised one.
+
+    `_write` persists the whole merged config, so a file that has been saved
+    even once already carries a concrete number in every timeout field -
+    there is no "missing key" for `_deep_merge` to fill from the new default.
+    This is the repair that adopts one anyway, on the same reasoning
+    `_repair_agy_read_only` already uses for a different field.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-timeout-migrate-"))
+        self.path = self.tmp / "config.json"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def load(self, raw):
+        self.path.write_text(json.dumps(raw))
+        return ConfigStore(self.path).all()
+
+    def test_a_solo_timeout_still_on_the_old_default_is_raised(self):
+        conf = self.load({"providers": {"solo": {"timeout_seconds": 1800}}})
+        self.assertEqual(
+            conf["providers"]["solo"]["timeout_seconds"],
+            cfg.DEFAULT_SOLO["timeout_seconds"],
+        )
+
+    def test_a_deliberately_chosen_solo_timeout_is_left_alone(self):
+        # Something other than this app's own old default - unambiguously the
+        # operator's choice, and not touched.
+        conf = self.load({"providers": {"solo": {"timeout_seconds": 600}}})
+        self.assertEqual(conf["providers"]["solo"]["timeout_seconds"], 600)
+
+    def test_every_stale_provider_default_is_raised(self):
+        conf = self.load({"providers": {
+            "drafter": {"timeout_seconds": 900},
+            "polisher": {"timeout_seconds": 1800},
+            "architect": {"timeout_seconds": 1800},
+            "coder": {"timeout_seconds": 2700},
+            "qa": {"timeout_seconds": 1800},
+            "council_codex": {"timeout_seconds": 1200},
+        }})
+        self.assertEqual(
+            conf["providers"]["drafter"]["timeout_seconds"],
+            cfg.DEFAULT_DRAFTER["timeout_seconds"],
+        )
+        self.assertEqual(
+            conf["providers"]["polisher"]["timeout_seconds"],
+            cfg.DEFAULT_POLISHER["timeout_seconds"],
+        )
+        self.assertEqual(
+            conf["providers"]["architect"]["timeout_seconds"],
+            cfg.DEFAULT_ARCHITECT["timeout_seconds"],
+        )
+        self.assertEqual(
+            conf["providers"]["coder"]["timeout_seconds"],
+            cfg.DEFAULT_CODER["timeout_seconds"],
+        )
+        self.assertEqual(
+            conf["providers"]["qa"]["timeout_seconds"],
+            cfg.DEFAULT_QA["timeout_seconds"],
+        )
+        self.assertGreater(
+            conf["providers"]["council_codex"]["timeout_seconds"], 1200
+        )
+
+    def test_the_chair_timeout_is_raised_too(self):
+        conf = self.load({"council": {"chair_timeout_seconds": 1800}})
+        self.assertEqual(
+            conf["council"]["chair_timeout_seconds"],
+            cfg.DEFAULTS["council"]["chair_timeout_seconds"],
+        )
+
+    def test_a_deliberately_chosen_chair_timeout_is_left_alone(self):
+        conf = self.load({"council": {"chair_timeout_seconds": 900}})
+        self.assertEqual(conf["council"]["chair_timeout_seconds"], 900)
+
+
 class TestAgentSelection(unittest.TestCase):
     """No agent is required, none is preferred, and the operator says which.
 
