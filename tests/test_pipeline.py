@@ -3993,6 +3993,51 @@ class TestPushFromTheApp(PipelineTestBase):
         self.assertEqual(gitutil.remote_web_url(self.repo), "")
 
 
+class TestGlobalGitIdentity(unittest.TestCase):
+    """``git config --global`` writes to the real ``$HOME`` unless it is
+    pointed elsewhere - every test here gets its own, so nothing lands in
+    whichever home directory happens to be running the suite.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aicouncil-identity-"))
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self._previous_home = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.home)
+
+    def tearDown(self):
+        if self._previous_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._previous_home
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def get(self, key):
+        return git_out(["config", "--global", "--get", key], self.tmp)
+
+    def test_fills_in_both_when_neither_is_set(self):
+        changed = gitutil.ensure_global_identity("Octocat", "o@example.test")
+        self.assertEqual(changed, {"name": True, "email": True})
+        self.assertEqual(self.get("user.name"), "Octocat")
+        self.assertEqual(self.get("user.email"), "o@example.test")
+
+    def test_leaves_an_existing_identity_alone(self):
+        git(["config", "--global", "user.name", "Already Set"], self.tmp)
+        git(["config", "--global", "user.email", "already@example.test"], self.tmp)
+        changed = gitutil.ensure_global_identity("Octocat", "o@example.test")
+        self.assertEqual(changed, {"name": False, "email": False})
+        self.assertEqual(self.get("user.name"), "Already Set")
+        self.assertEqual(self.get("user.email"), "already@example.test")
+
+    def test_fills_in_only_the_half_that_is_missing(self):
+        git(["config", "--global", "user.email", "already@example.test"], self.tmp)
+        changed = gitutil.ensure_global_identity("Octocat", "o@example.test")
+        self.assertEqual(changed, {"name": True, "email": False})
+        self.assertEqual(self.get("user.name"), "Octocat")
+        self.assertEqual(self.get("user.email"), "already@example.test")
+
+
 class TestCloneFromGitHub(unittest.TestCase):
     """Picking a repo from GitHub instead of browsing to a local folder.
 

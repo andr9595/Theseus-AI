@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from . import config as cfg
+from . import gitutil
 from .providers import resolve_binary
 
 try:  # POSIX only, which is what this app supports
@@ -434,6 +435,33 @@ def github_connect(token: str) -> Dict[str, Any]:
             git_note = _sanitize((setup.stderr or "").strip())[:160]
     except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
         git_note = f"{type(exc).__name__}: {exc}"
+
+    # `setup-git` teaches git how to authenticate a push; it says nothing
+    # about who the commit is from. A container built fresh for this app has
+    # never had `git config user.name`/`user.email` run in it, so without
+    # this the very first commit - the one Projects' "Commit & push" or a
+    # Zero-Touch run tries to make - fails on exactly that. Filled in from
+    # this account (its display name, or its login if that is not public,
+    # and its GitHub-issued noreply address - no extra scope needed), and
+    # only ever filled in: `ensure_global_identity` leaves an identity the
+    # operator already set alone.
+    try:
+        who = _run_gh(["api", "user"])
+        if who.returncode == 0 and who.stdout.strip():
+            account = json.loads(who.stdout)
+            login = str(account.get("login") or "").strip()
+            account_id = account.get("id")
+            name = str(account.get("name") or "").strip() or login
+            if name and login and account_id is not None:
+                gitutil.ensure_global_identity(
+                    name, f"{account_id}+{login}@users.noreply.github.com"
+                )
+    except (OSError, subprocess.TimeoutExpired, ValueError,
+            json.JSONDecodeError, gitutil.GitError):
+        # Same shape as the setup-git failure above: the login still
+        # succeeded, and the identity gap is one `git config` away from being
+        # fixed by hand, same as it always was.
+        pass
 
     status = github_status()
     if git_note:

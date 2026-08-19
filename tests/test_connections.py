@@ -11,6 +11,7 @@ Nothing here installs software or starts a real sign-in.
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -138,6 +139,10 @@ if args[:2] == ["repo", "list"]:
             "defaultBranchRef": {"name": "main"},
         },
     ]))
+    sys.exit(0)
+if args[:2] == ["api", "user"]:
+    import json
+    print(json.dumps({"login": "octocat", "id": 583231, "name": "The Octocat"}))
     sys.exit(0)
 sys.exit(2)
 '''
@@ -372,10 +377,28 @@ class TestGitHubConnection(ConnectionsTestBase):
         write_fake(self.bin, "gh", FAKE_GH)
         self.state = self.tmp / "gh-state"
         os.environ["FAKE_GH_STATE"] = str(self.state)
+        # `github_connect` now also fills in a missing global git identity -
+        # a real `git config --global`, against a home directory of its own
+        # rather than the one running this suite.
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self._previous_home = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.home)
 
     def tearDown(self):
+        if self._previous_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._previous_home
         os.environ.pop("FAKE_GH_STATE", None)
         super().tearDown()
+
+    def global_git_config(self, key):
+        proc = subprocess.run(
+            ["git", "config", "--global", "--get", key],
+            capture_output=True, text=True, check=False,
+        )
+        return proc.stdout.strip()
 
     def argv_log(self):
         path = Path(str(self.state) + ".argv")
@@ -442,6 +465,33 @@ class TestGitHubConnection(ConnectionsTestBase):
     def test_setup_git_runs_so_a_plain_push_uses_the_same_login(self):
         connections.github_connect(VALID_TOKEN)
         self.assertIn("'setup-git'", self.argv_log())
+
+    def test_connecting_fills_in_a_missing_git_identity(self):
+        # `setup-git` alone leaves a fresh container able to authenticate a
+        # push but with no one to attribute the commit to - this is what
+        # makes the very first commit not fail on that.
+        self.assertEqual(self.global_git_config("user.name"), "")
+        connections.github_connect(VALID_TOKEN)
+        self.assertEqual(self.global_git_config("user.name"), "The Octocat")
+        self.assertEqual(
+            self.global_git_config("user.email"),
+            "583231+octocat@users.noreply.github.com",
+        )
+
+    def test_connecting_does_not_overwrite_an_existing_git_identity(self):
+        subprocess.run(
+            ["git", "config", "--global", "user.name", "Someone Else"],
+            check=True,
+        )
+        connections.github_connect(VALID_TOKEN)
+        self.assertEqual(self.global_git_config("user.name"), "Someone Else")
+        # The other half of the pair was still genuinely missing, and still
+        # gets filled in - this is "leave what is set alone", not "leave the
+        # pair alone once either half exists".
+        self.assertEqual(
+            self.global_git_config("user.email"),
+            "583231+octocat@users.noreply.github.com",
+        )
 
     def test_a_token_with_whitespace_is_refused_before_gh_is_run(self):
         for bad in ("", "   ", "ghp_one two", "ghp_one\nghp_two"):

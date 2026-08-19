@@ -740,6 +740,36 @@ def pull_request_blocker(path: str | Path) -> str:
     return ""
 
 
+def ensure_global_identity(name: str, email: str) -> Dict[str, bool]:
+    """Fill in whichever of git's global ``user.name`` / ``user.email`` is
+    unset, using the values given. Never overwrites one already set - an
+    identity the operator configured themselves, however it got there, is
+    left alone.
+
+    A container built fresh for this app has git installed but nobody has
+    ever committed in it, so there is no identity for a run's first commit to
+    use - and by the time that surfaces it is the error `commit_all` and
+    `pull_request_blocker` both raise. Called after a GitHub connection
+    succeeds, using that account's own name and noreply email, so the common
+    case - nobody has ever run `git config` in this environment - is fixed
+    before it can happen rather than explained after it does.
+    """
+    changed = {"name": False, "email": False}
+    home = str(Path.home())
+    for key, value, field_name in (
+        ("user.name", name, "name"), ("user.email", email, "email"),
+    ):
+        value = (value or "").strip()
+        if not value:
+            continue
+        existing = _run(["config", "--global", "--get", key], home, check=False)
+        if existing.returncode == 0 and existing.stdout.strip():
+            continue
+        _run(["config", "--global", key, value], home)
+        changed[field_name] = True
+    return changed
+
+
 def branch_for(run_id: str, task: str) -> str:
     """Name the branch a run delivers on: ``ai-council/<task-slug>-<run-id>``.
 
