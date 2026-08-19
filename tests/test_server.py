@@ -690,7 +690,7 @@ class TestAgentAssignment(unittest.TestCase):
         )
         # Everything that is not the CLI is untouched: only the agent changed.
         self.assertEqual(polisher["id"], "polisher")
-        self.assertEqual(polisher["timeout_seconds"], 1800)
+        self.assertEqual(polisher["timeout_seconds"], 7200)
 
     def test_the_same_agent_may_hold_both_jobs(self):
         conf = self.store.update({"providers": {"drafter": {"agent": "claude"}}})
@@ -990,7 +990,7 @@ class TestSoloConfigMigration(unittest.TestCase):
                 f"{pid} still carries a council role: {sorted(provider)}",
             )
         # Swept, not reset: the rest of the provider is the operator's.
-        self.assertEqual(conf["providers"]["drafter"]["timeout_seconds"], 900)
+        self.assertEqual(conf["providers"]["drafter"]["timeout_seconds"], 3600)
 
     def test_a_pinned_persona_is_not_swept_with_the_dead_role_keys(self):
         # `council.personas` is where a behaviour lives now. The sweep above

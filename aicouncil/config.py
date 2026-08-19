@@ -570,7 +570,7 @@ DEFAULT_DRAFTER = {
     # When true the prompt is piped on stdin and `{prompt}` is dropped from
     # argv. Useful for very long prompts that would blow the ARG_MAX limit.
     "prompt_on_stdin": False,
-    "timeout_seconds": 900,
+    "timeout_seconds": 3600,
     # --- Model selection ---------------------------------------------------
     # Empty means "whatever the CLI is configured to use by default", which is
     # the safest choice: it keeps working when a vendor ships a new model.
@@ -598,7 +598,7 @@ DEFAULT_POLISHER = {
     "id": "polisher",
     "enabled": True,
     "prompt_on_stdin": False,
-    "timeout_seconds": 1800,
+    "timeout_seconds": 7200,
     # --- Model selection ---------------------------------------------------
     "model": "",
     # Empty for the same reason as the drafter: the picker asks the CLI. For
@@ -628,7 +628,11 @@ DEFAULT_SOLO = {
     # council seat, whose lens the router picks when nobody has pinned one.
     "behavior": "",
     "prompt_on_stdin": False,
-    "timeout_seconds": 1800,
+    # Chat has no ceiling of its own to borrow, unlike a council chair - a
+    # long agentic turn (reading a large repo, running a build, iterating on
+    # a fix) can easily outlast half an hour, and this is what was cutting
+    # those off mid-answer.
+    "timeout_seconds": 7200,
     # --- Model selection ----------------------------------------------------
     "model": "",
     "models": [],
@@ -672,9 +676,9 @@ def _project_role(role: str, agent: str, timeout: int) -> Dict[str, Any]:
     }
 
 
-DEFAULT_ARCHITECT = _project_role("architect", "claude", 1800)
-DEFAULT_CODER = _project_role("coder", "codex", 2700)
-DEFAULT_QA = _project_role("qa", "agy", 1800)
+DEFAULT_ARCHITECT = _project_role("architect", "claude", 7200)
+DEFAULT_CODER = _project_role("coder", "codex", 7200)
+DEFAULT_QA = _project_role("qa", "agy", 7200)
 
 # What each chair is for, and which CLI the app would put in it. Kept beside
 # the defaults rather than in the front end because the same three facts are
@@ -733,7 +737,7 @@ def _council_seat(agent: str) -> Dict[str, Any]:
         "id": council_provider_id(agent),
         "enabled": True,
         "prompt_on_stdin": False,
-        "timeout_seconds": 1200,
+        "timeout_seconds": 3600,
         "model": "",
         "models": [],
         "effort": "",
@@ -855,8 +859,11 @@ DEFAULTS: Dict[str, Any] = {
         # Off is for when the routing is trusted and the row is just noise.
         "show_seats": True,
         # The chair applies the patch, so it gets a longer ceiling than the
-        # read-only members even though it is usually the same CLI.
-        "chair_timeout_seconds": 1800,
+        # read-only members even though it is usually the same CLI. A patch
+        # that touches several files, runs a build and fixes what it broke
+        # can easily run past a half hour on a real task - the ceiling is
+        # for a genuinely hung process, not for how long good work can take.
+        "chair_timeout_seconds": 7200,
         # How long a Zero-Touch run waits at the gate its own failure forced
         # on. Zero-Touch means nobody is watching, so an unanswerable gate has
         # to end the run rather than park the engine on it forever.
