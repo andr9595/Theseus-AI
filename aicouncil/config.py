@@ -168,7 +168,18 @@ AGENTS: Dict[str, Dict[str, Any]] = {
         # it is never granted write permission - and a CLI that discovers that
         # halfway through a task stalls on a prompt nothing here can answer.
         # Saying so up front turns that into an answer instead.
-        "read_only_args": ["--sandbox", "read-only"],
+        #
+        # `--skip-git-repo-check` is the other half of working outside a git
+        # repository - the scratch workspace, or any plain folder. Without it
+        # Codex refuses outright the moment real sandboxing is in effect:
+        # "Not inside a trusted directory and --skip-git-repo-check was not
+        # specified." Verified against codex-cli 0.145.0. Read-only is the
+        # only path that needs it here: `--dangerously-bypass-approvals-and-
+        # sandbox` in `auto_approve_args` disables the sandbox outright and
+        # never hits this check, and a council member or a read-only Chat
+        # turn is read-only by contract regardless of what the folder is -
+        # so this is exactly the case that was failing.
+        "read_only_args": ["--sandbox", "read-only", "--skip-git-repo-check"],
         # Incognito's half of the bargain on the CLI's side: `--ephemeral` runs
         # without persisting session files to disk, so the turn leaves nothing
         # in `~/.codex` for `codex resume` to find. Read off the installed
@@ -1071,6 +1082,7 @@ def _migrate(merged: Dict[str, Any], raw: Dict[str, Any]) -> Dict[str, Any]:
     if merged.get("mode") not in ("council", "solo"):
         merged["mode"] = "council"
     _repair_agy_read_only(merged)
+    _repair_codex_read_only(merged)
     _repair_incognito_args(merged, raw)
     _repair_stale_timeout_defaults(merged, raw)
     _adopt_agent_settings(merged, raw)
@@ -1220,6 +1232,28 @@ def _repair_agy_read_only(merged: Dict[str, Any]) -> None:
             continue
         if list(provider.get("read_only_args") or []) == _BROKEN_AGY_READ_ONLY:
             provider["read_only_args"] = list(AGENTS["agy"]["read_only_args"])
+
+
+# What Codex's read-only grant used to be, before `--skip-git-repo-check` was
+# added: without it, Codex refuses outright the moment it is not run with the
+# sandbox fully disabled, unless the working folder happens to be a git
+# repository - "Not inside a trusted directory and --skip-git-repo-check was
+# not specified." A provider still carrying exactly this is carrying that
+# bug, the same trade `_repair_agy_read_only` above makes for a different one.
+_BROKEN_CODEX_READ_ONLY = ["--sandbox", "read-only"]
+
+
+def _repair_codex_read_only(merged: Dict[str, Any]) -> None:
+    """Give stored Codex providers the git-repo-check bypass they were
+    missing. See `_BROKEN_CODEX_READ_ONLY`.
+    """
+    for provider in (merged.get("providers") or {}).values():
+        if not isinstance(provider, dict):
+            continue
+        if agent_for(provider) != "codex":
+            continue
+        if list(provider.get("read_only_args") or []) == _BROKEN_CODEX_READ_ONLY:
+            provider["read_only_args"] = list(AGENTS["codex"]["read_only_args"])
 
 
 # Timeout ceilings this app used to ship as defaults, before a real agentic

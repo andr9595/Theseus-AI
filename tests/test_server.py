@@ -790,7 +790,7 @@ class TestAgentAssignment(unittest.TestCase):
         conf = self.store.update({"providers": {"solo": {"agent": "codex"}}})
         self.assertEqual(
             conf["providers"]["solo"]["read_only_args"],
-            ["--sandbox", "read-only"],
+            ["--sandbox", "read-only", "--skip-git-repo-check"],
         )
         conf = self.store.update({"providers": {"solo": {"agent": "claude"}}})
         self.assertEqual(
@@ -1043,6 +1043,49 @@ class TestSoloConfigMigration(unittest.TestCase):
         }}})
         self.assertEqual(
             conf["providers"]["council_claude"]["read_only_args"], ["--mode", "plan"]
+        )
+
+    def test_a_stored_codex_seat_gets_the_git_repo_check_bypass(self):
+        # `--sandbox read-only` alone made Codex refuse outright the moment
+        # the working folder was not a git repository: "Not inside a trusted
+        # directory and --skip-git-repo-check was not specified." The merge
+        # cannot repair this on its own - a list is replaced wholesale, so a
+        # config written before the fix keeps the broken pair forever.
+        conf = self.load({"providers": {
+            "council_codex": {
+                "command": ["codex", "exec", "{prompt}"],
+                "read_only_args": ["--sandbox", "read-only"],
+            },
+            "solo": {
+                "command": ["/usr/local/bin/codex", "exec", "{prompt}"],
+                "read_only_args": ["--sandbox", "read-only"],
+            },
+        }})
+        for pid in ("council_codex", "solo"):
+            self.assertEqual(
+                conf["providers"][pid]["read_only_args"],
+                ["--sandbox", "read-only", "--skip-git-repo-check"],
+                f"{pid} still refuses to run outside a git repository",
+            )
+
+    def test_the_codex_repair_leaves_hand_written_flags_alone(self):
+        conf = self.load({"providers": {"council_codex": {
+            "command": ["codex", "exec", "{prompt}"],
+            "read_only_args": ["--sandbox", "read-only", "--some-other-flag"],
+        }}})
+        self.assertEqual(
+            conf["providers"]["council_codex"]["read_only_args"],
+            ["--sandbox", "read-only", "--some-other-flag"],
+        )
+
+    def test_the_codex_repair_does_not_reach_the_other_clis(self):
+        conf = self.load({"providers": {"council_claude": {
+            "command": ["claude", "-p", "{prompt}"],
+            "read_only_args": ["--sandbox", "read-only"],
+        }}})
+        self.assertEqual(
+            conf["providers"]["council_claude"]["read_only_args"],
+            ["--sandbox", "read-only"],
         )
 
     def test_a_swapped_assistant_gets_its_own_cli_s_no_save_flag(self):
